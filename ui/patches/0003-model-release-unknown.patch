@@ -1,0 +1,12 @@
+diff -r a/packages/app/src/runtime/server/global-sync/utils.ts b/packages/app/src/runtime/server/global-sync/utils.ts
+--- a/packages/app/src/runtime/server/global-sync/utils.ts
++++ b/packages/app/src/runtime/server/global-sync/utils.ts
+@@ -110,7 +110,7 @@
+       status: model.status,
+       options: model.settings ?? {},
+       headers: model.headers ?? {},
+-      release_date: new Date(model.time.released).toISOString().slice(0, 10),
++      release_date: model.time.released > 0 ? new Date(model.time.released).toISOString().slice(0, 10) : "",
+       variants: Object.fromEntries(model.variants.map((variant) => [variant.id, variant.settings ?? {}])),
+     }
+   }

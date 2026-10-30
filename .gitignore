@@ -1,0 +1,18 @@
+/target
+/web/dist
+/ui/.work
+/ui/vendor/opencode/node_modules/
+/ui/vendor/opencode/packages/*/node_modules/
+/ui/vendor/opencode/packages/*/dist/
+*.db
+*.db-wal
+*.db-shm
+.env
+
+# Local HTTP capture scratch (not source)
+/.c*.json
+/.m*.json
+/.r*.json
+/.s*.json
+/.t*.json
+/.tree*.json

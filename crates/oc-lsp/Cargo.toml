@@ -1,0 +1,30 @@
+[package]
+name = "oc-lsp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Language Server Protocol client, supervisor and diagnostics for opencode-rust"
+autobins = false
+
+[dependencies]
+futures-util.workspace = true
+parking_lot.workspace = true
+percent-encoding.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[[bin]]
+name = "fake-lsp"
+path = "src/bin/fake_lsp.rs"
+
+[lints]
+workspace = true

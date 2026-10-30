@@ -1,0 +1,5 @@
+[data-component="session-progress-indicator-v2"] {
+  display: block;
+  flex-shrink: 0;
+  color: var(--v2-icon-icon-muted, #808080);
+}

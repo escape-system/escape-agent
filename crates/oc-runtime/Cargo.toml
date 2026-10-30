@@ -1,0 +1,36 @@
+[package]
+name = "oc-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "opencode-rust session runtime"
+
+[dependencies]
+async-trait.workspace = true
+futures-util.workspace = true
+hex.workspace = true
+oc-config.workspace = true
+oc-lanes = { path = "../oc-lanes" }
+oc-llm.workspace = true
+oc-memory.workspace = true
+oc-observer.workspace = true
+oc-store.workspace = true
+oc-subagents.workspace = true
+oc-tools.workspace = true
+oc-types.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

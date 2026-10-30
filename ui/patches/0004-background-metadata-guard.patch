@@ -1,0 +1,25 @@
+diff -r a/packages/app/src/session/requests/background.ts b/packages/app/src/session/requests/background.ts
+--- a/packages/app/src/session/requests/background.ts
++++ b/packages/app/src/session/requests/background.ts
+@@ -66,14 +66,18 @@
+ 
+           if (part.name !== "shell" && part.name !== "subagent") return []
+           const shell = part.name === "shell"
++          // A running tool part may omit metadata (and, defensively, input): read both as absent
++          // instead of throwing while the session loads.
++          const metadata = part.state.metadata
++          const input = part.state.input
+ 
+           return [
+             {
+               type: shell ? ("shell" as const) : ("subagent" as const),
+               partID: part.id,
+-              id: text(shell ? part.state.metadata.shellID : part.state.metadata.sessionID),
+-              label: text(shell ? part.state.input.command : part.state.input.description),
+-              agent: shell ? undefined : text(part.state.input.agent),
++              id: text(shell ? metadata?.shellID : metadata?.sessionID),
++              label: text(shell ? input?.command : input?.description),
++              agent: shell ? undefined : text(input?.agent),
+               started: part.time.ran ?? part.time.created,
+             },
+           ]

@@ -1,0 +1,54 @@
+[package]
+name = "oc-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "HTTP, SSE and static server for opencode-rust"
+
+[dependencies]
+async-trait.workspace = true
+axum.workspace = true
+base64.workspace = true
+futures-util.workspace = true
+hex.workspace = true
+hmac.workspace = true
+http.workspace = true
+ignore.workspace = true
+jsonc-parser.workspace = true
+mime_guess.workspace = true
+oc-config.workspace = true
+oc-lanes = { path = "../oc-lanes" }
+oc-llm.workspace = true
+oc-lsp.workspace = true
+oc-mcp.workspace = true
+oc-memory.workspace = true
+oc-observer.workspace = true
+oc-plugin.workspace = true
+oc-pty.workspace = true
+oc-runtime.workspace = true
+oc-store.workspace = true
+oc-tools.workspace = true
+oc-types.workspace = true
+percent-encoding.workspace = true
+rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+subtle.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+http-body-util.workspace = true
+tempfile.workspace = true
+tokio-tungstenite.workspace = true
+tower.workspace = true
+
+[lints]
+workspace = true

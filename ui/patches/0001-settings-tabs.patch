@@ -1,0 +1,1761 @@
+diff -r a/packages/app/src/runtime/i18n/en.ts b/packages/app/src/runtime/i18n/en.ts
+--- a/packages/app/src/runtime/i18n/en.ts	2026-10-29 18:53:10.260597800 +0300
++++ b/packages/app/src/runtime/i18n/en.ts	2026-10-29 19:04:51.604000800 +0300
+@@ -1288,6 +1288,136 @@
+   "usage.signedOut.body": "Connect OpenCode Console to see your workspace's budgets and Go usage.",
+   "usage.error": "Usage limits couldn't be loaded.",
+   "usage.retry": "Try again",
++  "settings.tab.memory": "Memory",
++  "settings.tab.goals": "Goals",
++  "settings.tab.observer": "Observer",
++  "settings.tab.subagents": "Subagents",
++  "settings.tab.lanes": "Lanes",
++  "settings.agentic.invalidNumber": "Enter a positive whole number",
++  "settings.agentic.restart.title": "Restart required",
++  "settings.agentic.restart.description":
++    "The config file changed. The server keeps its loaded settings until it restarts, so this change applies after a restart.",
++  "settings.agentic.loadFailed": "Couldn't load the server's config.",
++  "settings.agentic.model.placeholder": "provider/model",
++  "settings.agentic.save": "Save",
++  "settings.memory.description":
++    "Durable facts the agent can recall across sessions. Stored in this server's database.",
++  "settings.memory.row.autoScribe.title": "Auto-scribe memories",
++  "settings.memory.row.autoScribe.description":
++    "After a root turn settles, a small model proposes durable memories that pass the filters.",
++  "settings.memory.row.maxTokens.title": "Retrieval token budget",
++  "settings.memory.row.maxTokens.description":
++    "The injected memory block is trimmed to about this many tokens.",
++  "settings.memory.row.embeddingModel.title": "Embedding model",
++  "settings.memory.row.embeddingModel.description":
++    "Optional. Enables semantic recall; without it retrieval uses full-text search only.",
++  "settings.memory.list.title": "Remembered items",
++  "settings.memory.scope.label": "Memory scope",
++  "settings.memory.scope.project": "Project",
++  "settings.memory.scope.global": "Global",
++  "settings.memory.search.placeholder": "Search memories",
++  "settings.memory.unavailable.title": "Memory service not attached",
++  "settings.memory.unavailable.description":
++    "This server is running without the memory service, so memories cannot be listed or added here.",
++  "settings.memory.add.placeholder": "Write a durable fact to remember",
++  "settings.memory.add.kind": "Memory kind",
++  "settings.memory.add.importance": "Memory importance",
++  "settings.memory.add.tags": "Tags, comma separated",
++  "settings.memory.add.submit": "Add",
++  "settings.memory.add.saving": "Adding…",
++  "settings.memory.loading": "Loading memories…",
++  "settings.memory.empty": "No memories in this scope yet.",
++  "settings.memory.importance": "importance {{value}}",
++  "settings.memory.delete": "Forget memory",
++  "settings.goals.description": "Defaults for the goal supervisor. Individual goals live on their session.",
++  "settings.goals.scope.title": "Goals are per session",
++  "settings.goals.scope.description":
++    "There is no goal selected here: a goal belongs to the session that set it. Use the goal chip in the session composer to see its objective, criteria and evidence.",
++  "settings.goals.row.maxRounds.title": "Maximum rounds",
++  "settings.goals.row.maxRounds.description": "The goal fails after this many rounds without completing.",
++  "settings.goals.row.maxStalls.title": "Maximum stalls",
++  "settings.goals.row.maxStalls.description":
++    "Consecutive no-progress rounds before the goal fails.",
++  "settings.goals.row.waitLimit.title": "Wait limit",
++  "settings.goals.row.waitLimit.description":
++    "Minutes a goal may wait in total before it is blocked, in minutes.",
++  "settings.observer.description":
++    "The observer supervises the session tree from terse flight strips, never transcripts.",
++  "settings.observer.note.title": "Flight strips and the repair audit",
++  "settings.observer.note.description":
++    "Each tool call contributes a flight strip: tool, why, expectation and outcome, never arguments or outputs. Repairs the observer applies are recorded in the repair audit, and the repair budget bounds them.",
++  "settings.observer.row.enabled.title": "Observer enabled",
++  "settings.observer.row.enabled.description": "When off, the observer never calls the model.",
++  "settings.observer.row.model.title": "Observer model",
++  "settings.observer.row.model.description": "Model reference used for observation calls.",
++  "settings.observer.row.digestModel.title": "Digest model",
++  "settings.observer.row.digestModel.description": "Model used by digest and inspect actions.",
++  "settings.observer.row.escalationModel.title": "Escalation model",
++  "settings.observer.row.escalationModel.description":
++    "Model offered to a switch-model repair; without it that repair kind is rejected.",
++  "settings.observer.row.tick_ms.title": "Tick (ms)",
++  "settings.observer.row.tick_ms.description": "Actor tick hint in milliseconds.",
++  "settings.observer.row.min_interval_ms.title": "Minimum interval (ms)",
++  "settings.observer.row.min_interval_ms.description": "Minimum gap between two model calls for one root.",
++  "settings.observer.row.max_calls_per_min.title": "Maximum calls per minute",
++  "settings.observer.row.max_calls_per_min.description": "Sliding one-minute call ceiling per root.",
++  "settings.observer.row.stall_seconds.title": "Stall seconds",
++  "settings.observer.row.stall_seconds.description":
++    "Busy execution with no activity for this long is treated as a stall.",
++  "settings.observer.row.max_repairs_per_10min.title": "Maximum repairs per 10 minutes",
++  "settings.observer.row.max_repairs_per_10min.description": "Repair ceiling per root per ten minutes.",
++  "settings.observer.row.nudge_max_chars.title": "Maximum nudge characters",
++  "settings.observer.row.nudge_max_chars.description": "Hard cap for the text of one nudge.",
++  "settings.subagents.description": "Limits and defaults for child sessions.",
++  "settings.subagents.row.enabled.title": "Subagents enabled",
++  "settings.subagents.row.enabled.description": "When off, no child session can be spawned.",
++  "settings.subagents.row.defaultAgent.title": "Default agent",
++  "settings.subagents.row.defaultAgent.description": "Agent used when a spawn does not name one.",
++  "settings.subagents.row.defaultModel.title": "Default model",
++  "settings.subagents.row.defaultModel.description":
++    "Model used when the agent, the override and the parent session name none.",
++  "settings.subagents.row.maxDepth.title": "Maximum depth",
++  "settings.subagents.row.maxDepth.description": "Deepest child level; 1 reproduces upstream behavior.",
++  "settings.subagents.row.maxChildren.title": "Maximum children per session",
++  "settings.subagents.row.maxChildren.description": "Direct children one session may create.",
++  "settings.subagents.row.allowSpawn.title": "Children may spawn",
++  "settings.subagents.row.allowSpawn.description":
++    "Lifts the default subagent deny when the agent has no explicit rule.",
++  "settings.subagents.row.siblingsEnabled.title": "Sibling messaging",
++  "settings.subagents.row.siblingsEnabled.description": "Allow sessions in the same tree to message each other.",
++  "settings.subagents.row.siblingsWake.title": "Wake idle siblings",
++  "settings.subagents.row.siblingsWake.description": "A peer message wakes an idle sibling.",
++  "settings.subagents.row.allowParent.title": "Children may message the parent",
++  "settings.subagents.row.allowParent.description": "A child may report upward to its parent session.",
++  "settings.subagents.row.maxMessages.title": "Messages per minute",
++  "settings.subagents.row.maxMessages.description": "Per-sender sibling message ceiling.",
++  "settings.subagents.agents.title": "Per-agent overrides",
++  "settings.subagents.agents.description":
++    "A JSON object keyed by agent, for example {\"explore\": {\"allow_spawn\": false}}. Saved as subagents.agents.",
++  "settings.subagents.agents.invalid": "Invalid JSON: {{message}}",
++  "settings.subagents.agents.object": "The overrides must be a JSON object.",
++  "settings.lanes.description": "Build lane concurrency and the live lane queue.",
++  "settings.lanes.row.cargo.title": "Cargo concurrency",
++  "settings.lanes.row.cargo.description": "Slots for cargo build and test lanes.",
++  "settings.lanes.row.node.title": "Node concurrency",
++  "settings.lanes.row.node.description": "Slots for node package and test lanes.",
++  "settings.lanes.row.network.title": "Network concurrency",
++  "settings.lanes.row.network.description": "Slots for fetching and network-bound commands.",
++  "settings.lanes.row.gpu.title": "GPU concurrency",
++  "settings.lanes.row.gpu.description": "Slots for GPU-bound commands.",
++  "settings.lanes.row.default.title": "Default concurrency",
++  "settings.lanes.row.default.description": "Fallback for lanes without an explicit value.",
++  "settings.lanes.status.title": "Live lane status",
++  "settings.lanes.status.refresh": "Refresh",
++  "settings.lanes.status.loading": "Loading lane status…",
++  "settings.lanes.status.empty": "No lanes are active.",
++  "settings.lanes.status.lane": "Lane",
++  "settings.lanes.status.concurrency": "Concurrency",
++  "settings.lanes.status.running": "Running",
++  "settings.lanes.status.queued": "Queued",
++  "settings.lanes.unavailable.title": "Lane service not attached",
++  "settings.lanes.unavailable.description":
++    "This server is running without the lane service, so there is no live queue to show. Concurrency settings still apply once it is attached.",
+ }
+ 
+ export default dict
+diff -r a/packages/app/src/settings/agentic/agentic.css b/packages/app/src/settings/agentic/agentic.css
+--- a/packages/app/src/settings/agentic/agentic.css	2026-10-29 18:53:35.380459000 +0300
++++ b/packages/app/src/settings/agentic/agentic.css	2026-10-29 19:04:51.878590800 +0300
+@@ -0,0 +1,4 @@
++/* Additive settings pages share the existing settings styles; only long memory text needs a break hint. */
++[data-testid="settings-memory-item"] {
++  overflow-wrap: anywhere;
++}
+diff -r a/packages/app/src/settings/agentic/config.ts b/packages/app/src/settings/agentic/config.ts
+--- a/packages/app/src/settings/agentic/config.ts	2026-10-29 18:53:35.381460700 +0300
++++ b/packages/app/src/settings/agentic/config.ts	2026-10-29 19:04:51.879152400 +0300
+@@ -0,0 +1,266 @@
++import { createEffect, createMemo, createSignal } from "solid-js"
++import { useQuery, useQueryClient } from "@tanstack/solid-query"
++import { authTokenFromCredentials } from "@/runtime/server/api"
++import { useServerSDK } from "@/runtime/server/client"
++
++export type ConfigObject = Record<string, unknown>
++
++export type AgenticSection = "memory" | "goal" | "observer" | "subagents" | "lanes"
++
++const SECTIONS: readonly AgenticSection[] = ["memory", "goal", "observer", "subagents", "lanes"]
++
++type SavedSections = Partial<Record<AgenticSection, ConfigObject>>
++
++export function isConfigObject(value: unknown): value is ConfigObject {
++  return !!value && typeof value === "object" && !Array.isArray(value)
++}
++
++/** Deep-merges config objects; later values win, arrays and scalars replace. */
++export function mergeConfig(base: ConfigObject, next: ConfigObject): ConfigObject {
++  const result: ConfigObject = { ...base }
++
++  for (const [key, value] of Object.entries(next)) {
++    const existing = result[key]
++    result[key] = isConfigObject(existing) && isConfigObject(value) ? mergeConfig(existing, value) : value
++  }
++
++  return result
++}
++
++/** The documented precedence: each later document overrides the previous one. Display only. */
++export function mergeDocuments(entries: readonly unknown[]): ConfigObject {
++  return entries.reduce<ConfigObject>((merged, entry) => {
++    if (!isConfigObject(entry) || entry.type !== "document" || !isConfigObject(entry.info)) return merged
++
++    return mergeConfig(merged, entry.info)
++  }, {})
++}
++
++/** The server's error body is `{ _tag, message }`; fall back to the status line. */
++export async function serverMessage(response: Response) {
++  try {
++    const body: unknown = await response.json()
++
++    if (isConfigObject(body)) {
++      if (typeof body.message === "string" && body.message) return body.message
++
++      const data = body.data
++
++      if (isConfigObject(data) && typeof data.message === "string" && data.message) return data.message
++    }
++  } catch {
++    // Not JSON.
++  }
++
++  return `${response.status} ${response.statusText}`.trim()
++}
++
++/** Raw `/api/*` access for the experimental routes the typed SDK does not model yet. */
++export function useAgenticRequest() {
++  const sdk = useServerSDK()
++
++  return async (path: string, init?: RequestInit) => {
++    const base = sdk.http.url.endsWith("/") ? sdk.http.url : `${sdk.http.url}/`
++    const headers = new Headers(init?.headers)
++
++    if (sdk.http.password) {
++      headers.set("Authorization", `Basic ${authTokenFromCredentials({ password: sdk.http.password })}`)
++    }
++
++    if (init?.body !== undefined) headers.set("Content-Type", "application/json")
++
++    return fetch(new URL(path.replace(/^\//, ""), base), { ...init, headers })
++  }
++}
++
++export interface AgenticConfig {
++  loading(): boolean
++  failed(): boolean
++  error(): string | undefined
++  saving(): boolean
++  restart(): boolean
++  display(): ConfigObject
++  section(key: AgenticSection): ConfigObject
++  save(key: AgenticSection, changes: ConfigObject): Promise<boolean>
++  clearError(): void
++  reload(): void
++}
++
++/**
++ * Sections this window has written, per server. The server's loaded config
++ * snapshot does not change until a restart, so without this a page remount
++ * would save against the pre-write document and drop the earlier keys.
++ *
++ * They are mirrored to `sessionStorage` so a reload before the restart keeps
++ * showing the written values instead of silently reverting to the snapshot.
++ */
++const savedSections = new Map<string, SavedSections>()
++
++function storageKey(scope: string) {
++  return `settings.agentic.pending.${encodeURIComponent(scope)}`
++}
++
++function loadSaved(scope: string): SavedSections {
++  try {
++    const raw = sessionStorage.getItem(storageKey(scope))
++
++    if (!raw) return {}
++    const parsed: unknown = JSON.parse(raw)
++
++    if (!isConfigObject(parsed)) return {}
++    const result: SavedSections = {}
++
++    for (const key of SECTIONS) {
++      const value = parsed[key]
++
++      if (isConfigObject(value)) result[key] = value
++    }
++
++    return result
++  } catch {
++    return {}
++  }
++}
++
++function storeSaved(scope: string, sections: SavedSections) {
++  try {
++    sessionStorage.setItem(storageKey(scope), JSON.stringify(sections))
++  } catch {
++    // Storage is optional: the in-memory overlay still covers SPA navigation.
++  }
++}
++
++/** True when every value in `overlay` is already present in `base`. */
++function contains(base: ConfigObject, overlay: ConfigObject): boolean {
++  return Object.entries(overlay).every(([key, value]) => {
++    const existing = base[key]
++
++    if (isConfigObject(value)) return isConfigObject(existing) && contains(existing, value)
++
++    return existing === value
++  })
++}
++
++/**
++ * The additive config sections (`memory`, `goal`, `observer`, `subagents`,
++ * `lanes`) read from the config documents and written one section at a time.
++ *
++ * The server replaces a whole top-level key, so a save merges the section's
++ * current value first. The loaded snapshot only changes after a restart, which
++ * the PATCH response announces, so the written values stay layered over the
++ * fetched documents until the page reloads.
++ */
++export function createAgenticConfig(): AgenticConfig {
++  const sdk = useServerSDK()
++  const client = useQueryClient()
++  const request = useAgenticRequest()
++
++  const query = useQuery(() => ({
++    queryKey: [sdk.scope, "settings-agentic-config"],
++    queryFn: () => sdk.api.config.get(),
++    staleTime: 30_000,
++  }))
++
++  const initial = savedSections.get(sdk.scope) ?? loadSaved(sdk.scope)
++  savedSections.set(sdk.scope, initial)
++
++  const [written, setWritten] = createSignal<SavedSections>(initial)
++  const [restart, setRestart] = createSignal(Object.keys(initial).length > 0)
++  const [error, setError] = createSignal<string>()
++  const [saving, setSaving] = createSignal(false)
++
++  const display = createMemo(() => mergeDocuments(query.data ?? []))
++
++  // A restarted server's snapshot already has these values, so they are no
++  // longer pending and the restart notice can clear.
++  createEffect(() => {
++    const data = query.data
++
++    if (!data) return
++    const document = mergeDocuments(data)
++    const current = written()
++    const remaining: SavedSections = {}
++    let settled = false
++
++    for (const key of SECTIONS) {
++      const value = current[key]
++
++      if (!value) continue
++      const base = document[key]
++
++      if (isConfigObject(base) && contains(base, value)) {
++        settled = true
++
++        continue
++      }
++
++      remaining[key] = value
++    }
++
++    if (!settled) return
++    setWritten(remaining)
++    savedSections.set(sdk.scope, remaining)
++    storeSaved(sdk.scope, remaining)
++
++    if (Object.keys(remaining).length === 0) setRestart(false)
++  })
++
++  const section = (key: AgenticSection): ConfigObject => {
++    const document = display()[key]
++
++    return mergeConfig(isConfigObject(document) ? document : {}, written()[key] ?? {})
++  }
++
++  const save = async (key: AgenticSection, changes: ConfigObject) => {
++    setSaving(true)
++    setError(undefined)
++
++    try {
++      const merged = mergeConfig(section(key), changes)
++      const response = await request("/api/experimental/config", {
++        method: "PATCH",
++        body: JSON.stringify({ [key]: merged }),
++      })
++
++      if (!response.ok) {
++        setError(await serverMessage(response))
++
++        return false
++      }
++
++      // A 204 has no body, but draining the response keeps Chromium from reporting the
++      // stream as aborted when the caller only reads headers.
++      await response.arrayBuffer()
++      setWritten((current) => {
++        const next = { ...current, [key]: merged }
++        savedSections.set(sdk.scope, next)
++        storeSaved(sdk.scope, next)
++
++        return next
++      })
++      setRestart(response.headers.get("x-opencode-restart") === "required")
++      void client.invalidateQueries({ queryKey: [sdk.scope, "settings-agentic-config"] })
++
++      return true
++    } catch (cause) {
++      setError(cause instanceof Error ? cause.message : String(cause))
++
++      return false
++    } finally {
++      setSaving(false)
++    }
++  }
++
++  return {
++    loading: () => query.isPending,
++    failed: () => query.isError,
++    error,
++    saving,
++    restart,
++    display,
++    section,
++    save,
++    clearError: () => setError(undefined),
++    reload: () => void query.refetch(),
++  }
++}
+diff -r a/packages/app/src/settings/agentic/fields.tsx b/packages/app/src/settings/agentic/fields.tsx
+--- a/packages/app/src/settings/agentic/fields.tsx	2026-10-29 18:53:35.381964200 +0300
++++ b/packages/app/src/settings/agentic/fields.tsx	2026-10-29 19:04:51.879152400 +0300
+@@ -0,0 +1,173 @@
++import { Show, createEffect, createSignal, type Component } from "solid-js"
++import { Switch } from "@opencode/ui/switch"
++import { TextInput } from "@opencode/ui/text-input"
++import { useLanguage } from "@/runtime/i18n/language"
++
++/** A positive-integer config field; commits on blur or Enter and never sends an invalid value. */
++export const NumberField: Component<{
++  label: string
++  value: number | undefined
++  fallback: number
++  testid?: string
++  onCommit: (value: number) => void
++}> = (props) => {
++  const language = useLanguage()
++  const [draft, setDraft] = createSignal("")
++  const [invalid, setInvalid] = createSignal(false)
++  let focused = false
++
++  createEffect(() => {
++    const value = props.value ?? props.fallback
++
++    if (focused) return
++    setDraft(String(value))
++    setInvalid(false)
++  })
++
++  const commit = () => {
++    const text = draft().trim()
++    const current = props.value ?? props.fallback
++
++    if (!/^\d+$/.test(text) || Number(text) < 1) {
++      setInvalid(true)
++
++      return
++    }
++
++    if (Number(text) === current) {
++      setInvalid(false)
++
++      return
++    }
++
++    setInvalid(false)
++    props.onCommit(Number(text))
++  }
++
++  return (
++    <div class="flex flex-col items-end gap-1" data-testid={props.testid} data-action={props.testid}>
++      <TextInput
++        type="number"
++        inputmode="numeric"
++        min="1"
++        step="1"
++        numeric
++        class="w-24"
++        value={draft()}
++        invalid={invalid()}
++        aria-label={props.label}
++        onInput={(event) => setDraft(event.currentTarget.value)}
++        onFocus={() => (focused = true)}
++        onBlur={() => {
++          focused = false
++          commit()
++        }}
++        onKeyDown={(event) => {
++          if (event.key === "Enter") event.currentTarget.blur()
++        }}
++      />
++      <Show when={invalid()}>
++        <span class="text-11-regular text-v2-state-fg-danger">{language.t("settings.agentic.invalidNumber")}</span>
++      </Show>
++    </div>
++  )
++}
++
++/** A free-text config field; commits on blur or Enter and sends `null` for an emptied model reference. */
++export const TextField: Component<{
++  label: string
++  value: string | undefined
++  placeholder?: string
++  testid?: string
++  commit?: (value: string | null) => void
++}> = (props) => {
++  const [draft, setDraft] = createSignal("")
++  let focused = false
++
++  createEffect(() => {
++    if (focused) return
++    setDraft(props.value ?? "")
++  })
++
++  const commit = () => {
++    if (!props.commit) return
++    const current = props.value ?? ""
++    const text = draft().trim()
++
++    if (text === current) return
++
++    props.commit(text ? text : null)
++  }
++
++  return (
++    <TextInput
++      type="text"
++      class="w-56"
++      value={draft()}
++      placeholder={props.placeholder}
++      aria-label={props.label}
++      data-testid={props.testid}
++      data-action={props.testid}
++      spellcheck={false}
++      onInput={(event) => setDraft(event.currentTarget.value)}
++      onFocus={() => (focused = true)}
++      onBlur={() => {
++        focused = false
++        commit()
++      }}
++      onKeyDown={(event) => {
++        if (event.key === "Enter") event.currentTarget.blur()
++      }}
++    />
++  )
++}
++
++export const ToggleField: Component<{
++  label: string
++  checked: boolean
++  onChange: (checked: boolean) => void
++  testid?: string
++}> = (props) => {
++  return (
++    <div data-testid={props.testid} data-action={props.testid}>
++      <Switch checked={props.checked} onChange={(checked) => props.onChange(checked)} hideLabel>
++        {props.label}
++      </Switch>
++    </div>
++  )
++}
++
++/** The restart banner the server asks for with `x-opencode-restart: required`. */
++export const RestartNotice: Component<{ show: boolean }> = (props) => {
++  const language = useLanguage()
++
++  return (
++    <Show when={props.show}>
++      <div
++        role="status"
++        data-testid="settings-restart-notice"
++        class="mb-4 flex flex-col gap-1 rounded-md border border-v2-state-border-warning bg-v2-state-bg-warning px-3 py-2"
++      >
++        <span class="text-12-medium text-v2-state-fg-warning">{language.t("settings.agentic.restart.title")}</span>
++        <span class="text-11-regular text-v2-text-text-muted">{language.t("settings.agentic.restart.description")}</span>
++      </div>
++    </Show>
++  )
++}
++
++/** A page-level failure: the server's message, never a toast. */
++export const InlineError: Component<{ message: string | undefined; testid?: string }> = (props) => {
++  return (
++    <Show when={props.message}>
++      {(message) => (
++        <div
++          role="alert"
++          data-testid={props.testid ?? "settings-agentic-error"}
++          class="mb-4 rounded-md border border-v2-state-border-danger bg-v2-state-bg-danger px-3 py-2 text-12-regular text-v2-state-fg-danger"
++        >
++          {message()}
++        </div>
++      )}
++    </Show>
++  )
++}
+diff -r a/packages/app/src/settings/agentic/goals.tsx b/packages/app/src/settings/agentic/goals.tsx
+--- a/packages/app/src/settings/agentic/goals.tsx	2026-10-29 18:53:35.381964200 +0300
++++ b/packages/app/src/settings/agentic/goals.tsx	2026-10-29 19:04:51.880660100 +0300
+@@ -0,0 +1,82 @@
++import { type Component } from "solid-js"
++import { useLanguage } from "@/runtime/i18n/language"
++import { SettingsList } from "@/settings/list"
++import { SettingsRow } from "@/settings/row"
++import { createAgenticConfig } from "./config"
++import { InlineError, NumberField, RestartNotice } from "./fields"
++import "./agentic.css"
++
++export const SettingsGoals: Component = () => {
++  const language = useLanguage()
++  const config = createAgenticConfig()
++
++  const section = () => config.section("goal")
++  const number = (key: "max_rounds" | "max_stalls" | "wait_limit_minutes") =>
++    typeof section()[key] === "number" ? (section()[key] as number) : undefined
++  const commit = (changes: Record<string, unknown>) => void config.save("goal", changes)
++
++  return (
++    <>
++      <div class="settings-tab-header">
++        <div class="settings-tab-header-row">
++          <div class="flex flex-col gap-1">
++            <h2 class="settings-tab-title">{language.t("settings.tab.goals")}</h2>
++            <span class="text-11-regular text-v2-text-text-muted">{language.t("settings.goals.description")}</span>
++          </div>
++        </div>
++      </div>
++
++      <div class="settings-tab-body">
++        <RestartNotice show={config.restart()} />
++        <InlineError message={config.error()} />
++        <div class="settings-section">
++          <div
++            data-testid="settings-goals-scope-note"
++            class="mb-4 rounded-md border border-v2-border-border-base bg-v2-background-bg-layer-01 px-3 py-2"
++          >
++            <div class="text-12-medium">{language.t("settings.goals.scope.title")}</div>
++            <div class="text-11-regular text-v2-text-text-muted">{language.t("settings.goals.scope.description")}</div>
++          </div>
++          <SettingsList>
++            <SettingsRow
++              title={language.t("settings.goals.row.maxRounds.title")}
++              description={language.t("settings.goals.row.maxRounds.description")}
++            >
++              <NumberField
++                label={language.t("settings.goals.row.maxRounds.title")}
++                testid="settings-goals-max-rounds"
++                value={number("max_rounds")}
++                fallback={50}
++                onCommit={(value) => commit({ max_rounds: value })}
++              />
++            </SettingsRow>
++            <SettingsRow
++              title={language.t("settings.goals.row.maxStalls.title")}
++              description={language.t("settings.goals.row.maxStalls.description")}
++            >
++              <NumberField
++                label={language.t("settings.goals.row.maxStalls.title")}
++                testid="settings-goals-max-stalls"
++                value={number("max_stalls")}
++                fallback={3}
++                onCommit={(value) => commit({ max_stalls: value })}
++              />
++            </SettingsRow>
++            <SettingsRow
++              title={language.t("settings.goals.row.waitLimit.title")}
++              description={language.t("settings.goals.row.waitLimit.description")}
++            >
++              <NumberField
++                label={language.t("settings.goals.row.waitLimit.title")}
++                testid="settings-goals-wait-limit"
++                value={number("wait_limit_minutes")}
++                fallback={30}
++                onCommit={(value) => commit({ wait_limit_minutes: value })}
++              />
++            </SettingsRow>
++          </SettingsList>
++        </div>
++      </div>
++    </>
++  )
++}
+diff -r a/packages/app/src/settings/agentic/lanes.tsx b/packages/app/src/settings/agentic/lanes.tsx
+--- a/packages/app/src/settings/agentic/lanes.tsx	2026-10-29 18:53:35.382466800 +0300
++++ b/packages/app/src/settings/agentic/lanes.tsx	2026-10-29 19:04:51.881162900 +0300
+@@ -0,0 +1,171 @@
++import { For, Show, type Component } from "solid-js"
++import { Button } from "@opencode/ui/button"
++import { useQuery } from "@tanstack/solid-query"
++import { useLanguage } from "@/runtime/i18n/language"
++import { useServerSDK } from "@/runtime/server/client"
++import { SettingsList } from "@/settings/list"
++import { SettingsRow } from "@/settings/row"
++import { createAgenticConfig, isConfigObject, serverMessage, useAgenticRequest } from "./config"
++import { InlineError, NumberField, RestartNotice } from "./fields"
++import "./agentic.css"
++
++type LaneStatus = {
++  lane: string
++  concurrency: number
++  running: number
++  queued: number
++}
++
++type LaneResult = {
++  unavailable: boolean
++  message?: string
++  lanes: LaneStatus[]
++}
++
++const LANES = [
++  { key: "cargo", fallback: 1 },
++  { key: "node", fallback: 1 },
++  { key: "network", fallback: 4 },
++  { key: "gpu", fallback: 1 },
++  { key: "default", fallback: 8 },
++] as const
++
++export const SettingsLanes: Component = () => {
++  const language = useLanguage()
++  const config = createAgenticConfig()
++  const sdk = useServerSDK()
++  const request = useAgenticRequest()
++
++  const section = () => config.section("lanes")
++  const concurrency = (key: (typeof LANES)[number]["key"]) =>
++    typeof section()[key] === "number" ? (section()[key] as number) : undefined
++  const commit = (changes: Record<string, unknown>) => void config.save("lanes", changes)
++
++  const status = useQuery(() => ({
++    queryKey: [sdk.scope, "settings-lane-status"],
++    queryFn: async (): Promise<LaneResult> => {
++      const response = await request("/api/experimental/lane")
++
++      if (response.status === 503) {
++        return { unavailable: true, message: await serverMessage(response), lanes: [] }
++      }
++
++      if (!response.ok) throw new Error(await serverMessage(response))
++      const body: unknown = await response.json()
++      const data = isConfigObject(body) && Array.isArray(body.data) ? body.data : []
++
++      return { unavailable: false, lanes: data.filter(isLaneStatus) }
++    },
++    staleTime: 30_000,
++    retry: false,
++  }))
++
++  return (
++    <>
++      <div class="settings-tab-header">
++        <div class="settings-tab-header-row">
++          <div class="flex flex-col gap-1">
++            <h2 class="settings-tab-title">{language.t("settings.tab.lanes")}</h2>
++            <span class="text-11-regular text-v2-text-text-muted">{language.t("settings.lanes.description")}</span>
++          </div>
++        </div>
++      </div>
++
++      <div class="settings-tab-body">
++        <RestartNotice show={config.restart()} />
++        <InlineError message={config.error()} />
++        <div class="settings-section">
++          <SettingsList>
++            <For each={LANES}>
++              {(item) => (
++                <SettingsRow
++                  title={language.t(`settings.lanes.row.${item.key}.title`)}
++                  description={language.t(`settings.lanes.row.${item.key}.description`)}
++                >
++                  <NumberField
++                    label={language.t(`settings.lanes.row.${item.key}.title`)}
++                    testid={`settings-lanes-${item.key}`}
++                    value={concurrency(item.key)}
++                    fallback={item.fallback}
++                    onCommit={(value) => commit({ [item.key]: value })}
++                  />
++                </SettingsRow>
++              )}
++            </For>
++          </SettingsList>
++        </div>
++
++        <div class="settings-section">
++          <div class="flex items-center justify-between gap-3">
++            <div class="settings-section-title">{language.t("settings.lanes.status.title")}</div>
++            <Button
++              variant="ghost-muted"
++              size="small"
++              data-testid="settings-lanes-refresh"
++              onClick={() => void status.refetch()}
++            >
++              {language.t("settings.lanes.status.refresh")}
++            </Button>
++          </div>
++
++          <Show when={status.data?.unavailable}>
++            <div
++              role="status"
++              data-testid="settings-lanes-unavailable"
++              class="rounded-md border border-v2-border-border-base px-3 py-2"
++            >
++              <div class="text-12-medium">{language.t("settings.lanes.unavailable.title")}</div>
++              <div class="text-11-regular text-v2-text-text-muted">{language.t("settings.lanes.unavailable.description")}</div>
++              <Show when={status.data?.message}>
++                {(message) => <div class="text-11-regular text-v2-text-text-faint">{message()}</div>}
++              </Show>
++            </div>
++          </Show>
++
++          <Show when={status.isPending}>
++            <div class="text-12-regular text-v2-text-text-muted">{language.t("settings.lanes.status.loading")}</div>
++          </Show>
++          <Show when={status.isError}>
++            <div role="alert" class="text-12-regular text-v2-state-fg-danger">
++              {status.error instanceof Error ? status.error.message : language.t("settings.agentic.loadFailed")}
++            </div>
++          </Show>
++
++          <Show when={!status.data?.unavailable && !status.isPending && !status.isError}>
++            <Show
++              when={status.data?.lanes.length}
++              fallback={<div class="text-12-regular text-v2-text-text-muted">{language.t("settings.lanes.status.empty")}</div>}
++            >
++              <table class="w-full text-left text-12-regular" data-testid="settings-lanes-status">
++                <thead class="text-11-regular text-v2-text-text-muted">
++                  <tr>
++                    <th class="py-1 font-normal">{language.t("settings.lanes.status.lane")}</th>
++                    <th class="py-1 font-normal">{language.t("settings.lanes.status.concurrency")}</th>
++                    <th class="py-1 font-normal">{language.t("settings.lanes.status.running")}</th>
++                    <th class="py-1 font-normal">{language.t("settings.lanes.status.queued")}</th>
++                  </tr>
++                </thead>
++                <tbody>
++                  <For each={status.data?.lanes ?? []}>
++                    {(lane) => (
++                      <tr class="border-t border-v2-border-border-base">
++                        <td class="py-1 font-mono">{lane.lane}</td>
++                        <td class="py-1 tabular-nums">{lane.concurrency}</td>
++                        <td class="py-1 tabular-nums">{lane.running}</td>
++                        <td class="py-1 tabular-nums">{lane.queued}</td>
++                      </tr>
++                    )}
++                  </For>
++                </tbody>
++              </table>
++            </Show>
++          </Show>
++        </div>
++      </div>
++    </>
++  )
++}
++
++function isLaneStatus(value: unknown): value is LaneStatus {
++  return isConfigObject(value) && typeof value.lane === "string"
++}
+diff -r a/packages/app/src/settings/agentic/memory.tsx b/packages/app/src/settings/agentic/memory.tsx
+--- a/packages/app/src/settings/agentic/memory.tsx	2026-10-29 18:53:35.382979400 +0300
++++ b/packages/app/src/settings/agentic/memory.tsx	2026-10-29 19:04:51.881162900 +0300
+@@ -0,0 +1,370 @@
++import { For, Show, createMemo, createSignal, onCleanup, type Component } from "solid-js"
++import { Badge } from "@opencode/ui/badge"
++import { Icon } from "@opencode/ui/icon"
++import { Button } from "@opencode/ui/button"
++import { IconButton } from "@opencode/ui/icon-button"
++import { Select } from "@opencode/ui/select"
++import { TextInput } from "@opencode/ui/text-input"
++import { useQuery } from "@tanstack/solid-query"
++import { useLanguage } from "@/runtime/i18n/language"
++import { useServer } from "@/runtime/server/current"
++import { useServerSDK } from "@/runtime/server/client"
++import { SettingsList } from "@/settings/list"
++import { SettingsRow } from "@/settings/row"
++import { createAgenticConfig, isConfigObject, serverMessage, useAgenticRequest } from "./config"
++import { InlineError, NumberField, RestartNotice, TextField, ToggleField } from "./fields"
++import "./agentic.css"
++
++type MemoryItem = {
++  id: string
++  kind?: string
++  text: string
++  tags?: string[]
++  importance?: number
++}
++
++type MemoryResult = {
++  unavailable: boolean
++  message?: string
++  items: MemoryItem[]
++}
++
++const KINDS = ["fact", "decision", "preference", "pattern", "gotcha"] as const
++
++export const SettingsMemory: Component = () => {
++  const language = useLanguage()
++  const config = createAgenticConfig()
++  const request = useAgenticRequest()
++  const sdk = useServerSDK()
++  const server = useServer()
++
++  const project = createMemo(() => server.ctx.projects.last() ?? server.ctx.projects.unique()[0])
++  const [scope, setScope] = createSignal<"project" | "global">()
++  const effectiveScope = () => (scope() === "global" || !project() ? "global" : "project")
++  const scopeID = () => (effectiveScope() === "project" ? project()?.id : undefined)
++
++  const [search, setSearch] = createSignal("")
++  const [query, setQuery] = createSignal("")
++  let timer: ReturnType<typeof setTimeout> | undefined
++  onCleanup(() => clearTimeout(timer))
++
++  const memory = useQuery(() => ({
++    queryKey: [sdk.scope, "settings-memory", effectiveScope(), scopeID(), query()],
++    queryFn: async (): Promise<MemoryResult> => {
++      const params = new URLSearchParams({ scope: effectiveScope(), limit: "100" })
++
++      if (scopeID()) params.set("scopeID", scopeID()!)
++      if (query().trim()) params.set("query", query().trim())
++      const response = await request(`/api/experimental/memory?${params.toString()}`)
++
++      if (response.status === 503) {
++        return { unavailable: true, message: await serverMessage(response), items: [] }
++      }
++
++      if (!response.ok) throw new Error(await serverMessage(response))
++      const body: unknown = await response.json()
++      const data = isConfigObject(body) && Array.isArray(body.data) ? body.data : []
++
++      return { unavailable: false, items: data.filter(isMemoryItem) }
++    },
++    staleTime: 30_000,
++    retry: false,
++  }))
++
++  const [text, setText] = createSignal("")
++  const [kind, setKind] = createSignal<(typeof KINDS)[number]>("fact")
++  const [importance, setImportance] = createSignal(3)
++  const [tags, setTags] = createSignal("")
++  const [submitting, setSubmitting] = createSignal(false)
++  const [submitError, setSubmitError] = createSignal<string>()
++
++  const section = () => config.section("memory")
++  const embeddingModel = createMemo(() => {
++    const embedding = section().embedding
++
++    return isConfigObject(embedding) && typeof embedding.model === "string" ? embedding.model : undefined
++  })
++
++  const commit = (changes: Record<string, unknown>) => void config.save("memory", changes)
++
++  const add = async () => {
++    const value = text().trim()
++
++    if (!value || submitting()) return
++    setSubmitting(true)
++    setSubmitError(undefined)
++
++    try {
++      const body: Record<string, unknown> = {
++        text: value,
++        kind: kind(),
++        importance: importance(),
++        tags: tags()
++          .split(",")
++          .map((tag) => tag.trim())
++          .filter(Boolean),
++        scope: effectiveScope(),
++      }
++
++      if (scopeID()) body.scopeID = scopeID()
++      const response = await request("/api/experimental/memory", { method: "POST", body: JSON.stringify(body) })
++
++      if (!response.ok) {
++        setSubmitError(await serverMessage(response))
++
++        return
++      }
++
++      await response.arrayBuffer()
++      setText("")
++      setTags("")
++      void memory.refetch()
++    } catch (cause) {
++      setSubmitError(cause instanceof Error ? cause.message : String(cause))
++    } finally {
++      setSubmitting(false)
++    }
++  }
++
++  const forget = async (id: string) => {
++    setSubmitError(undefined)
++
++    try {
++      const response = await request(`/api/experimental/memory/${encodeURIComponent(id)}`, { method: "DELETE" })
++
++      if (!response.ok) {
++        setSubmitError(await serverMessage(response))
++
++        return
++      }
++
++      await response.arrayBuffer()
++      void memory.refetch()
++    } catch (cause) {
++      setSubmitError(cause instanceof Error ? cause.message : String(cause))
++    }
++  }
++
++  const scopeOptions = createMemo(() => [
++    { value: "project" as const, label: language.t("settings.memory.scope.project"), disabled: !project() },
++    { value: "global" as const, label: language.t("settings.memory.scope.global") },
++  ])
++
++  const kindOptions = KINDS.map((value) => ({ value, label: value }))
++  const importanceOptions = [1, 2, 3, 4, 5].map((value) => ({ value, label: String(value) }))
++
++  return (
++    <>
++      <div class="settings-tab-header">
++        <div class="settings-tab-header-row">
++          <div class="flex flex-col gap-1">
++            <h2 class="settings-tab-title">{language.t("settings.tab.memory")}</h2>
++            <span class="text-11-regular text-v2-text-text-muted">{language.t("settings.memory.description")}</span>
++          </div>
++        </div>
++      </div>
++
++      <div class="settings-tab-body">
++        <RestartNotice show={config.restart()} />
++        <InlineError message={config.error()} />
++        <Show when={config.failed()}>
++          <div role="alert" class="mb-4 text-12-regular text-v2-state-fg-danger">
++            {language.t("settings.agentic.loadFailed")}
++          </div>
++        </Show>
++
++        <div class="settings-section">
++          <SettingsList>
++            <SettingsRow
++              title={language.t("settings.memory.row.autoScribe.title")}
++              description={language.t("settings.memory.row.autoScribe.description")}
++            >
++              <ToggleField
++                label={language.t("settings.memory.row.autoScribe.title")}
++                testid="settings-memory-auto-scribe"
++                checked={section().auto_scribe !== false}
++                onChange={(checked) => commit({ auto_scribe: checked })}
++              />
++            </SettingsRow>
++            <SettingsRow
++              title={language.t("settings.memory.row.maxTokens.title")}
++              description={language.t("settings.memory.row.maxTokens.description")}
++            >
++              <NumberField
++                label={language.t("settings.memory.row.maxTokens.title")}
++                testid="settings-memory-max-tokens"
++                value={typeof section().max_tokens === "number" ? (section().max_tokens as number) : undefined}
++                fallback={800}
++                onCommit={(value) => commit({ max_tokens: value })}
++              />
++            </SettingsRow>
++            <SettingsRow
++              title={language.t("settings.memory.row.embeddingModel.title")}
++              description={language.t("settings.memory.row.embeddingModel.description")}
++            >
++              <TextField
++                label={language.t("settings.memory.row.embeddingModel.title")}
++                testid="settings-memory-embedding-model"
++                placeholder={language.t("settings.agentic.model.placeholder")}
++                value={embeddingModel()}
++                commit={(value) => commit({ embedding: { model: value } })}
++              />
++            </SettingsRow>
++          </SettingsList>
++        </div>
++
++        <div class="settings-section">
++          <div class="settings-section-title">{language.t("settings.memory.list.title")}</div>
++          <div class="mb-3 flex flex-wrap items-center gap-2">
++            <Select
++              data-testid="settings-memory-scope"
++              aria-label={language.t("settings.memory.scope.label")}
++              options={scopeOptions()}
++              current={scopeOptions().find((option) => option.value === effectiveScope())}
++              value={(option) => option.value}
++              label={(option) => option.label}
++              placement="bottom-start"
++              gutter={6}
++              onSelect={(option) => option && setScope(option.value)}
++            />
++            <TextInput
++              type="search"
++              class="min-w-56 flex-1"
++              data-testid="settings-memory-search"
++              aria-label={language.t("settings.memory.search.placeholder")}
++              placeholder={language.t("settings.memory.search.placeholder")}
++              value={search()}
++              onInput={(event) => {
++                const value = event.currentTarget.value
++                setSearch(value)
++                clearTimeout(timer)
++                timer = setTimeout(() => setQuery(value), 250)
++              }}
++            />
++          </div>
++
++          <Show when={memory.data?.unavailable}>
++            <div
++              role="status"
++              data-testid="settings-memory-unavailable"
++              class="mb-3 rounded-md border border-v2-border-border-base px-3 py-2"
++            >
++              <div class="text-12-medium">{language.t("settings.memory.unavailable.title")}</div>
++              <div class="text-11-regular text-v2-text-text-muted">
++                {language.t("settings.memory.unavailable.description")}
++              </div>
++              <Show when={memory.data?.message}>
++                {(message) => <div class="text-11-regular text-v2-text-text-faint">{message()}</div>}
++              </Show>
++            </div>
++          </Show>
++
++          <Show when={!memory.data?.unavailable}>
++            <div class="mb-4 flex flex-col gap-2" data-testid="settings-memory-add">
++              <div class="flex flex-wrap items-center gap-2">
++                <TextInput
++                  type="text"
++                  class="min-w-56 flex-1"
++                  aria-label={language.t("settings.memory.add.placeholder")}
++                  placeholder={language.t("settings.memory.add.placeholder")}
++                  value={text()}
++                  maxLength={500}
++                  onInput={(event) => setText(event.currentTarget.value)}
++                  onKeyDown={(event) => {
++                    if (event.key === "Enter") void add()
++                  }}
++                />
++                <Select
++                  aria-label={language.t("settings.memory.add.kind")}
++                  options={kindOptions}
++                  current={kindOptions.find((option) => option.value === kind())}
++                  value={(option) => option.value}
++                  label={(option) => option.label}
++                  placement="bottom-end"
++                  gutter={6}
++                  onSelect={(option) => option && setKind(option.value)}
++                />
++                <Select
++                  aria-label={language.t("settings.memory.add.importance")}
++                  options={importanceOptions}
++                  current={importanceOptions.find((option) => option.value === importance())}
++                  value={(option) => String(option.value)}
++                  label={(option) => option.label}
++                  placement="bottom-end"
++                  gutter={6}
++                  onSelect={(option) => option && setImportance(option.value)}
++                />
++                <Button
++                  data-testid="settings-memory-add-button"
++                  variant="neutral"
++                  size="small"
++                  disabled={submitting() || !text().trim()}
++                  onClick={() => void add()}
++                >
++                  {submitting() ? language.t("settings.memory.add.saving") : language.t("settings.memory.add.submit")}
++                </Button>
++              </div>
++              <TextInput
++                type="text"
++                class="w-full"
++                aria-label={language.t("settings.memory.add.tags")}
++                placeholder={language.t("settings.memory.add.tags")}
++                value={tags()}
++                onInput={(event) => setTags(event.currentTarget.value)}
++              />
++            </div>
++          </Show>
++
++          <InlineError message={submitError()} testid="settings-memory-submit-error" />
++
++          <Show when={memory.isPending}>
++            <div class="text-12-regular text-v2-text-text-muted">{language.t("settings.memory.loading")}</div>
++          </Show>
++          <Show when={memory.isError}>
++            <div role="alert" class="text-12-regular text-v2-state-fg-danger">
++              {memory.error instanceof Error ? memory.error.message : language.t("settings.agentic.loadFailed")}
++            </div>
++          </Show>
++          <Show when={!memory.isPending && !memory.isError && !memory.data?.unavailable && memory.data?.items.length === 0}>
++            <div class="text-12-regular text-v2-text-text-muted">{language.t("settings.memory.empty")}</div>
++          </Show>
++
++          <div class="flex flex-col gap-2">
++            <For each={memory.data?.items ?? []}>
++              {(item) => (
++                <div
++                  data-testid="settings-memory-item"
++                  class="flex items-start gap-3 rounded-md border border-v2-border-border-base bg-v2-background-bg-layer-01 px-3 py-2"
++                >
++                  <div class="flex min-w-0 flex-1 flex-col gap-1">
++                    <span class="text-12-regular break-words">{item.text}</span>
++                    <div class="flex flex-wrap items-center gap-1">
++                      <Badge variant="accent">{item.kind ?? "fact"}</Badge>
++                      <For each={item.tags ?? []}>{(tag) => <Badge variant="subtle">#{tag}</Badge>}</For>
++                      <span class="text-11-regular text-v2-text-text-faint">
++                        {language.t("settings.memory.importance", { value: String(item.importance ?? 3) })}
++                      </span>
++                    </div>
++                  </div>
++                  <IconButton
++                    type="button"
++                    variant="ghost-muted"
++                    size="small"
++                    icon={<Icon name="xmark-small" />}
++                    aria-label={language.t("settings.memory.delete")}
++                    data-testid="settings-memory-delete"
++                    onClick={() => void forget(item.id)}
++                  />
++                </div>
++              )}
++            </For>
++          </div>
++        </div>
++      </div>
++    </>
++  )
++}
++
++function isMemoryItem(value: unknown): value is MemoryItem {
++  return isConfigObject(value) && typeof value.id === "string" && typeof value.text === "string"
++}
+diff -r a/packages/app/src/settings/agentic/observer.tsx b/packages/app/src/settings/agentic/observer.tsx
+--- a/packages/app/src/settings/agentic/observer.tsx	2026-10-29 18:53:35.383981900 +0300
++++ b/packages/app/src/settings/agentic/observer.tsx	2026-10-29 19:04:51.882182800 +0300
+@@ -0,0 +1,118 @@
++import { type Component } from "solid-js"
++import { useLanguage } from "@/runtime/i18n/language"
++import { SettingsList } from "@/settings/list"
++import { SettingsRow } from "@/settings/row"
++import { createAgenticConfig } from "./config"
++import { InlineError, NumberField, RestartNotice, TextField, ToggleField } from "./fields"
++import "./agentic.css"
++
++const NUMBERS = [
++  { key: "tick_ms", fallback: 1000 },
++  { key: "min_interval_ms", fallback: 2000 },
++  { key: "max_calls_per_min", fallback: 12 },
++  { key: "stall_seconds", fallback: 120 },
++  { key: "max_repairs_per_10min", fallback: 5 },
++  { key: "nudge_max_chars", fallback: 400 },
++] as const
++
++export const SettingsObserver: Component = () => {
++  const language = useLanguage()
++  const config = createAgenticConfig()
++
++  const section = () => config.section("observer")
++  const numberOf = (key: (typeof NUMBERS)[number]["key"]) =>
++    typeof section()[key] === "number" ? (section()[key] as number) : undefined
++  const textOf = (key: "model" | "digest_model" | "escalation_model") =>
++    typeof section()[key] === "string" ? (section()[key] as string) : undefined
++  const commit = (changes: Record<string, unknown>) => void config.save("observer", changes)
++
++  return (
++    <>
++      <div class="settings-tab-header">
++        <div class="settings-tab-header-row">
++          <div class="flex flex-col gap-1">
++            <h2 class="settings-tab-title">{language.t("settings.tab.observer")}</h2>
++            <span class="text-11-regular text-v2-text-text-muted">{language.t("settings.observer.description")}</span>
++          </div>
++        </div>
++      </div>
++
++      <div class="settings-tab-body">
++        <RestartNotice show={config.restart()} />
++        <InlineError message={config.error()} />
++        <div class="settings-section">
++          <div
++            data-testid="settings-observer-audit-note"
++            class="mb-4 rounded-md border border-v2-border-border-base bg-v2-background-bg-layer-01 px-3 py-2"
++          >
++            <div class="text-12-medium">{language.t("settings.observer.note.title")}</div>
++            <div class="text-11-regular text-v2-text-text-muted">{language.t("settings.observer.note.description")}</div>
++          </div>
++          <SettingsList>
++            <SettingsRow
++              title={language.t("settings.observer.row.enabled.title")}
++              description={language.t("settings.observer.row.enabled.description")}
++            >
++              <ToggleField
++                label={language.t("settings.observer.row.enabled.title")}
++                testid="settings-observer-enabled"
++                checked={section().enabled !== false}
++                onChange={(checked) => commit({ enabled: checked })}
++              />
++            </SettingsRow>
++            <SettingsRow
++              title={language.t("settings.observer.row.model.title")}
++              description={language.t("settings.observer.row.model.description")}
++            >
++              <TextField
++                label={language.t("settings.observer.row.model.title")}
++                testid="settings-observer-model"
++                placeholder={language.t("settings.agentic.model.placeholder")}
++                value={textOf("model")}
++                commit={(value) => commit({ model: value })}
++              />
++            </SettingsRow>
++            <SettingsRow
++              title={language.t("settings.observer.row.digestModel.title")}
++              description={language.t("settings.observer.row.digestModel.description")}
++            >
++              <TextField
++                label={language.t("settings.observer.row.digestModel.title")}
++                testid="settings-observer-digest-model"
++                placeholder={language.t("settings.agentic.model.placeholder")}
++                value={textOf("digest_model")}
++                commit={(value) => commit({ digest_model: value })}
++              />
++            </SettingsRow>
++            <SettingsRow
++              title={language.t("settings.observer.row.escalationModel.title")}
++              description={language.t("settings.observer.row.escalationModel.description")}
++            >
++              <TextField
++                label={language.t("settings.observer.row.escalationModel.title")}
++                testid="settings-observer-escalation-model"
++                placeholder={language.t("settings.agentic.model.placeholder")}
++                value={textOf("escalation_model")}
++                commit={(value) => commit({ escalation_model: value })}
++              />
++            </SettingsRow>
++            {NUMBERS.map((item) => (
++              <SettingsRow
++                title={language.t(`settings.observer.row.${item.key}.title`)}
++                description={language.t(`settings.observer.row.${item.key}.description`)}
++              >
++                <NumberField
++                  label={language.t(`settings.observer.row.${item.key}.title`)}
++                  testid={`settings-observer-${item.key}`}
++                  value={numberOf(item.key)}
++                  fallback={item.fallback}
++                  onCommit={(value) => commit({ [item.key]: value })}
++                />
++              </SettingsRow>
++            ))}
++          </SettingsList>
++        </div>
++      </div>
++    </>
++  )
++}
+diff -r a/packages/app/src/settings/agentic/subagents.tsx b/packages/app/src/settings/agentic/subagents.tsx
+--- a/packages/app/src/settings/agentic/subagents.tsx	2026-10-29 18:53:35.384486100 +0300
++++ b/packages/app/src/settings/agentic/subagents.tsx	2026-10-29 19:04:51.882808400 +0300
+@@ -0,0 +1,226 @@
++import { Show, createEffect, createSignal, type Component } from "solid-js"
++import { Button } from "@opencode/ui/button"
++import { Textarea } from "@opencode/ui/textarea"
++import { useLanguage } from "@/runtime/i18n/language"
++import { SettingsList } from "@/settings/list"
++import { SettingsRow } from "@/settings/row"
++import { createAgenticConfig, isConfigObject } from "./config"
++import { InlineError, NumberField, RestartNotice, TextField, ToggleField } from "./fields"
++import "./agentic.css"
++
++export const SettingsSubagents: Component = () => {
++  const language = useLanguage()
++  const config = createAgenticConfig()
++
++  const section = () => config.section("subagents")
++  const siblings = () => {
++    const value = section().siblings
++
++    return isConfigObject(value) ? value : {}
++  }
++  const numberOf = (key: "max_depth" | "max_children_per_session") =>
++    typeof section()[key] === "number" ? (section()[key] as number) : undefined
++  const textOf = (key: "default_agent" | "default_model") =>
++    typeof section()[key] === "string" ? (section()[key] as string) : undefined
++  const commit = (changes: Record<string, unknown>) => void config.save("subagents", changes)
++
++  const [agents, setAgents] = createSignal("")
++  const [agentsError, setAgentsError] = createSignal<string>()
++  let agentsFocused = false
++
++  createEffect(() => {
++    if (agentsFocused) return
++    const value = section().agents
++    setAgents(JSON.stringify(isConfigObject(value) ? value : {}, null, 2))
++  })
++
++  const saveAgents = () => {
++    let parsed: unknown
++
++    try {
++      parsed = JSON.parse(agents())
++    } catch (cause) {
++      setAgentsError(
++        cause instanceof Error
++          ? language.t("settings.subagents.agents.invalid", { message: cause.message })
++          : language.t("settings.subagents.agents.invalid", { message: String(cause) }),
++      )
++
++      return
++    }
++
++    if (!isConfigObject(parsed)) {
++      setAgentsError(language.t("settings.subagents.agents.object"))
++
++      return
++    }
++
++    setAgentsError(undefined)
++    void commit({ agents: parsed })
++  }
++
++  return (
++    <>
++      <div class="settings-tab-header">
++        <div class="settings-tab-header-row">
++          <div class="flex flex-col gap-1">
++            <h2 class="settings-tab-title">{language.t("settings.tab.subagents")}</h2>
++            <span class="text-11-regular text-v2-text-text-muted">{language.t("settings.subagents.description")}</span>
++          </div>
++        </div>
++      </div>
++
++      <div class="settings-tab-body">
++        <RestartNotice show={config.restart()} />
++        <InlineError message={config.error()} />
++        <div class="settings-section">
++          <SettingsList>
++            <SettingsRow
++              title={language.t("settings.subagents.row.enabled.title")}
++              description={language.t("settings.subagents.row.enabled.description")}
++            >
++              <ToggleField
++                label={language.t("settings.subagents.row.enabled.title")}
++                testid="settings-subagents-enabled"
++                checked={section().enabled !== false}
++                onChange={(checked) => commit({ enabled: checked })}
++              />
++            </SettingsRow>
++            <SettingsRow
++              title={language.t("settings.subagents.row.defaultAgent.title")}
++              description={language.t("settings.subagents.row.defaultAgent.description")}
++            >
++              <TextField
++                label={language.t("settings.subagents.row.defaultAgent.title")}
++                testid="settings-subagents-default-agent"
++                placeholder="general"
++                value={textOf("default_agent")}
++                commit={(value) => commit({ default_agent: value ?? "general" })}
++              />
++            </SettingsRow>
++            <SettingsRow
++              title={language.t("settings.subagents.row.defaultModel.title")}
++              description={language.t("settings.subagents.row.defaultModel.description")}
++            >
++              <TextField
++                label={language.t("settings.subagents.row.defaultModel.title")}
++                testid="settings-subagents-default-model"
++                placeholder={language.t("settings.agentic.model.placeholder")}
++                value={textOf("default_model")}
++                commit={(value) => commit({ default_model: value })}
++              />
++            </SettingsRow>
++            <SettingsRow
++              title={language.t("settings.subagents.row.maxDepth.title")}
++              description={language.t("settings.subagents.row.maxDepth.description")}
++            >
++              <NumberField
++                label={language.t("settings.subagents.row.maxDepth.title")}
++                testid="settings-subagents-max-depth"
++                value={numberOf("max_depth")}
++                fallback={3}
++                onCommit={(value) => commit({ max_depth: value })}
++              />
++            </SettingsRow>
++            <SettingsRow
++              title={language.t("settings.subagents.row.maxChildren.title")}
++              description={language.t("settings.subagents.row.maxChildren.description")}
++            >
++              <NumberField
++                label={language.t("settings.subagents.row.maxChildren.title")}
++                testid="settings-subagents-max-children"
++                value={numberOf("max_children_per_session")}
++                fallback={8}
++                onCommit={(value) => commit({ max_children_per_session: value })}
++              />
++            </SettingsRow>
++            <SettingsRow
++              title={language.t("settings.subagents.row.allowSpawn.title")}
++              description={language.t("settings.subagents.row.allowSpawn.description")}
++            >
++              <ToggleField
++                label={language.t("settings.subagents.row.allowSpawn.title")}
++                testid="settings-subagents-allow-spawn"
++                checked={section().allow_spawn !== false}
++                onChange={(checked) => commit({ allow_spawn: checked })}
++              />
++            </SettingsRow>
++            <SettingsRow
++              title={language.t("settings.subagents.row.siblingsEnabled.title")}
++              description={language.t("settings.subagents.row.siblingsEnabled.description")}
++            >
++              <ToggleField
++                label={language.t("settings.subagents.row.siblingsEnabled.title")}
++                testid="settings-subagents-siblings-enabled"
++                checked={siblings().enabled !== false}
++                onChange={(checked) => commit({ siblings: { enabled: checked } })}
++              />
++            </SettingsRow>
++            <SettingsRow
++              title={language.t("settings.subagents.row.siblingsWake.title")}
++              description={language.t("settings.subagents.row.siblingsWake.description")}
++            >
++              <ToggleField
++                label={language.t("settings.subagents.row.siblingsWake.title")}
++                testid="settings-subagents-siblings-wake"
++                checked={siblings().wake !== false}
++                onChange={(checked) => commit({ siblings: { wake: checked } })}
++              />
++            </SettingsRow>
++            <SettingsRow
++              title={language.t("settings.subagents.row.allowParent.title")}
++              description={language.t("settings.subagents.row.allowParent.description")}
++            >
++              <ToggleField
++                label={language.t("settings.subagents.row.allowParent.title")}
++                testid="settings-subagents-allow-parent"
++                checked={siblings().allow_parent !== false}
++                onChange={(checked) => commit({ siblings: { allow_parent: checked } })}
++              />
++            </SettingsRow>
++            <SettingsRow
++              title={language.t("settings.subagents.row.maxMessages.title")}
++              description={language.t("settings.subagents.row.maxMessages.description")}
++            >
++              <NumberField
++                label={language.t("settings.subagents.row.maxMessages.title")}
++                testid="settings-subagents-max-messages"
++                value={typeof siblings().max_messages_per_min === "number" ? (siblings().max_messages_per_min as number) : undefined}
++                fallback={20}
++                onCommit={(value) => commit({ siblings: { max_messages_per_min: value } })}
++              />
++            </SettingsRow>
++          </SettingsList>
++        </div>
++
++        <div class="settings-section">
++          <div class="settings-section-title">{language.t("settings.subagents.agents.title")}</div>
++          <p class="mb-3 text-11-regular text-v2-text-text-muted">{language.t("settings.subagents.agents.description")}</p>
++          <Textarea
++            data-testid="settings-subagents-agents"
++            class="!w-full [&_[data-slot=textarea-v2-textarea]]:font-mono"
++            rows={8}
++            value={agents()}
++            aria-label={language.t("settings.subagents.agents.title")}
++            spellcheck={false}
++            onInput={(event) => setAgents(event.currentTarget.value)}
++            onFocus={() => (agentsFocused = true)}
++            onBlur={() => (agentsFocused = false)}
++          />
++          <Show when={agentsError()}>
++            {(message) => (
++              <div role="alert" data-testid="settings-subagents-agents-error" class="mt-2 text-11-regular text-v2-state-fg-danger">
++                {message()}
++              </div>
++            )}
++          </Show>
++          <div class="mt-2 flex justify-end">
++            <Button variant="neutral" size="small" data-testid="settings-subagents-agents-save" onClick={saveAgents}>
++              {language.t("settings.agentic.save")}
++            </Button>
++          </div>
++        </div>
++      </div>
++    </>
++  )
++}
+diff -r a/packages/app/src/settings/pages.ts b/packages/app/src/settings/pages.ts
+--- a/packages/app/src/settings/pages.ts	2026-10-29 18:53:15.595048700 +0300
++++ b/packages/app/src/settings/pages.ts	2026-10-29 19:04:51.900796600 +0300
+@@ -12,6 +12,11 @@
+   providers: "providers",
+   models: "models",
+   extensions: "extensions",
++  memory: "outline-brain",
++  goals: "check",
++  observer: "outline-eye",
++  subagents: "branch-out",
++  lanes: "window-analytics",
+   servers: "server",
+   experimental: "flask",
+   about: "info",
+@@ -27,6 +32,11 @@
+   providers: "settings.providers.title",
+   models: "settings.models.title",
+   extensions: "settings.tab.extensions",
++  memory: "settings.tab.memory",
++  goals: "settings.tab.goals",
++  observer: "settings.tab.observer",
++  subagents: "settings.tab.subagents",
++  lanes: "settings.tab.lanes",
+   servers: "settings.section.server",
+   experimental: "settings.tab.experimental",
+   about: "settings.tab.about",
+diff -r a/packages/app/src/settings/route.ts b/packages/app/src/settings/route.ts
+--- a/packages/app/src/settings/route.ts	2026-10-29 18:53:15.701667100 +0300
++++ b/packages/app/src/settings/route.ts	2026-10-29 19:04:51.907357100 +0300
+@@ -8,6 +8,11 @@
+   | "providers"
+   | "models"
+   | "extensions"
++  | "memory"
++  | "goals"
++  | "observer"
++  | "subagents"
++  | "lanes"
+   | "servers"
+   | "experimental"
+   | "about"
+@@ -18,7 +23,17 @@
+ export type SettingsPluginTab = string & { readonly [pluginTab]: true }
+ 
+ /** Root pages that show one server's settings: the selected server, or the default one. */
+-export type SettingsServerTab = "projects" | "workspaces" | "providers" | "models" | "extensions"
++export type SettingsServerTab =
++  | "projects"
++  | "workspaces"
++  | "providers"
++  | "models"
++  | "extensions"
++  | "memory"
++  | "goals"
++  | "observer"
++  | "subagents"
++  | "lanes"
+ 
+ export type SettingsProjectTab = "general" | "workspaces" | "extensions"
+ 
+@@ -53,6 +68,11 @@
+   providers: true,
+   models: true,
+   extensions: true,
++  memory: true,
++  goals: true,
++  observer: true,
++  subagents: true,
++  lanes: true,
+   servers: true,
+   experimental: true,
+   about: true,
+diff -r a/packages/app/src/settings/search-catalog.ts b/packages/app/src/settings/search-catalog.ts
+--- a/packages/app/src/settings/search-catalog.ts	2026-10-29 18:53:15.723000100 +0300
++++ b/packages/app/src/settings/search-catalog.ts	2026-10-29 19:04:51.919200100 +0300
+@@ -234,6 +234,41 @@
+     keywords: "extension gui built-in",
+   },
+   { tab: "extensions", subtab: "skills", label: "settings.extensions.tab.skills" },
++  { tab: "memory", label: "settings.tab.memory", keywords: "remember forget scribe embedding" },
++  {
++    tab: "memory",
++    label: "settings.memory.row.autoScribe.title",
++    target: "settings-memory-auto-scribe",
++    keywords: "scribe automatic memory",
++  },
++  {
++    tab: "memory",
++    label: "settings.memory.row.maxTokens.title",
++    target: "settings-memory-max-tokens",
++    keywords: "budget tokens context",
++  },
++  {
++    tab: "memory",
++    label: "settings.memory.row.embeddingModel.title",
++    target: "settings-memory-embedding-model",
++    keywords: "semantic embedding model",
++  },
++  { tab: "goals", label: "settings.tab.goals", keywords: "goal rounds stalls wait criteria" },
++  { tab: "observer", label: "settings.tab.observer", keywords: "flight strip repair audit supervisor" },
++  {
++    tab: "observer",
++    label: "settings.observer.row.enabled.title",
++    target: "settings-observer-enabled",
++    keywords: "observer supervisor enable",
++  },
++  { tab: "subagents", label: "settings.tab.subagents", keywords: "children spawn depth siblings" },
++  {
++    tab: "subagents",
++    label: "settings.subagents.agents.title",
++    target: "settings-subagents-agents",
++    keywords: "per-agent overrides json",
++  },
++  { tab: "lanes", label: "settings.tab.lanes", keywords: "concurrency queue cargo node network gpu" },
+   {
+     tab: "servers",
+     label: "settings.general.row.shell.title",
+diff -r a/packages/app/src/settings/shell.tsx b/packages/app/src/settings/shell.tsx
+--- a/packages/app/src/settings/shell.tsx	2026-10-29 18:53:15.951451700 +0300
++++ b/packages/app/src/settings/shell.tsx	2026-10-29 19:04:51.930052000 +0300
+@@ -25,6 +25,11 @@
+ import { SettingsProjects } from "./workspaces/projects"
+ import { SettingsExtensions } from "./providers/extensions"
+ import { SettingsAbout } from "./about/about"
++import { SettingsMemory } from "./agentic/memory"
++import { SettingsGoals } from "./agentic/goals"
++import { SettingsObserver } from "./agentic/observer"
++import { SettingsSubagents } from "./agentic/subagents"
++import { SettingsLanes } from "./agentic/lanes"
+ import { SettingsServerDataScope } from "./server-scope"
+ import { SettingsNavigation, type SettingsNavGroup } from "./navigation"
+ import { SettingsProjectGeneral } from "./workspaces/project"
+@@ -47,6 +52,11 @@
+   { value: "providers", icon: pageIcons.providers, label: "settings.providers.title" },
+   { value: "models", icon: pageIcons.models, label: "settings.models.title" },
+   { value: "extensions", icon: pageIcons.extensions, label: "settings.tab.extensions" },
++  { value: "memory", icon: pageIcons.memory, label: "settings.tab.memory" },
++  { value: "goals", icon: pageIcons.goals, label: "settings.tab.goals" },
++  { value: "observer", icon: pageIcons.observer, label: "settings.tab.observer" },
++  { value: "subagents", icon: pageIcons.subagents, label: "settings.tab.subagents" },
++  { value: "lanes", icon: pageIcons.lanes, label: "settings.tab.lanes" },
+   { value: "projects", icon: pageIcons.projects, label: "settings.tab.projects" },
+   { value: "workspaces", icon: pageIcons.workspaces, label: "settings.tab.workspaces" },
+ ] as const
+@@ -56,6 +66,11 @@
+   providers: { title: "settings.providers.title", description: "settings.providers.description" },
+   models: { title: "settings.models.title", description: "settings.models.description" },
+   extensions: { title: "settings.tab.extensions", description: "settings.extensions.description" },
++  memory: { title: "settings.tab.memory", description: "settings.memory.description" },
++  goals: { title: "settings.tab.goals", description: "settings.goals.description" },
++  observer: { title: "settings.tab.observer", description: "settings.observer.description" },
++  subagents: { title: "settings.tab.subagents", description: "settings.subagents.description" },
++  lanes: { title: "settings.tab.lanes", description: "settings.lanes.description" },
+   projects: { title: "settings.projects.title", description: "settings.projects.description" },
+   workspaces: { title: "settings.tab.workspaces", description: "settings.workspaces.description" },
+ } as const
+@@ -393,6 +408,21 @@
+                 headerAction={<SettingsServerSwitcher />}
+               />
+             </Tabs.Content>
++            <Tabs.Content value="memory" class="settings-panel">
++              <SettingsMemory />
++            </Tabs.Content>
++            <Tabs.Content value="goals" class="settings-panel">
++              <SettingsGoals />
++            </Tabs.Content>
++            <Tabs.Content value="observer" class="settings-panel">
++              <SettingsObserver />
++            </Tabs.Content>
++            <Tabs.Content value="subagents" class="settings-panel">
++              <SettingsSubagents />
++            </Tabs.Content>
++            <Tabs.Content value="lanes" class="settings-panel">
++              <SettingsLanes />
++            </Tabs.Content>
+           </SettingsServerDataScope>
+         )}
+       </Show>

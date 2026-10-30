@@ -1,0 +1,3 @@
+version=2.2.0
+commit=unknown-source-tree-without-git
+note=Re-pin this file when the upstream checkout is updated; regenerate patches first.

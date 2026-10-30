@@ -1,0 +1,17 @@
+@utility no-scrollbar {
+  &::-webkit-scrollbar {
+    display: none;
+  }
+  & {
+    -ms-overflow-style: none; /* IE and Edge */
+    scrollbar-width: none; /* Firefox */
+  }
+}
+
+@utility hover-reveal {
+  @apply opacity-0 transition-opacity;
+
+  @media (hover: none) {
+    opacity: 1;
+  }
+}

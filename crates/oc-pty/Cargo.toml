@@ -1,0 +1,21 @@
+[package]
+name = "oc-pty"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "In-process PTY manager with bounded scrollback for opencode-rust"
+
+[dependencies]
+bytes.workspace = true
+portable-pty = "0.9"
+thiserror.workspace = true
+tokio = { workspace = true, features = ["sync", "time"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+
+[lints]
+workspace = true

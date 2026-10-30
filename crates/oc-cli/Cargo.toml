@@ -1,0 +1,48 @@
+[package]
+name = "oc-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "opencode-rust command line"
+
+[[bin]]
+name = "opencode"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+base64.workspace = true
+clap.workspace = true
+futures-util.workspace = true
+oc-config.workspace = true
+oc-lanes = { path = "../oc-lanes" }
+oc-llm.workspace = true
+oc-lsp.workspace = true
+oc-mcp.workspace = true
+oc-memory.workspace = true
+oc-plugin.workspace = true
+oc-pty.workspace = true
+oc-runtime.workspace = true
+oc-server.workspace = true
+oc-store.workspace = true
+oc-tools.workspace = true
+oc-types.workspace = true
+rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+oc-testkit.workspace = true
+reqwest.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,1623 @@
+diff -r a/packages/app/src/runtime/i18n/en.ts b/packages/app/src/runtime/i18n/en.ts
+--- a/packages/app/src/runtime/i18n/en.ts	2026-10-29 20:34:38.147078500 +0300
++++ b/packages/app/src/runtime/i18n/en.ts	2026-10-29 20:58:12.797120800 +0300
+@@ -1418,6 +1418,55 @@
+   "settings.lanes.unavailable.title": "Lane service not attached",
+   "settings.lanes.unavailable.description":
+     "This server is running without the lane service, so there is no live queue to show. Concurrency settings still apply once it is attached.",
++  "session.agentPanels.tree.title": "Subagents",
++  "session.agentPanels.tree.count": "{{count}} sessions",
++  "session.agentPanels.tree.expand": "Show the session tree",
++  "session.agentPanels.tree.collapse": "Hide the session tree",
++  "session.agentPanels.tree.open": "Open session {{title}}",
++  "session.agentPanels.tree.depth": "d{{depth}}",
++  "session.agentPanels.relation.current": "current",
++  "session.agentPanels.relation.parent": "parent",
++  "session.agentPanels.relation.ancestor": "ancestor",
++  "session.agentPanels.relation.sibling": "sibling",
++  "session.agentPanels.relation.child": "child",
++  "session.agentPanels.relation.descendant": "descendant",
++  "session.agentPanels.state.busy": "running",
++  "session.agentPanels.state.idle": "idle",
++  "session.agentPanels.state.suspended": "suspended",
++  "session.agentPanels.state.failed": "failed",
++  "session.agentPanels.state.interrupted": "interrupted",
++  "session.agentPanels.state.archived": "archived",
++  "session.agentPanels.observer.title": "Observer repairs",
++  "session.agentPanels.observer.count": "{{count}} repairs",
++  "session.agentPanels.observer.expand": "Show observer repairs",
++  "session.agentPanels.observer.collapse": "Hide observer repairs",
++  "session.agentPanels.observer.noReason": "No reason recorded",
++  "session.agentPanels.observer.attempt": "attempt {{count}}",
++  "session.agentPanels.observer.budget.title": "Repair budget exhausted",
++  "session.agentPanels.observer.budget.description":
++    "The observer used its repair budget for this session and is escalating instead of retrying.",
++  "session.agentPanels.observer.budget.usage": "{{used}} of {{limit}} repairs used",
++  "session.agentPanels.lane.unavailable": "Lanes unavailable",
++  "session.agentPanels.lane.queue": "{{count}} queued",
++  "session.agentPanels.lane.state.queued": "queued",
++  "session.agentPanels.lane.state.running": "running",
++  "session.agentPanels.lane.state.succeeded": "finished",
++  "session.agentPanels.lane.state.failed": "failed",
++  "session.agentPanels.lane.state.cancelled": "cancelled",
++  "session.goal.criteria": "{{done}}/{{total}} criteria",
++  "session.goal.open": "Open the goals page for {{objective}}",
++  "session.peer.title": "Peer messages",
++  "session.peer.empty": "No peer messages yet. Siblings reach this session with talk; those messages land here.",
++  "session.peer.badge": "peer",
++  "session.peer.you": "you",
++  "session.peer.close": "Close peer messages",
++  "session.peer.open": "Open peer messages",
++  "session.peer.unread": "{{count}} new",
++  "session.peer.placeholder": "Write into this session as a peer",
++  "session.peer.send": "Send",
++  "session.peer.queue": "Queue",
++  "session.peer.sending": "Sending…",
++  "session.peer.error": "Couldn't send: {{message}}",
+ }
+ 
+ export default dict
+diff -r a/packages/app/src/session/agent-panels/agent-events.ts b/packages/app/src/session/agent-panels/agent-events.ts
+--- a/packages/app/src/session/agent-panels/agent-events.ts	1970-01-01 02:00:00.000000000 +0200
++++ b/packages/app/src/session/agent-panels/agent-events.ts	2026-10-29 20:58:14.485034500 +0300
+@@ -0,0 +1,142 @@
++import { createMemo, createSignal, onCleanup, type Accessor } from "solid-js"
++import { createStore } from "solid-js/store"
++import { isConfigObject } from "@/settings/agentic/config"
++import { useServerSDK } from "@/runtime/server/client"
++import {
++  asCount,
++  asText,
++  parseGoal,
++  parseLaneTicket,
++  parseObserverRepaired,
++  parsePeerMessage,
++  type Goal,
++  type LaneTicket,
++  type ObserverRepair,
++  type PeerMessage,
++} from "./agent-wire"
++
++type RawEvent = { type?: string; created?: number; data?: unknown }
++
++/** Live extension state for one session tree, merged into the fetched rows. */
++export interface AgentEvents {
++  /** `observer.repaired` rows, newest first. */
++  repairs: Accessor<ObserverRepair[]>
++  /** Set when the server says the repair budget ran out (`observer.escalated`). */
++  escalation: Accessor<{ reason: string; budget?: number } | undefined>
++  /** `goal.updated` for this tree. */
++  goal: Accessor<Goal | undefined>
++  /** Queued or running lane tickets owned by this session. */
++  activeTickets: Accessor<LaneTicket[]>
++}
++
++/** Peer messages delivered to one child session while the drawer is mounted. */
++export interface PeerFeed {
++  messages: Accessor<PeerMessage[]>
++  unread: Accessor<number>
++  add(message: PeerMessage): void
++  markRead(): void
++}
++
++/**
++ * Live extension events for one session's panels (`docs/13-ui.md`).
++ *
++ * The typed SDK event union predates these events, so the stream is read raw
++ * and every payload is filtered by the session tree it belongs to: a sibling
++ * tree's observer repairs never appear on this screen.
++ */
++export function createAgentEvents(input: {
++  sessionID: () => string | undefined
++  root: () => string | undefined
++}): AgentEvents {
++  const sdk = useServerSDK()
++  const [repairs, setRepairs] = createSignal<ObserverRepair[]>([])
++  const [escalation, setEscalation] = createSignal<{ reason: string; budget?: number }>()
++  const [goal, setGoal] = createSignal<Goal>()
++  const [tickets, setTickets] = createStore<Record<string, LaneTicket>>({})
++
++  const ours = (rootID: string | undefined) => !!rootID && (rootID === input.sessionID() || rootID === input.root())
++
++  const stop = sdk.event.listen((event) => {
++    const raw = event as unknown as RawEvent
++    const sessionID = input.sessionID()
++    if (!sessionID || !raw.type) return
++    const data = raw.data
++
++    switch (raw.type) {
++      case "observer.repaired": {
++        if (!isConfigObject(data) || !ours(asText(data.rootID))) return
++        const repair = parseObserverRepaired(data)
++        if (!repair) return
++        setRepairs((current) => [repair, ...current].slice(0, 20))
++
++        return
++      }
++      case "observer.escalated": {
++        if (!isConfigObject(data) || !ours(asText(data.rootID))) return
++        setEscalation({ reason: asText(data.reason) ?? "", budget: asCount(data.budget) })
++
++        return
++      }
++      case "goal.updated": {
++        if (!isConfigObject(data) || !ours(asText(data.rootID))) return
++        const next = parseGoal(data.goal)
++        if (next) setGoal(next)
++
++        return
++      }
++      case "lane.queued":
++      case "lane.started":
++      case "lane.finished":
++      case "lane.cancelled": {
++        const ticket = parseLaneTicket(data)
++        // A ticket belongs to the session that submitted it; another session's
++        // queue is shown by that session, not here.
++        if (!ticket || ticket.owner !== sessionID) return
++        setTickets(ticket.id, ticket)
++
++        return
++      }
++      default:
++        return
++    }
++  })
++  onCleanup(stop)
++
++  const activeTickets = createMemo(() =>
++    Object.values(tickets).filter((ticket) => ticket.state === "queued" || ticket.state === "running"),
++  )
++
++  return { repairs, escalation, goal, activeTickets }
++}
++
++/**
++ * Peer messages for one child session: `subagent.peer.message` events whose
++ * target is this session. There is no history endpoint — a peer message is an
++ * inbox row, so the drawer is live-only and starts empty.
++ */
++export function createPeerFeed(sessionID: () => string | undefined): PeerFeed {
++  const sdk = useServerSDK()
++  const [messages, setMessages] = createSignal<PeerMessage[]>([])
++  const [unread, setUnread] = createSignal(0)
++
++  const add = (message: PeerMessage) => {
++    setMessages((current) => (current.some((item) => item.id === message.id) ? current : [...current, message]))
++    setUnread((current) => current + 1)
++  }
++
++  const stop = sdk.event.listen((event) => {
++    const raw = event as unknown as RawEvent
++    const id = sessionID()
++    if (raw.type !== "subagent.peer.message" || !id) return
++    const message = parsePeerMessage(raw.data, id)
++    if (message) add(message)
++  })
++  onCleanup(stop)
++
++  return {
++    messages,
++    unread,
++    add,
++    markRead: () => setUnread(0),
++  }
++}
+diff -r a/packages/app/src/session/agent-panels/agent-panels.tsx b/packages/app/src/session/agent-panels/agent-panels.tsx
+--- a/packages/app/src/session/agent-panels/agent-panels.tsx	1970-01-01 02:00:00.000000000 +0200
++++ b/packages/app/src/session/agent-panels/agent-panels.tsx	2026-10-29 20:58:14.486542600 +0300
+@@ -0,0 +1,24 @@
++import { createAgentEvents } from "./agent-events"
++import { useSubagentTreeQuery } from "./agent-queries"
++import { ObserverRepairPanel } from "./observer-repairs"
++import { SubagentTreePanel } from "./subagent-tree"
++
++/**
++ * The session header's agent panels (`docs/13-ui.md`): the subagent tree and the
++ * observer's repair rows. Both hide themselves when the server has nothing to
++ * show, so a session without subagents keeps the plain header.
++ */
++export function SessionAgentPanels(props: { sessionID: string }) {
++  const tree = useSubagentTreeQuery(() => props.sessionID)
++  // The tree's root owns the observer rows; before it loads the routed session
++  // is the only candidate, which is correct for a root session.
++  const root = () => (tree.data?.available ? tree.data.value.root : props.sessionID)
++  const events = createAgentEvents({ sessionID: () => props.sessionID, root })
++
++  return (
++    <>
++      <SubagentTreePanel sessionID={props.sessionID} />
++      <ObserverRepairPanel sessionID={props.sessionID} live={events.repairs} escalation={events.escalation} />
++    </>
++  )
++}
+diff -r a/packages/app/src/session/agent-panels/agent-queries.ts b/packages/app/src/session/agent-panels/agent-queries.ts
+--- a/packages/app/src/session/agent-panels/agent-queries.ts	1970-01-01 02:00:00.000000000 +0200
++++ b/packages/app/src/session/agent-panels/agent-queries.ts	2026-10-29 20:58:14.488110200 +0300
+@@ -0,0 +1,155 @@
++import { useQuery } from "@tanstack/solid-query"
++import { serverMessage, useAgenticRequest } from "@/settings/agentic/config"
++import { useServerSDK } from "@/runtime/server/client"
++import {
++  parseGoal,
++  parseLaneStatuses,
++  parseObserverRepairs,
++  parseObserverState,
++  parseSubagentTree,
++  type Goal,
++  type LaneStatus,
++  type ObserverBudget,
++  type ObserverRepair,
++  type SubagentTree,
++} from "./agent-wire"
++
++/**
++ * A fetched extension value. A `503` is the server saying the subsystem is not
++ * attached; it is shown inline instead of being retried or rendered as empty.
++ */
++export type Fetched<T> = { available: true; value: T } | { available: false; reason: string }
++
++type Request = (path: string, init?: RequestInit) => Promise<Response>
++
++type ReadResult = { kind: "unavailable"; reason: string } | { kind: "data"; value: unknown }
++
++/**
++ * Reads one experimental route. Every route here answers `{data: …}`, so the
++ * envelope is unwrapped once: a body without it is a malformed response, not an
++ * empty list.
++ */
++async function read(request: Request, path: string, signal: AbortSignal | undefined): Promise<ReadResult> {
++  const response = await request(path, { signal })
++  if (response.status === 503) return { kind: "unavailable", reason: await serverMessage(response) }
++  if (!response.ok) throw new Error(await serverMessage(response))
++
++  const body: unknown = await response.json()
++  if (!body || typeof body !== "object" || !("data" in body)) throw new Error(`Malformed response from ${path}`)
++
++  return { kind: "data", value: body.data }
++}
++
++// The panels share these keys, so a screen with the tree, the observer rows and
++// the composer chip issues each request once.
++export function useSubagentTreeQuery(sessionID: () => string | undefined) {
++  const sdk = useServerSDK()
++  const request = useAgenticRequest()
++
++  return useQuery(() => ({
++    queryKey: [sdk.scope, "agent-panels", "tree", sessionID()],
++    queryFn: async ({ signal }): Promise<Fetched<SubagentTree>> => {
++      const id = sessionID()
++      if (!id) return { available: false, reason: "no session" }
++
++      const result = await read(request, `/api/experimental/subagent/tree?sessionID=${encodeURIComponent(id)}`, signal)
++      if (result.kind === "unavailable") return { available: false, reason: result.reason }
++      const tree = parseSubagentTree(result.value)
++
++      return tree ? { available: true, value: tree } : { available: false, reason: "malformed tree" }
++    },
++    enabled: !!sessionID() && sdk.connection.status() === "connected",
++    refetchOnMount: false,
++    staleTime: 30_000,
++    retry: false,
++  }))
++}
++
++export function useObserverRepairsQuery(sessionID: () => string | undefined) {
++  const sdk = useServerSDK()
++  const request = useAgenticRequest()
++
++  return useQuery(() => ({
++    queryKey: [sdk.scope, "agent-panels", "repairs", sessionID()],
++    queryFn: async ({ signal }): Promise<Fetched<ObserverRepair[]>> => {
++      const id = sessionID()
++      if (!id) return { available: false, reason: "no session" }
++
++      const result = await read(
++        request,
++        `/api/experimental/observer/repairs?sessionID=${encodeURIComponent(id)}&limit=20`,
++        signal,
++      )
++      if (result.kind === "unavailable") return { available: false, reason: result.reason }
++
++      return { available: true, value: parseObserverRepairs(result.value) }
++    },
++    enabled: !!sessionID() && sdk.connection.status() === "connected",
++    refetchOnMount: false,
++    staleTime: 30_000,
++    retry: false,
++  }))
++}
++
++export function useObserverStateQuery(sessionID: () => string | undefined) {
++  const sdk = useServerSDK()
++  const request = useAgenticRequest()
++
++  return useQuery(() => ({
++    queryKey: [sdk.scope, "agent-panels", "observer", sessionID()],
++    queryFn: async ({ signal }): Promise<Fetched<{ budget?: ObserverBudget }>> => {
++      const id = sessionID()
++      if (!id) return { available: false, reason: "no session" }
++
++      const result = await read(request, `/api/experimental/observer?sessionID=${encodeURIComponent(id)}`, signal)
++      if (result.kind === "unavailable") return { available: false, reason: result.reason }
++
++      return { available: true, value: parseObserverState(result.value) }
++    },
++    enabled: !!sessionID() && sdk.connection.status() === "connected",
++    refetchOnMount: false,
++    staleTime: 30_000,
++    retry: false,
++  }))
++}
++
++export function useSessionGoalQuery(sessionID: () => string | undefined) {
++  const sdk = useServerSDK()
++  const request = useAgenticRequest()
++
++  return useQuery(() => ({
++    queryKey: [sdk.scope, "agent-panels", "goal", sessionID()],
++    queryFn: async ({ signal }): Promise<Fetched<Goal | undefined>> => {
++      const id = sessionID()
++      if (!id) return { available: false, reason: "no session" }
++
++      const result = await read(request, `/api/experimental/goal?sessionID=${encodeURIComponent(id)}`, signal)
++      if (result.kind === "unavailable") return { available: false, reason: result.reason }
++
++      return { available: true, value: parseGoal(result.value) }
++    },
++    enabled: !!sessionID() && sdk.connection.status() === "connected",
++    refetchOnMount: false,
++    staleTime: 30_000,
++    retry: false,
++  }))
++}
++
++export function useLaneSnapshotQuery() {
++  const sdk = useServerSDK()
++  const request = useAgenticRequest()
++
++  return useQuery(() => ({
++    queryKey: [sdk.scope, "agent-panels", "lanes"],
++    queryFn: async ({ signal }): Promise<Fetched<LaneStatus[]>> => {
++      const result = await read(request, "/api/experimental/lane", signal)
++      if (result.kind === "unavailable") return { available: false, reason: result.reason }
++
++      return { available: true, value: parseLaneStatuses(result.value) }
++    },
++    enabled: sdk.connection.status() === "connected",
++    refetchOnMount: false,
++    staleTime: 30_000,
++    retry: false,
++  }))
++}
+diff -r a/packages/app/src/session/agent-panels/agent-wire.ts b/packages/app/src/session/agent-panels/agent-wire.ts
+--- a/packages/app/src/session/agent-panels/agent-wire.ts	1970-01-01 02:00:00.000000000 +0200
++++ b/packages/app/src/session/agent-panels/agent-wire.ts	2026-10-29 20:58:14.489167700 +0300
+@@ -0,0 +1,287 @@
++import { isConfigObject } from "@/settings/agentic/config"
++
++/**
++ * Wire values for the experimental agent panels (docs/13-ui.md).
++ *
++ * These routes are extensions: every parser ignores unknown fields and returns
++ * `undefined` for a value it cannot read, so an older or newer server can never
++ * make the session screen throw.
++ */
++
++/** `Store::session_node` derives exactly these states. */
++export type SubagentState = "busy" | "idle" | "suspended" | "failed" | "interrupted" | "archived"
++
++export type SubagentNode = {
++  id: string
++  parentID?: string
++  agent: string
++  model?: string
++  /** Derived lifecycle state; see `Store::session_node`. */
++  state: SubagentState
++  depth: number
++  role: string
++  spawnAllowed: boolean
++  childCount: number
++}
++
++export type SubagentTree = { root: string; nodes: SubagentNode[] }
++
++/** One observer repair, from `GET /api/experimental/observer/repairs` or `observer.repaired`. */
++export type ObserverRepair = {
++  id?: string
++  kind: string
++  reason: string
++  /** Repaired session, tool call or message. */
++  target: string
++  attempt: number
++  created?: number
++}
++
++export type ObserverBudget = {
++  used: number
++  limit: number
++  exhausted: boolean
++}
++
++export type ObserverState = { budget?: ObserverBudget }
++
++export type Goal = {
++  id: string
++  rootID: string
++  objective: string
++  criteria: string[]
++  status: string
++  rounds: number
++  stalls: number
++  evidence: string[]
++  model?: string
++}
++
++export type LaneStatus = { lane: string; concurrency: number; running: number; queued: number }
++
++export type LaneTicket = {
++  id: string
++  lane: string
++  command: string
++  /** The owning session, from `ownerSession`; `undefined` when the submitter was unknown. */
++  owner?: string
++  state: "queued" | "running" | "succeeded" | "failed" | "cancelled"
++  queued: number
++}
++
++export type PeerMessage = {
++  /** Inbox row id when the event carries one; used to fold the POST echo into the same row. */
++  id: string
++  from: string
++  /** Sender agent id, when the event names one. */
++  agent?: string
++  /** `note`, `question` or `answer` for `talk`; absent for a hand-written message. */
++  kind?: string
++  /** Written from this drawer, not delivered by a peer. */
++  own?: boolean
++  text: string
++  created: number
++}
++
++/** A non-empty string field, or `undefined` when it is absent or mistyped. */
++export const asText = (value: unknown) => (typeof value === "string" && value ? value : undefined)
++/** A finite numeric field, or `undefined` when it is absent or mistyped. */
++export const asCount = (value: unknown) => (typeof value === "number" && Number.isFinite(value) ? value : undefined)
++const list = (value: unknown) => (Array.isArray(value) ? value : [])
++
++export function parseSubagentTree(value: unknown): SubagentTree | undefined {
++  if (!isConfigObject(value)) return undefined
++  const root = asText(value.root)
++  if (!root) return undefined
++
++  return { root, nodes: list(value.nodes).flatMap((node) => parseSubagentNode(node) ?? []) }
++}
++
++function parseSubagentNode(value: unknown): SubagentNode | undefined {
++  if (!isConfigObject(value)) return undefined
++  const id = asText(value.id)
++  if (!id) return undefined
++
++  return {
++    id,
++    parentID: asText(value.parentID),
++    agent: asText(value.agent) ?? "build",
++    model: asText(value.model),
++    state: subagentState(value.state),
++    depth: asCount(value.depth) ?? 0,
++    role: asText(value.role) ?? "primary",
++    spawnAllowed: value.spawnAllowed === true,
++    childCount: asCount(value.childCount) ?? 0,
++  }
++}
++
++/** Unknown states (a newer server) fall back to `idle`, never to a fake activity. */
++function subagentState(value: unknown): SubagentState {
++  const state = asText(value)
++  switch (state) {
++    case "busy":
++    case "suspended":
++    case "failed":
++    case "interrupted":
++    case "archived":
++      return state
++    default:
++      return "idle"
++  }
++}
++
++export function parseObserverRepairs(value: unknown): ObserverRepair[] {
++  return list(value).flatMap((row) => {
++    if (!isConfigObject(row)) return []
++    const kind = asText(row.kind)
++    if (!kind) return []
++
++    return [
++      {
++        id: asText(row.id),
++        kind,
++        reason: asText(row.reason) ?? "",
++        target: asText(row.targetID) ?? asText(row.target) ?? "",
++        attempt: asCount(row.attempt) ?? 0,
++        created: timeOf(row.time),
++      },
++    ]
++  })
++}
++
++/** `observer.repaired` carries no id and no timestamp: it is the newest row of the audit. */
++export function parseObserverRepaired(value: unknown): ObserverRepair | undefined {
++  if (!isConfigObject(value)) return undefined
++  const kind = asText(value.kind)
++  if (!kind) return undefined
++
++  return {
++    kind,
++    reason: asText(value.reason) ?? "",
++    target: asText(value.target) ?? asText(value.targetID) ?? "",
++    attempt: asCount(value.attempt) ?? 0,
++  }
++}
++
++export function parseObserverState(value: unknown): ObserverState {
++  if (!isConfigObject(value)) return {}
++
++  const budget = isConfigObject(value.budget)
++    ? {
++        used: asCount(value.budget.rootUsed) ?? 0,
++        limit: asCount(value.budget.rootLimit) ?? 0,
++        exhausted: value.budget.exhausted === true,
++      }
++    : undefined
++
++  return { budget }
++}
++
++export function parseGoal(value: unknown): Goal | undefined {
++  if (!isConfigObject(value)) return undefined
++  const id = asText(value.id)
++  const objective = asText(value.objective)
++  if (!id || !objective) return undefined
++
++  return {
++    id,
++    rootID: asText(value.rootID) ?? "",
++    objective,
++    criteria: list(value.criteria).filter((item): item is string => typeof item === "string"),
++    status: asText(value.status) ?? "active",
++    rounds: asCount(value.rounds) ?? 0,
++    stalls: asCount(value.stalls) ?? 0,
++    evidence: list(value.evidence).filter((item): item is string => typeof item === "string"),
++    model: asText(value.model),
++  }
++}
++
++export function parseLaneStatuses(value: unknown): LaneStatus[] {
++  return list(value).flatMap((row) => {
++    if (!isConfigObject(row)) return []
++    const lane = asText(row.lane)
++    if (!lane) return []
++
++    return [
++      {
++        lane,
++        concurrency: asCount(row.concurrency) ?? 0,
++        running: asCount(row.running) ?? 0,
++        queued: asCount(row.queued) ?? 0,
++      },
++    ]
++  })
++}
++
++/**
++ * One lane ticket event: `{lane, ticket, sessionID?}` where `ticket` is the
++ * full ticket object (`lane.queued|started|finished|cancelled`).
++ */
++export function parseLaneTicket(value: unknown): LaneTicket | undefined {
++  if (!isConfigObject(value)) return undefined
++  const ticket = isConfigObject(value.ticket) ? value.ticket : value
++  const id = asText(ticket.id)
++  const lane = asText(value.lane) ?? asText(ticket.lane)
++  if (!id || !lane) return undefined
++
++  return {
++    id,
++    lane,
++    command: asText(ticket.command) ?? "",
++    owner: asText(value.sessionID) ?? asText(ticket.ownerSession),
++    state: ticketState(ticket.state),
++    queued: asCount(ticket.queuedMs) ?? 0,
++  }
++}
++
++function ticketState(value: unknown): LaneTicket["state"] {
++  const tag = isConfigObject(value) ? asText(value.state) : asText(value)
++  switch (tag) {
++    case "queued":
++    case "running":
++    case "succeeded":
++    case "failed":
++    case "cancelled":
++      return tag
++    default:
++      return "queued"
++  }
++}
++
++/**
++ * `subagent.peer.message`. The field names are matched loosely on purpose:
++ * the event is an extension and the drawer must not lose a message to a rename.
++ */
++export function parsePeerMessage(value: unknown, sessionID: string): PeerMessage | undefined {
++  if (!isConfigObject(value)) return undefined
++
++  const target = asText(value.sessionID) ?? asText(value.target) ?? asText(value.targetID) ?? asText(value.to)
++  if (target !== sessionID) return undefined
++
++  const payload = isConfigObject(value.payload) ? value.payload : undefined
++  const textBody = asText(value.text) ?? asText(value.message) ?? (payload ? asText(payload.text) : undefined)
++  if (!textBody) return undefined
++
++  const from =
++    asText(value.from) ??
++    asText(value.fromID) ??
++    asText(value.fromSessionID) ??
++    asText(value.sender) ??
++    asText(value.source) ??
++    "peer"
++  const created = asCount(value.created) ?? timeOf(value.time) ?? Date.now()
++  const id = asText(value.messageID) ?? asText(value.id) ?? `${from}:${created}`
++
++  return {
++    id,
++    from,
++    agent: asText(value.agent),
++    kind: asText(value.kind),
++    text: textBody,
++    created,
++  }
++}
++
++function timeOf(value: unknown) {
++  return isConfigObject(value) ? asCount(value.created) : undefined
++}
+diff -r a/packages/app/src/session/agent-panels/goal-chip.tsx b/packages/app/src/session/agent-panels/goal-chip.tsx
+--- a/packages/app/src/session/agent-panels/goal-chip.tsx	1970-01-01 02:00:00.000000000 +0200
++++ b/packages/app/src/session/agent-panels/goal-chip.tsx	2026-10-29 20:58:14.489678900 +0300
+@@ -0,0 +1,52 @@
++import { Icon } from "@opencode/ui/icon"
++import { Show } from "solid-js"
++import { useLanguage } from "@/runtime/i18n/language"
++import { useServer } from "@/runtime/server/current"
++import { useSettingsSurface } from "@/settings/surface"
++import { createAgentEvents } from "./agent-events"
++import { useSessionGoalQuery } from "./agent-queries"
++
++/**
++ * The composer chip for the session tree's goal (`docs/13-ui.md`):
++ * `objective · 2/5 criteria`. Clicking it opens the goals page; `goal.updated`
++ * replaces the fetched goal without a refetch.
++ */
++export function SessionGoalChip(props: { sessionID: string }) {
++  const language = useLanguage()
++  const server = useServer()
++  const surface = useSettingsSurface()
++  const query = useSessionGoalQuery(() => props.sessionID)
++  const events = createAgentEvents({ sessionID: () => props.sessionID, root: () => props.sessionID })
++
++  const goal = () => events.goal() ?? (query.data?.available ? query.data.value : undefined)
++
++  return (
++    <Show when={goal()}>
++      {(current) => (
++        <button
++          type="button"
++          data-component="session-goal-chip"
++          data-status={current().status}
++          class="pointer-events-auto flex h-6 max-w-[min(320px,50vw)] items-center gap-1.5 rounded-full border border-v2-border-border-base bg-v2-background-bg-layer-01 px-2.5 text-11-regular text-v2-text-text-muted hover:bg-v2-background-bg-layer-02"
++          title={current().objective}
++          aria-label={language.t("session.goal.open", { objective: current().objective })}
++          onClick={() => surface.replace({ type: "root", tab: "goals", server: server.key })}
++        >
++          <Icon name="status-active" size="small" class="shrink-0 text-v2-icon-icon-faint" />
++          <span class="min-w-0 truncate" dir="auto">
++            {current().objective}
++          </span>
++          <Show when={current().criteria.length > 0}>
++            <span class="shrink-0 tabular-nums text-v2-text-text-faint">
++              {/* Evidence entries are the proven criteria; never more than the criteria themselves. */}
++              {language.t("session.goal.criteria", {
++                done: String(Math.min(current().evidence.length, current().criteria.length)),
++                total: String(current().criteria.length),
++              })}
++            </span>
++          </Show>
++        </button>
++      )}
++    </Show>
++  )
++}
+diff -r a/packages/app/src/session/agent-panels/lane-pill.tsx b/packages/app/src/session/agent-panels/lane-pill.tsx
+--- a/packages/app/src/session/agent-panels/lane-pill.tsx	1970-01-01 02:00:00.000000000 +0200
++++ b/packages/app/src/session/agent-panels/lane-pill.tsx	2026-10-29 20:58:14.490697500 +0300
+@@ -0,0 +1,69 @@
++import { Icon } from "@opencode/ui/icon"
++import { Show, createMemo } from "solid-js"
++import { useLanguage } from "@/runtime/i18n/language"
++import { createAgentEvents } from "./agent-events"
++import { useLaneSnapshotQuery } from "./agent-queries"
++
++/**
++ * The lane pill (`docs/13-ui.md`): the lane this session's build command is
++ * waiting in, with the lane's queue depth. With no lane service attached the
++ * server answers `503`, and the pill says so inline instead of showing a
++ * healthy empty queue.
++ */
++export function SessionLanePill(props: { sessionID: string }) {
++  const language = useLanguage()
++  const snapshot = useLaneSnapshotQuery()
++  const events = createAgentEvents({ sessionID: () => props.sessionID, root: () => props.sessionID })
++
++  const ticket = createMemo(() => events.activeTickets()[0])
++  // `cargo:/path/to/worktree` is shown by the resource the queue serialises.
++  const laneName = createMemo(() => ticket()?.lane.split(":")[0] ?? "")
++  const queueDepth = createMemo(() => {
++    const current = ticket()
++    if (!current || !snapshot.data?.available) return undefined
++
++    return snapshot.data.value.find((item) => item.lane === current.lane)?.queued
++  })
++  const unavailable = createMemo(() => (snapshot.data && !snapshot.data.available ? snapshot.data.reason : undefined))
++
++  return (
++    <Show
++      when={ticket()}
++      fallback={
++        <Show when={unavailable()}>
++          {(reason) => (
++            <span
++              data-component="session-lane-pill"
++              data-state="unavailable"
++              class="pointer-events-auto flex h-6 items-center gap-1.5 rounded-full border border-v2-border-border-base bg-v2-background-bg-layer-01 px-2.5 text-11-regular text-v2-text-text-faint"
++              title={reason()}
++            >
++              <Icon name="outline-worktree" size="small" class="shrink-0 text-v2-icon-icon-faint" />
++              <span class="shrink-0">{language.t("session.agentPanels.lane.unavailable")}</span>
++            </span>
++          )}
++        </Show>
++      }
++    >
++      {(current) => (
++        <span
++          data-component="session-lane-pill"
++          data-state={current().state}
++          class="pointer-events-auto flex h-6 items-center gap-1.5 rounded-full border border-v2-border-border-base bg-v2-background-bg-layer-01 px-2.5 text-11-regular text-v2-text-text-muted"
++          title={current().command}
++        >
++          <Icon name="outline-worktree" size="small" class="shrink-0 text-v2-icon-icon-faint" />
++          <span class="shrink-0 font-mono">{laneName()}</span>
++          <span class="shrink-0">{language.t(`session.agentPanels.lane.state.${current().state}`)}</span>
++          <Show when={queueDepth()}>
++            {(count) => (
++              <span class="shrink-0 tabular-nums">
++                · {language.t("session.agentPanels.lane.queue", { count: String(count()) })}
++              </span>
++            )}
++          </Show>
++        </span>
++      )}
++    </Show>
++  )
++}
+diff -r a/packages/app/src/session/agent-panels/observer-repairs.tsx b/packages/app/src/session/agent-panels/observer-repairs.tsx
+--- a/packages/app/src/session/agent-panels/observer-repairs.tsx	1970-01-01 02:00:00.000000000 +0200
++++ b/packages/app/src/session/agent-panels/observer-repairs.tsx	2026-10-29 20:58:14.491207600 +0300
+@@ -0,0 +1,133 @@
++import { Icon } from "@opencode/ui/icon"
++import { For, Show, createMemo, createSignal, type Accessor } from "solid-js"
++import { useLanguage } from "@/runtime/i18n/language"
++import { useObserverRepairsQuery, useObserverStateQuery } from "./agent-queries"
++import type { ObserverRepair } from "./agent-wire"
++
++/**
++ * Observer repair audit for the session tree (`docs/13-ui.md`).
++ *
++ * The fetched rows are the durable audit; live `observer.repaired` events are
++ * merged on top, deduplicated by kind/target/attempt because the event carries
++ * no row id. `observer.escalated` and the engine's budget turn into the banner:
++ * the observer is out of repairs for this tree.
++ */
++export function ObserverRepairPanel(props: {
++  sessionID: string
++  live: Accessor<ObserverRepair[]>
++  escalation: Accessor<{ reason: string; budget?: number } | undefined>
++}) {
++  const language = useLanguage()
++  const history = useObserverRepairsQuery(() => props.sessionID)
++  const state = useObserverStateQuery(() => props.sessionID)
++  const [collapsed, setCollapsed] = createSignal(false)
++
++  const rows = createMemo(() => {
++    const fetched = history.data?.available ? history.data.value : []
++    const seen = new Set(fetched.map(identity))
++    const live = props.live().filter((row) => !seen.has(identity(row)))
++
++    return [...live, ...fetched].slice(0, 20)
++  })
++
++  const exhausted = createMemo(() => {
++    if (props.escalation()) return true
++    const budget = state.data?.available ? state.data.value.budget : undefined
++
++    return budget?.exhausted === true
++  })
++
++  // What the observer reported, else the engine's own repair counter.
++  const reason = createMemo(() => {
++    const escalation = props.escalation()
++    if (escalation?.reason) return escalation.reason
++    const budget = state.data?.available ? state.data.value.budget : undefined
++    if (!budget) return undefined
++
++    return language.t("session.agentPanels.observer.budget.usage", {
++      used: String(budget.used),
++      limit: String(budget.limit),
++    })
++  })
++
++  return (
++    <Show when={rows().length > 0 || exhausted() || props.escalation()}>
++      <div
++        data-component="session-observer-repairs"
++        class="border-b border-v2-border-border-base bg-v2-background-bg-base"
++      >
++        <Show when={exhausted()}>
++          <div
++            role="alert"
++            data-testid="session-observer-budget"
++            class="flex items-start gap-2 border-b border-v2-border-border-base bg-v2-background-bg-layer-01 px-4 py-1.5 md:px-6"
++          >
++            <Icon name="circle-exclamation" size="small" class="mt-0.5 shrink-0 text-v2-state-fg-warning" />
++            <div class="min-w-0">
++              <div class="text-12-medium text-v2-text-text-base">
++                {language.t("session.agentPanels.observer.budget.title")}
++              </div>
++              <div class="text-11-regular text-v2-text-text-muted">
++                {language.t("session.agentPanels.observer.budget.description")}
++              </div>
++              <Show when={reason()}>
++                {(reason) => (
++                  <div class="truncate text-11-regular text-v2-text-text-faint" dir="auto">
++                    {reason()}
++                  </div>
++                )}
++              </Show>
++            </div>
++          </div>
++        </Show>
++        <button
++          type="button"
++          class="flex w-full items-center gap-2 px-4 py-1.5 text-left text-11-regular text-v2-text-text-muted hover:bg-v2-overlay-simple-overlay-hover md:px-6"
++          aria-expanded={!collapsed()}
++          aria-label={language.t(
++            collapsed() ? "session.agentPanels.observer.expand" : "session.agentPanels.observer.collapse",
++          )}
++          onClick={() => setCollapsed((value) => !value)}
++        >
++          <Icon name="outline-brain" size="small" class="shrink-0 text-v2-icon-icon-faint" />
++          <span class="shrink-0">{language.t("session.agentPanels.observer.title")}</span>
++          <span class="shrink-0 tabular-nums text-v2-text-text-faint">
++            {language.t("session.agentPanels.observer.count", { count: String(rows().length) })}
++          </span>
++          <span class="flex-1" />
++          <Icon name={collapsed() ? "outline-chevron-right" : "chevron-down"} size="small" class="shrink-0" />
++        </button>
++        <Show when={!collapsed()}>
++          <ol class="pb-1" data-testid="session-observer-repair-rows">
++            <For each={rows()}>
++              {(row) => (
++                <li class="flex items-baseline gap-2 px-4 py-0.5 text-12-regular md:px-6">
++                  <span class="w-28 shrink-0 truncate font-mono text-11-regular text-v2-text-text-muted">
++                    {row.kind}
++                  </span>
++                  <span class="min-w-0 flex-1">
++                    <span class="me-2 text-v2-text-text-muted" dir="auto">
++                      {row.reason || language.t("session.agentPanels.observer.noReason")}
++                    </span>
++                    <Show when={row.target}>
++                      <span class="font-mono text-11-regular text-v2-text-text-faint" dir="auto">
++                        {row.target}
++                      </span>
++                    </Show>
++                  </span>
++                  <span class="shrink-0 text-11-regular tabular-nums text-v2-text-text-faint">
++                    {language.t("session.agentPanels.observer.attempt", { count: String(row.attempt) })}
++                  </span>
++                </li>
++              )}
++            </For>
++          </ol>
++        </Show>
++      </div>
++    </Show>
++  )
++}
++
++function identity(row: ObserverRepair) {
++  return `${row.kind}\u0000${row.target}\u0000${row.attempt}\u0000${row.reason}`
++}
+diff -r a/packages/app/src/session/agent-panels/peer-drawer.tsx b/packages/app/src/session/agent-panels/peer-drawer.tsx
+--- a/packages/app/src/session/agent-panels/peer-drawer.tsx	1970-01-01 02:00:00.000000000 +0200
++++ b/packages/app/src/session/agent-panels/peer-drawer.tsx	2026-10-29 20:58:14.491770300 +0300
+@@ -0,0 +1,193 @@
++import { Button } from "@opencode/ui/button"
++import { Icon } from "@opencode/ui/icon"
++import { IconButton } from "@opencode/ui/icon-button"
++import { Textarea } from "@opencode/ui/textarea"
++import { For, Show, createEffect, createSignal } from "solid-js"
++import { useLanguage } from "@/runtime/i18n/language"
++import { useServer } from "@/runtime/server/current"
++import { isConfigObject, serverMessage, useAgenticRequest } from "@/settings/agentic/config"
++import type { PeerFeed } from "./agent-events"
++import { asText, type PeerMessage } from "./agent-wire"
++
++type Delivery = "steer" | "queue"
++
++/**
++ * Peer-message drawer for a child session (`docs/13-ui.md`).
++ *
++ * The list is fed by `subagent.peer.message` events whose target is this
++ * session; the composer posts into the same session through
++ * `POST /api/experimental/subagent/:SID/message` and folds the returned inbox
++ * row into the list. Peer messages are not user messages, so each row carries
++ * a peer badge and the drawer never touches the transcript.
++ */
++export function SessionPeerDrawer(props: { sessionID: string; feed: PeerFeed; open: boolean; onClose: () => void }) {
++  const language = useLanguage()
++  const server = useServer()
++  const request = useAgenticRequest()
++  const [draft, setDraft] = createSignal("")
++  const [sending, setSending] = createSignal<Delivery>()
++  const [error, setError] = createSignal<string>()
++  let list: HTMLDivElement | undefined
++
++  // Opening the drawer is what reads the messages; the bar's badge counts the
++  // ones that arrived while it was closed.
++  createEffect(() => {
++    if (props.open) props.feed.markRead()
++  })
++
++  createEffect(() => {
++    const messages = props.feed.messages()
++    if (!props.open || messages.length === 0) return
++    queueMicrotask(() => list?.scrollTo({ top: list.scrollHeight }))
++  })
++
++  const sender = (message: PeerMessage) => {
++    if (message.own) return language.t("session.peer.you")
++    const title = server.ctx.data.session.get(message.from)?.title?.trim()
++
++    return title ?? message.from
++  }
++
++  const send = async (delivery: Delivery) => {
++    const text = draft().trim()
++    if (!text || sending()) return
++    setSending(delivery)
++    setError(undefined)
++
++    try {
++      const response = await request(`/api/experimental/subagent/${encodeURIComponent(props.sessionID)}/message`, {
++        method: "POST",
++        body: JSON.stringify({ text, delivery }),
++      })
++      if (!response.ok) {
++        setError(await serverMessage(response))
++
++        return
++      }
++
++      const body: unknown = await response.json()
++      const item = isConfigObject(body) && isConfigObject(body.data) ? body.data : undefined
++      props.feed.add({
++        id: asText(item?.id) ?? `local:${Date.now()}`,
++        from: "you",
++        own: true,
++        text,
++        created: Date.now(),
++      })
++      setDraft("")
++    } catch (cause) {
++      setError(cause instanceof Error ? cause.message : String(cause))
++    } finally {
++      setSending(undefined)
++    }
++  }
++
++  return (
++    <Show when={props.open}>
++      <div
++        data-component="session-peer-drawer"
++        role="dialog"
++        aria-label={language.t("session.peer.title")}
++        class="fixed bottom-24 end-4 top-16 z-50 flex w-[360px] max-w-[calc(100vw-2rem)] flex-col overflow-hidden rounded-xl border border-v2-border-border-base bg-v2-background-bg-base shadow-[0_16px_40px_rgba(0,0,0,0.28)]"
++      >
++        <div class="flex h-9 shrink-0 items-center gap-2 border-b border-v2-border-border-base px-3">
++          <Icon name="chat-bubble" size="small" class="shrink-0 text-v2-icon-icon-faint" />
++          <span class="text-12-medium text-v2-text-text-base">{language.t("session.peer.title")}</span>
++          <span class="flex-1" />
++          <IconButton
++            icon={<Icon name="outline-xmark" />}
++            variant="ghost-muted"
++            size="small"
++            aria-label={language.t("session.peer.close")}
++            onClick={props.onClose}
++          />
++        </div>
++
++        <div ref={list} class="flex-1 min-h-0 overflow-y-auto overscroll-contain px-3 py-2">
++          <Show
++            when={props.feed.messages().length > 0}
++            fallback={<div class="text-11-regular text-v2-text-text-faint">{language.t("session.peer.empty")}</div>}
++          >
++            <ol class="flex flex-col gap-2">
++              <For each={props.feed.messages()}>
++                {(message) => (
++                  <li data-peer-message={message.id} class="rounded-lg border border-v2-border-border-base p-2">
++                    <div class="mb-1 flex items-center gap-1.5">
++                      <span
++                        class="shrink-0 rounded-full px-1.5 py-px text-11-regular"
++                        classList={{
++                          "bg-v2-background-bg-layer-02 text-v2-text-text-accent": !message.own,
++                          "text-v2-text-text-faint": message.own,
++                        }}
++                      >
++                        {language.t(message.own ? "session.peer.you" : "session.peer.badge")}
++                      </span>
++                      <span class="min-w-0 flex-1 truncate text-11-regular text-v2-text-text-faint" dir="auto">
++                        {sender(message)}
++                      </span>
++                      <Show when={message.agent}>
++                        {(agent) => (
++                          <span class="shrink-0 text-11-regular capitalize text-v2-text-text-faint">{agent()}</span>
++                        )}
++                      </Show>
++                      <Show when={message.kind}>
++                        {(kind) => <span class="shrink-0 text-11-regular text-v2-text-text-faint">{kind()}</span>}
++                      </Show>
++                    </div>
++                    <div class="whitespace-pre-wrap break-words text-12-regular text-v2-text-text-base" dir="auto">
++                      {message.text}
++                    </div>
++                  </li>
++                )}
++              </For>
++            </ol>
++          </Show>
++        </div>
++
++        <div class="flex shrink-0 flex-col gap-1.5 border-t border-v2-border-border-base p-2">
++          <Textarea
++            rows={2}
++            class="w-full"
++            value={draft()}
++            placeholder={language.t("session.peer.placeholder")}
++            aria-label={language.t("session.peer.placeholder")}
++            onInput={(event) => setDraft(event.currentTarget.value)}
++            onKeyDown={(event) => {
++              if (event.key !== "Enter" || event.shiftKey || event.isComposing) return
++              event.preventDefault()
++              void send("steer")
++            }}
++          />
++          <Show when={error()}>
++            {(message) => (
++              <div role="alert" class="text-11-regular text-v2-state-fg-danger">
++                {language.t("session.peer.error", { message: message() })}
++              </div>
++            )}
++          </Show>
++          <div class="flex items-center justify-end gap-1.5">
++            <Button
++              type="button"
++              variant="ghost-muted"
++              size="small"
++              disabled={!!sending() || !draft().trim()}
++              onClick={() => void send("queue")}
++            >
++              {language.t("session.peer.queue")}
++            </Button>
++            <Button
++              type="button"
++              variant="submit"
++              size="small"
++              disabled={!!sending() || !draft().trim()}
++              data-testid="session-peer-send"
++              onClick={() => void send("steer")}
++            >
++              {sending() === "steer" ? language.t("session.peer.sending") : language.t("session.peer.send")}
++            </Button>
++          </div>
++        </div>
++      </div>
++    </Show>
++  )
++}
+diff -r a/packages/app/src/session/agent-panels/subagent-tree.tsx b/packages/app/src/session/agent-panels/subagent-tree.tsx
+--- a/packages/app/src/session/agent-panels/subagent-tree.tsx	1970-01-01 02:00:00.000000000 +0200
++++ b/packages/app/src/session/agent-panels/subagent-tree.tsx	2026-10-29 20:58:14.492280300 +0300
+@@ -0,0 +1,175 @@
++import { Icon } from "@opencode/ui/icon"
++import { For, Show, createEffect, createMemo, createSignal, onCleanup } from "solid-js"
++import { useLanguage } from "@/runtime/i18n/language"
++import { useServer } from "@/runtime/server/current"
++import { formatElapsed } from "@/session/composer/activity-chips"
++import { useOpenSessionRoute } from "@/session/session-identity-header"
++import { useSubagentTreeQuery } from "./agent-queries"
++import type { SubagentNode } from "./agent-wire"
++
++type Relation = "current" | "parent" | "ancestor" | "sibling" | "child" | "descendant"
++
++/**
++ * The session tree above the timeline (`docs/13-ui.md`): parent, children and
++ * siblings with the agent, model, depth, state and elapsed time. A row opens
++ * that session in the current tab; the routed session is marked and is not a
++ * link to itself.
++ */
++export function SubagentTreePanel(props: { sessionID: string }) {
++  const language = useLanguage()
++  const server = useServer()
++  const open = useOpenSessionRoute()
++  const tree = useSubagentTreeQuery(() => props.sessionID)
++  const [collapsed, setCollapsed] = createSignal(false)
++  const [now, setNow] = createSignal(Date.now())
++
++  const nodes = createMemo(() => (tree.data?.available ? tree.data.value.nodes : []))
++  const byID = createMemo(() => new Map(nodes().map((node) => [node.id, node])))
++
++  // Ancestors of the routed session, from the same tree, so the panel can label
++  // each row without a second request.
++  const ancestors = createMemo(() => {
++    const map = byID()
++    const path = new Set<string>()
++    let id = server.ctx.data.session.get(props.sessionID)?.parentID
++    for (let depth = 0; id && depth < 64 && !path.has(id); depth++) {
++      path.add(id)
++      id = map.get(id)?.parentID
++    }
++
++    return path
++  })
++
++  const relation = (node: SubagentNode): Relation => {
++    if (node.id === props.sessionID) return "current"
++    if (ancestors().has(node.id)) return node.parentID === props.sessionID ? "parent" : "ancestor"
++    if (node.parentID === props.sessionID) return "child"
++
++    const parent = server.ctx.data.session.get(props.sessionID)?.parentID
++    if (parent && node.parentID === parent) return "sibling"
++
++    return "descendant"
++  }
++
++  // Only a running tree ticks; a settled tree keeps its final durations.
++  createEffect(() => {
++    if (!nodes().some((node) => node.state === "busy")) return
++    setNow(Date.now())
++    const timer = setInterval(() => setNow(Date.now()), 1000)
++    onCleanup(() => clearInterval(timer))
++  })
++
++  const elapsed = (node: SubagentNode) => {
++    const info = server.ctx.data.session.get(node.id)
++    if (!info) return undefined
++    const end = node.state === "busy" ? now() : (info.time.idle ?? info.time.updated)
++
++    return Math.max(0, end - info.time.created)
++  }
++
++  const title = (node: SubagentNode) => {
++    const info = server.ctx.data.session.get(node.id)
++
++    return info?.title?.trim() || node.id
++  }
++
++  const elapsedLabel = (ms: number) => formatElapsed(ms, (key, params) => language.t(key, params) ?? key)
++
++  return (
++    <Show when={tree.data?.available && nodes().length > 1}>
++      <div data-component="session-agent-tree" class="border-b border-v2-border-border-base bg-v2-background-bg-base">
++        <button
++          type="button"
++          class="flex w-full items-center gap-2 px-4 py-1.5 text-left text-11-regular text-v2-text-text-muted hover:bg-v2-overlay-simple-overlay-hover md:px-6"
++          aria-expanded={!collapsed()}
++          aria-label={language.t(collapsed() ? "session.agentPanels.tree.expand" : "session.agentPanels.tree.collapse")}
++          onClick={() => setCollapsed((value) => !value)}
++        >
++          <Icon name="branch-out" size="small" class="shrink-0 text-v2-icon-icon-faint" />
++          <span class="shrink-0">{language.t("session.agentPanels.tree.title")}</span>
++          <span class="shrink-0 tabular-nums text-v2-text-text-faint">
++            {language.t("session.agentPanels.tree.count", { count: String(nodes().length) })}
++          </span>
++          <span class="flex-1" />
++          <Icon name={collapsed() ? "outline-chevron-right" : "chevron-down"} size="small" class="shrink-0" />
++        </button>
++        <Show when={!collapsed()}>
++          <div role="tree" class="pb-1" data-testid="session-agent-tree-nodes">
++            <For each={nodes()}>
++              {(node) => {
++                const kind = relation(node)
++                const current = () => kind === "current"
++
++                return (
++                  <button
++                    type="button"
++                    role="treeitem"
++                    aria-current={current() ? "true" : undefined}
++                    aria-selected={current() ? "true" : undefined}
++                    data-session-id={node.id}
++                    data-relation={kind}
++                    disabled={current()}
++                    title={language.t("session.agentPanels.tree.open", { title: title(node) })}
++                    class="flex h-7 w-full items-center gap-2 pe-4 text-left text-12-regular hover:bg-v2-overlay-simple-overlay-hover disabled:opacity-100 disabled:hover:bg-transparent"
++                    classList={{
++                      "font-[530] text-v2-text-text-base": current(),
++                      "text-v2-text-text-muted": !current(),
++                    }}
++                    style={{ "padding-inline-start": `${16 + node.depth * 14}px` }}
++                    onClick={() => {
++                      if (!current()) open(props.sessionID, node.id)
++                    }}
++                  >
++                    <span class="w-14 shrink-0 text-11-regular text-v2-text-text-faint">
++                      {language.t(`session.agentPanels.relation.${kind}`)}
++                    </span>
++                    <Show when={node.depth > 0}>
++                      <span class="shrink-0 text-11-regular tabular-nums text-v2-text-text-faint">
++                        {language.t("session.agentPanels.tree.depth", { depth: String(node.depth) })}
++                      </span>
++                    </Show>
++                    <span class="min-w-0 flex-1 truncate" dir="auto">
++                      {title(node)}
++                    </span>
++                    <span class="hidden shrink-0 text-11-regular capitalize text-v2-text-text-faint sm:block">
++                      {node.agent}
++                    </span>
++                    <Show when={node.model}>
++                      {(model) => (
++                        <span class="hidden max-w-[180px] shrink-0 truncate text-11-regular text-v2-text-text-faint md:block">
++                          {model()}
++                        </span>
++                      )}
++                    </Show>
++                    <span
++                      class="w-16 shrink-0 text-11-regular"
++                      classList={{
++                        "text-v2-state-fg-success": node.state === "busy",
++                        "text-v2-state-fg-danger": node.state === "failed" || node.state === "interrupted",
++                        "text-v2-state-fg-warning": node.state === "suspended",
++                        "text-v2-text-text-faint":
++                          node.state !== "busy" &&
++                          node.state !== "failed" &&
++                          node.state !== "interrupted" &&
++                          node.state !== "suspended",
++                      }}
++                    >
++                      {language.t(`session.agentPanels.state.${node.state}`)}
++                    </span>
++                    <Show when={elapsed(node)}>
++                      {(ms) => (
++                        <span class="w-14 shrink-0 text-end text-11-regular tabular-nums text-v2-text-text-faint">
++                          {elapsedLabel(ms())}
++                        </span>
++                      )}
++                    </Show>
++                  </button>
++                )
++              }}
++            </For>
++          </div>
++        </Show>
++      </div>
++    </Show>
++  )
++}
+diff -r a/packages/app/src/session/composer/region.tsx b/packages/app/src/session/composer/region.tsx
+--- a/packages/app/src/session/composer/region.tsx	2026-10-29 20:34:38.607812900 +0300
++++ b/packages/app/src/session/composer/region.tsx	2026-10-29 20:58:14.620567200 +0300
+@@ -5,7 +5,7 @@
+ import { isScrollKeyTarget, scrollKey, scrollKeyOwner } from "@opencode/ui/scroll-view"
+ import { makeEventListener } from "@solid-primitives/event-listener"
+ import { useNavigate } from "@solidjs/router"
+-import { createEffect, createMemo, on, onCleanup, onMount, Show, type Accessor } from "solid-js"
++import { createEffect, createMemo, createSignal, on, onCleanup, onMount, Show, type Accessor } from "solid-js"
+ import { Composer } from "@/composer/composer"
+ import { VoiceComposer } from "@/voice/composer"
+ import { useComposerState } from "@/composer/persistence"
+@@ -46,6 +46,10 @@
+ import { composerModelLabelKey, composerModelLabels, composerProviderName } from "@/composer/model-label"
+ import { useProviders } from "@/providers/catalog/providers"
+ import { SubagentBar } from "./subagent-bar"
++import { createPeerFeed } from "../agent-panels/agent-events"
++import { SessionGoalChip } from "../agent-panels/goal-chip"
++import { SessionLanePill } from "../agent-panels/lane-pill"
++import { SessionPeerDrawer } from "../agent-panels/peer-drawer"
+ import { createSessionRequestModel } from "../requests/model"
+ import type { Region } from "@/runtime/plugin/panels"
+ import { SessionLocationMissing } from "./location-missing"
+@@ -416,6 +420,12 @@
+   const language = useLanguage()
+   const openRoute = useOpenSessionRoute()
+ 
++  // Peer messages and the lane pill are session-scoped: they follow the routed
++  // session, not the open tab.
++  const sessionID = () => props.session.data.info()?.id
++  const peerFeed = createPeerFeed(sessionID)
++  const [peersOpen, setPeersOpen] = createSignal(false)
++
+   // Only the server's LocationNotFoundError for the session's own Location replaces the composer.
+   const missing = createMemo(() => {
+     const ref = location().missing
+@@ -542,69 +552,96 @@
+   }
+ 
+   return (
+-    <SessionComposerRegion
+-      controller={props.model.region}
+-      subagent={
+-        <Show when={props.session.data.info()}>
+-          {(info) => (
+-            <SubagentBar
+-              agent={info().agent}
+-              model={subagentModel()}
+-              status={subagentStatus()}
+-              started={info().time.created}
+-              ended={subagentStatus() === "running" ? undefined : (info().time.idle ?? info().time.updated)}
+-              onBack={props.model.region.openParent}
+-            />
+-          )}
+-        </Show>
+-      }
+-      above={
+-        <Show when={!missing() && !props.session.data.isChild()}>
+-          <SessionComposerLane>
+-            <SessionActivityChips
+-              subagents={subagents()}
+-              shells={shells()}
+-              shell={shell}
+-              onOpen={open}
+-              onStop={stop}
+-              onEmpty={props.model.region.focusPrompt}
+-            />
+-            <Show when={todosVisible()}>
+-              <SessionTodoPill todos={todos()} />
+-            </Show>
+-            <SessionPluginPills session={props.view()} screen={props.screen} alignment={alignment} />
+-          </SessionComposerLane>
+-          <SessionQueuePanel queue={props.model.queue} hidden={props.model.region.state.blocked()} />
+-        </Show>
+-      }
+-      composer={
+-        <Show
+-          when={missing()}
+-          keyed
+-          fallback={
+-            // The container for the composer's `cqw` caps: only the composer re-evaluates as a panel beside it
+-            // animates the chat's width.
+-            <div class="@container">
+-              <VoiceComposer session={props.session.data.info()}>
+-                <Composer
+-                  model={props.model.composer}
+-                  borderUnderlay
+-                  readOnly={props.model.queue.undoing()}
+-                  suggestionBoundary={props.suggestionBoundary}
+-                />
+-              </VoiceComposer>
+-            </div>
+-          }
+-        >
+-          {(current) => (
+-            <SessionLocationMissing
+-              sessionID={current.sessionID}
+-              projectID={current.projectID}
+-              directory={current.directory}
+-            />
+-          )}
+-        </Show>
+-      }
+-    />
++    <>
++      <SessionComposerRegion
++        controller={props.model.region}
++        subagent={
++          <Show when={props.session.data.info()}>
++            {(info) => (
++              <SubagentBar
++                agent={info().agent}
++                model={subagentModel()}
++                status={subagentStatus()}
++                started={info().time.created}
++                ended={subagentStatus() === "running" ? undefined : (info().time.idle ?? info().time.updated)}
++                onBack={props.model.region.openParent}
++                lane={
++                  <Show when={info().id}>
++                    {(id) => <SessionLanePill sessionID={id()} />}
++                  </Show>
++                }
++                peer={{ count: peerFeed.unread, onOpen: () => setPeersOpen(true) }}
++              />
++            )}
++          </Show>
++        }
++        above={
++          <Show when={!missing() && !props.session.data.isChild()}>
++            <SessionComposerLane>
++              <Show when={sessionID()} keyed>
++                {(id) => (
++                  <>
++                    <SessionGoalChip sessionID={id} />
++                    <SessionLanePill sessionID={id} />
++                  </>
++                )}
++              </Show>
++              <SessionActivityChips
++                subagents={subagents()}
++                shells={shells()}
++                shell={shell}
++                onOpen={open}
++                onStop={stop}
++                onEmpty={props.model.region.focusPrompt}
++              />
++              <Show when={todosVisible()}>
++                <SessionTodoPill todos={todos()} />
++              </Show>
++              <SessionPluginPills session={props.view()} screen={props.screen} alignment={alignment} />
++            </SessionComposerLane>
++            <SessionQueuePanel queue={props.model.queue} hidden={props.model.region.state.blocked()} />
++          </Show>
++        }
++        composer={
++          <Show
++            when={missing()}
++            keyed
++            fallback={
++              // The container for the composer's `cqw` caps: only the composer re-evaluates as a panel beside it
++              // animates the chat's width.
++              <div class="@container">
++                <VoiceComposer session={props.session.data.info()}>
++                  <Composer
++                    model={props.model.composer}
++                    borderUnderlay
++                    readOnly={props.model.queue.undoing()}
++                    suggestionBoundary={props.suggestionBoundary}
++                  />
++                </VoiceComposer>
++              </div>
++            }
++          >
++            {(current) => (
++              <SessionLocationMissing
++                sessionID={current.sessionID}
++                projectID={current.projectID}
++                directory={current.directory}
++              />
++            )}
++          </Show>
++        }
++      />
++      {/* A child session's peer drawer floats over the timeline, so it is a sibling of the composer dock. */}
++      <Show when={sessionID()} keyed>
++        {(id) => (
++          <SessionPeerDrawer
++            sessionID={id}
++            feed={peerFeed}
++            open={peersOpen()}
++            onClose={() => setPeersOpen(false)}
++          />
++        )}
++      </Show>
++    </>
+   )
+ }
+diff -r a/packages/app/src/session/composer/subagent-bar.tsx b/packages/app/src/session/composer/subagent-bar.tsx
+--- a/packages/app/src/session/composer/subagent-bar.tsx	2026-10-29 20:34:38.614795400 +0300
++++ b/packages/app/src/session/composer/subagent-bar.tsx	2026-10-29 20:58:14.663887500 +0300
+@@ -3,7 +3,7 @@
+ import { Keybind } from "@opencode/ui/keybind"
+ import { Slash } from "@opencode/ui/slash"
+ import { SessionProgressIndicatorV2 } from "@opencode/session-ui/v2/session-progress-indicator-v2"
+-import { createEffect, createSignal, For, Match, onCleanup, Show, Switch } from "solid-js"
++import { createEffect, createSignal, For, Match, onCleanup, Show, Switch, type Accessor, type JSX } from "solid-js"
+ import { useLanguage } from "@/runtime/i18n/language"
+ import { formatKeybind } from "@/shell/commands/command"
+ import { formatElapsed } from "./activity-chips"
+@@ -19,6 +19,10 @@
+   started: number
+   ended?: number
+   onBack: () => void
++  /** The build lane this session's command waits in, when it has one. */
++  lane?: JSX.Element
++  /** Peer messages for this child session; the count is what arrived while the drawer was closed. */
++  peer?: { count: Accessor<number>; onOpen: () => void }
+ }) {
+   const language = useLanguage()
+   const [now, setNow] = createSignal(Date.now())
+@@ -105,6 +109,30 @@
+           )}
+         </For>
+       </div>
++      <Show when={props.lane}>{props.lane}</Show>
++      <Show when={props.peer}>
++        {(peer) => (
++          <Button
++            type="button"
++            variant="ghost-faint"
++            size="small"
++            class="shrink-0 gap-1.5 px-1.5"
++            aria-label={language.t("session.peer.open")}
++            onClick={() => peer().onOpen()}
++          >
++            <Icon name="chat-bubble" size="small" />
++            <span class="hidden sm:block">{language.t("session.peer.title")}</span>
++            <Show when={peer().count() > 0}>
++              <span
++                data-testid="session-peer-unread"
++                class="rounded-full bg-v2-background-bg-layer-02 px-1.5 text-11-regular tabular-nums text-v2-text-text-accent"
++              >
++                {language.t("session.peer.unread", { count: String(peer().count()) })}
++              </span>
++            </Show>
++          </Button>
++        )}
++      </Show>
+       <Button type="button" variant="ghost-faint" size="small" class="shrink-0 gap-1.5 px-1.5" onClick={props.onBack}>
+         {language.t("session.child.backToParent")}
+         <span class="hidden sm:block">
+diff -r a/packages/app/src/session/session-identity-header.tsx b/packages/app/src/session/session-identity-header.tsx
+--- a/packages/app/src/session/session-identity-header.tsx	2026-10-29 20:34:38.671684400 +0300
++++ b/packages/app/src/session/session-identity-header.tsx	2026-10-29 20:58:15.053803500 +0300
+@@ -47,7 +47,7 @@
+ 
+ const SessionHeaderCollapse = createContext<() => number>(() => 0)
+ 
+-export function SessionTitleHeader(props: ParentProps) {
++export function SessionTitleHeader(props: ParentProps<{ below?: JSX.Element }>) {
+   return (
+     <>
+       {/* The bottom inset reserves room for the fade without covering rows stuck below the bar. */}
+@@ -56,6 +56,8 @@
+           <CollapsedSidebarToggleSpace />
+           <div class="min-w-0 flex-1">{props.children}</div>
+         </div>
++        {/* Session-level panels that belong to the bar: they scroll with it and stay under its actions. */}
++        <Show when={props.below}>{(below) => <div class="pointer-events-auto">{below()}</div>}</Show>
+       </div>
+       {/* Stuck timeline headers stack above this fade, so it only fades content scrolling under the bar. */}
+       <div
+diff -r a/packages/app/src/session/timeline/message-timeline.tsx b/packages/app/src/session/timeline/message-timeline.tsx
+--- a/packages/app/src/session/timeline/message-timeline.tsx	2026-10-29 20:34:38.685796600 +0300
++++ b/packages/app/src/session/timeline/message-timeline.tsx	2026-10-29 20:58:15.180834000 +0300
+@@ -37,6 +37,7 @@
+ import { SessionHeaderSpacer } from "@/session/header/session-header"
+ import { SessionHeaderGap } from "@/session/header/drag-area"
+ import { SessionWorkingIndicator } from "@/session/header/session-working-indicator"
++import { SessionAgentPanels } from "@/session/agent-panels/agent-panels"
+ 
+ type BlockingTask = { type: "shell" | "subagent"; partID: string; id?: string; label?: string }
+ 
+@@ -510,7 +511,13 @@
+       )}
+       header={
+         <Show when={!props.hideHeader}>
+-          <SessionTitleHeader>
++          <SessionTitleHeader
++            below={
++              <Show when={sessionID()} keyed>
++                {(id) => <SessionAgentPanels sessionID={id} />}
++              </Show>
++            }
++          >
+             <SessionHeaderLayout
+               title={title.editing ? title.draft : childTitle()}
+               location={

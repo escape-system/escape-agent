@@ -1,0 +1,4 @@
+/* Additive settings pages share the existing settings styles; only long memory text needs a break hint. */
+[data-testid="settings-memory-item"] {
+  overflow-wrap: anywhere;
+}

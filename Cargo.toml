@@ -1,0 +1,100 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/oc-types",
+    "crates/oc-store",
+    "crates/oc-config",
+    "crates/oc-llm",
+    "crates/oc-runtime",
+    "crates/oc-tools",
+    "crates/oc-observer",
+    "crates/oc-subagents",
+    "crates/oc-lanes",
+    "crates/oc-memory",
+    "crates/oc-mcp",
+    "crates/oc-lsp",
+    "crates/oc-plugin",
+    "crates/oc-pty",
+    "crates/oc-server",
+    "crates/oc-testkit",
+    "crates/oc-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+license = "MIT"
+repository = "https://github.com/opencode-rust/opencode-rust"
+authors = ["opencode-rust contributors"]
+
+[workspace.dependencies]
+oc-types = { path = "crates/oc-types" }
+oc-store = { path = "crates/oc-store" }
+oc-config = { path = "crates/oc-config" }
+oc-llm = { path = "crates/oc-llm" }
+oc-runtime = { path = "crates/oc-runtime" }
+oc-tools = { path = "crates/oc-tools" }
+oc-observer = { path = "crates/oc-observer" }
+oc-memory = { path = "crates/oc-memory" }
+oc-subagents = { path = "crates/oc-subagents" }
+oc-mcp = { path = "crates/oc-mcp" }
+oc-lsp = { path = "crates/oc-lsp" }
+oc-plugin = { path = "crates/oc-plugin" }
+oc-pty = { path = "crates/oc-pty" }
+oc-server = { path = "crates/oc-server" }
+oc-testkit = { path = "crates/oc-testkit" }
+
+anyhow = "1"
+async-trait = "0.1"
+axum = { version = "0.8", features = ["ws"] }
+base64 = "0.22"
+bytes = "1"
+clap = { version = "4", features = ["derive", "env"] }
+futures-util = "0.3"
+globset = "0.4"
+grep-matcher = "0.1"
+grep-regex = "0.1"
+grep-searcher = "0.1"
+hex = "0.4"
+hmac = "0.12"
+http = "1"
+http-body-util = "0.1"
+ignore = "0.4"
+jsonc-parser = { version = "0.34", features = ["serde", "serde_json"] }
+mime_guess = "2"
+parking_lot = "0.12"
+percent-encoding = "2"
+rand = "0.9"
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2", "json", "stream", "gzip", "brotli"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
+rust-embed = "8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+shell-words = "1"
+subtle = "2"
+tempfile = "3"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time", "fs", "io-util", "process"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+tokio-tungstenite = "0.28"
+tokio-util = "0.7"
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+url = "2"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
