@@ -13,6 +13,7 @@ import { Dynamic } from "solid-js/web"
 import { CommandProvider } from "@/shell/commands/command"
 import { DesktopCommands } from "@/shell/commands/desktop"
 import { ProjectIconsProvider } from "@/shell/layout/project-icons"
+import { GlobalStyles } from "@/escape/GlobalStyles"
 import { GlobalProvider } from "@/runtime/server/runtime"
 import { LanguageProvider, UiI18nBridge, type Locale } from "@/runtime/i18n/language"
 import { ServerConnection, ServersProvider } from "@/runtime/server/registry"
@@ -57,7 +58,8 @@ export function AppBaseProviders(
 ) {
   return (
     <MetaProvider>
-      <Title>OpenCode</Title>
+      <Title>Escape Agent</Title>
+      <GlobalStyles />
       <Font />
       <ThemeProvider
         onThemeApplied={(_, mode, scheme) => {

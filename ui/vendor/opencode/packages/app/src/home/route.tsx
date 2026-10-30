@@ -31,6 +31,13 @@ export function Home() {
           <HomeProjects projects={projects} scroll={scroll} dropdown />
         </div>
       </Show>
+      <div class="ea-home-hero" aria-label="Escape Agent" role="img">
+        <img src="/brand/escape-agent-mark.png" alt="" draggable={false} />
+        <div class="ea-home-hero-copy">
+          <div class="ea-home-hero-title">ESCAPE AGENT</div>
+          <div class="ea-home-hero-tagline">Autonomous coding agent</div>
+        </div>
+      </div>
       <ScrollView
         class="min-h-0 flex-1 [container-type:size]"
         thumbContainer={scroll.viewport.thumbTrack()}
@@ -39,6 +46,7 @@ export function Home() {
         onScroll={(event) => scroll.viewport.update(event.currentTarget.scrollTop)}
       >
         <div
+          data-slot="home-grid"
           class={`
             mx-auto grid min-h-full w-full max-w-[1080px] grid-rows-[auto_minmax(0,1fr)] gap-4 px-3
             max-md:grid-rows-[minmax(0,1fr)] lg:grid-cols-[280px_minmax(0,720px)] lg:grid-rows-1 lg:gap-8 lg:px-6

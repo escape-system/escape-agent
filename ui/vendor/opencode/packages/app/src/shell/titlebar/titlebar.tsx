@@ -635,6 +635,10 @@ export function Titlebar(props: { verticalTabs?: { mount?: HTMLElement } }) {
                     {homeButton()}
                     {searchButton()}
                   </div>
+                  <span class="ea-titlebar-brand" aria-hidden="true">
+                    <b>ESCAPE</b>
+                    <i>AGENT</i>
+                  </span>
                 </Show>
 
                 <Show
@@ -741,7 +745,7 @@ export function Titlebar(props: { verticalTabs?: { mount?: HTMLElement } }) {
                                 setMobileTabs("open", false)
                               }}
                             >
-                              <Icon name="grid-plus" />
+                              <Icon name="grid-plus" class="shrink-0" />
                               {language.t("home.title")}
                             </button>
                             <div class="flex items-center gap-1">

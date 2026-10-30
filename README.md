@@ -51,7 +51,9 @@ cargo fmt --all --check
 
 ## Web UI
 
-The upstream SolidJS app is built from a pinned commit with a patch set:
+The upstream SolidJS app is built from a pinned commit with a patch set. The
+fork is branded **Escape Agent** through the theme, `src/escape/GlobalStyles.jsx`
+and the brand assets; upstream layout and routes are left intact.
 
 ```sh
 ui/build.sh          # or ui/build.ps1
@@ -60,3 +62,14 @@ ui/build.sh          # or ui/build.ps1
 Output goes to `web/dist`. The server serves it from disk when present (phase 1
 adds in-binary embedding); until then `/` returns 503 with a build instruction
 and API routes are unaffected.
+
+Live end-user checks (run against a running server, no fixture web server):
+
+```sh
+cd ui/vendor/opencode/packages/app
+bun run test:e2e:escape
+```
+
+Set `ESCAPE_BASE_URL`, `ESCAPE_AUTH_URL`/`ESCAPE_AUTH_PASSWORD`, and
+`ESCAPE_CHROMIUM` when the machine uses a different server or Playwright
+browser cache. See [`docs/13-ui.md`](docs/13-ui.md).

@@ -1,72 +1,62 @@
-import { Logo } from "@opencode/ui/logo"
 import { prefersReducedMotion } from "@opencode/ui/motion"
+import { EscapeBrandline } from "@/escape/brand"
 import { For, onCleanup, onMount, Show } from "solid-js"
 import { PinSound } from "./pin-sound"
 import "./wordmark.css"
 
 // Each letter in the 234×42 logo viewBox, with its counter shadow, stem, and bottom-centre pivot.
+// Escape Agent wordmark: six 5×7 block letters centred in the canvas; the pin board uses
+// the same 78×14 pitch, so the interactive stage keeps its original aspect.
 const LETTERS = [
   {
-    cx: 12,
-    weak: "M18 30H6V18H18V30Z",
-    fill: "var(--icon-base)",
-    stem: "M18 12H6V30H18V12ZM24 36H0V6H24V36Z",
+    cx: 42.5,
+    weak: "M31.1 4.6h25v5h-25ZM31.1 9.6h5v5h-5ZM31.1 14.6h5v5h-5ZM31.1 19.6h20v5h-20ZM31.1 24.6h5v5h-5ZM31.1 29.6h5v5h-5ZM31.1 34.6h25v5h-25Z",
+    fill: "url(#ea-wordmark-gradient)",
+    stem: "M30 3.5h25v5h-25ZM30 8.5h5v5h-5ZM30 13.5h5v5h-5ZM30 18.5h20v5h-20ZM30 23.5h5v5h-5ZM30 28.5h5v5h-5ZM30 33.5h25v5h-25Z",
   },
   {
-    cx: 42,
-    weak: "M48 30H36V18H48V30Z",
-    fill: "var(--icon-base)",
-    stem: "M36 30H48V12H36V30ZM54 36H36V42H30V6H54V36Z",
+    cx: 72.5,
+    weak: "M66.1 4.6h20v5h-20ZM61.1 9.6h5v5h-5ZM61.1 14.6h5v5h-5ZM66.1 19.6h15v5h-15ZM81.1 24.6h5v5h-5ZM81.1 29.6h5v5h-5ZM61.1 34.6h20v5h-20Z",
+    fill: "url(#ea-wordmark-gradient)",
+    stem: "M65 3.5h20v5h-20ZM60 8.5h5v5h-5ZM60 13.5h5v5h-5ZM65 18.5h15v5h-15ZM80 23.5h5v5h-5ZM80 28.5h5v5h-5ZM60 33.5h20v5h-20Z",
   },
   {
-    cx: 72,
-    weak: "M84 24V30H66V24H84Z",
-    fill: "var(--icon-base)",
-    stem: "M84 24H66V30H84V36H60V6H84V24ZM66 18H78V12H66V18Z",
+    cx: 102.5,
+    weak: "M96.1 4.6h20v5h-20ZM91.1 9.6h5v5h-5ZM91.1 14.6h5v5h-5ZM91.1 19.6h5v5h-5ZM91.1 24.6h5v5h-5ZM91.1 29.6h5v5h-5ZM96.1 34.6h20v5h-20Z",
+    fill: "url(#ea-wordmark-gradient)",
+    stem: "M95 3.5h20v5h-20ZM90 8.5h5v5h-5ZM90 13.5h5v5h-5ZM90 18.5h5v5h-5ZM90 23.5h5v5h-5ZM90 28.5h5v5h-5ZM95 33.5h20v5h-20Z",
   },
   {
-    cx: 102,
-    weak: "M108 36H96V18H108V36Z",
-    fill: "var(--icon-base)",
-    stem: "M108 12H96V36H90V6H108V12ZM114 36H108V12H114V36Z",
+    cx: 132.5,
+    weak: "M126.1 4.6h15v5h-15ZM121.1 9.6h5v5h-5ZM141.1 9.6h5v5h-5ZM121.1 14.6h5v5h-5ZM141.1 14.6h5v5h-5ZM121.1 19.6h25v5h-25ZM121.1 24.6h5v5h-5ZM141.1 24.6h5v5h-5ZM121.1 29.6h5v5h-5ZM141.1 29.6h5v5h-5ZM121.1 34.6h5v5h-5ZM141.1 34.6h5v5h-5Z",
+    fill: "url(#ea-wordmark-gradient)",
+    stem: "M125 3.5h15v5h-15ZM120 8.5h5v5h-5ZM140 8.5h5v5h-5ZM120 13.5h5v5h-5ZM140 13.5h5v5h-5ZM120 18.5h25v5h-25ZM120 23.5h5v5h-5ZM140 23.5h5v5h-5ZM120 28.5h5v5h-5ZM140 28.5h5v5h-5ZM120 33.5h5v5h-5ZM140 33.5h5v5h-5Z",
   },
   {
-    cx: 132,
-    weak: "M144 30H126V18H144V30Z",
-    fill: "var(--icon-strong-base)",
-    stem: "M144 12H126V30H144V36H120V6H144V12Z",
+    cx: 162.5,
+    weak: "M151.1 4.6h20v5h-20ZM151.1 9.6h5v5h-5ZM171.1 9.6h5v5h-5ZM151.1 14.6h5v5h-5ZM171.1 14.6h5v5h-5ZM151.1 19.6h20v5h-20ZM151.1 24.6h5v5h-5ZM151.1 29.6h5v5h-5ZM151.1 34.6h5v5h-5Z",
+    fill: "url(#ea-wordmark-gradient)",
+    stem: "M150 3.5h20v5h-20ZM150 8.5h5v5h-5ZM170 8.5h5v5h-5ZM150 13.5h5v5h-5ZM170 13.5h5v5h-5ZM150 18.5h20v5h-20ZM150 23.5h5v5h-5ZM150 28.5h5v5h-5ZM150 33.5h5v5h-5Z",
   },
   {
-    cx: 162,
-    weak: "M168 30H156V18H168V30Z",
-    fill: "var(--icon-strong-base)",
-    stem: "M168 12H156V30H168V12ZM174 36H150V6H174V36Z",
-  },
-  {
-    cx: 192,
-    weak: "M198 30H186V18H198V30Z",
-    fill: "var(--icon-strong-base)",
-    stem: "M198 12H186V30H198V12ZM204 36H180V6H198V0H204V36Z",
-  },
-  {
-    cx: 222,
-    weak: "M234 24V30H216V24H234Z",
-    fill: "var(--icon-strong-base)",
-    stem: "M216 12V18H228V12H216ZM234 24H216V30H234V36H210V6H234V24Z",
+    cx: 192.5,
+    weak: "M181.1 4.6h25v5h-25ZM181.1 9.6h5v5h-5ZM181.1 14.6h5v5h-5ZM181.1 19.6h20v5h-20ZM181.1 24.6h5v5h-5ZM181.1 29.6h5v5h-5ZM181.1 34.6h25v5h-25Z",
+    fill: "url(#ea-wordmark-gradient)",
+    stem: "M180 3.5h25v5h-25ZM180 8.5h5v5h-5ZM180 13.5h5v5h-5ZM180 18.5h20v5h-20ZM180 23.5h5v5h-5ZM180 28.5h5v5h-5ZM180 33.5h25v5h-25Z",
   },
 ] as const
 
 // Lodger geometry, in the logo's 234×42 viewBox units. The lodger is drawn from its bottom centre.
 const W = 234
 const H = 42
-const HOLE = { x: 222, y: 15 }
-const REST = { x: 222, y: 21 }
-const PIN_SLOT = { x: 226.5, y: 10.5 }
+const HOLE = { x: 200, y: 7 }
+const REST = { x: 200, y: 13 }
+const PIN_SLOT = { x: 204.5, y: 3 }
 const GROUND = 36
-const HOME = 246
-const POP = 26
-const SLIP = 60
-const HOLE_MAGNET = 24
+const HOME = 222
+const POP = 24
+const SLIP = 54
+const HOLE_MAGNET = 20
 
 type Phase = "hidden" | "drag" | "snap" | "show" | "idle" | "hop" | "carry" | "return" | "pack" | "game"
 
@@ -150,6 +140,7 @@ export function NewSessionWordmark(props: {
           />
         </Show>
       </div>
+      <EscapeBrandline />
     </div>
   )
 }
@@ -197,18 +188,26 @@ function WordmarkLodger(props: {
     <div ref={stage} class="absolute">
       <div ref={flat} data-slot="wordmark-flat" class="absolute inset-0">
         <svg viewBox="0 0 234 42" fill="none" class="block size-full overflow-visible">
+          <defs>
+            <linearGradient id="ea-wordmark-gradient" x1="30" y1="0" x2="205" y2="42" gradientUnits="userSpaceOnUse">
+              <stop stop-color="var(--ea-gold-deep)" />
+              <stop offset="0.32" stop-color="var(--ea-gold)" />
+              <stop offset="0.58" stop-color="var(--ea-cream)" />
+              <stop offset="1" stop-color="var(--ea-gold-bright)" />
+            </linearGradient>
+          </defs>
           <For each={LETTERS}>
             {(item, i) => (
               <g ref={(el) => (letters[i()] = el)}>
-                <g class="opacity-[0.16]">
-                  <path d={item.weak} fill="var(--icon-weak-base)" />
+                <g class="opacity-100">
+                  <path d={item.weak} fill="var(--ea-wordmark-shadow)" />
                   <path d={item.stem} fill={item.fill} />
                 </g>
-                <Show when={i() === 7}>
+                <Show when={i() === 5}>
                   <rect
                     ref={notch}
-                    x="224.6"
-                    y="8.6"
+                    x="198.6"
+                    y="4.6"
                     width="3.8"
                     height="3.8"
                     fill="var(--v2-background-bg-base)"
@@ -219,7 +218,13 @@ function WordmarkLodger(props: {
             )}
           </For>
         </svg>
-        <Logo class="wordmark-shimmer absolute inset-0 size-full" />
+        <svg
+          viewBox="0 0 234 42"
+          class="wordmark-shimmer absolute inset-0 size-full overflow-visible"
+          aria-hidden="true"
+        >
+          <For each={LETTERS}>{(item) => <path d={item.stem} fill="white" />}</For>
+        </svg>
       </div>
       <svg
         ref={svg}
@@ -351,7 +356,7 @@ function mountLodger(
       return
     }
     parts.grip.style.display = ""
-    const box = where === "hidden" ? { x: 213, y: 8, w: 18, h: 14 } : { x: 234, y: 18, w: 24, h: 24 }
+    const box = where === "hidden" ? { x: 196, y: 4, w: 18, h: 14 } : { x: HOME, y: 18, w: 24, h: 24 }
     parts.grip.style.left = `${(box.x / W) * 100}%`
     parts.grip.style.top = `${(box.y / H) * 100}%`
     parts.grip.style.width = `${(box.w / W) * 100}%`

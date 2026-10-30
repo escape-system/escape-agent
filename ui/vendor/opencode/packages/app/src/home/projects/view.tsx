@@ -179,7 +179,7 @@ function HomeProjectsPanel(props: HomeProjectsViewProps) {
               which lines the label up with the icons that follow it in the session and settings headers. */}
           <div class="flex min-w-0 items-center">
             <CollapsedSidebarToggleSpace start={20} class="lg:hidden" />
-            <div class="text-v2-text-text-muted [font-weight:530]">{props.language.t("home.projects")}</div>
+            <div data-slot="home-projects-title" class="text-v2-text-text-muted [font-weight:530]">{props.language.t("home.projects")}</div>
           </div>
           <Show when={props.servers.length === 1}>
             <Tooltip placement="bottom" value={props.language.t("home.project.add")}>

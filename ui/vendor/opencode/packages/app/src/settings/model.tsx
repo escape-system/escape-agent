@@ -4,7 +4,7 @@ import { createMediaQuery } from "@solid-primitives/media"
 import { Effect, Option, Predicate, Schema, SchemaGetter } from "effect"
 import { createSimpleContext } from "@opencode/ui/context"
 import { setNewIcons } from "@opencode/ui/icon"
-import { timelinePresets, type TimelineCategory, type TimelineDetail } from "@opencode/session-ui/timeline/detail"
+import { timelineCategories, timelinePresets, type TimelineCategory, type TimelineDetail } from "@opencode/session-ui/timeline/detail"
 import { persisted } from "@/runtime/persistence/storage"
 import { Persistence } from "@/runtime/persistence/schema"
 import { ScopedKey, type ServerScope } from "@/runtime/server/scope"
@@ -241,6 +241,25 @@ function legacyTimelineActivity(value: boolean | "hidden" | "compact" | "full" |
   } as const
 }
 
+function sameActivity(current: TimelineDetail[TimelineCategory], expected: TimelineDetail[TimelineCategory]) {
+  if (current.placement !== expected.placement) return false
+  if (current.placement === "hidden") return true
+  if ("details" in current && "details" in expected) return current.details === expected.details
+
+  return !("details" in current) && !("details" in expected)
+}
+
+/** Old installs stored the untouched compact preset; surface reasoning instead of hiding it. */
+function upgradeCompactReasoning(detail: TimelineDetail): TimelineDetail {
+  if (timelineCategories.some((category) => !detail[category])) return detail
+
+  const compact = timelinePresets[2].value
+
+  if (!timelineCategories.every((category) => sameActivity(detail[category], compact[category]))) return detail
+
+  return { ...detail, thinking: { placement: "separate", details: "expanded" } }
+}
+
 export const settingsPersistence = Persistence.migrate(
   settingsSchema,
   Persistence.legacy({
@@ -272,19 +291,32 @@ export const settingsPersistence = Persistence.migrate(
       decode: SchemaGetter.transform((value) => {
         const general = value.general
 
-        if (!general || general.timelineDetail !== undefined) return value
+        if (!general) return value
+
+        let timelineDetail = general.timelineDetail
+        if (timelineDetail === undefined) {
+          const hasLegacy =
+            general.shellToolPartsExpanded !== undefined ||
+            general.editToolPartsExpanded !== undefined ||
+            general.reasoningMode !== undefined ||
+            general.showReasoningSummaries !== undefined
+
+          if (!hasLegacy) return value
+
+          timelineDetail = {
+            shell: legacyTimelineActivity(general.shellToolPartsExpanded),
+            edit: legacyTimelineActivity(general.editToolPartsExpanded),
+            thinking: legacyTimelineActivity(
+              general.reasoningMode === undefined ? general.showReasoningSummaries : general.reasoningMode,
+            ),
+          }
+        }
 
         return {
           ...value,
           general: {
             ...general,
-            timelineDetail: {
-              shell: legacyTimelineActivity(general.shellToolPartsExpanded),
-              edit: legacyTimelineActivity(general.editToolPartsExpanded),
-              thinking: legacyTimelineActivity(
-                general.reasoningMode === undefined ? general.showReasoningSummaries : general.reasoningMode,
-              ),
-            },
+            timelineDetail: timelineDetail && upgradeCompactReasoning(timelineDetail as TimelineDetail),
           },
         }
       }),
@@ -295,7 +327,12 @@ export const settingsPersistence = Persistence.migrate(
 
 export const defaultSettings: Settings = {
   general: {
-    timelineDetail: { ...timelinePresets[2].value },
+    // Reasoning is content, not chrome: show it expanded by default while
+    // keeping tool/edit rows grouped. Users can still pick a quieter preset.
+    timelineDetail: {
+      ...timelinePresets[1].value,
+      thinking: { placement: "separate", details: "expanded" },
+    },
     showCustomAgents: false,
     showTurnDiffs: false,
     backgroundActivity: "left",

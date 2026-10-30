@@ -21,10 +21,11 @@ beforeEach(() => {
 
 describe("theme preload", () => {
   test.each([
-    { stored: undefined, systemDark: false, scheme: "light", background: "#fafafa" },
-    { stored: "dark", systemDark: false, scheme: "dark", background: "#080808" },
-    { stored: "light", systemDark: true, scheme: "light", background: "#fafafa" },
-    { stored: "system", systemDark: true, scheme: "dark", background: "#080808" },
+    { stored: undefined, systemDark: false, scheme: "dark", background: "#050505" },
+    { stored: "dark", systemDark: false, scheme: "dark", background: "#050505" },
+    { stored: "light", systemDark: true, scheme: "light", background: "#ece5d8" },
+    { stored: "system", systemDark: true, scheme: "dark", background: "#050505" },
+    { stored: "system", systemDark: false, scheme: "light", background: "#ece5d8" },
   ])(
     "paints the default theme in $scheme for stored scheme $stored (system dark: $systemDark)",
     ({ stored, systemDark, scheme, background }) => {
@@ -40,8 +41,8 @@ describe("theme preload", () => {
   )
 
   test.each([
-    { scheme: undefined, key: "opencode-theme-css-light", css: "--background-base:#fff;", expected: "light" },
-    { scheme: "dark", key: "opencode-theme-css-dark", css: "--background-base:#010203;", expected: "dark" },
+    { scheme: undefined, key: "opencode-theme-css-dark", css: "--background-base:#010203;", expected: "dark" },
+    { scheme: "light", key: "opencode-theme-css-light", css: "--background-base:#fff;", expected: "light" },
   ])("restores the cached $expected css of a custom theme", ({ scheme, key, css, expected }) => {
     localStorage.setItem("opencode-theme-id", "nightowl")
 

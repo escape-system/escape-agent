@@ -127,6 +127,7 @@ export function HomeSessionsView(props: HomeSessionsViewProps) {
       aria-label={props.language.t("sidebar.project.recentSessions")}
     >
       <div
+        data-slot="home-sessions-toolbar"
         class="sticky top-0 z-30 shrink-0 bg-v2-background-bg-base pb-1 pt-6 md:pb-3 lg:pt-12"
         onWheel={props.onWheel}
       >
@@ -502,6 +503,7 @@ function HomeSessionGroupHeader(props: {
   return (
     <div
       ref={props.onSetRef}
+      data-slot="home-session-group-header"
       class={`
         pointer-events-none sticky top-[68px] flex h-7 min-w-0 items-center justify-between
         bg-v2-background-bg-base ps-1.5 md:ps-3 md:top-[84px] lg:top-[108px]

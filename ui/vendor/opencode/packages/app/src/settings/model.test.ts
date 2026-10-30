@@ -34,6 +34,17 @@ describe("settings timeline detail migration", () => {
     expect(settings.appearance.fontSize).toBe(16)
     expect(decode(encode(settings))).toEqual(settings)
   })
+
+  test("surfaces reasoning for the untouched compact default", () => {
+    const settings = decode({ general: { timelineDetail: timelinePresets[2].value } })
+    expect(settings.general.timelineDetail.thinking).toEqual({ placement: "separate", details: "expanded" })
+
+    const custom = {
+      ...timelinePresets[2].value,
+      thinking: { placement: "hidden" as const, details: "collapsed" as const },
+    }
+    expect(decode({ general: { timelineDetail: custom } }).general.timelineDetail.thinking).toEqual(custom.thinking)
+  })
 })
 
 describe("settings schema", () => {
@@ -90,7 +101,7 @@ describe("settings schema", () => {
   test("supplies the existing defaults for an empty document", () => {
     expect(decode({})).toEqual({
       general: {
-        timelineDetail: timelinePresets[2].value,
+        timelineDetail: defaultSettings.general.timelineDetail,
         showCustomAgents: false,
         showTurnDiffs: false,
         backgroundActivity: "left",
@@ -148,7 +159,7 @@ describe("settings schema", () => {
     expect(settings.general).toMatchObject({
       showTerminal: true,
       autoSave: false,
-      timelineDetail: timelinePresets[2].value,
+      timelineDetail: defaultSettings.general.timelineDetail,
       followUpBehavior: "steer",
       backgroundActivity: "left",
       timelineWidth: "comfortable",
