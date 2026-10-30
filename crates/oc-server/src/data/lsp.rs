@@ -4,7 +4,7 @@
 //! therefore never forces a spawn: it reports live slots and adds a `cold` row
 //! for every configured server that has no client yet.
 //!
-//! [`bridge_events`] forwards `lsp.updated` and `lsp.client.diagnostics` onto
+//! `bridge_events` forwards `lsp.updated` and `lsp.client.diagnostics` onto
 //! the server's SSE bus. The task holds only the broadcast receiver, never the
 //! supervisor, so it exits when the last supervisor handle is dropped at
 //! shutdown (the channel closes).

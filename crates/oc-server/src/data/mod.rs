@@ -12,6 +12,7 @@ pub mod config_patch;
 pub mod events;
 pub mod experimental;
 pub mod fs;
+pub mod git;
 pub mod goal;
 pub mod inbox;
 pub mod integration;

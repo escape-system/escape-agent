@@ -336,14 +336,15 @@ notified; partial projections are impossible.
   required for imported DBs.
 - **Context** (model view): find the latest completed compaction
   (`json_extract(data,'$.status')='completed'`), read rows from its seq, apply
-  `metadata.keepID`, stop at the first unsettled assistant for `preview`.
+  the top-level `keepID`, stop at the first unsettled assistant for `preview`.
 - **Session list**: keyset on `(time_updated,id)`; filters directory/project/
   parentID/archived; search is `LIKE` on title (documented table scan, capped
   at 200 rows) — a future FTS index is allowed but must not change results.
-- **Incremental history**: the runtime keeps a per-session watermark
-  (`through_seq` + decoded tail). A step loads only rows after the watermark;
-  it never re-reads the full transcript. This is the main fix for upstream's
-  O(n) per step behavior.
+- **Context reload (current behavior)**: the runtime reloads the full context
+  from the store at the start of an execution and after each completed step,
+  plus after a steer promotion or compaction. The `through_seq` column and
+  keyset read path exist, but the runtime does not yet keep a decoded tail;
+  an incremental watermark is a documented optimization, not landed behavior.
 
 ## Revert, fork, delete
 
@@ -361,7 +362,7 @@ notified; partial projections are impossible.
 - **Fork**: create a new session row (fresh `ses_` id, `parent_id = NULL`,
   same project/directory/title/agent/model/metadata), copy messages below the
   boundary with **new** message ids and fresh `seq` values (compaction
-  `metadata.keepID` is remapped to the copied message), then publish a durable
+  top-level `keepID` is remapped to the copied message), then publish a durable
   `session.forked` v2 event on the child with
   `{sessionID, parentID, boundary}` where `boundary` is
   `{type:"before",messageID}` or `{type:"through",messageID}`. A fork with no

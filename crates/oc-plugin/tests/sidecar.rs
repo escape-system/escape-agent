@@ -4,7 +4,6 @@
 //! `oc-plugin-fake-sidecar` test double, which speaks the same newline-framed
 //! JSON-RPC 2.0 protocol.
 
-use std::ffi::OsString;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -362,13 +361,32 @@ async fn callback_reaches_host_services() {
 
 #[test]
 fn runtime_detection_is_path_based() {
-    let empty = std::env::temp_dir().join("oc-plugin-missing-runtime-path");
-    assert!(detect_runtime_in(&OsString::from(empty)).is_none());
-    let path = std::env::var_os("PATH").unwrap_or_default();
-    // Any found runtime must actually exist on disk.
-    if let Some(runtime) = detect_runtime_in(&path) {
-        assert!(runtime.is_file());
-    }
+    let root = std::env::temp_dir().join(format!(
+        "oc-plugin-runtime-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let empty = root.join("empty");
+    let populated = root.join("populated");
+    std::fs::create_dir_all(&empty).unwrap();
+    std::fs::create_dir_all(&populated).unwrap();
+
+    assert!(detect_runtime_in(empty.as_os_str()).is_none());
+
+    #[cfg(windows)]
+    let bun = "bun.exe";
+    #[cfg(not(windows))]
+    let bun = "bun";
+    std::fs::write(populated.join(bun), b"").unwrap();
+    assert_eq!(
+        detect_runtime_in(populated.as_os_str()),
+        Some(populated.join(bun))
+    );
+
+    std::fs::remove_dir_all(&root).unwrap();
 }
 
 #[test]

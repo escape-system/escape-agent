@@ -1,7 +1,7 @@
 //! Experimental goal routes: current goal, set, patch and history.
 //!
 //! A goal belongs to the root of a session tree. Every route resolves the
-//! requested session through [`Store::session_node`], so a subagent session
+//! requested session through [`oc_store::Store::session_node`], so a subagent session
 //! addresses the same goal as its root and an unknown session is a 404.
 //!
 //! `PATCH /goal/:id` returns `409 ConflictError` for a reactivation

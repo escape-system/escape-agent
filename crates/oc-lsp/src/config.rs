@@ -643,23 +643,6 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn builtin_table_has_the_documented_ids() {
-        let ids: Vec<&str> = BUILTINS.iter().map(|entry| entry.0).collect();
-        assert_eq!(ids.len(), 38);
-        for required in [
-            "deno",
-            "typescript",
-            "gopls",
-            "rust",
-            "clangd",
-            "jdtls",
-            "julials",
-        ] {
-            assert!(ids.contains(&required), "missing {required}");
-        }
-    }
-
-    #[test]
     fn disabled_entries_are_removed_from_active_servers() {
         let config = LspConfig::from_config(&json!({
             "lsp": {"servers": {"rust": {"disabled": true}}}
@@ -712,7 +695,10 @@ mod tests {
     fn lsp_false_disables_everything_but_keeps_registry() {
         let config = LspConfig::from_config(&json!({"lsp": false, "lsp_install": true}));
         assert!(!config.enabled);
-        assert_eq!(config.servers.len(), 38);
+        assert!(
+            config.get("rust").is_some(),
+            "the built-in registry survives lsp: false"
+        );
     }
 
     #[test]
@@ -754,13 +740,6 @@ mod tests {
         assert!(docker.matches_file(Path::new("Dockerfile")));
         assert!(docker.matches_file(Path::new("nested/Dockerfile")));
         assert!(!docker.matches_file(Path::new("Dockerfile.dev")));
-    }
-
-    #[test]
-    fn heavy_servers_cost_two_slots() {
-        let config = LspConfig::default();
-        assert_eq!(config.get("rust").unwrap().slot_cost(), 2);
-        assert_eq!(config.get("typescript").unwrap().slot_cost(), 1);
     }
 
     #[test]

@@ -488,6 +488,29 @@ injection here; the runtime adds it.
 Note the `&str` return type is deliberate: dynamic tool names (MCP) need to be
 backed by an owned `String`. Do not change it back to `&'static str`.
 
+## Module layout (oversized-file split)
+
+The public paths above are unchanged. Former single-file modules are now
+facades (`foo/mod.rs`, or `foo.rs` beside `foo/`) that re-export the same names
+explicitly — no `pub use x::*`. Shared types stay in the facade; helpers called
+across sibling modules are `pub(super)`.
+
+| Crate | Facade → submodules |
+|---|---|
+| `oc-runtime` | `turn` → `types, assistant, stats, session, stream, finalize, tools, permissions, compaction`; `subagent` → `settings, state, tree, protocol, wait, spawn, talk, roster, write, digest`; `observer` → `repair, host, tick, repair_worker, strips`; `lane` → `runner, output, shell_tool, tool`; `prompt` → `sources, transcript, model, tests`; `skill` → `activate, write, lint, util, tests`; `runtime` → `traits, actor` |
+| `oc-server` | `data/session_ext` → `common, fork, revert, context, diff, view, forms, saved_permissions, export, import, stats, skill, instructions`; `data/session` → `bodies, crud, select, run, prompt, wait, events`; `permission` → `state, rules, tests`; `observer_host` → `model, notifier, tests`; `data/shells` → `util, selection, http, persistent, manager/{output,process}`; `data/worktree` → `git, paths, plan, http`; `data/vcs` → `git, refs, status, diff, http`; shared `data/git.rs` |
+| `oc-llm` | `catalog` → `types, resolved, snapshot, overlay, resolve, reference, cost, source, convert, v1, variants, util, time, tests` |
+| `oc-config` | `normalize` → `ctx, keys, root, copy, permissions, policies, model, agents, commands, resources, skills, compaction, mcp, providers, experimental`; `jsonc.rs`, `merge.rs` |
+| `oc-store` | `schedule` → `when, ends, model, row, repo, zone, cron` |
+| `oc-plugin` | `sidecar` → `config, status, process, inner, dispatch, register, error` |
+| `oc-mcp` | `client` → `types, handler, session, request, catalog, accessors, handshake` |
+| `oc-lsp` | `client` → `types, spawn, accessors, handshake, request, sync, diagnostics, lifecycle, dispatch, io, json` |
+| `oc-cli` | `cli, serve, bootstrap, schedule, lane, paths, auth, net` |
+
+Rules for future splits: move item bodies byte-identically; keep serde shapes,
+route tables, error tags and publish ordering untouched; keep `#[allow]`
+attributes attached; run the crate gate after each split.
+
 ## Handoff format (every agent)
 
 Return ≤ 80 lines:

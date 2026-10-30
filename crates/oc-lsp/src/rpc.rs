@@ -452,4 +452,24 @@ mod tests {
             assert!(parse_message(value).is_err());
         }
     }
+
+    #[test]
+    fn reader_decodes_multiple_frames_and_rejects_oversized_bodies() {
+        let mut bytes = b"Content-Length: 2\n\n{}".to_vec();
+        bytes.extend_from_slice(&encode_frame(b"[]"));
+        let mut reader = SyncFrameReader::new(std::io::Cursor::new(bytes));
+        assert_eq!(reader.read_frame().unwrap(), Some(b"{}".to_vec()));
+        assert_eq!(reader.read_frame().unwrap(), Some(b"[]".to_vec()));
+        assert_eq!(reader.read_frame().unwrap(), None);
+
+        let header = format!("Content-Length: {}\r\n\r\n", MAX_BODY_BYTES + 1);
+        let mut reader = SyncFrameReader::new(std::io::Cursor::new(header.into_bytes()));
+        match reader.read_frame() {
+            Err(RpcError::BodyTooLarge(length)) => {
+                assert_eq!(length, 67_108_865);
+                assert_eq!(length, MAX_BODY_BYTES + 1);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
 }

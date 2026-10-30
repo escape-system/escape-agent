@@ -445,4 +445,32 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].data, "line1\nline2");
     }
+
+    #[test]
+    fn newline_decoder_ignores_blank_lines_and_recovers_after_oversize() {
+        let mut decoder = NewlineDecoder::new();
+        let (frames, error) = decoder.feed(b"\n\r\n{\"a\":1}\r\n");
+        assert!(error.is_none());
+        assert_eq!(frames, vec![b"{\"a\":1}".to_vec()]);
+
+        let oversized = vec![b'x'; MAX_FRAME_BYTES + 1];
+        let (frames, error) = decoder.feed(&oversized);
+        assert!(frames.is_empty());
+        assert!(matches!(error, Some(McpError::FrameTooLarge)));
+
+        let (frames, error) = decoder.feed(b"discarded\n{\"ok\":true}\r\n");
+        assert!(error.is_none());
+        assert_eq!(frames, vec![b"{\"ok\":true}".to_vec()]);
+    }
+
+    #[test]
+    fn sse_decoder_joins_data_split_across_crlf_chunks() {
+        let mut decoder = SseDecoder::new();
+        let mut events = Vec::new();
+        for chunk in [b"data: a\r".as_slice(), b"\ndata: b\r", b"\n\r", b"\n"] {
+            events.extend(decoder.feed(chunk));
+        }
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].data, "a\nb");
+    }
 }

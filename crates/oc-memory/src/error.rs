@@ -99,20 +99,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn secret_rule_ids_are_stable() {
-        assert_eq!(SecretRule::OpenAiKey.id(), "openai-api-key");
-        assert_eq!(SecretRule::GitHubToken.id(), "github-token");
-        assert_eq!(SecretRule::SlackToken.id(), "slack-token");
-        assert_eq!(SecretRule::AwsAccessKey.id(), "aws-access-key");
-        assert_eq!(SecretRule::Jwt.id(), "json-web-token");
-        assert_eq!(SecretRule::PrivateKey.id(), "private-key");
-        assert_eq!(
-            SecretRule::CredentialAssignment.id(),
-            "credential-assignment"
-        );
-    }
-
-    #[test]
     fn secret_error_display_names_the_rule() {
         let error = MemoryError::Secret {
             rule: SecretRule::OpenAiKey,

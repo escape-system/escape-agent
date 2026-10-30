@@ -12,15 +12,21 @@ is described in `docs/02-protocol.md`.
 ## Verified state
 
 - Workspace gate: `cargo fmt --all --check` clean, `cargo clippy --workspace
-  --all-targets -- -D warnings` clean, `cargo test --workspace` →
-  **773 tests / 78 suites / 3 ignored / 0 failed**, `cargo build -p oc-cli` OK
-  (binary mtime 2026-10-30 15:07:06, `target/debug/opencode.exe`, 53,683,200
-  bytes). The same binary passed the fix-wave and feature-wave live matrices in
-  `docs/18-status.md` (real-model spawn/depth-2 and `/compress`, background
-  detach, steer/queue, password/auth/pairing, permission restart + wildcard,
-  manual compaction, worktree/fork/revert/export/import, observer repairs,
-  sessions, schedule/lane/shell/PTY, MCP/LSP/plugin, route truth, siblings,
-  UI).
+  --all-targets -- -D warnings` clean, `cargo test --workspace` (side target
+  `target/verify`, because the 4096 process holds `target/debug/opencode.exe`)
+  → **803 tests / 80 suites / 0 ignored / 0 failed**. A fresh
+  `target/verify/debug/opencode.exe` (53,785,088 bytes, 2026-10-30 21:42) was
+  built and passed a 16-check isolated smoke (UI, SSE, session CRUD,
+  provider-less truthful failure, shell process/capture) plus `oc-cli`'s
+  binary-level E2E suite **5/5** (text turn, read-tool turn, restart
+  durability, static UI, permission ask). The live 4096 process still runs the
+  previous binary; restart it to pick up this build.
+- The 2026-10-30 modularization wave split every oversized module and the four
+  largest integration-test files with no public-path or wire change (layout map
+  in `docs/17-interfaces.md`). A real defect was fixed: compaction `keepID` is
+  top-level message data, but fork/import read `/metadata/keepID`; both now
+  remap top-level (legacy metadata migrates) with a failing-before/passing-after
+  regression test.
 - Live smoke previously passed **29/29** (auth P0, SSE filter, forms, shell,
   schedule, UI, restart durability). The post-snapshot quick smoke also passed
   on the prior gate binary (info/location bare/session/diff empty/shell
@@ -142,6 +148,10 @@ else `%TEMP%/opencode/opencode.db` (Windows without `HOME`). WAL sidecars are
   compaction writes `reason:"manual"`; inline auto compaction writes
   `"auto"`. Never hardcode `"auto"` in the shared compact path (a test pins
   both the completed/failed rows).
+- **Compaction `keepID` is top-level message data.** The runtime writes it on
+  the compaction row; fork/import must read and remap `keepID` at the top level
+  (legacy `/metadata/keepID` is migrated and removed). Both routes have a
+  regression test.
 - **Saved permission rules use config wildcard matching.** `permission_saved`
   rows are matched with `oc_config::wildcard_match` (case-insensitive on
   Windows, `/`-normalized) and are consulted by both the runtime ask path and

@@ -112,6 +112,59 @@ fn sleeper() -> &'static str {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HostShell {
+    Cmd,
+    PowerShell,
+    Posix,
+}
+
+/// Mirrors the manager's platform-shell discovery so the test speaks the same
+/// command language the spawned process will parse.
+fn program_on_path(program: &str) -> bool {
+    let Some(paths) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&paths).any(|directory| {
+        if directory.join(program).is_file() {
+            return true;
+        }
+        #[cfg(windows)]
+        {
+            if std::path::Path::new(program).extension().is_none() {
+                return ["exe", "cmd", "bat", "com"]
+                    .iter()
+                    .any(|extension| directory.join(format!("{program}.{extension}")).is_file());
+            }
+        }
+        false
+    })
+}
+
+fn host_shell() -> HostShell {
+    if cfg!(windows) {
+        if program_on_path("pwsh") || program_on_path("powershell") {
+            HostShell::PowerShell
+        } else {
+            HostShell::Cmd
+        }
+    } else {
+        HostShell::Posix
+    }
+}
+
+/// Delay briefly so the running shell is observable in `GET /api/shell`, then
+/// print the exported session id and exit.
+fn session_id_command() -> String {
+    match host_shell() {
+        HostShell::Cmd => "ping -n 2 127.0.0.1 >nul & echo %OPENCODE_SESSION_ID%".to_owned(),
+        HostShell::PowerShell => {
+            "Start-Sleep -Milliseconds 300; Write-Output $env:OPENCODE_SESSION_ID".to_owned()
+        }
+        HostShell::Posix => "sleep 0.3; printf '%s\\n' \"$OPENCODE_SESSION_ID\"".to_owned(),
+    }
+}
+
 async fn create_shell(state: &AppState, command: &str) -> Option<Value> {
     let (status, body) = call(
         state,
@@ -410,6 +463,82 @@ async fn session_shell_uses_session_directory_and_requires_session() {
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(error["_tag"], "SessionNotFoundError");
+}
+
+#[tokio::test]
+async fn session_shell_exports_the_session_id_and_records_metadata() {
+    let harness = harness().await;
+    let (status, session) = call(
+        &harness.state,
+        Method::POST,
+        "/api/session",
+        Some(json!({ "title": "shell env session" })),
+        false,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{session}");
+    let sid = session["data"]["id"].as_str().unwrap().to_owned();
+
+    let (status, body) = call(
+        &harness.state,
+        Method::POST,
+        &format!("/api/session/{sid}/shell"),
+        Some(json!({ "command": session_id_command() })),
+        false,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+
+    // The endpoint answers 204, so the running shell is located by the session
+    // metadata it records. It sleeps briefly, keeping that window reliable.
+    let found = timeout(WAIT, async {
+        loop {
+            let (_, listing) = call(&harness.state, Method::GET, "/api/shell", None, false).await;
+            if let Some(entry) = listing["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry["metadata"]["sessionID"] == sid.as_str())
+            {
+                return entry.clone();
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("session shell was never listed while running");
+    assert_eq!(found["metadata"]["sessionID"], sid.as_str());
+    assert_eq!(found["metadata"]["background"], true);
+    let id = found["id"].as_str().expect("shell id").to_owned();
+
+    let exited = wait_exited(&harness.state, &id).await;
+    assert_eq!(exited["status"], "exited", "{exited}");
+    assert_eq!(exited["exit"], 0, "{exited}");
+
+    let (status, page) = call(
+        &harness.state,
+        Method::GET,
+        &format!("/api/shell/{id}/output"),
+        None,
+        false,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    let output = page["data"]["output"].as_str().expect("output text");
+    assert!(
+        output.contains(sid.as_str()),
+        "shell output did not contain the session id: {page}"
+    );
+
+    let (status, _) = call(
+        &harness.state,
+        Method::DELETE,
+        &format!("/api/shell/{id}"),
+        None,
+        false,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
 }
 
 #[tokio::test]

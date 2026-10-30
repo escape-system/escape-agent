@@ -480,6 +480,37 @@ async fn failed_compaction_consumes_row_without_retrying() {
 }
 
 #[tokio::test]
+async fn failed_manual_compaction_records_reason_manual_and_compaction_error() {
+    let harness = Harness::new(vec![Script::Fail]).await;
+    let id = harness.enqueue_compaction().await;
+    harness
+        .runtime
+        .notify(&harness.session)
+        .await
+        .expect("notify");
+
+    let rows = harness
+        .wait_compaction_settled(Duration::from_secs(10))
+        .await;
+    assert!(
+        harness.inbox().await.is_empty(),
+        "inbox row {id} must be consumed"
+    );
+    assert_eq!(rows.len(), 1);
+    let row = &rows[0];
+    assert_eq!(row["status"], "failed");
+    assert_eq!(row["reason"], "manual");
+    assert_eq!(row["error"]["type"], "CompactionError");
+    assert!(
+        row["error"]["message"]
+            .as_str()
+            .is_some_and(|message| !message.is_empty()),
+        "the failure carries the provider message: {row}"
+    );
+    assert_eq!(harness.model.calls(), 1, "the failure is not retried");
+}
+
+#[tokio::test]
 async fn compaction_keeps_the_active_turn_in_the_next_context() {
     let harness = Harness::new(vec![
         text_script("## Objective\nhandoff summary"),

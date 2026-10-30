@@ -1,6 +1,6 @@
 //! Typed `data` payloads for the phase-1 durable/ephemeral session events.
 //!
-//! The [`EventEnvelope`] keeps `data` as [`Value`](serde_json::Value) on the
+//! The [`EventEnvelope`] keeps `data` as [`serde_json::Value`] on the
 //! wire; each payload below serializes to exactly that value and can build an
 //! envelope through [`EventPayload::into_envelope`].
 

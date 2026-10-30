@@ -13,7 +13,7 @@
 //! namespace owns it.
 //!
 //! Hooks are sequential and see earlier mutations. Only
-//! [`Hook::ToolExecuteBefore`](crate::hook::Hook::ToolExecuteBefore) may fail
+//! [`crate::hook::Hook::ToolExecuteBefore`] may fail
 //! and abort the call; errors from other hooks are logged and ignored. A panic
 //! in plugin code is caught, the plugin is disabled, and dispatch continues.
 

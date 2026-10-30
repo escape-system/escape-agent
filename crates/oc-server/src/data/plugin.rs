@@ -4,7 +4,7 @@
 //! route is truthful: an empty inventory if nothing is configured, and a `503`
 //! when `plugins` is configured but the host is missing (fail closed).
 //!
-//! RPC dispatches through [`PluginRegistry::invoke`]. GUI bundles and the npm
+//! RPC dispatches through [`oc_plugin::PluginRegistry::invoke`]. GUI bundles and the npm
 //! package installer are not part of this host: a GUI request is a truthful
 //! `404`, and an update request fails with `503` plus a per-target failure
 //! instead of pretending the install succeeded.

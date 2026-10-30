@@ -27,33 +27,53 @@ running agent. Verify the workspace gate, then continue from the first item in
 
 ## Snapshot
 
-**Gate 1 is green.** `cargo fmt --all --check` and `cargo clippy --workspace
---all-targets -- -D warnings` are clean; `cargo test --workspace` reports
-**778 tests / 78 suites / 3 ignored / 0 failed**. `cargo build -p oc-cli` is OK
-(side target `target/fixbuild/debug/opencode.exe`, 53,758,976 bytes, mtime
-**2026-10-30 19:48**; `target/debug/opencode.exe` is held by the running 4096
-server). The stability wave fixes are included: boot-recovered children settle
-to their parent, DELETE interrupts the subtree, compaction carries a `keepID`
-tail, and the store rejects a second server on the same database.
-Live smoke passed 29/29 (auth P0, SSE
-filter, forms, shell, schedule, UI, restart durability); the post-snapshot quick
-smoke also passed on the prior gate binary (info/location bare/session/diff
-empty/shell output/schedule create+delete/SSE first frame/UI title `OpenCode`,
-zero console errors, clean shutdown). The 15:07 binary passed the feature-wave
-matrix below (password UI, `/compress`, vendored UI, route truth, sessions,
-subagents, observer/goal/memory, schedule/lane/shell/PTY, MCP/LSP/plugin,
-worktree/fork/revert/export/import, permissions, auth); the 14:02 binary had
-already passed the fix-wave matrix (real-model spawn/depth-2, background
-detach, steer/queue, permission restart, manual compaction, worktree, observer
-repairs, siblings, UI). This document describes that landed state;
-routes listed in [02](02-protocol.md) are registered, and everything that is not
-implemented answers a truthful `501`/`503` instead of faking success.
+**Gate is green after the 2026-10-30 modularization wave.** `cargo fmt --all
+--check` and `cargo clippy --workspace --all-targets -- -D warnings` are clean;
+`cargo test --workspace` (run with `CARGO_TARGET_DIR=target/verify` because the
+live 4096 process holds `target/debug/opencode.exe`) reports **803 tests / 80
+suites / 0 ignored / 0 failed**. A fresh `target/verify/debug/opencode.exe`
+(53,785,088 bytes) was built and live-smoked; the 4096 server still runs the
+previous binary until restarted.
+
+The wave split every source file that exceeded 1,000 lines, and every
+integration-test file that exceeded 1,000 lines, into a facade plus focused
+submodules without changing public paths, serde shapes, routes or error payloads
+(map in [17](17-interfaces.md#module-layout-oversized-file-split)). The largest
+split source module is 500 lines (`oc-runtime/src/turn/stream.rs`), down from
+`turn.rs` 2,722; the largest remaining source file is 964 lines
+(`oc-observer/src/engine.rs`), a candidate for the next wave.
+`oc-server` `session_ext.rs` 1,945 → 15 files, `shells.rs` 1,754 → 8,
+`observer_host.rs` 1,287 → 7, `permission.rs` 1,095 → 6, worktree/vcs →
+5/6 + shared `data/git.rs`; `oc-llm` `catalog.rs` 2,426 → 15, `oc-config`
+`normalize.rs` 1,700 → 16 (+`jsonc`/`merge`), `oc-store` `schedule.rs` 1,262 →
+8, `oc-plugin` sidecar → 8, `oc-cli` main → 9, MCP/LSP clients → 8/12. Six
+integration-test files over 1,000 lines (`oc-runtime` runtime/steer_live,
+`oc-store` store_ext, `oc-server` session_ext/runtime/data) were split into
+topic modules with identical test counts.
+
+Test expansion: **+32 new behavioral tests total** (11 landed before the
+intermediate gate), and **7 non-behavioral getter/prose tests removed**, for a
+net **778 → 803**. Coverage added: runtime steer FIFO/recovery/compaction
+reasons, server form validation/export sanitize/import rejection, shell UTF-8
+cursor + session env, worktree confinement, cron/weekday/duration/ends, config
+permission precedence, MCP/LSP framing. A real defect was fixed: compaction
+`keepID` lives at the top level of message data, but fork/import read
+`/metadata/keepID`; both now remap top-level (legacy metadata migrates) with a
+failing-before/passing-after regression test.
+
+Live evidence this wave: a real task on 4096 (`read` tool, 17 durable frames,
+live SSE deltas + busy/idle, clean DELETE) passed; the new binary on an isolated
+port/database passed a 16-check smoke (UI, SSE, session CRUD, provider-less
+truthful failure, shell process/capture); and `oc-cli`'s binary-level E2E suite
+passed **5/5** (text turn, read-tool turn, restart durability, static UI,
+permission ask) against the new binary. The stability fixes and the earlier
+feature/fix-wave matrices below remain landed.
 
 ## Verified
 
 | Area | State |
 |---|---|
-| Workspace | 17 crates, edition 2024, `rust-version 1.90`; fmt/clippy clean, 733 tests / 77 suites / 3 ignored / 0 failed, `oc-cli` builds |
+| Workspace | 17 crates, edition 2024, `rust-version 1.90`; fmt/clippy clean, 803 tests / 80 suites / 0 ignored / 0 failed, `oc-cli` builds |
 | `oc-types` | full wire model (session/message/inbox/permission/agent/file/config/location/info/error) + typed event payloads (`SessionViewed` included; fork/form/instruction/skill payloads are typed locally in the runtime/server) |
 | `oc-store` | SQLite WAL, writer thread + 4-connection read pool, sessions/messages/inbox/events, dense-seq projection, memory FTS, goals/observations/repairs, subagent tree, forms, schedules, snapshots, instruction entries, saved permissions, lane tickets, credentials, worktrees, projects; migrations `0001`–`0010`; `register_project` upserts the `LocationRef` project on `GET /api/location` |
 | `oc-config` | discovery/JSONC/V1 aliases, agents, permissions, skills, commands, AGENTS.md, rescan |

@@ -10,8 +10,10 @@ mod commands;
 mod diagnostic;
 mod discovery;
 mod instructions;
+mod jsonc;
 pub(crate) mod markdown;
 mod markdown_agents;
+mod merge;
 mod normalize;
 mod permissions;
 mod scan;
@@ -28,9 +30,11 @@ pub use commands::CommandInfo;
 pub use diagnostic::{Diagnostic, DiagnosticKind};
 use discovery::{Discovery, Env};
 pub use instructions::InstructionFile;
+pub(crate) use jsonc::parse_jsonc;
 /// Frontmatter reader shared with callers that validate a skill file before
 /// writing it (`skill_lint`).
 pub use markdown::{Parsed as MarkdownDocument, parse as parse_markdown};
+use merge::merge_documents;
 pub use permissions::{Effect, PermissionRule, evaluate_rules, wildcard_match};
 pub use skills::{SkillInfo, SkillSource};
 
@@ -525,102 +529,6 @@ impl<'a> Loader<'a> {
                 path.map(|path| path.to_string_lossy().into_owned()),
                 info,
             ));
-        }
-    }
-}
-
-/// Parse strict JSONC: comments and trailing commas are allowed, JSON5
-/// extensions are not.
-pub(crate) fn parse_jsonc(text: &str) -> Result<Value, String> {
-    let options = jsonc_parser::ParseOptions {
-        allow_comments: true,
-        allow_trailing_commas: true,
-        allow_loose_object_property_names: false,
-        allow_missing_commas: false,
-        allow_single_quoted_strings: false,
-        allow_hexadecimal_numbers: false,
-        allow_unary_plus_numbers: false,
-        allow_bare_decimal_point_numbers: false,
-        allow_non_finite_numbers: false,
-        allow_extended_string_escapes: false,
-    };
-    jsonc_parser::parse_to_serde_value::<Value>(text, &options).map_err(|error| error.to_string())
-}
-
-fn merge_documents(documents: &[Value]) -> Value {
-    let mut merged = Map::new();
-    for document in documents {
-        let Some(object) = document.as_object() else {
-            continue;
-        };
-        for (key, value) in object {
-            match key.as_str() {
-                "permissions" | "policies" => {
-                    let target = merged
-                        .entry(key.clone())
-                        .or_insert_with(|| Value::Array(Vec::new()));
-                    if let (Some(target), Some(values)) = (target.as_array_mut(), value.as_array())
-                    {
-                        target.extend(values.iter().cloned());
-                    } else {
-                        merged.insert(key.clone(), value.clone());
-                    }
-                }
-                "agents" | "providers" | "commands" => {
-                    let target = merged
-                        .entry(key.clone())
-                        .or_insert_with(|| Value::Object(Map::new()));
-                    if let (Some(target), Some(values)) =
-                        (target.as_object_mut(), value.as_object())
-                    {
-                        for (name, item) in values {
-                            target.insert(name.clone(), item.clone());
-                        }
-                    } else {
-                        merged.insert(key.clone(), value.clone());
-                    }
-                }
-                "mcp" => merge_mcp(&mut merged, value),
-                _ => {
-                    merged.insert(key.clone(), value.clone());
-                }
-            }
-        }
-    }
-    Value::Object(merged)
-}
-
-fn merge_mcp(merged: &mut Map<String, Value>, value: &Value) {
-    let Some(source) = value.as_object() else {
-        merged.insert("mcp".to_owned(), value.clone());
-        return;
-    };
-    let target = merged
-        .entry("mcp".to_owned())
-        .or_insert_with(|| Value::Object(Map::new()));
-    if !target.is_object() {
-        *target = Value::Object(Map::new());
-    }
-    let Some(target) = target.as_object_mut() else {
-        return;
-    };
-    for (key, item) in source {
-        if key == "servers" && item.is_object() {
-            let servers = target
-                .entry(key.clone())
-                .or_insert_with(|| Value::Object(Map::new()));
-            if !servers.is_object() {
-                *servers = Value::Object(Map::new());
-            }
-            if let Some(servers) = servers.as_object_mut()
-                && let Some(items) = item.as_object()
-            {
-                for (name, server) in items {
-                    servers.insert(name.clone(), server.clone());
-                }
-            }
-        } else {
-            target.insert(key.clone(), item.clone());
         }
     }
 }

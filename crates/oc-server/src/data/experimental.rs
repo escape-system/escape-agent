@@ -59,7 +59,7 @@ pub fn routes() -> Router<AppState> {
 }
 
 /// Route table with a caller-chosen watch poll interval (tests use a short
-/// interval; production uses [`DEFAULT_WATCH_INTERVAL`]).
+/// interval; production uses `DEFAULT_WATCH_INTERVAL`).
 pub fn routes_with_watch_interval(interval: Duration) -> Router<AppState> {
     let interval = interval.max(Duration::from_millis(10));
     Router::new()

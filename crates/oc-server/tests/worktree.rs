@@ -111,6 +111,16 @@ fn git_available() -> bool {
         .is_ok_and(|output| output.status.success())
 }
 
+/// Explicit skip: return `false` with a visible note rather than silently
+/// letting the test body "pass" when the prerequisite is missing.
+fn require_git() -> bool {
+    if git_available() {
+        return true;
+    }
+    eprintln!("skipping worktree test: git is not installed");
+    false
+}
+
 /// Worktree directories as git lists them, canonicalised for comparison.
 fn porcelain_directories(repository: &Path) -> Vec<PathBuf> {
     git(repository, &["worktree", "list", "--porcelain"])
@@ -546,4 +556,157 @@ async fn worktree_refresh_non_git_directory_is_400() {
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body:?}");
     assert_eq!(body.unwrap()["_tag"], "WorktreeError");
+}
+
+#[tokio::test]
+async fn worktree_relative_base_is_rejected_before_git() {
+    // Deliberately no git repository: the relative-path policy check must run
+    // first, so the response is the base-directory rejection rather than a
+    // repository error from a git invocation.
+    let harness = harness().await;
+    let app = router(harness.state.clone());
+    let project = project_id(&app).await;
+
+    let relative = Path::new("relative-worktrees").join("api");
+    let (status, body) = call(
+        &app,
+        Method::POST,
+        "/api/worktree",
+        Some(json!({
+            "projectID": project,
+            "directory": relative.to_string_lossy(),
+            "name": "api",
+        })),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body:?}");
+    let body = body.unwrap();
+    assert_eq!(body["_tag"], "WorktreeError");
+    assert!(
+        body["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("absolute")),
+        "expected the absolute-directory rejection, got {body:?}"
+    );
+    assert!(
+        list_project(&app, &project).await.is_empty(),
+        "a rejected relative base must not add an inventory row"
+    );
+}
+
+#[tokio::test]
+async fn worktree_absolute_base_outside_the_project_creates_no_inventory_row() {
+    // Also git-free: confinement is checked before any repository lookup.
+    let harness = harness().await;
+    let app = router(harness.state.clone());
+    let project = project_id(&app).await;
+
+    let outside = tempfile::tempdir().unwrap();
+    let target = outside.path().join("escape");
+    let (status, body) = call(
+        &app,
+        Method::POST,
+        "/api/worktree",
+        Some(json!({
+            "projectID": project,
+            "directory": target.to_string_lossy(),
+            "name": "escape",
+        })),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body:?}");
+    let body = body.unwrap();
+    assert_eq!(body["_tag"], "WorktreeError");
+    assert!(
+        body["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("outside")),
+        "expected the confinement rejection, got {body:?}"
+    );
+    assert!(!target.exists(), "the rejected base must not be created");
+    assert!(
+        list_project(&app, &project).await.is_empty(),
+        "a rejected base must not add an inventory row"
+    );
+}
+
+#[tokio::test]
+async fn worktree_delete_unknown_is_404_and_collection_delete_is_204() {
+    if !require_git() {
+        return;
+    }
+    let harness = harness().await;
+    let root = harness.directory.path();
+    init_repository(root);
+    let app = router(harness.state.clone());
+    let project = project_id(&app).await;
+    let base = root.join(".worktrees");
+
+    let (status, body) = call(
+        &app,
+        Method::POST,
+        "/api/worktree",
+        Some(json!({
+            "projectID": project,
+            "directory": base.to_string_lossy(),
+            "name": "api",
+        })),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    let created = body.unwrap()["directory"]
+        .as_str()
+        .expect("created directory")
+        .to_owned();
+    assert_eq!(
+        list_project(&app, &project).await,
+        vec![canonical(&created)]
+    );
+
+    // Deleting a directory that is not in the inventory is a 404 and must not
+    // touch the rows or the checkout.
+    let unknown = base.join("never-created");
+    let (status, body) = call(
+        &app,
+        Method::DELETE,
+        "/api/worktree",
+        Some(json!({
+            "projectID": project,
+            "directory": unknown.to_string_lossy(),
+        })),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body:?}");
+    let body = body.unwrap();
+    assert_eq!(body["_tag"], "WorktreeNotFoundError");
+    assert_eq!(body["directory"], unknown.to_string_lossy().as_ref());
+    assert_eq!(
+        list_project(&app, &project).await,
+        vec![canonical(&created)],
+        "a 404 delete must leave the inventory intact"
+    );
+    assert!(Path::new(&created).join(".git").exists());
+
+    // Deleting the collection (no directory) removes every saved worktree.
+    let (status, body) = call(
+        &app,
+        Method::DELETE,
+        "/api/worktree",
+        Some(json!({ "projectID": project })),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body:?}");
+    assert!(
+        list_project(&app, &project).await.is_empty(),
+        "collection delete must empty the inventory"
+    );
+    assert!(
+        !Path::new(&created).exists(),
+        "collection delete must remove the checkout"
+    );
 }
