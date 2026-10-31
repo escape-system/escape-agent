@@ -288,9 +288,60 @@ async fn max_steps_makes_one_final_tool_less_call() {
 
     assert_eq!(harness.model.calls(), 3);
     let requests = harness.model.requests();
-    assert!(requests[2].tools.is_empty());
+    assert!(
+        !requests[2].tools.is_empty(),
+        "tool definitions are preserved on final_call so the provider prompt cache stays valid"
+    );
+    assert_eq!(requests[2].tools, requests[0].tools);
     assert_eq!(requests[2].options.tool_choice.as_deref(), Some("none"));
     assert_eq!(harness.sink.count("session.tool.success"), 2);
+    assert!(harness.sink.has("session.execution.succeeded"));
+}
+
+#[tokio::test]
+async fn length_finish_reason_triggers_output_limit_continuation() {
+    let harness = Harness::new(
+        vec![
+            Script::Events(vec![
+                LlmEvent::StepStart,
+                LlmEvent::TextStart,
+                LlmEvent::TextDelta {
+                    delta: "part 1 ".to_owned(),
+                },
+                LlmEvent::TextEnd {
+                    text: "part 1 ".to_owned(),
+                },
+                LlmEvent::Finish {
+                    reason: "length".to_owned(),
+                    usage: usage(),
+                },
+            ]),
+            text_script("part 2 complete"),
+        ],
+        Arc::new(AllowAll),
+        json!({}),
+        None,
+    )
+    .await;
+    harness.prompt("write a long file").await;
+
+    assert_eq!(
+        harness.model.calls(),
+        2,
+        "truncated length step automatically continues"
+    );
+    let requests = harness.model.requests();
+    assert!(
+        request_contains(
+            &requests[1],
+            "cut off because it hit the output token limit"
+        ),
+        "continuation prompt is injected"
+    );
+    assert_eq!(
+        requests[0].options.cache_key.as_deref(),
+        Some(harness.session.as_str())
+    );
     assert!(harness.sink.has("session.execution.succeeded"));
 }
 
@@ -492,7 +543,12 @@ async fn oversized_context_compacts_before_the_request() {
 
     assert_eq!(harness.model.calls(), 2);
     let requests = harness.model.requests();
-    assert!(requests[0].tools.is_empty());
+    assert!(
+        !requests[0].tools.is_empty(),
+        "compaction preserves tool definitions and system prefix for KV cache reuse"
+    );
+    assert_eq!(requests[0].tools, requests[1].tools);
+    assert_eq!(requests[0].system, requests[1].system);
     assert_eq!(requests[0].options.tool_choice.as_deref(), Some("none"));
     let summary_seen = requests[1].messages.iter().any(|message| {
         message.content.iter().any(|part| {

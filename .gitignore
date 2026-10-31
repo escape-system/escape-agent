@@ -16,3 +16,5 @@
 /.s*.json
 /.t*.json
 /.tree*.json
+
+/.test-server/

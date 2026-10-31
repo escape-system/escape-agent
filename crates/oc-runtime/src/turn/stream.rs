@@ -111,17 +111,14 @@ impl Runtime {
         let options = LlmOptions {
             api_key: self.credential_key(&turn.model.provider.id).await,
             tool_choice: final_call.then(|| "none".to_owned()),
+            cache_key: Some(session.to_owned()),
             ..LlmOptions::default()
         };
         let request = LlmRequest {
             model: turn.model.clone(),
             system: turn.system.clone(),
             messages: messages.to_vec(),
-            tools: if final_call {
-                Vec::new()
-            } else {
-                turn.tools.clone()
-            },
+            tools: turn.tools.clone(),
             options,
         };
 

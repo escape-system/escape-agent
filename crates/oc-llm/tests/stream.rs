@@ -294,6 +294,22 @@ async fn anthropic_content_blocks() {
     assert_eq!(body["model"], "claude-sonnet-4-5");
     assert_eq!(body["stream"], true);
     assert_eq!(body["messages"][1]["role"], "assistant");
+    assert_eq!(
+        body["tools"][0]["cache_control"],
+        json!({"type": "ephemeral"})
+    );
+    assert_eq!(
+        body["system"][0]["cache_control"],
+        json!({"type": "ephemeral"})
+    );
+    assert_eq!(
+        body["messages"][0]["content"][0]["cache_control"],
+        json!({"type": "ephemeral"})
+    );
+    assert_eq!(
+        body["messages"][2]["content"][0]["cache_control"],
+        json!({"type": "ephemeral"})
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

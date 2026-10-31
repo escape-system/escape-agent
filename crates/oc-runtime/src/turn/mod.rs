@@ -220,7 +220,11 @@ impl Runtime {
     ) -> Result<ExecutionOutcome, RuntimeError> {
         let mut context = self.load_context(session).await?;
         stats.user_text = prompt::last_user_text(&context);
-        let mut compacted = false;
+        let mut last_compacted_len: Option<usize> = None;
+        let mut auto_compactions = 0_usize;
+        let mut overflow_compacted = false;
+        let mut length_continuations = 0_usize;
+        let mut pending_output_continuation = false;
         let mut step_number = 0_usize;
         let ceiling = if turn.context_window == 0 {
             u64::MAX
@@ -243,11 +247,15 @@ impl Runtime {
             if step_number > 0 && self.promote_steers(session, &turn.directory).await? {
                 context = self.load_context(session).await?;
             }
-            if !compacted {
-                let estimate = oc_llm::estimate_request_tokens(&turn.system, &context, &turn.tools);
+            if auto_compactions < 3 && last_compacted_len != Some(context.len()) {
+                let estimate = self.estimate_turn_tokens(session, turn, &context).await?;
                 if estimate > ceiling {
                     match self.compact(session, turn, &context, cancel, "auto").await {
-                        Ok(()) => context = self.load_context(session).await?,
+                        Ok(()) => {
+                            context = self.load_context(session).await?;
+                            auto_compactions += 1;
+                            last_compacted_len = Some(context.len());
+                        }
                         Err(RuntimeError::Cancelled) => {
                             return Ok(ExecutionOutcome::Interrupted(cancel.reason()));
                         }
@@ -256,11 +264,16 @@ impl Runtime {
                         }
                     }
                 }
-                compacted = true;
             }
 
             let final_call = step_number >= turn.max_steps;
             let mut messages = context.clone();
+            if let Some(supplement) = &turn.memory_supplement {
+                messages.push(LlmMessage::user(supplement.clone()));
+            }
+            if pending_output_continuation {
+                messages.push(LlmMessage::user(prompt::CONTINUE_AFTER_OUTPUT_LIMIT_PROMPT));
+            }
             if final_call {
                 messages.push(LlmMessage::user(MAX_STEPS_PROMPT));
             }
@@ -272,12 +285,36 @@ impl Runtime {
                 Err(RuntimeError::Cancelled) => {
                     return Ok(ExecutionOutcome::Interrupted(cancel.reason()));
                 }
+                Err(error)
+                    if !overflow_compacted
+                        && compaction::is_context_overflow_message(&error.to_string()) =>
+                {
+                    match self
+                        .compact(session, turn, &context, cancel, "overflow")
+                        .await
+                    {
+                        Ok(()) => {
+                            overflow_compacted = true;
+                            context = self.load_context(session).await?;
+                            last_compacted_len = Some(context.len());
+                            continue;
+                        }
+                        Err(RuntimeError::Cancelled) => {
+                            return Ok(ExecutionOutcome::Interrupted(cancel.reason()));
+                        }
+                        Err(compact_err) => {
+                            return Ok(ExecutionOutcome::Failed(compact_err.structured()));
+                        }
+                    }
+                }
                 Err(error) => {
                     return Ok(ExecutionOutcome::Failed(error.structured()));
                 }
             };
+            pending_output_continuation = false;
 
             if !final_call && !step.calls.is_empty() {
+                length_continuations = 0;
                 stats.tool_calls = stats.tool_calls.saturating_add(step.calls.len());
                 match self
                     .execute_tools(session, turn, &mut step.state, &step.calls, cancel)
@@ -292,6 +329,17 @@ impl Runtime {
             }
             self.finish_step(session, turn, &mut step).await?;
             collect_tool_lines(stats, &step.state);
+            if !final_call
+                && step.calls.is_empty()
+                && step.state.finish == Some(oc_types::message::FinishReason::Length)
+                && length_continuations < 2
+            {
+                length_continuations += 1;
+                pending_output_continuation = true;
+                step_number += 1;
+                context = self.load_context(session).await?;
+                continue;
+            }
             if final_call || step.calls.is_empty() {
                 stats.assistant_text = assistant_text(&step.state);
                 return Ok(ExecutionOutcome::Succeeded);
@@ -299,6 +347,71 @@ impl Runtime {
             step_number += 1;
             context = self.load_context(session).await?;
         }
+    }
+
+    async fn estimate_turn_tokens(
+        &self,
+        session: &str,
+        turn: &ResolvedTurn,
+        context: &[LlmMessage],
+    ) -> Result<u64, RuntimeError> {
+        let heuristic = oc_llm::estimate_request_tokens(&turn.system, context, &turn.tools);
+        let stored = self.list_all_messages(session).await?;
+        let boundary = stored.iter().rposition(|message| {
+            message.get("type").and_then(Value::as_str) == Some("compaction")
+                && message.get("status").and_then(Value::as_str) == Some("completed")
+        });
+        let epoch_start = boundary.map_or(0, |index| index + 1);
+        let active = &stored[epoch_start..];
+        let anchor = active
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, message)| {
+                if message.get("type").and_then(Value::as_str) != Some("assistant") {
+                    return None;
+                }
+                let provider = message
+                    .get("model")
+                    .and_then(|model| model.get("providerID"))
+                    .and_then(Value::as_str)?;
+                if provider != turn.model_ref.provider_id {
+                    return None;
+                }
+                let tokens_obj = message.get("tokens")?;
+                let input = tokens_obj.get("input").and_then(Value::as_u64)?;
+                if input == 0 {
+                    return None;
+                }
+                let output = tokens_obj
+                    .get("output")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let reasoning = tokens_obj
+                    .get("reasoning")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                Some((
+                    index,
+                    input.saturating_add(output.saturating_sub(reasoning)),
+                ))
+            });
+        let Some((anchor_index, measured)) = anchor else {
+            return Ok(heuristic);
+        };
+        let anchor_converted =
+            prompt::messages_from_store(std::slice::from_ref(&active[anchor_index]));
+        let tool_results_tokens: u64 = anchor_converted
+            .iter()
+            .filter(|msg| msg.role == oc_llm::Role::Tool)
+            .map(oc_llm::estimate_message_tokens)
+            .sum();
+        let after_converted = prompt::messages_from_store(&active[anchor_index + 1..]);
+        let after_tokens =
+            tool_results_tokens.saturating_add(oc_llm::estimate_messages_tokens(&after_converted));
+        let anchored =
+            oc_llm::estimate_prompt_tokens(Some(measured), &[]).saturating_add(after_tokens);
+        Ok(heuristic.max(anchored))
     }
 
     async fn settle(

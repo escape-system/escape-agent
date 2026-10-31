@@ -5,14 +5,60 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 
 #[derive(Debug, Parser)]
-#[command(name = "opencode", version, about = "opencode-rust server")]
+#[command(
+    name = "opencode",
+    version,
+    about = "opencode-rust AI coding agent & server"
+)]
 pub(crate) struct Cli {
     #[command(subcommand)]
-    pub(crate) command: Command,
+    pub(crate) command: Option<Command>,
 }
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum Command {
+    /// Execute a single prompt in the terminal and exit when the turn settles.
+    Run {
+        /// Prompt text to send to the agent (reads from stdin if omitted and piped).
+        #[arg(trailing_var_arg = true)]
+        prompt: Vec<String>,
+        /// Model reference (`provider/id[#variant]`).
+        #[arg(short, long)]
+        model: Option<String>,
+        /// Agent identifier (`build`, `plan`, etc.).
+        #[arg(short, long)]
+        agent: Option<String>,
+        /// Working directory for the session.
+        #[arg(short = 'C', long)]
+        directory: Option<PathBuf>,
+        /// Resume or target a specific session ID.
+        #[arg(short, long)]
+        session: Option<String>,
+        /// SQLite database path (default: `<data>/opencode.db` or `$OPENCODE_DB`).
+        #[arg(long, env = "OPENCODE_DB")]
+        db: Option<PathBuf>,
+        /// Emit raw JSONL event envelopes to stdout instead of formatted text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Start an interactive multi-turn terminal chat session (default when no subcommand is given).
+    Chat {
+        /// Model reference (`provider/id[#variant]`).
+        #[arg(short, long)]
+        model: Option<String>,
+        /// Agent identifier (`build`, `plan`, etc.).
+        #[arg(short, long)]
+        agent: Option<String>,
+        /// Working directory for the session.
+        #[arg(short = 'C', long)]
+        directory: Option<PathBuf>,
+        /// Resume or target a specific session ID.
+        #[arg(short, long)]
+        session: Option<String>,
+        /// SQLite database path (default: `<data>/opencode.db` or `$OPENCODE_DB`).
+        #[arg(long, env = "OPENCODE_DB")]
+        db: Option<PathBuf>,
+    },
     /// Start the HTTP/SSE server.
     Serve {
         /// Interface to bind.
@@ -64,5 +110,23 @@ pub(crate) struct ServeOptions {
     pub(crate) web_dist: Option<PathBuf>,
     pub(crate) cors: Vec<String>,
     pub(crate) service_mode: bool,
+    pub(crate) db: Option<PathBuf>,
+}
+
+pub(crate) struct RunOptions {
+    pub(crate) prompt: Vec<String>,
+    pub(crate) model: Option<String>,
+    pub(crate) agent: Option<String>,
+    pub(crate) directory: Option<PathBuf>,
+    pub(crate) session: Option<String>,
+    pub(crate) db: Option<PathBuf>,
+    pub(crate) json: bool,
+}
+
+pub(crate) struct ChatOptions {
+    pub(crate) model: Option<String>,
+    pub(crate) agent: Option<String>,
+    pub(crate) directory: Option<PathBuf>,
+    pub(crate) session: Option<String>,
     pub(crate) db: Option<PathBuf>,
 }

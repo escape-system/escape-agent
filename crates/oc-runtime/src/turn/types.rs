@@ -28,6 +28,7 @@ pub(super) struct ResolvedTurn {
     pub(super) system: Vec<String>,
     pub(super) tools: Vec<ToolDef>,
     pub(super) memory_ids: Vec<String>,
+    pub(super) memory_supplement: Option<String>,
     pub(super) max_steps: usize,
     pub(super) session_rules: Vec<PermissionRule>,
     pub(super) context_window: u64,

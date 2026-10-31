@@ -31,6 +31,12 @@ You have reached the step limit for this request. Do not call any more tools. \
 Answer the user using the information gathered so far, and state clearly \
 anything that remains unverified.";
 
+/// Instruction appended when a step finishes with `FinishReason::Length` and no
+/// tool calls so the model can finish a truncated response cleanly.
+pub const CONTINUE_AFTER_OUTPUT_LIMIT_PROMPT: &str = "\
+Your previous response was cut off because it hit the output token limit. \
+Continue directly from where you stopped without repeating prior text.";
+
 /// Default system prompt used when the selected agent has no `system` field.
 ///
 /// It advertises the tool names actually offered for this request and embeds

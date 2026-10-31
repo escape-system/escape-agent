@@ -162,6 +162,7 @@ impl Runtime {
             system: Vec::new(),
             tools,
             memory_ids: Vec::new(),
+            memory_supplement: None,
             max_steps,
             session_rules,
             context_window,
@@ -203,16 +204,25 @@ impl Runtime {
         })
         .await;
 
-        let (initial, delta) = {
+        let (initial, delta, has_memory, supplement) = {
             let mut guard = handle.instructions.lock().expect("instruction set");
             if let Some(set) = guard.as_mut() {
-                let delta = set.commit(&assembly.sources);
-                (set.initial().to_owned(), Some(delta))
+                let supplement = set.memory_supplement(&assembly.sources);
+                let stabilized = set.stabilize_epoch_sources(&assembly.sources);
+                let delta = set.commit(&stabilized);
+                let has_memory = set.source("oc/memory").is_some();
+                (
+                    set.initial().to_owned(),
+                    Some(delta),
+                    has_memory,
+                    supplement,
+                )
             } else {
                 let set = InstructionSet::new(&assembly.sources);
                 let initial = set.initial().to_owned();
+                let has_memory = set.source("oc/memory").is_some();
                 *guard = Some(set);
-                (initial, None)
+                (initial, None, has_memory, None)
             }
         };
         if let Some(delta) = delta
@@ -230,8 +240,8 @@ impl Runtime {
             .await?;
         }
 
-        let has_memory = !assembly.memory_ids.is_empty();
         turn.memory_ids = assembly.memory_ids;
+        turn.memory_supplement = supplement;
         turn.system = prompt::system_prefix(
             turn.agent_system.as_deref(),
             &turn.tool_names,

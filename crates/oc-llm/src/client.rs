@@ -175,6 +175,12 @@ impl LlmClient {
         for (name, value) in model.headers() {
             headers.insert(name, value);
         }
+        if let Some(cache_key) = &request.options.cache_key
+            && !cache_key.is_empty()
+        {
+            headers.insert("x-session-affinity".to_string(), cache_key.clone());
+            headers.insert("x-opencode-session-id".to_string(), cache_key.clone());
+        }
         for (name, value) in &request.options.headers {
             headers.insert(name.clone(), value.clone());
         }

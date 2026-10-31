@@ -220,6 +220,8 @@ pub struct LlmOptions {
     pub headers: BTreeMap<String, String>,
     /// `auto`, `none`, `required`, or a specific tool name.
     pub tool_choice: Option<String>,
+    /// Optional session / cache affinity key used for sticky KV-cache routing.
+    pub cache_key: Option<String>,
     pub timeouts: Option<Timeouts>,
 }
 

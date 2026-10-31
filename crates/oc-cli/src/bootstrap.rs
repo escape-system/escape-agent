@@ -44,12 +44,27 @@ pub(crate) async fn open_services(
     directory: &std::path::Path,
     db: Option<PathBuf>,
 ) -> anyhow::Result<Services> {
+    let explicit_db = db.is_some();
     let db_path = db.unwrap_or_else(default_db_path);
-    let store = std::sync::Arc::new(
-        oc_store::Store::open(&db_path)
-            .await
-            .with_context(|| format!("open database {}", db_path.display()))?,
-    );
+    let store = match oc_store::Store::open(&db_path).await {
+        Ok(store) => std::sync::Arc::new(store),
+        Err(error) if !explicit_db && error.to_string().contains("checksum") => {
+            let fallback = db_path.with_file_name("opencode-rust.db");
+            tracing::warn!(
+                primary = %db_path.display(),
+                fallback = %fallback.display(),
+                "default database has an incompatible migration table; using opencode-rust.db"
+            );
+            std::sync::Arc::new(
+                oc_store::Store::open(&fallback)
+                    .await
+                    .with_context(|| format!("open database {}", fallback.display()))?,
+            )
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("open database {}", db_path.display()));
+        }
+    };
     let config = std::sync::Arc::new(
         oc_config::ConfigService::load(oc_config::LoadOptions {
             directory: directory.to_path_buf(),

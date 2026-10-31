@@ -78,6 +78,7 @@ pub fn render(sources: &[InstructionSource]) -> String {
 pub struct InstructionSet {
     initial: String,
     hashes: BTreeMap<String, String>,
+    sources: BTreeMap<String, InstructionSource>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -97,6 +98,10 @@ impl InstructionSet {
                 .iter()
                 .map(|source| (source.key.clone(), source.hash()))
                 .collect(),
+            sources: sources
+                .iter()
+                .map(|source| (source.key.clone(), source.clone()))
+                .collect(),
         }
     }
 
@@ -108,6 +113,69 @@ impl InstructionSet {
     #[must_use]
     pub fn hashes(&self) -> &BTreeMap<String, String> {
         &self.hashes
+    }
+
+    #[must_use]
+    pub fn source(&self, key: &str) -> Option<&InstructionSource> {
+        self.sources.get(key)
+    }
+
+    /// Stabilize volatile sources (`date` and an already-established
+    /// `oc/memory` block) within an active epoch so UTC midnight rollovers or
+    /// per-turn FTS query churn never invalidate the provider prompt cache.
+    #[must_use]
+    pub fn stabilize_epoch_sources(&self, next: &[InstructionSource]) -> Vec<InstructionSource> {
+        let mut out: Vec<InstructionSource> = next
+            .iter()
+            .map(|source| {
+                if source.key == "date"
+                    && let Some(pinned) = self.sources.get("date")
+                {
+                    return pinned.clone();
+                }
+                if source.key == "oc/memory"
+                    && let Some(pinned) = self.sources.get("oc/memory")
+                {
+                    return pinned.clone();
+                }
+                source.clone()
+            })
+            .collect();
+        if let Some(pinned_memory) = self.sources.get("oc/memory")
+            && !out.iter().any(|source| source.key == "oc/memory")
+        {
+            out.push(pinned_memory.clone());
+        }
+        out.sort_by(|left, right| {
+            (left.kind, left.key.as_str()).cmp(&(right.kind, right.key.as_str()))
+        });
+        out
+    }
+
+    /// Extract any newly retrieved memory lines in `next` that are not already
+    /// present in the epoch's pinned `oc/memory` source, so they can be
+    /// injected at the conversation tail without mutating the system prefix.
+    #[must_use]
+    pub fn memory_supplement(&self, next: &[InstructionSource]) -> Option<String> {
+        let pinned = self.sources.get("oc/memory")?;
+        let candidate = next.iter().find(|source| source.key == "oc/memory")?;
+        if candidate.text == pinned.text {
+            return None;
+        }
+        let mut novel = Vec::new();
+        for line in candidate.text.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("- [") && !pinned.text.contains(trimmed) {
+                novel.push(trimmed);
+            }
+        }
+        if novel.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "<system-reminder>\n<memory scope=\"supplement\">\n{}\n</memory>\n</system-reminder>",
+            novel.join("\n")
+        ))
     }
 
     /// Compute the delta to `next` without mutating self.
@@ -141,6 +209,10 @@ impl InstructionSet {
             self.hashes = next
                 .iter()
                 .map(|source| (source.key.clone(), source.hash()))
+                .collect();
+            self.sources = next
+                .iter()
+                .map(|source| (source.key.clone(), source.clone()))
                 .collect();
         }
         delta
@@ -214,5 +286,44 @@ mod tests {
         assert_eq!(hash_text("abc"), hash_text("abc"));
         assert_ne!(hash_text("abc"), hash_text("abd"));
         assert_eq!(hash_text("abc").len(), 16);
+    }
+
+    #[test]
+    fn stabilize_epoch_sources_pins_date_and_memory_and_extracts_supplement() {
+        let initial = [
+            source(
+                SourceKind::Builtins,
+                "date",
+                "Today's date is 2026-04-17 (UTC).",
+            ),
+            source(
+                SourceKind::Memory,
+                "oc/memory",
+                "<memory scope=\"project\">\n- [fact] alpha (mem_1)\n</memory>",
+            ),
+        ];
+        let mut set = InstructionSet::new(&initial);
+        let next = [
+            source(
+                SourceKind::Builtins,
+                "date",
+                "Today's date is 2026-04-18 (UTC).",
+            ),
+            source(
+                SourceKind::Memory,
+                "oc/memory",
+                "<memory scope=\"project\">\n- [fact] alpha (mem_1)\n- [fact] beta (mem_2)\n</memory>",
+            ),
+        ];
+        let supplement = set.memory_supplement(&next).expect("novel memory line");
+        assert!(supplement.contains("- [fact] beta (mem_2)"));
+        assert!(!supplement.contains("alpha"));
+
+        let stabilized = set.stabilize_epoch_sources(&next);
+        let delta = set.commit(&stabilized);
+        assert!(
+            delta.delta.is_empty(),
+            "date rollover and memory churn must not mutate the cached prefix"
+        );
     }
 }

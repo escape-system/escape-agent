@@ -354,10 +354,11 @@ async fn manual_compaction_consumes_row_and_completes() {
     );
 
     // The compaction request carries the transcript plus the summary prompt and
-    // no tools, and never produces a fake assistant turn.
+    // preserves tool definitions with `tool_choice: "none"` for cache hits, and
+    // never produces a fake assistant turn.
     let requests = harness.model.requests();
     assert_eq!(requests.len(), 1);
-    assert!(requests[0].tools.is_empty());
+    assert!(!requests[0].tools.is_empty());
     assert_eq!(requests[0].options.tool_choice.as_deref(), Some("none"));
     assert!(
         harness

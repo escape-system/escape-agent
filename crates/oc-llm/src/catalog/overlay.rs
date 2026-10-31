@@ -302,5 +302,9 @@ impl Catalog {
             self.model_index
                 .insert((model.provider_id.clone(), model.id.clone()), index);
         }
+        self.providers.shrink_to_fit();
+        self.models.shrink_to_fit();
+        self.provider_index.shrink_to_fit();
+        self.model_index.shrink_to_fit();
     }
 }

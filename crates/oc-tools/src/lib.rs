@@ -33,6 +33,7 @@ pub mod shell;
 pub mod todowrite;
 pub mod util;
 pub mod webfetch;
+pub mod websearch;
 pub mod write;
 
 pub use edit::EditTool;
@@ -43,6 +44,7 @@ pub use read::ReadTool;
 pub use shell::ShellTool;
 pub use todowrite::TodowriteTool;
 pub use webfetch::WebfetchTool;
+pub use websearch::WebsearchTool;
 pub use write::WriteTool;
 
 /// Execution context for a single tool call.
@@ -172,6 +174,7 @@ impl ToolRegistry {
         registry.register(Arc::new(ShellTool));
         registry.register(Arc::new(TodowriteTool));
         registry.register(Arc::new(WebfetchTool));
+        registry.register(Arc::new(WebsearchTool));
         registry.register(Arc::new(WriteTool));
         registry
     }
@@ -342,7 +345,7 @@ mod tests {
         memory.register(Arc::new(FakeTool("memory_write")));
 
         base.extend(&memory);
-        assert_eq!(base.len(), 10);
+        assert_eq!(base.len(), 11);
         assert!(base.contains("memory_write"));
         assert_eq!(
             base.names()
@@ -358,7 +361,7 @@ mod tests {
         assert_eq!(names, sorted, "registry names stay sorted");
 
         let merged = ToolRegistry::with_defaults().merged(&memory);
-        assert_eq!(merged.len(), 10);
+        assert_eq!(merged.len(), 11);
         assert!(merged.contains("memory_write"));
         assert_eq!(
             merged

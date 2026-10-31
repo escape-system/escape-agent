@@ -69,7 +69,29 @@ impl Runtime {
             .ok_or_else(|| RuntimeError::SessionNotFound(session.to_owned()))?;
         let info = Runtime::parse_session(&info_value)?;
         let directory = info.location.directory.clone();
-        let turn = self.resolve_turn(&info, &directory)?;
+        let mut turn = self.resolve_turn(&info, &directory)?;
+        if let Some(handle) = self
+            .inner
+            .actors
+            .lock()
+            .expect("actors")
+            .get(session)
+            .cloned()
+            && let Some(set) = handle
+                .instructions
+                .lock()
+                .expect("instruction set")
+                .as_ref()
+        {
+            let has_memory = set.source("oc/memory").is_some();
+            turn.system = crate::prompt::system_prefix(
+                turn.agent_system.as_deref(),
+                &turn.tool_names,
+                &turn.directory,
+                has_memory,
+                set.initial(),
+            );
+        }
         let context = self.load_context(session).await?;
         self.compact(session, &turn, &context, cancel, "manual")
             .await
@@ -109,21 +131,27 @@ impl Runtime {
             })
             .await?;
 
+        let system = if turn.system.is_empty() {
+            crate::prompt::system_parts(
+                turn.agent_system.as_deref(),
+                &turn.tool_names,
+                &turn.directory,
+            )
+        } else {
+            turn.system.clone()
+        };
         let mut messages = context.to_vec();
         messages.push(LlmMessage::user(crate::compaction::summary_prompt(None)));
         let api_key = self.credential_key(&turn.model.provider.id).await;
         let request = LlmRequest {
             model: turn.model.clone(),
-            system: vec![
-                "You compact an agent conversation into a handoff summary. Follow the \
-                 requested sections exactly and keep concrete facts, paths and failures."
-                    .to_owned(),
-            ],
+            system: system.clone(),
             messages,
-            tools: Vec::new(),
+            tools: turn.tools.clone(),
             options: LlmOptions {
-                api_key,
+                api_key: api_key.clone(),
                 tool_choice: Some("none".to_owned()),
+                cache_key: Some(session.to_owned()),
                 ..LlmOptions::default()
             },
         };
@@ -140,6 +168,46 @@ impl Runtime {
         };
         let mut stream = match stream_result {
             Ok(stream) => stream,
+            Err(error) if is_context_overflow_message(&error.to_string()) => {
+                let mut shortened = shorten_messages_for_compaction(context);
+                shortened.push(LlmMessage::user(crate::compaction::summary_prompt(None)));
+                let fallback = LlmRequest {
+                    model: turn.model.clone(),
+                    system,
+                    messages: shortened,
+                    tools: turn.tools.clone(),
+                    options: LlmOptions {
+                        api_key,
+                        tool_choice: Some("none".to_owned()),
+                        cache_key: Some(session.to_owned()),
+                        ..LlmOptions::default()
+                    },
+                };
+                let retry_result = tokio::select! {
+                    biased;
+                    () = cancel.cancelled() => None,
+                    result = self.inner.model.stream(fallback) => Some(result),
+                };
+                match retry_result {
+                    Some(Ok(stream)) => stream,
+                    Some(Err(retry_err)) => {
+                        self.fail_compaction(session, &id, created, reason, &retry_err.to_string())
+                            .await?;
+                        return Err(RuntimeError::Llm(retry_err));
+                    }
+                    None => {
+                        self.fail_compaction(
+                            session,
+                            &id,
+                            created,
+                            reason,
+                            "compaction was cancelled",
+                        )
+                        .await?;
+                        return Err(RuntimeError::Cancelled);
+                    }
+                }
+            }
             Err(error) => {
                 self.fail_compaction(session, &id, created, reason, &error.to_string())
                     .await?;
@@ -313,4 +381,63 @@ impl Runtime {
             .await?;
         Ok(())
     }
+}
+
+pub(super) fn is_context_overflow_message(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("context_length_exceeded")
+        || lower.contains("maximum context length")
+        || lower.contains("prompt is too long")
+        || lower.contains("context window")
+        || lower.contains("too many tokens")
+        || lower.contains("input is too long")
+        || lower.contains("exceeds the model's maximum context")
+}
+
+/// Mask oversized historical tool outputs when a compaction request itself
+/// exceeds the provider's context window.
+pub(super) fn shorten_messages_for_compaction(messages: &[LlmMessage]) -> Vec<LlmMessage> {
+    const HEAD_CHARS: usize = 1_000;
+    const TAIL_CHARS: usize = 500;
+    const MAX_TOOL_CHARS: usize = 2_000;
+
+    let last_tool_msg = messages
+        .iter()
+        .rposition(|message| message.role == oc_llm::Role::Tool);
+    messages
+        .iter()
+        .enumerate()
+        .map(|(index, message)| {
+            if Some(index) == last_tool_msg {
+                return message.clone();
+            }
+            let content = message
+                .content
+                .iter()
+                .map(|part| match part {
+                    oc_llm::ContentPart::ToolResult {
+                        tool_call_id,
+                        name,
+                        content,
+                        is_error,
+                    } if content.chars().count() > MAX_TOOL_CHARS => {
+                        let total = content.chars().count();
+                        let head: String = content.chars().take(HEAD_CHARS).collect();
+                        let tail: String = content.chars().skip(total - TAIL_CHARS).collect();
+                        let omitted = total.saturating_sub(HEAD_CHARS + TAIL_CHARS);
+                        oc_llm::ContentPart::ToolResult {
+                            tool_call_id: tool_call_id.clone(),
+                            name: name.clone(),
+                            content: format!(
+                                "{head}\n...[omitted {omitted} chars during compaction]...\n{tail}"
+                            ),
+                            is_error: *is_error,
+                        }
+                    }
+                    other => other.clone(),
+                })
+                .collect();
+            LlmMessage::new(message.role, content)
+        })
+        .collect()
 }

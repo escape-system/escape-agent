@@ -69,6 +69,16 @@ pub(crate) fn request(request: &LlmRequest) -> WireRequest {
     if let Some(effort) = settings.get("reasoningEffort").and_then(Value::as_str) {
         object.insert("reasoning_effort".to_string(), json!(effort));
     }
+    if let Some(cache_key) = &request.options.cache_key
+        && !cache_key.is_empty()
+        && (model.provider.id == "openai"
+            || settings
+                .get("promptCacheKey")
+                .and_then(Value::as_bool)
+                .unwrap_or(false))
+    {
+        object.insert("prompt_cache_key".to_string(), json!(cache_key));
+    }
     let mut body = Value::Object(object);
     apply_body_overlays(&mut body, model);
     WireRequest {

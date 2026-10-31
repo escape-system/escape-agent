@@ -11,6 +11,11 @@ use crate::event::{ContentPart, LlmEvent, LlmMessage, LlmRequest, Role, Usage};
 use crate::sse::SseEvent;
 
 const DEFAULT_MAX_TOKENS: u64 = 32_000;
+const MAX_CACHE_BREAKPOINTS: usize = 4;
+
+fn ephemeral_cache_control() -> Value {
+    json!({"type": "ephemeral"})
+}
 
 pub(crate) fn request(request: &LlmRequest) -> WireRequest {
     let model = &request.model;
@@ -27,38 +32,59 @@ pub(crate) fn request(request: &LlmRequest) -> WireRequest {
             limit.clamp(1, DEFAULT_MAX_TOKENS)
         }
     });
+    let mut remaining_breakpoints = MAX_CACHE_BREAKPOINTS;
     let mut object = Map::new();
     object.insert("model".to_string(), json!(model.model_id()));
     object.insert("max_tokens".to_string(), json!(max_tokens));
     object.insert("stream".to_string(), json!(true));
-    object.insert("messages".to_string(), Value::Array(messages));
-    if !request.system.is_empty() {
-        object.insert(
-            "system".to_string(),
-            Value::String(request.system.join("\n\n")),
-        );
-    }
     if !request.tools.is_empty() {
-        object.insert(
-            "tools".to_string(),
-            Value::Array(
-                request
-                    .tools
-                    .iter()
-                    .map(|tool| {
-                        json!({
-                            "name": tool.name,
-                            "description": tool.description,
-                            "input_schema": tool.input_schema,
-                        })
-                    })
-                    .collect(),
-            ),
-        );
+        let mut tools: Vec<Value> = request
+            .tools
+            .iter()
+            .map(|tool| {
+                json!({
+                    "name": tool.name,
+                    "description": tool.description,
+                    "input_schema": tool.input_schema,
+                })
+            })
+            .collect();
+        if remaining_breakpoints > 0
+            && let Some(last_tool) = tools.last_mut().and_then(Value::as_object_mut)
+        {
+            last_tool.insert("cache_control".to_string(), ephemeral_cache_control());
+            remaining_breakpoints -= 1;
+        }
+        object.insert("tools".to_string(), Value::Array(tools));
         if let Some(choice) = &request.options.tool_choice {
             object.insert("tool_choice".to_string(), tool_choice(choice));
         }
     }
+    let mut system_blocks: Vec<Value> = request
+        .system
+        .iter()
+        .filter(|part| !part.trim().is_empty())
+        .map(|part| json!({"type": "text", "text": part}))
+        .collect();
+    if !system_blocks.is_empty() {
+        if system_blocks.len() > 1
+            && remaining_breakpoints > 2
+            && let Some(first_block) = system_blocks.first_mut().and_then(Value::as_object_mut)
+        {
+            first_block.insert("cache_control".to_string(), ephemeral_cache_control());
+            remaining_breakpoints -= 1;
+        }
+        if remaining_breakpoints > 0
+            && let Some(last_block) = system_blocks.last_mut().and_then(Value::as_object_mut)
+            && !last_block.contains_key("cache_control")
+        {
+            last_block.insert("cache_control".to_string(), ephemeral_cache_control());
+            remaining_breakpoints -= 1;
+        }
+        object.insert("system".to_string(), Value::Array(system_blocks));
+    }
+    apply_message_cache_breakpoints(&mut messages, remaining_breakpoints);
+    object.insert("messages".to_string(), Value::Array(messages));
     if let Some(temperature) = request.options.temperature {
         object.insert("temperature".to_string(), json!(temperature));
     }
@@ -86,6 +112,63 @@ fn tool_choice(choice: &str) -> Value {
         "required" => json!({"type": "any"}),
         name => json!({"type": "tool", "name": name}),
     }
+}
+
+/// Place remaining `cache_control: {"type": "ephemeral"}` breakpoints on the
+/// conversation tail:
+/// 1. When at least 2 breakpoints remain, mark the previous `"user"` turn
+///    boundary (which matches the prefix written on the immediately preceding
+///    step/turn) so multi-step loops get an immediate cache hit.
+/// 2. Mark the final message in `messages` so the next step/turn hits the newly
+///    extended prefix.
+fn apply_message_cache_breakpoints(messages: &mut [Value], mut remaining: usize) {
+    if remaining == 0 || messages.is_empty() {
+        return;
+    }
+    let last_index = messages.len() - 1;
+    if remaining >= 2 && last_index > 0 {
+        let prev_user = messages[..last_index]
+            .iter()
+            .rposition(|message| message.get("role").and_then(Value::as_str) == Some("user"));
+        if let Some(index) = prev_user
+            && mark_last_cacheable_block(&mut messages[index])
+        {
+            remaining -= 1;
+        }
+    }
+    if remaining >= 1 {
+        let _ = mark_last_cacheable_block(&mut messages[last_index]);
+    }
+}
+
+fn mark_last_cacheable_block(message: &mut Value) -> bool {
+    let Some(content) = message.get_mut("content").and_then(Value::as_array_mut) else {
+        return false;
+    };
+    for block in content.iter_mut().rev() {
+        let Some(object) = block.as_object_mut() else {
+            continue;
+        };
+        let kind = object
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let cacheable = match kind {
+            "text" => object
+                .get("text")
+                .and_then(Value::as_str)
+                .is_some_and(|text| !text.is_empty()),
+            "tool_use" | "tool_result" | "image" | "document" => true,
+            _ => false,
+        };
+        if cacheable {
+            object
+                .entry("cache_control".to_string())
+                .or_insert_with(ephemeral_cache_control);
+            return true;
+        }
+    }
+    false
 }
 
 fn anthropic_settings(thinking: &Value) -> Value {

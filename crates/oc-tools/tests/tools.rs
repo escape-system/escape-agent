@@ -38,6 +38,7 @@ async fn registry_definitions_are_sorted_without_expectation() {
             "shell",
             "todowrite",
             "webfetch",
+            "websearch",
             "write"
         ]
     );
