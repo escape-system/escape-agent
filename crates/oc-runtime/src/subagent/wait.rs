@@ -57,7 +57,7 @@ async fn wait_child(
             return Err(runtime_error(&crate::RuntimeError::Shutdown));
         }
         if let Some(session) = detach_on
-            && runtime.take_background_request(session)
+            && runtime.has_background_request(session)
         {
             return Ok(("detached".to_owned(), String::new()));
         }
@@ -139,6 +139,19 @@ pub(super) fn spawn_watcher(
     prompt_id: String,
     timeout: Duration,
 ) {
+    let should_watch = {
+        let mut state = runtime.inner.subagents.lock().expect("subagent state");
+        state.active_watchers.insert((parent.clone(), child.clone()))
+    };
+    if !should_watch {
+        tracing::debug!(
+            parent = %parent,
+            child = %child,
+            "watcher already active for child; skipping duplicate watcher"
+        );
+        return;
+    }
+
     tokio::spawn(async move {
         let outcome = match wait_child(&runtime, &child, &prompt_id, Some(timeout), None).await {
             Ok((state, _)) if state == "running" => {
@@ -151,6 +164,10 @@ pub(super) fn spawn_watcher(
                 ("failed".to_owned(), reason.clone(), Some(reason))
             }
         };
+        {
+            let mut state = runtime.inner.subagents.lock().expect("subagent state");
+            state.active_watchers.remove(&(parent.clone(), child.clone()));
+        }
         deliver_subagent_result(&runtime, &parent, &child, &agent, &description, outcome).await;
     });
 }
@@ -169,6 +186,13 @@ fn spawn_timeout_watcher(
     prompt_id: String,
     timeout: Duration,
 ) {
+    let should_watch = {
+        let mut state = runtime.inner.subagents.lock().expect("subagent state");
+        state.active_watchers.insert((parent.clone(), child.clone()))
+    };
+    if !should_watch {
+        return;
+    }
     tokio::spawn(async move {
         let _ = wait_child(
             &runtime,
@@ -178,6 +202,10 @@ fn spawn_timeout_watcher(
             None,
         )
         .await;
+        {
+            let mut state = runtime.inner.subagents.lock().expect("subagent state");
+            state.active_watchers.remove(&(parent.clone(), child.clone()));
+        }
         deliver_subagent_result(
             &runtime,
             &parent,
@@ -261,7 +289,7 @@ pub(crate) async fn deliver_subagent_result(
         payload,
         delivery: Delivery::Steer,
     };
-    if let Err(error) = runtime.inner.config.store.enqueue(item).await {
+    if let Err(error) = runtime.enqueue_and_emit(item).await {
         tracing::warn!(parent = %parent, error = %error, "subagent completion was not delivered");
         return;
     }
@@ -278,10 +306,7 @@ pub(super) async fn enqueue_prompt(
 ) -> Result<String, ToolError> {
     let id = MessageId::new().into_inner();
     runtime
-        .inner
-        .config
-        .store
-        .enqueue(NewInbox {
+        .enqueue_and_emit(NewInbox {
             id: id.clone(),
             session_id: session.to_owned(),
             kind: "user".to_owned(),
@@ -292,7 +317,7 @@ pub(super) async fn enqueue_prompt(
             delivery: Delivery::Steer,
         })
         .await
-        .map_err(|error| store_error(&error))?;
+        .map_err(|error| runtime_error(&error))?;
     Ok(id)
 }
 

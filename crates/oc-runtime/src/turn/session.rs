@@ -242,6 +242,13 @@ impl Runtime {
 
         turn.memory_ids = assembly.memory_ids;
         turn.memory_supplement = supplement;
+        let subagent_mode = crate::subagent::session_subagent_mode(self, session).await;
+        if subagent_mode.as_deref() == Some("complex") && depth == 0 {
+            turn.tools
+                .retain(|tool| !is_complex_root_restricted_tool(&tool.name));
+            turn.tool_names
+                .retain(|name| !is_complex_root_restricted_tool(name));
+        }
         turn.system = prompt::system_prefix(
             turn.agent_system.as_deref(),
             &turn.tool_names,
@@ -249,6 +256,9 @@ impl Runtime {
             has_memory,
             &initial,
         );
+        if let Some(mode_block) = subagent_mode_instructions(subagent_mode.as_deref(), depth) {
+            turn.system.push(mode_block);
+        }
         Ok(())
     }
 
@@ -365,7 +375,46 @@ impl Runtime {
     }
 }
 
-pub(super) fn session_rules(info: &SessionInfo) -> Vec<PermissionRule> {
+pub(crate) fn is_complex_root_restricted_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "read" | "write" | "edit" | "patch" | "glob" | "grep" | "shell" | "lane"
+    )
+}
+
+fn subagent_mode_instructions(mode: Option<&str>, depth: u32) -> Option<String> {
+    match mode {
+        Some("complex") if depth == 0 => Some(
+            "[Subagent Mode: /complex — 3-Level Multi-Agent Orchestrator]\n\
+             - Hierarchy depth limit: max_depth = 3 (Root = depth 0; Level 1 = depth 1; Level 2 = depth 2; Level 3 = depth 3).\n\
+             - You are the Root Primary Orchestrator (depth = 0). Do NOT call direct file or shell tools (`read`, `write`, `edit`, `patch`, `glob`, `grep`, `shell`) yourself.\n\
+             - Delegate all file exploration, code modifications, and shell/test execution by spawning `subagent` workers or `role: \"coordinator\"` (\"abi/kardeş\" older-brother/sibling coordinator) subagents.\n\
+             - Level 1 and Level 2 subagents (especially with `role: \"coordinator\"`) can spawn their own child subagents up to depth 3 and coordinate with siblings via `talk`, `session_write`, `roster`, and `digest`."
+                .to_owned(),
+        ),
+        Some("complex") => Some(format!(
+            "[Subagent Mode: /complex — 3-Level Hierarchy (current depth = {depth}/3)]\n\
+             - This session tree runs in `/complex` mode (`max_depth = 3`).\n\
+             - {}Use `talk`, `roster`, `session_write`, and `digest` to coordinate with siblings and child subagents.",
+            if depth < 3 {
+                format!(
+                    "You may spawn child subagents (up to depth 3; next child depth = {}) to parallelize subtasks. ",
+                    depth + 1
+                )
+            } else {
+                "You are at the leaf depth (depth 3/3); execute your assigned task directly using your tools. ".to_owned()
+            }
+        )),
+        Some("basic") => Some(
+            "[Subagent Mode: /basic — Single-Level Hierarchy]\n\
+             - Hierarchy depth limit: max_depth = 1 (only root depth 0 may spawn depth-1 subagents; depth-1 subagents cannot spawn further children)."
+                .to_owned(),
+        ),
+        _ => None,
+    }
+}
+
+fn session_rules(info: &SessionInfo) -> Vec<PermissionRule> {
     info.permissions
         .clone()
         .unwrap_or_default()

@@ -162,7 +162,7 @@ export function createSessionBackground(input: {
     const current = history()
 
     const shells = input.shells().flatMap((shell) => {
-      if (shell.status !== "running" || shell.metadata.sessionID !== id) return []
+      if (shell.status !== "running" || shell.metadata?.sessionID !== id) return []
 
       if (
         current.blocking.some(

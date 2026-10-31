@@ -21,17 +21,14 @@ impl Runtime {
             "metadata": { "observer": true, "target": root },
             "time": { "created": now_millis() },
         });
-        self.inner
-            .config
-            .store
-            .enqueue(NewInbox {
-                id: MessageId::new().into_inner(),
-                session_id: session.to_owned(),
-                kind: "synthetic".to_owned(),
-                payload,
-                delivery: Delivery::Steer,
-            })
-            .await?;
+        self.enqueue_and_emit(NewInbox {
+            id: MessageId::new().into_inner(),
+            session_id: session.to_owned(),
+            kind: "synthetic".to_owned(),
+            payload,
+            delivery: Delivery::Steer,
+        })
+        .await?;
         self.notify_local(session).await
     }
 
@@ -47,17 +44,14 @@ impl Runtime {
         if let Some(note) = note {
             payload.insert("note".to_owned(), Value::String(note.to_owned()));
         }
-        self.inner
-            .config
-            .store
-            .enqueue(NewInbox {
-                id: MessageId::new().into_inner(),
-                session_id: session.to_owned(),
-                kind: "compaction".to_owned(),
-                payload: Value::Object(payload),
-                delivery: Delivery::Queue,
-            })
-            .await?;
+        self.enqueue_and_emit(NewInbox {
+            id: MessageId::new().into_inner(),
+            session_id: session.to_owned(),
+            kind: "compaction".to_owned(),
+            payload: Value::Object(payload),
+            delivery: Delivery::Queue,
+        })
+        .await?;
         self.notify_local(session).await
     }
 

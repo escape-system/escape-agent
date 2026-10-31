@@ -140,6 +140,64 @@ pub(super) fn settings(runtime: &Runtime) -> SubagentSettings {
     load_settings(&runtime.inner.config.config)
 }
 
+/// Resolve the active subagent mode (`"complex"` or `"basic"`) for `session_id`
+/// from the session or its root session's `metadata.subagentMode` (or
+/// `metadata.mode`), falling back to `subagents.mode` in the merged config.
+pub(crate) async fn session_subagent_mode(runtime: &Runtime, session_id: &str) -> Option<String> {
+    let store = &runtime.inner.config.store;
+    let root_id = store
+        .session_node(session_id)
+        .await
+        .ok()
+        .flatten()
+        .map_or_else(|| session_id.to_owned(), |node| node.root_id);
+    for id in [session_id, root_id.as_str()] {
+        if let Ok(Some(session)) = store.get_session(id).await
+            && let Some(mode) = session
+                .pointer("/metadata/subagentMode")
+                .or_else(|| session.pointer("/metadata/mode"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|mode| !mode.is_empty())
+        {
+            return Some(mode.to_ascii_lowercase());
+        }
+    }
+    runtime
+        .inner
+        .config
+        .config
+        .merged()
+        .pointer("/subagents/mode")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|mode| !mode.is_empty())
+        .map(str::to_ascii_lowercase)
+}
+
+/// Resolve [`SubagentSettings`] for `session_id`, applying `/complex` (3-level
+/// hierarchy) or `/basic` (single-level hierarchy) overrides from the root
+/// session's metadata.
+pub(super) async fn settings_for_session(runtime: &Runtime, session_id: &str) -> SubagentSettings {
+    let mut resolved = settings(runtime);
+    match session_subagent_mode(runtime, session_id).await.as_deref() {
+        Some("complex") => {
+            resolved.limits.max_depth = 3;
+            resolved.limits.max_children = 64;
+            resolved.limits.allow_spawn = true;
+            resolved.limits.siblings_enabled = true;
+            if resolved.timeout < Duration::from_secs(3600) {
+                resolved.timeout = Duration::from_secs(3600);
+            }
+        }
+        Some("basic") => {
+            resolved.limits.max_depth = 1;
+        }
+        _ => {}
+    }
+    resolved
+}
+
 pub(super) fn available_agents(config: &ConfigService) -> Vec<String> {
     config
         .agents()

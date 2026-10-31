@@ -6,9 +6,11 @@ import type { SessionMessageHandoff } from "@/session/handoff"
 export function applyTimelineMessageHandoff(
   messages: SessionMessageInfo[],
   handoff: SessionMessageHandoff | undefined,
-  session: { agent?: string; model?: ModelRef } | undefined,
+  session: { agent?: string; model?: ModelRef; revert?: { messageID: string } } | undefined,
 ) {
   if (!handoff) return messages
+  const revertMessageID = session?.revert?.messageID
+  if (revertMessageID && handoff.message.id >= revertMessageID) return messages
   const notices = handoffNotices(handoff, session)
   const index = messages.findIndex((message) => message.id === handoff.message.id)
 

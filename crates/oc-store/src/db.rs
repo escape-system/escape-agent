@@ -92,6 +92,14 @@ pub(crate) struct Inner {
     _lock: Option<std::fs::File>,
 }
 
+impl Drop for Inner {
+    fn drop(&mut self) {
+        if let Some(path) = &self.path {
+            let _ = std::fs::remove_file(lock_path(path));
+        }
+    }
+}
+
 /// Handle to the SQLite database.
 ///
 /// Cloning is cheap and every clone shares the same writer thread and read pool.

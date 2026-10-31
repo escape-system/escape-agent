@@ -59,8 +59,9 @@ export function useSubagentTreeQuery(sessionID: () => string | undefined) {
       return tree ? { available: true, value: tree } : { available: false, reason: "malformed tree" }
     },
     enabled: !!sessionID() && sdk.connection.status() === "connected",
-    refetchOnMount: false,
-    staleTime: 30_000,
+    refetchOnMount: true,
+    refetchInterval: 3_000,
+    staleTime: 2_000,
     retry: false,
   }))
 }
@@ -85,8 +86,9 @@ export function useObserverRepairsQuery(sessionID: () => string | undefined) {
       return { available: true, value: parseObserverRepairs(result.value) }
     },
     enabled: !!sessionID() && sdk.connection.status() === "connected",
-    refetchOnMount: false,
-    staleTime: 30_000,
+    refetchOnMount: true,
+    refetchInterval: 3_000,
+    staleTime: 2_000,
     retry: false,
   }))
 }
@@ -107,8 +109,9 @@ export function useObserverStateQuery(sessionID: () => string | undefined) {
       return { available: true, value: parseObserverState(result.value) }
     },
     enabled: !!sessionID() && sdk.connection.status() === "connected",
-    refetchOnMount: false,
-    staleTime: 30_000,
+    refetchOnMount: true,
+    refetchInterval: 3_000,
+    staleTime: 2_000,
     retry: false,
   }))
 }
@@ -129,8 +132,9 @@ export function useSessionGoalQuery(sessionID: () => string | undefined) {
       return { available: true, value: parseGoal(result.value) }
     },
     enabled: !!sessionID() && sdk.connection.status() === "connected",
-    refetchOnMount: false,
-    staleTime: 30_000,
+    refetchOnMount: true,
+    refetchInterval: 3_000,
+    staleTime: 2_000,
     retry: false,
   }))
 }

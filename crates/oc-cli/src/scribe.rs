@@ -51,6 +51,7 @@ impl ScribeModel for LlmScribe {
                 options: LlmOptions {
                     temperature: Some(0.0),
                     max_output_tokens: Some(SCRIBE_MAX_TOKENS),
+                    cache_key: Some("ses_scribe".to_owned()),
                     api_key,
                     ..LlmOptions::default()
                 },

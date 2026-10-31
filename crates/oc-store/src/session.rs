@@ -348,6 +348,24 @@ impl Store {
         .await
     }
 
+    /// Returns the count of active (currently busy or running) children of `parent_id`.
+    pub async fn active_child_count(&self, parent_id: &str) -> Result<u32, StoreError> {
+        let parent_id = parent_id.to_owned();
+        self.read(move |connection| {
+            let count: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM session_v2 
+                     WHERE parent_id = ?1 
+                       AND (time_idle IS NULL OR (time_busy IS NOT NULL AND time_busy > time_idle))",
+                    [&parent_id],
+                    |row| row.get(0),
+                )
+                .unwrap_or(0);
+            Ok(u32::try_from(count).unwrap_or(u32::MAX))
+        })
+        .await
+    }
+
     /// Lists sessions with keyset pagination.
     #[allow(clippy::too_many_lines)] // one linear keyset query; splitting hides the cursor contract
     pub async fn list_sessions(&self, query: SessionQuery) -> Result<SessionPage, StoreError> {
@@ -565,6 +583,87 @@ impl Store {
                 }
                 Ok(())
             })
+        })
+        .await
+    }
+
+    /// Records the start of an active execution on `session_v2`.
+    pub async fn mark_session_busy(&self, id: &str, time_busy: i64) -> Result<(), StoreError> {
+        let id = id.to_owned();
+        self.write(move |connection| {
+            connection.execute(
+                "UPDATE session_v2
+                 SET time_busy = max(?1, coalesce(time_idle + 1, ?1)),
+                     idle_outcome = NULL,
+                     time_updated = max(time_updated, ?1)
+                 WHERE id = ?2",
+                params![time_busy, id],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Records the completion of an execution on `session_v2`.
+    pub async fn mark_session_idle(
+        &self,
+        id: &str,
+        time_idle: i64,
+        outcome: &str,
+    ) -> Result<(), StoreError> {
+        let id = id.to_owned();
+        let outcome = outcome.to_owned();
+        self.write(move |connection| {
+            connection.execute(
+                "UPDATE session_v2
+                 SET time_idle = max(?1, coalesce(time_busy, ?1)),
+                     idle_outcome = ?2,
+                     time_updated = max(time_updated, ?1)
+                 WHERE id = ?3",
+                params![time_idle, outcome, id],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Accumulates step token and cost usage onto `session_v2`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn add_session_usage(
+        &self,
+        id: &str,
+        cost: f64,
+        tokens_input: i64,
+        tokens_output: i64,
+        tokens_reasoning: i64,
+        tokens_cache_read: i64,
+        tokens_cache_write: i64,
+    ) -> Result<(), StoreError> {
+        let id = id.to_owned();
+        let updated = now_ms();
+        self.write(move |connection| {
+            connection.execute(
+                "UPDATE session_v2
+                 SET cost = cost + ?1,
+                     tokens_input = tokens_input + ?2,
+                     tokens_output = tokens_output + ?3,
+                     tokens_reasoning = tokens_reasoning + ?4,
+                     tokens_cache_read = tokens_cache_read + ?5,
+                     tokens_cache_write = tokens_cache_write + ?6,
+                     time_updated = max(time_updated, ?7)
+                 WHERE id = ?8",
+                params![
+                    cost,
+                    tokens_input,
+                    tokens_output,
+                    tokens_reasoning,
+                    tokens_cache_read,
+                    tokens_cache_write,
+                    updated,
+                    id,
+                ],
+            )?;
+            Ok(())
         })
         .await
     }

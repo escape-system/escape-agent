@@ -1,16 +1,17 @@
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 
 use oc_subagents::{Limits, SiblingBudget, SpawnBudget};
 
 use super::digest::DIGEST_CACHE_CAPACITY;
 
-/// Per-runtime mutable tool state: rate budgets and the digest cache.
+/// Per-runtime mutable tool state: rate budgets, active watcher set, and the digest cache.
 #[derive(Debug, Default)]
 pub(crate) struct SubagentState {
     pub(super) spawn: std::collections::HashMap<String, SpawnBudget>,
     pub(super) siblings: std::collections::HashMap<String, SiblingBudget>,
     pub(super) digests: DigestCache,
     pub(super) digest_rate: std::collections::HashMap<String, VecDeque<i64>>,
+    pub(super) active_watchers: HashSet<(String, String)>,
 }
 
 impl SubagentState {

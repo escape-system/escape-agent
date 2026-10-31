@@ -204,9 +204,8 @@ impl LaneTool {
             ));
         }
         let message_id = MessageId::new().into_inner();
-        let store = self.runtime.inner.config.store.clone();
-        store
-            .enqueue(NewInbox {
+        self.runtime
+            .enqueue_and_emit(NewInbox {
                 id: message_id.clone(),
                 session_id: session_id.clone(),
                 kind: "synthetic".to_owned(),

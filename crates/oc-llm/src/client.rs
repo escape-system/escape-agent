@@ -180,6 +180,7 @@ impl LlmClient {
         {
             headers.insert("x-session-affinity".to_string(), cache_key.clone());
             headers.insert("x-opencode-session-id".to_string(), cache_key.clone());
+            headers.insert("x-opencode-session".to_string(), cache_key.clone());
         }
         for (name, value) in &request.options.headers {
             headers.insert(name.clone(), value.clone());

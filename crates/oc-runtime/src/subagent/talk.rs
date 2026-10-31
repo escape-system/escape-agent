@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 use crate::runtime::Runtime;
 
 use super::protocol::SubagentPeerMessage;
-use super::settings::settings;
+use super::settings::settings_for_session;
 use super::tree::{
     budget_error, load_info, load_node, load_tree, message_error, optional_bool, required_str,
     runtime_error, store_error,
@@ -54,7 +54,7 @@ impl Tool for TalkTool {
             ));
         }
         let request_reply = optional_bool(&input, "request_reply").unwrap_or(false);
-        let settings = settings(runtime);
+        let settings = settings_for_session(runtime, &caller).await;
         let from_node = load_node(runtime, &caller).await?;
         let to_node = load_node(runtime, &to).await?;
         let to_info = load_info(runtime, &to).await?;

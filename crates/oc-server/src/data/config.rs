@@ -267,6 +267,27 @@ pub async fn commands(
             "description": "Compress the session to reduce context size",
         }));
     }
+    for (name, description) in [
+        (
+            "complex",
+            "Switch session to complex 3-level multi-agent orchestrator mode (max_depth = 3)",
+        ),
+        (
+            "basic",
+            "Switch session to basic single-level subagent mode (max_depth = 1)",
+        ),
+    ] {
+        if !config
+            .commands()
+            .iter()
+            .any(|command| command.name.eq_ignore_ascii_case(name))
+        {
+            commands.push(json!({
+                "name": name,
+                "description": description,
+            }));
+        }
+    }
     Ok(Json(LocationEnvelope::new(
         resolved.reference(),
         Value::Array(commands),

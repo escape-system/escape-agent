@@ -1,14 +1,12 @@
 //! Experimental subagent routes: tree view and peer messages.
 //!
-//! The tree is a bounded breadth-first walk of `Store::children` starting at
+//! The tree is a bounded pre-order depth-first walk of `Store::children` starting at
 //! the requested session's root, capped at [`MAX_NODES`].
 //!
 //! The peer-message route is addressed to the target session and the HTTP
 //! client is trusted; it only enqueues input. Ancestry and write authorization
 //! are enforced by the tool layer (`talk` / `session_write`), not here. The
 //! item is published as the normal `session.inbox.enqueued` event.
-
-use std::collections::VecDeque;
 
 use axum::Json;
 use axum::extract::rejection::{JsonRejection, QueryRejection};
@@ -61,19 +59,19 @@ pub async fn tree(
     };
 
     let mut nodes = Vec::new();
-    let mut queue: VecDeque<SessionNodeRow> = VecDeque::new();
-    queue.push_back(root_node);
-    while let Some(node) = queue.pop_front() {
+    let mut stack: Vec<SessionNodeRow> = Vec::new();
+    stack.push(root_node);
+    while let Some(node) = stack.pop() {
         if nodes.len() >= MAX_NODES {
             break;
         }
         let children = store.children(&node.id).await?;
         nodes.push(node_value(&node));
-        for child in children {
-            if nodes.len() + queue.len() >= MAX_NODES {
+        for child in children.into_iter().rev() {
+            if nodes.len() + stack.len() >= MAX_NODES {
                 break;
             }
-            queue.push_back(child);
+            stack.push(child);
         }
     }
     Ok(Json(json!({

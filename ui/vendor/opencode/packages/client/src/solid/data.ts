@@ -708,6 +708,10 @@ export function createData(config: CreateDataInput) {
         sessionOutbox.delete(event.data.sessionID)
         result.session.invalidate(event.data.sessionID)
         refresh(() => result.session.sync(event.data.sessionID))
+        if (event.data.parentID) {
+          result.session.invalidate(event.data.parentID)
+          refresh(() => result.session.sync(event.data.parentID, { children: true }))
+        }
         // Band-aid: a newly created session starts empty, so live events can be its source of truth.
         // Fetching pending inputs and projected messages separately lets promotion move an input between snapshots,
         // causing both requests to miss it and overwrite event-built state. Skip those racy initial reads until
@@ -913,7 +917,7 @@ export function createData(config: CreateDataInput) {
           status: event.data.shell.status,
           exit: event.data.shell.exit,
           metadata:
-            event.data.shell.metadata.background === true ? { ...event.metadata, background: true } : event.metadata,
+            event.data.shell.metadata?.background === true ? { ...event.metadata, background: true } : event.metadata,
           time: { created: event.created },
         })
         return
@@ -1109,7 +1113,10 @@ export function createData(config: CreateDataInput) {
       case "session.execution.started":
         setSessionActive(event.data.sessionID, "running")
         // Revalidate so `time.busy` follows the projected execution start.
-        if (!store.session.info[event.data.sessionID] && !sync.has(`session:${event.data.sessionID}`)) return
+        if (!store.session.info[event.data.sessionID] && !sync.has(`session:${event.data.sessionID}`)) {
+          refresh(() => result.session.sync(event.data.sessionID))
+          return
+        }
         result.session.invalidate(event.data.sessionID)
         refresh(() => result.session.sync(event.data.sessionID))
         return

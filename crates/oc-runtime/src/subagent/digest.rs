@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 use crate::runtime::Runtime;
 
 use super::protocol::message_text;
-use super::settings::settings;
+use super::settings::settings_for_session;
 use super::state::SubagentState;
 use super::tree::{authorize_digest, load_info, optional_str, store_error};
 
@@ -78,7 +78,7 @@ impl Tool for DigestTool {
             .and_then(Value::as_u64)
             .unwrap_or(300)
             .clamp(1, 4096);
-        let settings = settings(runtime);
+        let settings = settings_for_session(runtime, &caller).await;
         let scribe = runtime.scribe_model().ok_or_else(|| {
             let configured = settings
                 .digest_model

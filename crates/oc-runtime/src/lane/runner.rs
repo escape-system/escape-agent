@@ -238,7 +238,7 @@ fn exit_code(status: std::process::ExitStatus) -> i32 {
 /// Kills a process tree by pid. Windows uses `taskkill /T /F`; Unix signals the
 /// process group created by [`ProcessLaneRunner`].
 async fn kill_tree(pid: u32) {
-    if pid == 0 {
+    if pid <= 1 {
         return;
     }
     #[cfg(windows)]

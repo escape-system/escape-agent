@@ -20,7 +20,26 @@ export function SubagentTreePanel(props: { sessionID: string }) {
   const server = useServer()
   const open = useOpenSessionRoute()
   const tree = useSubagentTreeQuery(() => props.sessionID)
-  const [collapsed, setCollapsed] = createSignal(false)
+
+  const initialCollapsed = () => {
+    if (typeof localStorage !== "undefined") {
+      const stored = localStorage.getItem("opencode.session.subagent-tree.collapsed")
+      if (stored !== null) return stored === "true"
+    }
+    return false
+  }
+
+  const [collapsed, setCollapsed] = createSignal(initialCollapsed())
+  const toggleCollapsed = () => {
+    setCollapsed((val) => {
+      const next = !val
+      if (typeof localStorage !== "undefined") {
+        localStorage.setItem("opencode.session.subagent-tree.collapsed", String(next))
+      }
+      return next
+    })
+  }
+
   const [now, setNow] = createSignal(Date.now())
 
   const nodes = createMemo(() => (tree.data?.available ? tree.data.value.nodes : []))
@@ -83,10 +102,10 @@ export function SubagentTreePanel(props: { sessionID: string }) {
           class="flex w-full items-center gap-2 px-4 py-1.5 text-left text-11-regular text-v2-text-text-muted hover:bg-v2-overlay-simple-overlay-hover md:px-6"
           aria-expanded={!collapsed()}
           aria-label={language.t(collapsed() ? "session.agentPanels.tree.expand" : "session.agentPanels.tree.collapse")}
-          onClick={() => setCollapsed((value) => !value)}
+          onClick={toggleCollapsed}
         >
           <Icon name="branch-out" size="small" class="shrink-0 text-v2-icon-icon-faint" />
-          <span class="shrink-0">{language.t("session.agentPanels.tree.title")}</span>
+          <span class="shrink-0 font-medium text-v2-text-text-base">{language.t("session.agentPanels.tree.title")}</span>
           <span class="shrink-0 tabular-nums text-v2-text-text-faint">
             {language.t("session.agentPanels.tree.count", { count: String(nodes().length) })}
           </span>
@@ -112,19 +131,30 @@ export function SubagentTreePanel(props: { sessionID: string }) {
                     title={language.t("session.agentPanels.tree.open", { title: title(node) })}
                     class="flex h-7 w-full items-center gap-2 pe-4 text-left text-12-regular hover:bg-v2-overlay-simple-overlay-hover disabled:opacity-100 disabled:hover:bg-transparent"
                     classList={{
-                      "font-[530] text-v2-text-text-base": current(),
+                      "font-[530] text-v2-text-text-base bg-v2-overlay-simple-overlay-active/50": current(),
                       "text-v2-text-text-muted": !current(),
                     }}
-                    style={{ "padding-inline-start": `${16 + node.depth * 14}px` }}
+                    style={{ "padding-inline-start": `${16 + node.depth * 20}px` }}
                     onClick={() => {
                       if (!current()) open(props.sessionID, node.id)
                     }}
                   >
-                    <span class="w-14 shrink-0 text-11-regular text-v2-text-text-faint">
+                    <Show when={node.depth > 0}>
+                      <span class="shrink-0 select-none font-mono text-[11px] text-v2-text-text-faint/60" aria-hidden="true">
+                        └─
+                      </span>
+                    </Show>
+                    <span
+                      class="w-20 shrink-0 truncate text-11-regular capitalize"
+                      classList={{
+                        "font-semibold text-v2-text-text-base": current(),
+                        "text-v2-text-text-faint": !current(),
+                      }}
+                    >
                       {language.t(`session.agentPanels.relation.${kind}`)}
                     </span>
                     <Show when={node.depth > 0}>
-                      <span class="shrink-0 text-11-regular tabular-nums text-v2-text-text-faint">
+                      <span class="shrink-0 rounded px-1 text-[10px] tabular-nums font-mono bg-v2-surface-surface-muted text-v2-text-text-faint">
                         {language.t("session.agentPanels.tree.depth", { depth: String(node.depth) })}
                       </span>
                     </Show>
@@ -158,7 +188,7 @@ export function SubagentTreePanel(props: { sessionID: string }) {
                     </span>
                     <Show when={elapsed(node)}>
                       {(ms) => (
-                        <span class="w-14 shrink-0 text-end text-11-regular tabular-nums text-v2-text-text-faint">
+                        <span class="w-24 shrink-0 text-end text-11-regular tabular-nums whitespace-nowrap text-v2-text-text-faint">
                           {elapsedLabel(ms())}
                         </span>
                       )}

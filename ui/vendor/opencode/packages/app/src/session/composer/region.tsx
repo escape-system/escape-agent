@@ -225,6 +225,7 @@ export function createActiveSessionRegion(input: {
   const revert = createSessionRevert({
     session: input.session,
     setActiveMessage: input.timeline.actions.setActiveMessage,
+    focus,
   })
 
   const revertMessage: NonNullable<SessionUserActions["revert"]> = ({ messageID }) => revert.to(messageID)

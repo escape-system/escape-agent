@@ -3,7 +3,9 @@
   "model": "opencode-go/deepseek-v4.1-flash#max",
   "small_model": "opencode-go/deepseek-v4.1-flash#max",
   "subagents": {
-    "default_model": "opencode-go/deepseek-v4.1-flash#max"
+    "default_model": "opencode-go/deepseek-v4.1-flash#max",
+    "timeout_seconds": 3600,
+    "max_children_per_session": 64
   },
   "observer": {
     "model": "opencode-go/deepseek-v4.1-flash#max"

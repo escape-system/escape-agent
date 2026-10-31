@@ -4,8 +4,9 @@ use std::sync::Arc;
 use oc_tools::ToolContext;
 use oc_types::MessageId;
 use oc_types::message::{AssistantPart, StructuredError, ToolContent, ToolState};
-use oc_types::payload::{SessionToolFailed, SessionToolSuccess};
+use oc_types::payload::{SessionToolFailed, SessionToolProgress, SessionToolSuccess};
 use serde_json::{Map, Value};
+use tokio::sync::mpsc;
 
 use crate::expectation::{self, Expectation};
 use crate::runtime::{CancelToken, Runtime, RuntimeError};
@@ -13,6 +14,32 @@ use crate::runtime::{CancelToken, Runtime, RuntimeError};
 use super::assistant::{AssistantState, tool_id};
 use super::permissions::authorize_tool_call;
 use super::types::{AuthFailure, PendingToolCall, ResolvedTurn, ToolOutcome};
+
+#[derive(Clone)]
+struct ToolProgressSender {
+    index: usize,
+    call_id: String,
+    tx: mpsc::UnboundedSender<(usize, String, Map<String, Value>)>,
+}
+
+tokio::task_local! {
+    static TOOL_PROGRESS: ToolProgressSender;
+}
+
+/// Emit intermediate metadata for the currently executing tool call in this task.
+pub(crate) fn report_tool_progress(metadata: Map<String, Value>) {
+    let _ = TOOL_PROGRESS.try_with(|sender| {
+        let _ = sender
+            .tx
+            .send((sender.index, sender.call_id.clone(), metadata));
+    });
+}
+
+enum ToolStepWait {
+    Cancelled,
+    Progress((usize, String, Map<String, Value>)),
+    Joined(Option<Result<(usize, ToolOutcome), tokio::task::JoinError>>),
+}
 
 const MAX_TOOL_PARALLELISM: usize = 8;
 /// Maximum characters kept inline inside a single tool text block (~12k tokens).
@@ -43,6 +70,8 @@ impl Runtime {
         };
         let mut open: Vec<String> = Vec::new();
         let mut set = tokio::task::JoinSet::new();
+        let (progress_tx, mut progress_rx) =
+            mpsc::unbounded_channel::<(usize, String, Map<String, Value>)>();
         let mut next = 0_usize;
         while next < calls.len() || !set.is_empty() {
             while set.len() < MAX_TOOL_PARALLELISM && next < calls.len() {
@@ -64,20 +93,31 @@ impl Runtime {
                 let turn = turn.clone();
                 let message_id = state.id.clone();
                 let token = Arc::clone(cancel);
-                set.spawn(async move {
+                let sender = ToolProgressSender {
+                    index,
+                    call_id: call.id.clone(),
+                    tx: progress_tx.clone(),
+                };
+                set.spawn(TOOL_PROGRESS.scope(sender, async move {
                     (
                         index,
                         run_tool(runtime, turn, message_id, call, token).await,
                     )
-                });
+                }));
                 next += 1;
             }
-            let joined = tokio::select! {
+            let wait = tokio::select! {
                 biased;
-                () = cancel.cancelled() => {
+                () = cancel.cancelled() => ToolStepWait::Cancelled,
+                Some(progress) = progress_rx.recv() => ToolStepWait::Progress(progress),
+                joined = set.join_next() => ToolStepWait::Joined(joined),
+            };
+            let joined = match wait {
+                ToolStepWait::Cancelled => {
                     set.abort_all();
                     while set.join_next().await.is_some() {}
                     settle_open(observer.as_deref(), &mut open, "cancelled");
+                    self.clear_background_request(session);
                     self.schedule_finalizer(
                         session.to_owned(),
                         turn.directory.clone(),
@@ -86,13 +126,23 @@ impl Runtime {
                     .await;
                     return Err(RuntimeError::Cancelled);
                 }
-                joined = set.join_next() => joined,
+                ToolStepWait::Progress((index, call_id, metadata)) => {
+                    self.apply_tool_progress(session, turn, state, index, call_id, metadata)
+                        .await?;
+                    continue;
+                }
+                ToolStepWait::Joined(joined) => joined,
             };
+            while let Ok((p_index, p_call_id, p_meta)) = progress_rx.try_recv() {
+                self.apply_tool_progress(session, turn, state, p_index, p_call_id, p_meta)
+                    .await?;
+            }
             match joined {
                 Some(Ok((_index, ToolOutcome::Cancelled))) => {
                     set.abort_all();
                     while set.join_next().await.is_some() {}
                     settle_open(observer.as_deref(), &mut open, "cancelled");
+                    self.clear_background_request(session);
                     self.schedule_finalizer(
                         session.to_owned(),
                         turn.directory.clone(),
@@ -115,10 +165,45 @@ impl Runtime {
                 }
                 Some(Err(error)) => {
                     settle_open(observer.as_deref(), &mut open, "task failed");
+                    self.clear_background_request(session);
                     return Err(RuntimeError::Task(error.to_string()));
                 }
                 None => break,
             }
+        }
+        self.clear_background_request(session);
+        Ok(())
+    }
+
+    async fn apply_tool_progress(
+        &self,
+        session: &str,
+        turn: &ResolvedTurn,
+        state: &mut AssistantState,
+        index: usize,
+        call_id: String,
+        metadata: Map<String, Value>,
+    ) -> Result<(), RuntimeError> {
+        let mut updated = false;
+        if let Some(AssistantPart::Tool(tool)) = state.content.get_mut(index)
+            && let ToolState::Running { metadata: slot, .. } = &mut tool.state
+        {
+            *slot = Some(metadata.clone());
+            updated = true;
+        }
+        if updated {
+            self.persist_assistant(session, state).await?;
+            self.emit(
+                session,
+                &turn.directory,
+                SessionToolProgress {
+                    session_id: Runtime::session_id(session),
+                    assistant_message_id: state.id.clone(),
+                    id: call_id,
+                    metadata,
+                },
+            )
+            .await?;
         }
         Ok(())
     }
@@ -231,6 +316,27 @@ async fn run_tool(
             index: call.index,
             input: call.input,
             error,
+            content: None,
+            metadata: None,
+            executed: false,
+        };
+    }
+
+    if super::session::is_complex_root_restricted_tool(&call.name)
+        && !turn.tool_names.iter().any(|name| name == &call.name)
+    {
+        return ToolOutcome::Failed {
+            index: call.index,
+            input: call.input,
+            error: StructuredError::new(
+                "ComplexModePolicyError",
+                format!(
+                    "Tool {:?} is disabled for the root orchestrator (depth 0) in /complex mode. \
+                     Delegate file exploration, edits, and shell execution by spawning a `subagent` \
+                     or a `role: \"coordinator\"` subagent.",
+                    call.name
+                ),
+            ),
             content: None,
             metadata: None,
             executed: false,

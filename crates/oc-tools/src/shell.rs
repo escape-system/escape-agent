@@ -112,7 +112,7 @@ impl Tool for ShellTool {
         let file = fs::OpenOptions::new()
             .create(true)
             .write(true)
-            .truncate(true)
+            .append(true)
             .open(&output_path)
             .map_err(|error| ToolError::new(format!("Unable to capture shell output: {error}")))?;
         let stdout = file
@@ -312,6 +312,9 @@ async fn kill_tree(child: &mut Child, pid: u32) -> io::Result<ExitStatus> {
 
 #[cfg(unix)]
 fn send_signal(pid: u32, signal: &str) {
+    if pid <= 1 {
+        return;
+    }
     let _ = std::process::Command::new("kill")
         .arg(signal)
         .arg(format!("-{pid}"))

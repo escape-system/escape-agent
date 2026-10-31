@@ -29,6 +29,7 @@ mod stream;
 mod tools;
 mod types;
 
+pub(crate) use tools::report_tool_progress;
 pub(crate) use types::{PendingToolCall, ToolOutcome};
 
 use assistant::assistant_text;
@@ -98,6 +99,12 @@ pub(crate) async fn run_execution(
                 inbox_id: MessageId::from_wire(inbox_id.to_owned()),
             },
         )
+        .await?;
+    runtime
+        .inner
+        .config
+        .store
+        .mark_session_busy(session, oc_types::now_millis())
         .await?;
     runtime
         .emit(
@@ -431,6 +438,12 @@ impl Runtime {
             ExecutionOutcome::Failed(error) => ("failed", Some(error.clone())),
             ExecutionOutcome::Interrupted(_) => ("interrupted", None),
         };
+        self.clear_background_request(session);
+        self.inner
+            .config
+            .store
+            .mark_session_idle(session, now, name)
+            .await?;
         let mut idle = Map::new();
         idle.insert("time".to_owned(), json!({ "created": now }));
         idle.insert("outcome".to_owned(), Value::String(name.to_owned()));

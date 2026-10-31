@@ -4,17 +4,135 @@ use axum::Json;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, State};
 use axum::response::Response;
-use oc_store::{Delivery, NewInbox, NewMessage};
+use oc_store::{Delivery, NewInbox, NewMessage, SessionPatch};
 use oc_types::{ApiError, MessageId, now_millis};
 use serde_json::{Map, Value, json};
 
 use super::bodies::{CommandBody, CompactBody, PromptBody, SyntheticBody};
 use super::{notify, publish_enqueued};
 use crate::AppState;
+use crate::data::events::publish_durable;
 use crate::data::{
     delivery_from_wire, no_content, require_config, require_store, schema_error, session_not_found,
 };
 use crate::error::ErrorResponse;
+
+fn parse_mode_slash_command(raw: &str) -> Option<(&'static str, Option<u32>, &str)> {
+    let trimmed = raw.trim();
+    for (prefix, mode) in [("/complex", "complex"), ("/basic", "basic")] {
+        if let Some(rest) = trimmed.strip_prefix(prefix) {
+            if rest.is_empty() {
+                return Some((mode, None, ""));
+            }
+            if rest.starts_with(char::is_whitespace) {
+                let rest = rest.trim();
+                if let Some(first_word) = rest.split_whitespace().next() {
+                    if let Ok(depth) = first_word.parse::<u32>() {
+                        if (1..=10).contains(&depth) {
+                            let remainder = rest[first_word.len()..].trim();
+                            return Some((mode, Some(depth), remainder));
+                        }
+                    }
+                }
+                return Some((mode, None, rest));
+            }
+        }
+    }
+    None
+}
+
+async fn apply_subagent_mode(
+    state: &AppState,
+    session_id: &str,
+    mode: &str,
+    custom_depth: Option<u32>,
+) -> Result<(), ErrorResponse> {
+    let store = require_store(state)?;
+    let session = store
+        .get_session(session_id)
+        .await?
+        .ok_or_else(|| session_not_found(session_id))?;
+    let root_id = store
+        .session_node(session_id)
+        .await?
+        .map_or_else(|| session_id.to_owned(), |node| node.root_id);
+    let max_depth = custom_depth.unwrap_or_else(|| if mode == "complex" { 3 } else { 1 });
+
+    let mut targets = vec![session_id.to_owned()];
+    if root_id != session_id {
+        targets.push(root_id);
+    }
+    for target_id in targets {
+        let current = if target_id == session_id {
+            Some(session.clone())
+        } else {
+            store.get_session(&target_id).await?
+        };
+        let mut metadata = current
+            .as_ref()
+            .and_then(|value| value.get("metadata"))
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        metadata.insert("subagentMode".to_owned(), Value::String(mode.to_owned()));
+        metadata.insert("maxDepth".to_owned(), json!(max_depth));
+        store
+            .patch_session(
+                &target_id,
+                SessionPatch {
+                    metadata: Some(Value::Object(metadata.clone())),
+                    ..SessionPatch::default()
+                },
+            )
+            .await?;
+        publish_durable(
+            state,
+            &target_id,
+            "session.metadata.updated",
+            json!({
+                "sessionID": target_id,
+                "metadata": metadata,
+            }),
+            1,
+        )
+        .await?;
+    }
+
+    let notice = if mode == "complex" {
+        format!(
+            "Subagent mode switched to /complex ({max_depth}-level orchestrator: max_depth = {max_depth}; root agent delegates via subagent and coordinator agents)."
+        )
+    } else {
+        format!("Subagent mode switched to /basic (single-level subagents: max_depth = {max_depth}).")
+    };
+    let now = now_millis();
+    store
+        .append_message(NewMessage {
+            id: MessageId::new().into_inner(),
+            session_id: session_id.to_owned(),
+            kind: "system".to_owned(),
+            data: json!({
+                "text": notice,
+                "description": format!("Instructions updated: subagentMode ({mode})"),
+                "time": { "created": now },
+            }),
+            time_created: now,
+        })
+        .await?;
+    publish_durable(
+        state,
+        session_id,
+        "session.instructions.updated",
+        json!({
+            "sessionID": session_id,
+            "delta": { "subagentMode": mode },
+            "text": notice,
+        }),
+        2,
+    )
+    .await?;
+    Ok(())
+}
 
 /// `POST /api/session/:sid/prompt`
 pub async fn prompt(
@@ -31,6 +149,49 @@ pub async fn prompt(
     // is admitted, exactly like the upstream `/compact` command.
     if body.text.trim().eq_ignore_ascii_case("/compress") {
         let item = admit_compaction(&state, &session_id, body.id, body.delivery).await?;
+        return Ok(Json(json!({ "data": item })));
+    }
+    if let Some((mode, depth_override, rest)) = parse_mode_slash_command(&body.text) {
+        apply_subagent_mode(&state, &session_id, mode, depth_override).await?;
+        if rest.is_empty() {
+            let id = body
+                .id
+                .filter(|id| !id.is_empty())
+                .unwrap_or_else(|| MessageId::new().into_inner());
+            let delivery = delivery_from_wire(body.delivery.as_deref())?;
+            return Ok(Json(json!({
+                "data": {
+                    "id": id,
+                    "sessionID": session_id,
+                    "time": { "created": now_millis() },
+                    "type": "user",
+                    "payload": { "text": body.text },
+                    "delivery": delivery,
+                }
+            })));
+        }
+        let mut extra = Map::new();
+        if let Some(files) = body.files {
+            extra.insert("files".to_owned(), Value::Array(files));
+        }
+        if let Some(agents) = body.agents {
+            extra.insert("agents".to_owned(), Value::Array(agents));
+        }
+        if let Some(skills) = body.skills {
+            extra.insert("skills".to_owned(), Value::Array(skills));
+        }
+        if let Some(metadata) = body.metadata {
+            extra.insert("metadata".to_owned(), Value::Object(metadata));
+        }
+        let item = admit(
+            &state,
+            &session_id,
+            body.id,
+            rest.to_owned(),
+            extra,
+            body.delivery,
+        )
+        .await?;
         return Ok(Json(json!({ "data": item })));
     }
     let mut extra = Map::new();
@@ -255,6 +416,48 @@ pub async fn command(
     // A markdown command named `compress` keeps precedence.
     if name.eq_ignore_ascii_case("compress") && config.command(&name).is_none() {
         admit_compaction(&state, &session_id, None, body.delivery).await?;
+        return Ok(no_content());
+    }
+    if (name.eq_ignore_ascii_case("complex") || name.eq_ignore_ascii_case("basic"))
+        && config.command(&name).is_none()
+    {
+        let mode = if name.eq_ignore_ascii_case("complex") {
+            "complex"
+        } else {
+            "basic"
+        };
+        let mut arguments = body.text.unwrap_or_default();
+        let mut depth_override = None;
+        if let Some(first_word) = arguments.split_whitespace().next() {
+            if let Ok(depth) = first_word.parse::<u32>() {
+                if (1..=10).contains(&depth) {
+                    depth_override = Some(depth);
+                    arguments = arguments[first_word.len()..].trim().to_owned();
+                }
+            }
+        }
+        apply_subagent_mode(&state, &session_id, mode, depth_override).await?;
+        if !arguments.trim().is_empty() {
+            let mut extra = Map::new();
+            if let Some(files) = body.files {
+                extra.insert("files".to_owned(), Value::Array(files));
+            }
+            if let Some(agents) = body.agents {
+                extra.insert("agents".to_owned(), Value::Array(agents));
+            }
+            if let Some(skills) = body.skills {
+                extra.insert("skills".to_owned(), Value::Array(skills));
+            }
+            admit(
+                &state,
+                &session_id,
+                None,
+                arguments.trim().to_owned(),
+                extra,
+                body.delivery,
+            )
+            .await?;
+        }
         return Ok(no_content());
     }
     let Some(command) = config.command(&name) else {

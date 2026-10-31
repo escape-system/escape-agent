@@ -9,11 +9,13 @@ import { extractPromptContext, extractPromptFromMessage } from "@/composer/promp
 import { pinPromptMedia } from "@/composer/media"
 import { clonePrompt, promptLength } from "@/composer/prompt-parts"
 import { showToast } from "@/shell/notifications/toast"
+import { clearSessionMessageHandoff } from "./handoff"
 import type { SessionModel } from "./model"
 
 export function createSessionRevert(input: {
   session: SessionModel
   setActiveMessage: (message: SessionMessageUser | undefined) => void
+  focus?: () => void
 }) {
   const prompt = useComposerState()
   const server = useServerSDK()
@@ -93,7 +95,21 @@ export function createSessionRevert(input: {
     // Read before staging: the staged event can land before the request resolves.
     const prior = input.session.data.revertMessageID()
 
-    if (!(await request(() => server.api.session.revert.stage({ sessionID, messageID: message.id })))) return
+    const stagedOutput = await server.api.session.revert.stage({ sessionID, messageID: message.id }).catch((error) => {
+      fail(error)
+      return undefined
+    })
+    if (!stagedOutput) return
+
+    clearSessionMessageHandoff(input.session.identity.sessionKey(), message.id)
+
+    const currentInfo = data.session.get(sessionID)
+    if (currentInfo) {
+      data.session.remember({
+        ...currentInfo,
+        revert: { messageID: message.id, files: stagedOutput.files ?? [] },
+      })
+    }
 
     const draft = {
       prompt: clonePrompt(target.current()),
@@ -105,6 +121,7 @@ export function createSessionRevert(input: {
     // and redo delivers them.
     restore(target, message)
     owner.run(() => input.setActiveMessage(previous))
+    input.focus?.()
 
     // Rewinding also puts the files back, so offer the way out right where it happened. Undo is bound to
     // this Session and its earlier revert, not to whatever the route and the event stream show when clicked.
@@ -114,8 +131,16 @@ export function createSessionRevert(input: {
         : request(() => server.api.session.revert.clear({ sessionID }))
 
       if (!(await undone)) return
+      const currentInfo = data.session.get(sessionID)
+      if (currentInfo) {
+        data.session.remember({
+          ...currentInfo,
+          revert: prior ? { messageID: prior, files: [] } : undefined,
+        })
+      }
       target.set(draft.prompt, draft.cursor ?? promptLength(draft.prompt))
       target.context.replace(draft.context)
+      input.focus?.()
       owner.run(() => {
         const messages = input.session.history.userMessages()
         const boundary = prior ? messages.findIndex((item) => item.id === prior) : -1
@@ -163,6 +188,13 @@ export function createSessionRevert(input: {
 
     // Like the TUI, redo restores every reverted message at once and leaves the composer alone.
     if (!(await request(() => server.api.session.revert.clear({ sessionID })))) return
+    const currentInfo = data.session.get(sessionID)
+    if (currentInfo) {
+      data.session.remember({
+        ...currentInfo,
+        revert: undefined,
+      })
+    }
     owner.run(() =>
       input.setActiveMessage(
         input.session.history

@@ -19,7 +19,7 @@ export function currentToolMetadata(tool: SessionMessageAssistantTool): Record<s
 
 export function currentToolOutput(tool: SessionMessageAssistantTool) {
   if (tool.state.status === "running") {
-    const output = tool.state.metadata.output
+    const output = tool.state.metadata?.output
 
     return typeof output === "string" ? output : undefined
   }

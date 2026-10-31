@@ -6,9 +6,9 @@ use serde_json::{Value, json};
 
 use crate::runtime::Runtime;
 
-use super::settings::settings;
+use super::settings::settings_for_session;
 use super::tree::{
-    load_node, load_tree, optional_bool, optional_str, required_str, runtime_error, store_error,
+    load_info, load_node, load_tree, optional_bool, optional_str, required_str, runtime_error,
     write_error,
 };
 
@@ -46,7 +46,7 @@ impl Tool for WriteSessionTool {
         let caller = ctx.session_id.clone();
         let to = required_str(&input, "session_id")?;
         let text = required_str(&input, "text")?;
-        let settings = settings(runtime);
+        let settings = settings_for_session(runtime, &caller).await;
         let delivery = match optional_str(&input, "delivery").as_deref() {
             None | Some("steer") => Delivery::Steer,
             Some("queue") => Delivery::Queue,
@@ -69,12 +69,10 @@ impl Tool for WriteSessionTool {
                 .await
                 .map_err(|error| runtime_error(&error))?;
         }
+        let item_id = MessageId::new().into_inner();
         runtime
-            .inner
-            .config
-            .store
-            .enqueue(NewInbox {
-                id: MessageId::new().into_inner(),
+            .enqueue_and_emit(NewInbox {
+                id: item_id.clone(),
                 session_id: to.clone(),
                 kind: "synthetic".to_owned(),
                 payload: json!({
@@ -84,11 +82,26 @@ impl Tool for WriteSessionTool {
                 delivery,
             })
             .await
-            .map_err(|error| store_error(&error))?;
+            .map_err(|error| runtime_error(&error))?;
         runtime
             .notify(&to)
             .await
             .map_err(|error| runtime_error(&error))?;
+        if caller != to {
+            let to_info = load_info(runtime, &to).await.ok();
+            let description = to_info
+                .and_then(|info| info.title)
+                .unwrap_or_else(|| to.clone());
+            super::wait::spawn_watcher(
+                runtime.clone(),
+                caller.clone(),
+                to.clone(),
+                to_node.agent,
+                description,
+                item_id,
+                settings.timeout,
+            );
+        }
         Ok(ToolResult::text(format!("wrote to {to}")))
     }
 }

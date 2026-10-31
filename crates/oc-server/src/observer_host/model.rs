@@ -85,6 +85,7 @@ impl ObserverModel for LlmObserverModel {
                 options: LlmOptions {
                     temperature: Some(0.0),
                     max_output_tokens: Some(VERDICT_MAX_TOKENS),
+                    cache_key: Some("ses_observer".to_owned()),
                     api_key,
                     ..LlmOptions::default()
                 },

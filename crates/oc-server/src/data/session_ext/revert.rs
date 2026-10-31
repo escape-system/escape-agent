@@ -13,6 +13,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::AppState;
+use crate::data::events::publish_durable;
 use crate::data::fs::confined_target;
 use crate::data::{no_content, require_store, schema_error};
 use crate::error::ErrorResponse;
@@ -200,6 +201,17 @@ pub async fn revert_stage(
             },
         )
         .await?;
+    publish_durable(
+        &state,
+        &session_id,
+        "session.revert.staged",
+        json!({
+            "sessionID": session_id,
+            "revert": revert,
+        }),
+        1,
+    )
+    .await?;
     Ok(Json(json!({ "data": revert })))
 }
 
@@ -234,6 +246,14 @@ pub async fn revert_clear(
                 },
             )
             .await?;
+        publish_durable(
+            &state,
+            &session_id,
+            "session.revert.cleared",
+            json!({ "sessionID": session_id }),
+            1,
+        )
+        .await?;
     }
     Ok(no_content())
 }
@@ -267,6 +287,17 @@ pub async fn revert_commit(
                 },
             )
             .await?;
+        publish_durable(
+            &state,
+            &session_id,
+            "session.revert.committed",
+            json!({
+                "sessionID": session_id,
+                "to": message_id,
+            }),
+            1,
+        )
+        .await?;
     }
     Ok(no_content())
 }

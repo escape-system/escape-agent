@@ -35,6 +35,7 @@ mod tree;
 mod wait;
 mod write;
 
+pub(crate) use settings::session_subagent_mode;
 pub(crate) use state::SubagentState;
 pub(crate) use wait::deliver_subagent_result;
 

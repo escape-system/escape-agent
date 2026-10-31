@@ -247,12 +247,35 @@ impl Runtime {
 
     /// Consume a pending background request for `session`, clearing it so one
     /// request detaches one wait.
+    #[allow(dead_code)]
     pub(crate) fn take_background_request(&self, session: &str) -> bool {
         let handle = {
             let actors = self.inner.actors.lock().expect("actor map");
             actors.get(session).cloned()
         };
         handle.is_some_and(|handle| handle.background.swap(false, Ordering::SeqCst))
+    }
+
+    /// Check whether a background detach has been requested for `session`
+    /// without clearing it, so parallel foreground waits in the same step can
+    /// all observe the request.
+    pub(crate) fn has_background_request(&self, session: &str) -> bool {
+        let handle = {
+            let actors = self.inner.actors.lock().expect("actor map");
+            actors.get(session).cloned()
+        };
+        handle.is_some_and(|handle| handle.background.load(Ordering::SeqCst))
+    }
+
+    /// Clear any pending background request for `session`.
+    pub(crate) fn clear_background_request(&self, session: &str) {
+        let handle = {
+            let actors = self.inner.actors.lock().expect("actor map");
+            actors.get(session).cloned()
+        };
+        if let Some(handle) = handle {
+            handle.background.store(false, Ordering::SeqCst);
+        }
     }
 
     /// Wait until the session actor has no running execution and no deliverable
@@ -353,6 +376,44 @@ impl Runtime {
         }
         self.inner.config.sink.publish(envelope);
         Ok(())
+    }
+
+    /// Enqueue an inbox item in SQLite and publish its durable
+    /// `session.inbox.enqueued` event so live SSE clients see the message
+    /// without refreshing.
+    pub(crate) async fn enqueue_and_emit(
+        &self,
+        inbox: oc_store::NewInbox,
+    ) -> Result<Value, RuntimeError> {
+        let session_id = inbox.session_id.clone();
+        let inbox_id = inbox.id.clone();
+        let item = self.inner.config.store.enqueue(inbox).await?;
+        let directory = self
+            .inner
+            .config
+            .store
+            .get_session(&session_id)
+            .await?
+            .and_then(|value| {
+                value
+                    .pointer("/location/directory")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .unwrap_or_default();
+        if let Ok(parsed) = serde_json::from_value::<oc_types::InboxItem>(item.clone()) {
+            self.emit(
+                &session_id,
+                &directory,
+                oc_types::payload::SessionInboxEnqueued {
+                    session_id: SessionId::from_wire(session_id.clone()),
+                    inbox_id: oc_types::MessageId::from_wire(inbox_id),
+                    item: parsed,
+                },
+            )
+            .await?;
+        }
+        Ok(item)
     }
 
     pub(crate) fn session_id(session: &str) -> SessionId {

@@ -9,7 +9,7 @@ use crate::runtime::Runtime;
 
 use super::settings::{
     SubagentSettings, available_agents, available_models, model_defaults, model_value,
-    requested_role, settings,
+    requested_role, settings_for_session,
 };
 use super::tree::{
     budget_error, load_info, load_node, load_tree, optional_bool, optional_str, required_str,
@@ -106,7 +106,7 @@ impl Tool for SubagentTool {
     async fn execute(&self, ctx: &ToolContext, input: Value) -> Result<ToolResult, ToolError> {
         let runtime = &self.runtime;
         let caller = ctx.session_id.clone();
-        let settings = settings(runtime);
+        let settings = settings_for_session(runtime, &caller).await;
         let agent =
             optional_str(&input, "agent").unwrap_or_else(|| settings.limits.default_agent.clone());
         let description = required_str(&input, "description")?;
@@ -127,7 +127,7 @@ impl Tool for SubagentTool {
             .await;
         }
 
-        let parent = load_node(runtime, &caller).await?;
+        let mut parent = load_node(runtime, &caller).await?;
         let mut limits = settings.limits.clone();
         if let Some(over) = settings.overrides.get(&parent.agent) {
             if over.allow_spawn == Some(false) {
@@ -135,6 +135,18 @@ impl Tool for SubagentTool {
             }
             if let Some(max_children) = over.max_children {
                 limits.max_children = max_children;
+            }
+        }
+        if parent.child_count >= limits.max_children {
+            let active = runtime
+                .inner
+                .config
+                .store
+                .active_child_count(&caller)
+                .await
+                .unwrap_or(parent.child_count);
+            if active < limits.max_children {
+                parent.child_count = active;
             }
         }
         let available = available_agents(&runtime.inner.config.config);
@@ -185,11 +197,13 @@ impl Tool for SubagentTool {
         )
         .map_err(|error| ToolError::new(format!("ModelUnavailableError: {error}")))?;
         let model_value = model_value(&choice.reference, &runtime.inner.config.catalog)?;
+        let created_model = serde_json::from_value(model_value.clone()).ok();
         let parent_info = load_info(runtime, &caller).await?;
         let child = SessionId::new().into_inner();
         let role = requested_role(&input, &settings, &agent);
         let lane = optional_str(&input, "lane");
         let metadata = lane.map(|lane| json!({ "lane": lane }));
+        let created_metadata = metadata.as_ref().and_then(Value::as_object).cloned();
         runtime
             .inner
             .config
@@ -216,6 +230,27 @@ impl Tool for SubagentTool {
             )
             .await
             .map_err(|error| store_error(&error))?;
+        runtime
+            .emit(
+                &child,
+                &parent_info.location.directory,
+                oc_types::payload::SessionCreated {
+                    session_id: SessionId::from_wire(child.clone()),
+                    project_id: parent_info.project_id.clone(),
+                    location: parent_info.location.clone(),
+                    subpath: parent_info.subpath.clone(),
+                    parent_id: Some(SessionId::from_wire(caller.clone())),
+                    slug: format!("subagent-{}", &child[child.len().saturating_sub(6)..]),
+                    title: Some(description.clone()),
+                    agent: Some(agent.clone()),
+                    model: created_model,
+                    metadata: created_metadata,
+                    permissions: None,
+                    version: env!("CARGO_PKG_VERSION").to_owned(),
+                },
+            )
+            .await
+            .map_err(|error| runtime_error(&error))?;
 
         let prompt_id = enqueue_prompt(runtime, &child, &prompt, &caller).await?;
         runtime
@@ -238,6 +273,10 @@ impl Tool for SubagentTool {
             )
             .with_metadata(json!({ "sessionID": child, "status": "running" })));
         }
+        let mut running_meta = serde_json::Map::new();
+        running_meta.insert("sessionID".to_owned(), Value::String(child.clone()));
+        running_meta.insert("status".to_owned(), Value::String("running".to_owned()));
+        crate::turn::report_tool_progress(running_meta);
         finish_foreground(
             runtime,
             &caller,
@@ -289,6 +328,10 @@ async fn continue_child(
         )
         .with_metadata(json!({ "sessionID": target, "status": "running" })));
     }
+    let mut running_meta = serde_json::Map::new();
+    running_meta.insert("sessionID".to_owned(), Value::String(target.to_owned()));
+    running_meta.insert("status".to_owned(), Value::String("running".to_owned()));
+    crate::turn::report_tool_progress(running_meta);
     finish_foreground(
         runtime,
         caller,

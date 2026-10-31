@@ -347,6 +347,19 @@ impl Runtime {
                     state.tokens = Some(tokens.clone());
                     let cost = oc_llm::model_cost(&turn.model.model, &usage);
                     state.cost = Some(cost);
+                    self.inner
+                        .config
+                        .store
+                        .add_session_usage(
+                            session,
+                            cost,
+                            i64::try_from(tokens.input).unwrap_or(i64::MAX),
+                            i64::try_from(tokens.output).unwrap_or(i64::MAX),
+                            i64::try_from(tokens.reasoning).unwrap_or(i64::MAX),
+                            i64::try_from(tokens.cache.read).unwrap_or(i64::MAX),
+                            i64::try_from(tokens.cache.write).unwrap_or(i64::MAX),
+                        )
+                        .await?;
                     self.persist_assistant(session, &state).await?;
                     self.emit(
                         session,
