@@ -5,6 +5,9 @@
   "subagents": {
     "default_model": "opencode-go/deepseek-v4.1-flash#max"
   },
+  "observer": {
+    "model": "opencode-go/deepseek-v4.1-flash#max"
+  },
   "agents": {
     "build": {
       "model": "opencode-go/deepseek-v4.1-flash#max"
