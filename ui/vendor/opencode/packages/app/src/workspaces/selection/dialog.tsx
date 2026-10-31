@@ -536,6 +536,7 @@ export function DirectoryPickerDialog(props: DirectoryPickerDialogProps) {
       initialExpansion: "closed",
       itemHeight: 24,
       stickyFolders: true,
+      middleTruncate: false,
       icons: {
         spriteSheet: TREE_SPRITE_SHEET,
         remap: {
@@ -642,6 +643,19 @@ export function DirectoryPickerDialog(props: DirectoryPickerDialogProps) {
         }
         [data-file-tree-virtualized-scroll] {
           overscroll-behavior: contain;
+        }
+        [data-truncate-marker] {
+          display: none !important;
+        }
+        [data-truncate-content] {
+          direction: ltr !important;
+          unicode-bidi: normal !important;
+        }
+        [data-item-section="content"] {
+          flex: 1 1 auto !important;
+          overflow: hidden !important;
+          text-overflow: ellipsis !important;
+          white-space: nowrap !important;
         }
       `,
       onExpansionChange(change) {

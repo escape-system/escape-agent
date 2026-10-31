@@ -1,0 +1,22 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "opencode-go/deepseek-v4.1-flash#max",
+  "small_model": "opencode-go/deepseek-v4.1-flash#max",
+  "subagents": {
+    "default_model": "opencode-go/deepseek-v4.1-flash#max"
+  },
+  "agents": {
+    "build": {
+      "model": "opencode-go/deepseek-v4.1-flash#max"
+    },
+    "plan": {
+      "model": "opencode-go/deepseek-v4.1-flash#max"
+    },
+    "general": {
+      "model": "opencode-go/deepseek-v4.1-flash#max"
+    },
+    "explore": {
+      "model": "opencode-go/deepseek-v4.1-flash#max"
+    }
+  }
+}

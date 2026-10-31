@@ -83,6 +83,8 @@ const TREE_UNSAFE_CSS = `
   [data-type="item"]:not([data-item-selected="true"]) > [data-item-section="icon"] > * { color: var(--v2-icon-icon-muted) !important; }
   [data-item-git-status]:not([data-item-git-status="ignored"]) > [data-item-section="content"] { color: inherit; }
   [data-item-section="content"] { flex: 1 0 auto; max-width: none; overflow: visible; white-space: nowrap; }
+  [data-truncate-marker] { display: none !important; }
+  [data-truncate-content] { direction: ltr !important; unicode-bidi: normal !important; }
   [data-item-section="decoration"] { flex: 0 0 auto; color: var(--v2-text-text-weak, var(--v2-text-text-muted)); font-size: 12px; font-weight: 400; }
   [data-item-section="git"] {
     font-size: 11px; font-weight: 530; line-height: 1; letter-spacing: -0.04px;
