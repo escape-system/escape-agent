@@ -1,0 +1,113 @@
+diff --git a/packages/app/src/composer/prompt.ts b/packages/app/src/composer/prompt.ts
+index 7843401..b0a2708 100644
+--- a/packages/app/src/composer/prompt.ts
++++ b/packages/app/src/composer/prompt.ts
+@@ -112,7 +112,7 @@ export function extractPromptFromMessage(
+     const fileData = "data" in file ? file.data : undefined
+ 
+     const uri =
+-      source.type === "uri"
++      source?.type === "uri"
+         ? source.uri
+         : fileUri !== undefined
+           ? fileUri
+@@ -137,14 +137,14 @@ export function extractPromptFromMessage(
+     }
+ 
+     // A file reference returns as a context chip through extractPromptContext.
+-    if (source.type === "uri" && source.uri.startsWith("file:")) continue
++    if (source?.type === "uri" && (source.uri ?? "").startsWith("file:")) continue
+ 
+     // Stored files carry their bytes or a media ref, and an empty file has empty data; only a local handoff row
+     // leaves data empty because its bytes live at a blob URL.
+-    const stored = source.type === "inline" || !!fileData
++    const stored = source?.type === "inline" || !!fileData
+ 
+     const dataUrl =
+-      source.type === "uri" && source.uri.startsWith("data:")
++      source?.type === "uri" && (source.uri ?? "").startsWith("data:")
+         ? source.uri
+         : (fileUri ?? (stored ? `data:${file.mime};base64,${fileData ?? ""}` : undefined))
+ 
+diff --git a/packages/session-ui/src/components/message-file.ts b/packages/session-ui/src/components/message-file.ts
+index 3fa7177..a31b789 100644
+--- a/packages/session-ui/src/components/message-file.ts
++++ b/packages/session-ui/src/components/message-file.ts
+@@ -33,7 +33,7 @@ export function attached(file: PromptAttachment) {
+ 
+   if (!source || source.type === "inline") return true
+ 
+-  return source.uri.startsWith("data:") || source.uri.startsWith("blob:")
++  return (source.uri ?? "").startsWith("data:") || (source.uri ?? "").startsWith("blob:")
+ }
+ 
+ // Display names for common source extensions; any other extension is shown in upper case.
+diff --git a/packages/session-ui/src/message/message-content.tsx b/packages/session-ui/src/message/message-content.tsx
+index 6c0dbe2..46ef828 100644
+--- a/packages/session-ui/src/message/message-content.tsx
++++ b/packages/session-ui/src/message/message-content.tsx
+@@ -593,11 +593,35 @@ export function CurrentUserMessageDisplay(props: {
+               if (source?.type === "uri") return source.uri
+ 
+               if ("data" in current && current.data !== undefined) {
+-                return `data:${current.mime};base64,${current.data}`
++                return `data:${current.mime ?? "application/octet-stream"};base64,${current.data}`
+               }
+ 
+-              if ("uri" in current && current.uri) return data.peekMedia?.(current.uri, current.mime)
++              if ("uri" in current && typeof current.uri === "string") {
++                if (
++                  current.uri.startsWith("data:") ||
++                  current.uri.startsWith("blob:") ||
++                  current.uri.startsWith("http:") ||
++                  current.uri.startsWith("https:")
++                ) {
++                  return current.uri
++                }
++              }
++
++              if ("uri" in current && current.uri) return data.peekMedia?.(current.uri, current.mime ?? "application/octet-stream")
++
++              return undefined
++            }
+ 
++            const directMime = () => {
++              const current = file()
++              if (current.mime) return current.mime
++              const uri = "uri" in current && typeof current.uri === "string" ? current.uri : undefined
++              if (uri?.startsWith("data:")) {
++                const comma = uri.indexOf(",")
++                const header = comma >= 0 ? uri.slice(5, comma) : uri.slice(5)
++                const part = header.split(";")[0]
++                if (part) return part
++              }
+               return undefined
+             }
+ 
+@@ -624,7 +648,7 @@ export function CurrentUserMessageDisplay(props: {
+               const controller = new AbortController()
+               onCleanup(() => controller.abort())
+               void data
+-                .readMedia(uri, current.mime, controller.signal)
++                .readMedia(uri, current.mime ?? "application/octet-stream", controller.signal)
+                 .then((loaded) => {
+                   if (!controller.signal.aborted) setResolvedUrl(loaded)
+                 })
+@@ -635,7 +659,7 @@ export function CurrentUserMessageDisplay(props: {
+ 
+             const url = () => directUrl() ?? resolvedUrl()
+             const name = () => file().name ?? i18n.t("ui.message.attachment.alt")
+-            const image = () => file().mime.startsWith("image/")
++            const image = () => Boolean(directMime()?.startsWith("image/"))
+ 
+             const width = () => {
+               const current = file()
+@@ -695,7 +719,7 @@ export function CurrentUserMessageDisplay(props: {
+                   clickable={!!props.actions?.openAttachment}
+                   onClick={() => props.actions?.openAttachment?.(file())}
+                 >
+-                  {typeLabel(name(), file().mime, i18n.t("ui.common.file"))}
++                  {typeLabel(name(), directMime() ?? "", i18n.t("ui.common.file"))}
+                 </AttachmentCard>
+               </Show>
+             )

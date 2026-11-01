@@ -252,3 +252,67 @@ async fn duplicate_prompt_id_conflicts() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body.unwrap()["_tag"], "BadRequestError");
 }
+
+#[tokio::test]
+async fn prompt_normalizes_data_url_file_attachments() {
+    let harness = harness().await;
+    let app = router(harness.state.clone());
+    let sid = session_id(&create_session(&app, json!({})).await);
+
+    let (status, body) = call(
+        &app,
+        Method::POST,
+        &format!("/api/session/{sid}/prompt"),
+        Some(json!({
+            "id": "msg_img_prompt",
+            "text": "look at this image",
+            "delivery": "steer",
+            "files": [{
+                "uri": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+                "name": "pixel.png"
+            }]
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let item = body.unwrap()["data"].clone();
+    assert_eq!(item["id"], "msg_img_prompt");
+
+    // Check materialised message row in transcript
+    let (status, body) = call(
+        &app,
+        Method::GET,
+        &format!("/api/session/{sid}/message"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let messages = body.unwrap();
+    let user_msg = messages["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"] == "msg_img_prompt")
+        .expect("user message found");
+
+    let files = user_msg["files"].as_array().expect("files array present");
+    assert_eq!(files.len(), 1);
+    let file = &files[0];
+    assert_eq!(file["name"], "pixel.png");
+    assert_eq!(file["mime"], "image/png");
+    assert_eq!(file["source"]["type"], "inline");
+    assert_eq!(
+        file["data"],
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+    );
+
+    // Verify it deserializes cleanly into oc_types::message::UserMessage
+    let parsed: oc_types::message::UserMessage =
+        serde_json::from_value(user_msg.clone()).expect("UserMessage deserializes");
+    assert_eq!(parsed.id.into_inner(), "msg_img_prompt");
+    assert_eq!(parsed.files.as_ref().unwrap().len(), 1);
+    let f = &parsed.files.as_ref().unwrap()[0];
+    assert_eq!(f.mime, "image/png");
+    assert_eq!(f.name.as_deref(), Some("pixel.png"));
+}
+

@@ -33,7 +33,7 @@ export function attached(file: PromptAttachment) {
 
   if (!source || source.type === "inline") return true
 
-  return source.uri.startsWith("data:") || source.uri.startsWith("blob:")
+  return (source.uri ?? "").startsWith("data:") || (source.uri ?? "").startsWith("blob:")
 }
 
 // Display names for common source extensions; any other extension is shown in upper case.

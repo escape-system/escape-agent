@@ -15,6 +15,9 @@ contains them, and `build.sh`/`build.ps1` do not apply them.
 - `0004-background-metadata-guard.patch` — the session background tracker reads
   a running tool part's `metadata`/`input` optionally, so a `shell` call that is
   still running without metadata no longer crashes the session page.
+- `0005-attachment-mime-guard.patch` — guards message attachments and composer prompt
+  extraction against missing `mime` and `source`, and extracts mime from data URLs so
+  image attachments without explicit mime fields don't throw TypeError on startsWith.
 
 Rules:
 

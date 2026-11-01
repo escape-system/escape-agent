@@ -593,11 +593,35 @@ export function CurrentUserMessageDisplay(props: {
               if (source?.type === "uri") return source.uri
 
               if ("data" in current && current.data !== undefined) {
-                return `data:${current.mime};base64,${current.data}`
+                return `data:${current.mime ?? "application/octet-stream"};base64,${current.data}`
               }
 
-              if ("uri" in current && current.uri) return data.peekMedia?.(current.uri, current.mime)
+              if ("uri" in current && typeof current.uri === "string") {
+                if (
+                  current.uri.startsWith("data:") ||
+                  current.uri.startsWith("blob:") ||
+                  current.uri.startsWith("http:") ||
+                  current.uri.startsWith("https:")
+                ) {
+                  return current.uri
+                }
+              }
 
+              if ("uri" in current && current.uri) return data.peekMedia?.(current.uri, current.mime ?? "application/octet-stream")
+
+              return undefined
+            }
+
+            const directMime = () => {
+              const current = file()
+              if (current.mime) return current.mime
+              const uri = "uri" in current && typeof current.uri === "string" ? current.uri : undefined
+              if (uri?.startsWith("data:")) {
+                const comma = uri.indexOf(",")
+                const header = comma >= 0 ? uri.slice(5, comma) : uri.slice(5)
+                const part = header.split(";")[0]
+                if (part) return part
+              }
               return undefined
             }
 
@@ -624,7 +648,7 @@ export function CurrentUserMessageDisplay(props: {
               const controller = new AbortController()
               onCleanup(() => controller.abort())
               void data
-                .readMedia(uri, current.mime, controller.signal)
+                .readMedia(uri, current.mime ?? "application/octet-stream", controller.signal)
                 .then((loaded) => {
                   if (!controller.signal.aborted) setResolvedUrl(loaded)
                 })
@@ -635,7 +659,7 @@ export function CurrentUserMessageDisplay(props: {
 
             const url = () => directUrl() ?? resolvedUrl()
             const name = () => file().name ?? i18n.t("ui.message.attachment.alt")
-            const image = () => file().mime.startsWith("image/")
+            const image = () => Boolean(directMime()?.startsWith("image/"))
 
             const width = () => {
               const current = file()
@@ -695,7 +719,7 @@ export function CurrentUserMessageDisplay(props: {
                   clickable={!!props.actions?.openAttachment}
                   onClick={() => props.actions?.openAttachment?.(file())}
                 >
-                  {typeLabel(name(), file().mime, i18n.t("ui.common.file"))}
+                  {typeLabel(name(), directMime() ?? "", i18n.t("ui.common.file"))}
                 </AttachmentCard>
               </Show>
             )

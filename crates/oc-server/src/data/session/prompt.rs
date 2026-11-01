@@ -172,7 +172,10 @@ pub async fn prompt(
         }
         let mut extra = Map::new();
         if let Some(files) = body.files {
-            extra.insert("files".to_owned(), Value::Array(files));
+            extra.insert(
+                "files".to_owned(),
+                Value::Array(normalize_prompt_files(files)),
+            );
         }
         if let Some(agents) = body.agents {
             extra.insert("agents".to_owned(), Value::Array(agents));
@@ -196,7 +199,10 @@ pub async fn prompt(
     }
     let mut extra = Map::new();
     if let Some(files) = body.files {
-        extra.insert("files".to_owned(), Value::Array(files));
+        extra.insert(
+            "files".to_owned(),
+            Value::Array(normalize_prompt_files(files)),
+        );
     }
     if let Some(agents) = body.agents {
         extra.insert("agents".to_owned(), Value::Array(agents));
@@ -217,6 +223,105 @@ pub async fn prompt(
     )
     .await?;
     Ok(Json(json!({ "data": item })))
+}
+
+/// Normalizes incoming prompt file attachments into canonical `PromptFileAttachment` objects.
+///
+/// Converts client `PromptInput.FileAttachment` records carrying a `uri` (such as inline
+/// data URLs like `data:image/png;base64,...` or external URIs) into the stored representation
+/// with `data`, `mime`, and `source` (`{ type: "inline" }` or `{ type: "uri", uri }`).
+fn normalize_prompt_files(files: Vec<Value>) -> Vec<Value> {
+    files
+        .into_iter()
+        .map(|val| {
+            if let Value::Object(mut map) = val {
+                if map.contains_key("data")
+                    && map.contains_key("mime")
+                    && map.contains_key("source")
+                {
+                    return Value::Object(map);
+                }
+
+                let name = map
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned);
+                let uri = map
+                    .get("uri")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned();
+
+                if uri.starts_with("data:") {
+                    let (header, data_part) = uri.split_once(',').unwrap_or(("", &uri));
+                    let header_rest = header.strip_prefix("data:").unwrap_or(header);
+                    let mut mime_candidate = header_rest
+                        .split(';')
+                        .next()
+                        .unwrap_or("")
+                        .trim()
+                        .to_owned();
+                    if mime_candidate.is_empty() {
+                        if let Some(ref n) = name {
+                            mime_candidate = mime_guess::from_path(n)
+                                .first_or_octet_stream()
+                                .to_string();
+                        } else {
+                            mime_candidate = "application/octet-stream".to_owned();
+                        }
+                    }
+                    map.remove("uri");
+                    map.insert("data".to_owned(), Value::String(data_part.to_owned()));
+                    map.insert("mime".to_owned(), Value::String(mime_candidate));
+                    map.insert("source".to_owned(), json!({ "type": "inline" }));
+                    return Value::Object(map);
+                }
+
+                if !uri.is_empty() {
+                    let mime = map
+                        .get("mime")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned)
+                        .unwrap_or_else(|| {
+                            if let Some(ref n) = name {
+                                mime_guess::from_path(n).first_or_octet_stream().to_string()
+                            } else {
+                                mime_guess::from_path(&uri).first_or_octet_stream().to_string()
+                            }
+                        });
+                    let data = map
+                        .get("data")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_owned();
+                    map.remove("uri");
+                    map.insert("data".to_owned(), Value::String(data));
+                    map.insert("mime".to_owned(), Value::String(mime));
+                    map.insert("source".to_owned(), json!({ "type": "uri", "uri": uri }));
+                    return Value::Object(map);
+                }
+
+                if map.contains_key("data") {
+                    if !map.contains_key("mime") {
+                        let mime = if let Some(ref n) = name {
+                            mime_guess::from_path(n).first_or_octet_stream().to_string()
+                        } else {
+                            "application/octet-stream".to_owned()
+                        };
+                        map.insert("mime".to_owned(), Value::String(mime));
+                    }
+                    if !map.contains_key("source") {
+                        map.insert("source".to_owned(), json!({ "type": "inline" }));
+                    }
+                    return Value::Object(map);
+                }
+
+                Value::Object(map)
+            } else {
+                val
+            }
+        })
+        .collect()
 }
 
 /// Durably admit one user prompt, then wake the runtime.
@@ -440,7 +545,10 @@ pub async fn command(
         if !arguments.trim().is_empty() {
             let mut extra = Map::new();
             if let Some(files) = body.files {
-                extra.insert("files".to_owned(), Value::Array(files));
+                extra.insert(
+                    "files".to_owned(),
+                    Value::Array(normalize_prompt_files(files)),
+                );
             }
             if let Some(agents) = body.agents {
                 extra.insert("agents".to_owned(), Value::Array(agents));
@@ -481,7 +589,10 @@ pub async fn command(
     }
     let mut extra = Map::new();
     if let Some(files) = body.files {
-        extra.insert("files".to_owned(), Value::Array(files));
+        extra.insert(
+            "files".to_owned(),
+            Value::Array(normalize_prompt_files(files)),
+        );
     }
     if let Some(agents) = body.agents {
         extra.insert("agents".to_owned(), Value::Array(agents));

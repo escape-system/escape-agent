@@ -112,7 +112,7 @@ export function extractPromptFromMessage(
     const fileData = "data" in file ? file.data : undefined
 
     const uri =
-      source.type === "uri"
+      source?.type === "uri"
         ? source.uri
         : fileUri !== undefined
           ? fileUri
@@ -137,14 +137,14 @@ export function extractPromptFromMessage(
     }
 
     // A file reference returns as a context chip through extractPromptContext.
-    if (source.type === "uri" && source.uri.startsWith("file:")) continue
+    if (source?.type === "uri" && (source.uri ?? "").startsWith("file:")) continue
 
     // Stored files carry their bytes or a media ref, and an empty file has empty data; only a local handoff row
     // leaves data empty because its bytes live at a blob URL.
-    const stored = source.type === "inline" || !!fileData
+    const stored = source?.type === "inline" || !!fileData
 
     const dataUrl =
-      source.type === "uri" && source.uri.startsWith("data:")
+      source?.type === "uri" && (source.uri ?? "").startsWith("data:")
         ? source.uri
         : (fileUri ?? (stored ? `data:${file.mime};base64,${fileData ?? ""}` : undefined))
 
