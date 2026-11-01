@@ -21,7 +21,7 @@ pub use http::{BranchParams, DiffParams, InitParams, base, branches, diff, info,
 use std::time::Duration;
 
 /// Deadline for one git invocation.
-const TIMEOUT: Duration = Duration::from_secs(10);
+const TIMEOUT: Duration = Duration::from_secs(30);
 /// Working-copy entries reported by `status` and `diff`.
 const MAX_ENTRIES: usize = 2000;
 /// Total patch bytes reported by `diff`.

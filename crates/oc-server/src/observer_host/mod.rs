@@ -40,7 +40,7 @@ pub use model::LlmObserverModel;
 pub use notifier::BusObserverNotifier;
 
 /// Maximum tokens the observer may spend on one verdict.
-const VERDICT_MAX_TOKENS: u64 = 512;
+const VERDICT_MAX_TOKENS: u64 = 4096;
 
 /// Minimum gap between two `observer.unavailable` events per root.
 const UNAVAILABLE_NOTICE_INTERVAL_MS: i64 = 300_000;

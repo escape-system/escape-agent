@@ -8,7 +8,8 @@
     "max_children_per_session": 64
   },
   "observer": {
-    "model": "opencode-go/deepseek-v4.1-flash#max"
+    "model": "opencode-go/deepseek-v4.1-flash#max",
+    "nudge_max_chars": 600
   },
   "agents": {
     "build": {

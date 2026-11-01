@@ -258,14 +258,15 @@ pub fn parse_verdict(text: &str, cfg: &ObserverConfig) -> Result<ObserverVerdict
 /// Remove one surrounding Markdown code fence, if present.
 pub(crate) fn unwrap_fence(text: &str) -> &str {
     let trimmed = text.trim();
-    let Some(rest) = trimmed.strip_prefix("```") else {
-        return trimmed;
-    };
-    let rest = rest.trim_start();
-    let rest = rest.strip_prefix("json").unwrap_or(rest);
-    let rest = rest.trim_start_matches(['\r', '\n']);
-    let rest = rest.trim_end();
-    rest.strip_suffix("```").unwrap_or(rest).trim()
+    if let Some(start) = trimmed.find("```") {
+        let after_start = &trimmed[start + 3..];
+        let after_tag = after_start.strip_prefix("json").unwrap_or(after_start);
+        let after_tag = after_tag.trim_start_matches(['\r', '\n', ' ']);
+        if let Some(end) = after_tag.rfind("```") {
+            return after_tag[..end].trim();
+        }
+    }
+    trimmed
 }
 
 fn parse_action(name: &str) -> Result<ObserverAction, VerdictError> {
@@ -397,6 +398,13 @@ mod tests {
         )
         .expect("done");
         assert_eq!(done.goal_evidence.len(), 2);
+
+        let with_preamble = parse_verdict(
+            "Here is the supervisor evaluation:\n```json\n{\"action\":\"none\",\"reason\":\"on track\"}\n```\nHope this helps.",
+            &cfg(),
+        )
+        .expect("fence with preamble");
+        assert_eq!(with_preamble.action, ObserverAction::None);
     }
 
     #[test]

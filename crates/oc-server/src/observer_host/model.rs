@@ -123,11 +123,18 @@ fn system_prompt(nudge_max_chars: usize) -> String {
         "You are a supervisor. Return ONLY the JSON verdict described. Do not use tools.\n\n\
          The user message is one compact JSON document about a running session tree \
          (goal, root, active strips, recent strips, tree). Decide whether to intervene.\n\
-         Reply with exactly one JSON object and nothing else:\n\
+         Rules for fields:\n\
+         - action is required: \"none\" | \"nudge\" | \"inspect\" | \"repair\" | \"goal_done\" | \"goal_blocked\" | \"goal_failed\"\n\
+         - target is required except when action is \"none\"\n\
+         - reason is required (at most 20 words)\n\
+         - message is only for \"nudge\" (must be <= {nudge_max_chars} chars; omit for other actions)\n\
+         - repair is only for \"repair\" (omit for other actions)\n\
+         - goal_evidence is only for \"goal_done\" (omit for other actions)\n\n\
+         Reply with exactly one JSON object with only the applicable fields:\n\
          {{\"action\":\"none|nudge|inspect|repair|goal_done|goal_blocked|goal_failed\",\
-         \"target\":\"session or tool-call id (required except for none)\",\
+         \"target\":\"session or tool-call id\",\
          \"reason\":\"why, at most 20 words\",\
-         \"message\":\"nudge text, at most {nudge_max_chars} chars (nudge only)\",\
+         \"message\":\"nudge text, at most {nudge_max_chars} chars\",\
          \"repair\":{{\"kind\":\"retry_tool|cancel_tool|restart_subagent|compact_context|switch_model|repost\",\"args\":{{}}}},\
          \"goal_evidence\":[\"tool_call_id or message_id\"]}}"
     )

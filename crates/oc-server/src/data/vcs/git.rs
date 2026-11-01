@@ -62,7 +62,7 @@ pub(super) async fn run_git(
     };
     let (out_result, err_result) = tokio::time::timeout(TIMEOUT, read)
         .await
-        .map_err(|_| ApiError::service_unavailable("git command timed out after 10 s"))?;
+        .map_err(|_| ApiError::service_unavailable("git command timed out after 30 s"))?;
     let read_error = |error: std::io::Error| {
         tracing::error!(error = %error, "failed to read git output");
         ApiError::internal("Internal error")

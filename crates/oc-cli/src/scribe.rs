@@ -18,7 +18,7 @@ use oc_store::Store;
 use serde_json::Value;
 
 /// Output ceiling for one scribe completion; a JSON candidate array is short.
-const SCRIBE_MAX_TOKENS: u64 = 1024;
+const SCRIBE_MAX_TOKENS: u64 = 4096;
 
 /// A [`ScribeModel`] backed by the configured digest model.
 #[derive(Debug, Clone)]
@@ -583,7 +583,7 @@ mod tests {
         assert_eq!(messages.len(), 1, "no system message is sent");
         assert_eq!(messages[0]["role"], "user");
         assert_eq!(messages[0]["content"], "return the candidates");
-        assert_eq!(body["max_tokens"], json!(1024));
+        assert_eq!(body["max_tokens"], json!(SCRIBE_MAX_TOKENS));
         assert_eq!(body["temperature"], json!(0.0));
         provider.shutdown().await;
     }
