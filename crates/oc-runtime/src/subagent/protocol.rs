@@ -110,18 +110,37 @@ pub(super) fn final_assistant_text(messages: &[Value]) -> String {
     String::new()
 }
 
-pub(super) fn child_state(messages: &[Value]) -> String {
-    for message in messages.iter().rev() {
-        if message.get("type").and_then(Value::as_str) != Some("idle") {
-            continue;
-        }
-        return match message.get("outcome").and_then(Value::as_str) {
-            Some("failed") => "failed".to_owned(),
-            Some("interrupted") => "cancelled".to_owned(),
-            _ => "completed".to_owned(),
-        };
+fn outcome_state(outcome: Option<&str>) -> Option<&'static str> {
+    match outcome {
+        Some("failed") => Some("failed"),
+        Some("interrupted") => Some("cancelled"),
+        Some("succeeded") => Some("completed"),
+        _ => None,
     }
-    "completed".to_owned()
+}
+
+/// Terminal state of the child's current turn, or `None` when no terminal
+/// outcome is recorded for it.
+///
+/// `durable` is the session row's `idle_outcome`. The child's own `settle`
+/// writes it together with the idle message, and the parent-side wait only ever
+/// downgrades it to a failure, so the row is authoritative; the idle message is
+/// consulted only for states the row does not carry. A failure from either
+/// source wins over a success: the safe direction for a parent that plans on
+/// the result. Callers must never read `None` as success — it means the child
+/// is not known to have settled.
+pub(super) fn child_state(messages: &[Value], durable: Option<&str>) -> Option<&'static str> {
+    let idle = messages
+        .iter()
+        .rev()
+        .find(|message| message.get("type").and_then(Value::as_str) == Some("idle"))
+        .and_then(|message| message.get("outcome").and_then(Value::as_str));
+    match (outcome_state(durable), outcome_state(idle)) {
+        (Some("failed"), _) | (_, Some("failed")) => Some("failed"),
+        (Some("cancelled"), _) | (_, Some("cancelled")) => Some("cancelled"),
+        (Some("completed"), _) | (_, Some("completed")) => Some("completed"),
+        _ => None,
+    }
 }
 
 /// Messages appended after the prompt marker. The marker is absent until the
@@ -167,4 +186,29 @@ pub(super) fn assistant_failure(tail: &[Value]) -> Option<(String, String)> {
         .filter(|text| !text.trim().is_empty())
         .unwrap_or_else(|| final_assistant_text(std::slice::from_ref(message)));
     Some((state.to_owned(), text))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::child_state;
+    use serde_json::json;
+
+    #[test]
+    fn child_state_never_defaults_to_completed() {
+        // No recorded outcome is not success: the child has not settled.
+        assert_eq!(child_state(&[], None), None);
+        // The durable row wins; a stale idle message cannot resurrect success.
+        let idle = vec![json!({"type": "idle", "outcome": "succeeded"})];
+        assert_eq!(child_state(&idle, Some("failed")), Some("failed"));
+        assert_eq!(child_state(&idle, Some("interrupted")), Some("cancelled"));
+        // The idle message is still read when the row has no outcome yet.
+        assert_eq!(child_state(&idle, None), Some("completed"));
+        let failed = vec![json!({"type": "idle", "outcome": "failed"})];
+        assert_eq!(child_state(&failed, None), Some("failed"));
+        let interrupted = vec![json!({"type": "idle", "outcome": "interrupted"})];
+        assert_eq!(child_state(&interrupted, None), Some("cancelled"));
+        // An unrecognised value is not success either.
+        let unknown = vec![json!({"type": "idle", "outcome": "weird"})];
+        assert_eq!(child_state(&unknown, None), None);
+    }
 }

@@ -246,15 +246,26 @@ async fn subagent_reports_a_deleted_child_as_failed() {
         .await
         .expect("child deleted");
 
-    let result = tokio::time::timeout(Duration::from_secs(5), handle)
+    // A deleted child is a FAILURE for the parent: an `Ok(ToolResult)` here
+    // would be published as `session.tool.success` even though no result exists.
+    let error = tokio::time::timeout(Duration::from_secs(5), handle)
         .await
         .expect("wait_child notices the deleted session")
         .expect("tool task")
-        .expect("tool result");
-    let output = result.output.expect("output");
-    assert!(output.contains("state=\"failed\""), "{output}");
-    assert!(output.contains("session deleted"), "{output}");
-    assert_eq!(result.metadata.expect("metadata")["status"], "failed");
+        .expect_err("a deleted child must not report success");
+    assert!(
+        error.message.contains("state=\"failed\""),
+        "{}",
+        error.message
+    );
+    assert!(
+        error.message.contains("session deleted"),
+        "{}",
+        error.message
+    );
+    let metadata = error.metadata.as_ref().expect("failure metadata");
+    assert_eq!(metadata["sessionID"], child.as_str());
+    assert_eq!(metadata["status"], "failed");
 }
 
 #[tokio::test]

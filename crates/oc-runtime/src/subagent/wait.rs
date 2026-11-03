@@ -61,14 +61,19 @@ async fn wait_child(
         {
             return Ok(("detached".to_owned(), String::new()));
         }
-        let exists = store
+        let Some(session) = store
             .get_session(child)
             .await
             .map_err(|error| store_error(&error))?
-            .is_some();
-        if !exists {
+        else {
             return Ok(("failed".to_owned(), "session deleted".to_owned()));
-        }
+        };
+        // The durable terminal outcome of the child's last settled turn. It is
+        // written before the idle message, so it is the first source to trust.
+        let durable = session
+            .get("outcome")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
         let idle = runtime
             .is_idle(child)
             .await
@@ -92,14 +97,14 @@ async fn wait_child(
         } else {
             unstarted_ticks = 0;
         }
-        if idle {
-            let state = child_state(tail);
-            if matches!(state.as_str(), "failed" | "cancelled") {
+        if idle && started {
+            let state = child_state(tail, durable.as_deref());
+            if let Some(state @ ("failed" | "cancelled")) = state {
                 let text = match final_assistant_text(tail).trim() {
                     "" => format!("subagent {state}"),
                     text => text.to_owned(),
                 };
-                return Ok((state, text));
+                return Ok((state.to_owned(), text));
             }
             if let Some((state, text)) = assistant_failure(tail) {
                 return Ok((state, text));
@@ -112,9 +117,19 @@ async fn wait_child(
                         "subagent finished without final text".to_owned(),
                     ));
                 }
-                return Ok(("completed".to_owned(), text));
+                // Assistant text alone is not a result: only a turn the child
+                // settled as `succeeded` may be reported as completed. A child
+                // that went idle without settling (the actor died, or an error
+                // path bypassed `turn::settle`) did not deliver.
+                if state == Some("completed") {
+                    return Ok(("completed".to_owned(), text));
+                }
+                return Ok((
+                    "failed".to_owned(),
+                    "subagent ended without a settled outcome".to_owned(),
+                ));
             }
-            if started && observed_activity {
+            if observed_activity {
                 return Ok((
                     "failed".to_owned(),
                     "subagent ended without a final message".to_owned(),
@@ -463,5 +478,17 @@ pub(super) async fn finish_foreground(
     }
     persist_child_outcome(runtime, child, &state).await;
     let body = envelope(&state, child, None, &text);
+    if matches!(state.as_str(), "failed" | "cancelled") {
+        // A child that failed or was interrupted is not a result the parent may
+        // plan on: returning `Ok` here would be reported as
+        // `session.tool.success` even though the child never produced one. The
+        // envelope (with the child id and its final text) is the message, so the
+        // model still sees what the child said before it failed.
+        let error = ToolError::new(body).with_metadata(json!({
+            "sessionID": child,
+            "status": state,
+        }));
+        return Err(error);
+    }
     Ok(ToolResult::text(body).with_metadata(json!({ "sessionID": child, "status": state })))
 }
