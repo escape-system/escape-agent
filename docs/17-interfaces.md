@@ -23,6 +23,10 @@ public surface; `cargo doc -p <crate> --no-deps` is the reference.
   clear path later.
 - Typed payloads implement `EventPayload` (`TYPE`, `DURABLE`, `VERSION`,
   `data()`, `into_envelope(location)`).
+- Compaction lifecycle payloads are durable v1 events published after the
+  matching commit: `SessionCompactionStarted`/`Ended`/`Failed`
+  (`session.compaction.started|ended|failed`); ephemeral
+  `session.compaction.delta` is not implemented.
 
 ### `oc-store`
 - `Store::{open, open_memory}`, `Store: Clone`; bodies are wire `Value`.

@@ -315,7 +315,10 @@ and the 4096 server were not modified except for read-only UI checks.
   CLI (documented gap).
 - **Manual compaction** (`POST /api/session/:sid/compact`) consumes its inbox
   row, writes a `compaction` message (`completed` or `failed`), and never
-  retries a failed row.
+  retries a failed row. Compaction now publishes durable v1 lifecycle events
+  after each commit (`session.compaction.started`, `session.compaction.ended`,
+  `session.compaction.failed`); the ephemeral `session.compaction.delta` is
+  still absent.
 - **Background action**: `POST /api/session/:sid/background` now detaches a
   foreground subagent wait (the tool returns `status:"running"`, the parent turn
   continues, the child's final text arrives later as one synthetic message).

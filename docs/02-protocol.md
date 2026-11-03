@@ -312,12 +312,15 @@ Event envelope:
 
 `data` is the type-specific payload. Delta events (`session.text.delta`,
 `session.reasoning.delta`, `session.tool.input.delta`, `session.tool.progress`,
-`session.compaction.delta`, `session.usage.updated`, `session.status`,
+`session.usage.updated`, `session.status`,
 `session.idle`, `form.created`, `form.replied`, `form.cancelled`) are
 ephemeral: no `durable` marker and no seq reservation. All `*.ended`, tool
 called/success/failed, step/execution events, `session.viewed`,
-`session.forked`, `session.skill.activated` and `session.instructions.updated`
-are durable.
+`session.forked`, `session.skill.activated`, `session.instructions.updated`
+and the compaction lifecycle (`session.compaction.started`,
+`session.compaction.ended`, `session.compaction.failed`; all v1, published
+after the corresponding commit) are durable. `session.compaction.delta` is not
+implemented.
 
 `GET /api/experimental/session/:SID/log?after=<seq>&follow=true` (also exposed
 as `GET /api/session/:SID/log`) replays durable events for that session
