@@ -89,19 +89,35 @@ as `state="failed"` instead of hanging the parent.
 }
 ```
 
-Output (unchanged for foreground/background):
+Output (tool result metadata; a background spawn or a foreground wait that was
+detached returns immediately, a settled foreground child returns its result):
 
 ```jsonc
-{ "sessionID": "ses_…", "status": "completed|running", "output": "final text only" }
+{ "sessionID": "ses_…", "status": "running" }     // child not settled yet
+{ "sessionID": "ses_…", "status": "completed" }   // foreground, child settled
 ```
 
-Model-visible envelope for a completed child:
+Model-visible envelope (`state` is the child's settled state):
 
 ```
 <subagent sessionID="ses_…" state="completed">final text</subagent>
+<subagent sessionID="ses_…" state="failed">final text</subagent>
 ```
 
-The parent sees **only** this text plus `metadata.sessionID`. Everything else
+The reported state comes from the child session's durable `idle_outcome`, read
+through `pub(super) fn child_state(messages: &[Value], durable: Option<&str>) -> Option<&'static str>`
+(`succeeded`→`completed`, `failed`→`failed`, `interrupted`→`cancelled`). The
+durable row is authoritative; the idle message is consulted only for states the
+row does not carry, and a failure from either source wins. `child_state` never
+defaults to `completed`: no recorded outcome means the child is not known to
+have settled, and callers must not read that as success. A child whose state is
+`failed` or `cancelled` is returned as a tool **error**, so the parent publishes
+`session.tool.failed` rather than `session.tool.success`; the error text is the
+envelope and the metadata carries `sessionID`/`status`. A deleted child reports
+`state="failed"` with metadata `status: "failed"`.
+
+The parent sees **only** this text plus the tool metadata (`sessionID`,
+`status`; background delivery uses `childID`, `agent`, `state`). Everything else
 (tool calls, intermediate reasoning, costs) is retrieved on demand through
 `digest`:
 
