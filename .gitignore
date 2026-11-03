@@ -19,3 +19,7 @@
 
 /.test-server/
 /.opencode/tool-output/
+
+# Build/test scratch logs (not source)
+*.log
+test-run.log
