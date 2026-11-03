@@ -1,5 +1,5 @@
 use crate::support::{ids, new_message, seed_session};
-use oc_store::{Delivery, MessageQuery, NewInbox, Store, StoreError};
+use oc_store::{Delivery, MessageQuery, NewEvent, NewInbox, Store, StoreError};
 use serde_json::json;
 
 #[tokio::test]
@@ -87,18 +87,41 @@ async fn truncate_session_and_viewed_watermark() {
         Err(StoreError::NotFound(_))
     ));
 
-    store
-        .touch_session_viewed("ses_a", 1_700_000_000_000)
-        .await
-        .expect("touch viewed");
-    let session = store
-        .get_session("ses_a")
-        .await
-        .expect("get")
-        .expect("present");
-    assert_eq!(session["time"]["viewed"].as_i64(), Some(1_700_000_000_000));
-    assert!(matches!(
-        store.touch_session_viewed("ses_missing", 1).await,
-        Err(StoreError::NotFound(_))
-    ));
+    // `time_viewed` belongs to the `session.viewed` projector: it is written
+    // inside the event transaction and must never regress.
+    for (id, idle, expected) in [
+        ("evt_viewed_1", 1_700_000_000_000, 1_700_000_000_000),
+        ("evt_viewed_2", 1_600_000_000_000, 1_700_000_000_000),
+        ("evt_viewed_3", 1_800_000_000_000, 1_800_000_000_000),
+    ] {
+        store
+            .append_event(NewEvent {
+                id: id.to_owned(),
+                aggregate_id: "ses_a".to_owned(),
+                kind: "session.viewed".to_owned(),
+                data: json!({ "sessionID": "ses_a", "idle": idle }),
+                durable: true,
+                version: 1,
+                created: idle,
+            })
+            .await
+            .expect("append viewed");
+        let session = store
+            .get_session("ses_a")
+            .await
+            .expect("get")
+            .expect("present");
+        assert_eq!(
+            session["time"]["viewed"].as_i64(),
+            Some(expected),
+            "viewed never regresses after {id}"
+        );
+    }
+    // A surviving-view watermark is still monotonic: an older `idle` cannot
+    // rewind it, a newer one advances it.
+    assert_eq!(
+        store.get_session("ses_missing").await.expect("get"),
+        None,
+        "a viewed event never invents a session row"
+    );
 }

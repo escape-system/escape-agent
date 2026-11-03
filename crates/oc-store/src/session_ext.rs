@@ -1,5 +1,5 @@
 //! Session maintenance that is not part of the event path: reverting by
-//! sequence, resolving a message's sequence, and the "viewed" watermark.
+//! sequence and resolving a message's sequence.
 //!
 //! Wire messages do not expose `seq`, so callers that hold a message id (a
 //! staged revert, for example) resolve it with [`Store::message_seq`] and pass
@@ -58,24 +58,6 @@ impl Store {
                 )?;
                 Ok(u64::try_from(messages + inbox).unwrap_or(u64::MAX))
             })
-        })
-        .await
-    }
-
-    /// Records when the client last viewed the session.
-    ///
-    /// An unknown session is [`StoreError::NotFound`].
-    pub async fn touch_session_viewed(&self, session_id: &str, at: i64) -> Result<(), StoreError> {
-        let session_id = session_id.to_owned();
-        self.write(move |connection| {
-            let updated = connection.execute(
-                "UPDATE session_v2 SET time_viewed = ?2 WHERE id = ?1",
-                params![&session_id, at],
-            )?;
-            if updated == 0 {
-                return Err(StoreError::NotFound(format!("session {session_id}")));
-            }
-            Ok(())
         })
         .await
     }

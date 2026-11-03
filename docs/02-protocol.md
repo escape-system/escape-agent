@@ -356,8 +356,11 @@ and log the correlation id.
 2. 204 responses must have no body and no `content-type: application/json`.
 3. `message.updated` / `message.part.*` must **not** be emitted (v1-only).
 4. `server.connected` has no `created` and no `durable`.
-5. `durable.seq` is dense per session across durable event types; message rows
-   use that same seq. Do not invent a separate message counter.
+5. `durable.seq` comes from one per-session counter shared by `event`,
+   `session_message` and `session_inbox`; message rows use that same seq. The
+   event log therefore has gaps (messages and inbox rows consume numbers it
+   never shows, and delivered inbox rows are deleted). Do not invent a
+   separate message counter and never assume contiguity.
 6. Event id → message id: strip `evt_`, add `msg_`. Client-side dedupe depends
    on it.
 7. Cursors are base64url JSON, not opaque IDs; the client sends back what it got.

@@ -54,8 +54,9 @@ public surface; `cargo doc -p <crate> --no-deps` is the reference.
 - Instructions: `instruction_entries`, `set_instruction_entry` (the store
   deletes the row when the value is `None`).
 - Session maintenance: `message_seq`, `truncate_session(session_id, seq)`
-  (deletes messages and inbox rows at/after `seq` in one transaction),
-  `touch_session_viewed`.
+  (deletes messages and inbox rows at/after `seq` in one transaction).
+  `time_viewed` is written only by the `session.viewed` projector
+  (`append_event`), which keeps it monotonic.
 - Lane history: `save_lane_ticket(&Value)`, `lane_tickets(limit)`.
 - Projects: `list_projects(archived)`, `get_project`, `update_project`.
 - Credentials: `create_credential(NewCredential)`, `list_credentials()`,
