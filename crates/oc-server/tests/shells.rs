@@ -104,6 +104,45 @@ fn echo_command(text: &str) -> String {
     format!("echo {text}")
 }
 
+/// The manager's POSIX fallback order (`selection.rs`), mirrored here so tests
+/// probe the same shell binary the server will spawn. The harness passes no
+/// configured shell, so `resolve_shell(None)` reaches the platform default.
+#[cfg(unix)]
+fn host_posix_shell() -> std::path::PathBuf {
+    if let Some(shell) = std::env::var_os("SHELL") {
+        let path = std::path::PathBuf::from(shell);
+        if path.is_file() {
+            return path;
+        }
+    }
+    for candidate in ["/bin/bash", "/usr/bin/bash", "/bin/sh", "/usr/bin/sh"] {
+        let path = std::path::PathBuf::from(candidate);
+        if path.is_file() {
+            return path;
+        }
+    }
+    std::path::PathBuf::from("sh")
+}
+
+/// Pipeline-status tests only mean something where the host shell accepts
+/// `-o pipefail`; elsewhere the manager keeps last-segment semantics by design
+/// and the test reports a skip instead of asserting a platform it cannot have.
+#[cfg(unix)]
+fn pipefail_on_host(test: &str) -> bool {
+    let shell = host_posix_shell();
+    if oc_tools::util::shell_supports_pipefail(&shell) {
+        return true;
+    }
+    eprintln!("skipping {test}: {} rejects -o pipefail", shell.display());
+    false
+}
+
+#[cfg(not(unix))]
+fn pipefail_on_host(test: &str) -> bool {
+    eprintln!("skipping {test}: POSIX pipelines are not the host shell language");
+    false
+}
+
 fn sleeper() -> &'static str {
     if cfg!(windows) {
         "ping -n 10 127.0.0.1 >nul"
@@ -713,6 +752,199 @@ async fn persistent_pty_requires_a_manager() {
     .await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(body["_tag"], "ServiceUnavailableError");
+}
+
+#[tokio::test]
+async fn pipeline_failure_reports_non_zero_exit() {
+    if !pipefail_on_host("pipeline_failure_reports_non_zero_exit") {
+        return;
+    }
+    let harness = harness().await;
+    let Some(created) = create_shell(&harness.state, "false | cat").await else {
+        return;
+    };
+    let id = created["data"]["id"].as_str().unwrap().to_owned();
+    let exited = wait_exited(&harness.state, &id).await;
+    assert_eq!(exited["status"], "exited", "{exited}");
+    let exit = exited["exit"].as_i64().expect("pipeline exit");
+    assert_ne!(
+        exit, 0,
+        "a failed pipeline segment must not look successful: {exited}"
+    );
+    let (status, _) = call(
+        &harness.state,
+        Method::DELETE,
+        &format!("/api/shell/{id}"),
+        None,
+        false,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn pipeline_success_reports_zero_exit() {
+    let harness = harness().await;
+    let Some(created) = create_shell(&harness.state, "printf 'pipeline-ok\\n' | cat").await else {
+        return;
+    };
+    let id = created["data"]["id"].as_str().unwrap().to_owned();
+    let exited = wait_exited(&harness.state, &id).await;
+    assert_eq!(exited["status"], "exited", "{exited}");
+    assert_eq!(exited["exit"], 0, "{exited}");
+    let (status, _) = call(
+        &harness.state,
+        Method::DELETE,
+        &format!("/api/shell/{id}"),
+        None,
+        false,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn plain_failing_command_keeps_its_exit_code() {
+    let harness = harness().await;
+    let Some(created) = create_shell(&harness.state, "exit 3").await else {
+        return;
+    };
+    let id = created["data"]["id"].as_str().unwrap().to_owned();
+    let exited = wait_exited(&harness.state, &id).await;
+    assert_eq!(exited["status"], "exited", "{exited}");
+    assert_eq!(exited["exit"], 3, "{exited}");
+    let (status, _) = call(
+        &harness.state,
+        Method::DELETE,
+        &format!("/api/shell/{id}"),
+        None,
+        false,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn simple_command_wire_shape_is_unchanged() {
+    let harness = harness().await;
+    let Some(created) = create_shell(&harness.state, &echo_command("wire-shape")).await else {
+        return;
+    };
+    let info = &created["data"];
+    let id = info["id"].as_str().expect("shell id").to_owned();
+    // Documented `Shell.Info` fields are present, and optional ones are omitted
+    // rather than `null` (the wire invariant), on an unchanged response shape.
+    for field in [
+        "id", "status", "command", "cwd", "shell", "file", "metadata", "time",
+    ] {
+        assert!(info.get(field).is_some(), "missing {field}: {info}");
+    }
+    assert!(
+        info.as_object()
+            .unwrap()
+            .values()
+            .all(|value| !value.is_null()),
+        "{info}"
+    );
+    assert_eq!(info["status"], "running", "{info}");
+    assert_eq!(info["command"], "echo wire-shape", "{info}");
+    assert_eq!(info["metadata"], json!({}), "{info}");
+
+    let exited = wait_exited(&harness.state, &id).await;
+    assert_eq!(exited["status"], "exited", "{exited}");
+    assert_eq!(exited["exit"], 0, "{exited}");
+    assert!(exited["time"]["completed"].as_i64().is_some(), "{exited}");
+    let (status, page) = call(
+        &harness.state,
+        Method::GET,
+        &format!("/api/shell/{id}/output"),
+        None,
+        false,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        page["data"]["output"]
+            .as_str()
+            .is_some_and(|text| text.contains("wire-shape")),
+        "{page}"
+    );
+    let (status, _) = call(
+        &harness.state,
+        Method::DELETE,
+        &format!("/api/shell/{id}"),
+        None,
+        false,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+}
+
+/// The defect path: a failing pipeline started through the server-managed
+/// one-shot endpoint must not report success.
+#[tokio::test]
+async fn session_shell_pipeline_reports_non_zero_exit() {
+    if !pipefail_on_host("session_shell_pipeline_reports_non_zero_exit") {
+        return;
+    }
+    let harness = harness().await;
+    let (status, session) = call(
+        &harness.state,
+        Method::POST,
+        "/api/session",
+        Some(json!({ "title": "failed pipeline session" })),
+        false,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{session}");
+    let sid = session["data"]["id"].as_str().unwrap().to_owned();
+
+    // The endpoint answers 204, so keep the shell observable long enough to be
+    // located by its session metadata, like the round-trip test above.
+    let (status, body) = call(
+        &harness.state,
+        Method::POST,
+        &format!("/api/session/{sid}/shell"),
+        Some(json!({ "command": "sleep 0.5; false | cat" })),
+        false,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+
+    let found = timeout(WAIT, async {
+        loop {
+            let (_, listing) = call(&harness.state, Method::GET, "/api/shell", None, false).await;
+            if let Some(entry) = listing["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry["metadata"]["sessionID"] == sid.as_str())
+            {
+                return entry.clone();
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("session shell was never listed while running");
+    let id = found["id"].as_str().expect("shell id").to_owned();
+
+    let exited = wait_exited(&harness.state, &id).await;
+    assert_eq!(exited["status"], "exited", "{exited}");
+    let exit = exited["exit"].as_i64().expect("pipeline exit");
+    assert_ne!(
+        exit, 0,
+        "a failed pipeline segment must not look successful: {exited}"
+    );
+    let (status, _) = call(
+        &harness.state,
+        Method::DELETE,
+        &format!("/api/shell/{id}"),
+        None,
+        false,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
 }
 
 #[tokio::test]

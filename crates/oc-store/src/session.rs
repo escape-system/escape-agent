@@ -356,6 +356,8 @@ impl Store {
                 .query_row(
                     "SELECT COUNT(*) FROM session_v2 
                      WHERE parent_id = ?1 
+                       AND time_archived IS NULL
+                       AND idle_outcome IS NULL
                        AND (time_idle IS NULL OR (time_busy IS NOT NULL AND time_busy > time_idle))",
                     [&parent_id],
                     |row| row.get(0),

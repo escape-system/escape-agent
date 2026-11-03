@@ -84,6 +84,11 @@ impl SpawnBudget {
         Self::with_default_rate(limits.max_children)
     }
 
+    /// Sync active children count so completed children release their concurrency slot.
+    pub fn sync_active(&mut self, active_count: u32) {
+        self.total = active_count.min(self.per_session);
+    }
+
     pub fn try_spawn(&mut self, now_ms: i64) -> Result<(), BudgetError> {
         if self.total >= self.per_session {
             return Err(BudgetError::SessionLimit {

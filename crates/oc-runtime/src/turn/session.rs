@@ -207,7 +207,21 @@ impl Runtime {
         let (initial, delta, has_memory, supplement) = {
             let mut guard = handle.instructions.lock().expect("instruction set");
             if let Some(set) = guard.as_mut() {
-                let supplement = set.memory_supplement(&assembly.sources);
+                // The pinned `oc/memory` block may only be carried forward while
+                // every memory line it rendered is still rendered by the fresh
+                // assembly (`InstructionSet::memory_pin_holds`). A forgotten
+                // memory leaves the fresh block, so the pin is dropped and the
+                // prefix re-pins from fresh state instead of re-sending deleted
+                // text on every step through the tail supplement. A superset (a
+                // new memory appeared) stays pinned and is announced through the
+                // tail supplement, unchanged.
+                let supplement = if set.memory_pin_holds(&assembly.sources) {
+                    set.memory_supplement(&assembly.sources)
+                } else {
+                    // The pin is dropped, so the whole fresh block lands in the
+                    // prefix this turn: a tail supplement would duplicate it.
+                    None
+                };
                 let stabilized = set.stabilize_epoch_sources(&assembly.sources);
                 let delta = set.commit(&stabilized);
                 let has_memory = set.source("oc/memory").is_some();

@@ -141,7 +141,9 @@ pub(super) fn spawn_watcher(
 ) {
     let should_watch = {
         let mut state = runtime.inner.subagents.lock().expect("subagent state");
-        state.active_watchers.insert((parent.clone(), child.clone()))
+        state
+            .active_watchers
+            .insert((parent.clone(), child.clone()))
     };
     if !should_watch {
         tracing::debug!(
@@ -166,7 +168,9 @@ pub(super) fn spawn_watcher(
         };
         {
             let mut state = runtime.inner.subagents.lock().expect("subagent state");
-            state.active_watchers.remove(&(parent.clone(), child.clone()));
+            state
+                .active_watchers
+                .remove(&(parent.clone(), child.clone()));
         }
         deliver_subagent_result(&runtime, &parent, &child, &agent, &description, outcome).await;
     });
@@ -188,7 +192,9 @@ fn spawn_timeout_watcher(
 ) {
     let should_watch = {
         let mut state = runtime.inner.subagents.lock().expect("subagent state");
-        state.active_watchers.insert((parent.clone(), child.clone()))
+        state
+            .active_watchers
+            .insert((parent.clone(), child.clone()))
     };
     if !should_watch {
         return;
@@ -204,7 +210,9 @@ fn spawn_timeout_watcher(
         .await;
         {
             let mut state = runtime.inner.subagents.lock().expect("subagent state");
-            state.active_watchers.remove(&(parent.clone(), child.clone()));
+            state
+                .active_watchers
+                .remove(&(parent.clone(), child.clone()));
         }
         deliver_subagent_result(
             &runtime,
@@ -255,6 +263,57 @@ fn timeout_failure(timeout: Duration) -> (String, String, Option<String>) {
     ("failed".to_owned(), reason.clone(), Some(reason))
 }
 
+/// Mirrors a terminal state decided by the parent-side wait onto the child's
+/// durable session row.
+///
+/// [`wait_child`] can conclude a child failed without the child's own turn ever
+/// recording that: a prompt that never started, a child that produced no final
+/// text, or a timeout. Without this write the parent's tool result says
+/// `failed` while `session_v2.idle_outcome` still says `succeeded`, so the
+/// durable record disagrees with the delivered outcome.
+///
+/// Idempotent: when the child already recorded the same terminal outcome the
+/// row is left untouched, so this never rewrites `time_idle` for a child that
+/// settled itself.
+async fn persist_child_outcome(runtime: &Runtime, child: &str, state: &str) {
+    let outcome = match state {
+        "failed" => "failed",
+        "cancelled" => "interrupted",
+        _ => return,
+    };
+    let store = &runtime.inner.config.store;
+    match store.get_session(child).await {
+        Ok(Some(session)) => {
+            // The child already recorded a failure-ish terminal state that
+            // agrees with the parent-side view: do not rewrite it.
+            if let Some("failed" | "interrupted") = session.get("outcome").and_then(Value::as_str) {
+                return;
+            }
+            // `succeeded` (or no outcome at all) contradicts the failure the
+            // parent is about to deliver; that is the divergence to repair.
+        }
+        Ok(None) => return,
+        Err(error) => {
+            tracing::warn!(
+                child = %child,
+                error = %error,
+                "subagent outcome could not be read back from the child session"
+            );
+            return;
+        }
+    }
+    if let Err(error) = store
+        .mark_session_idle(child, oc_types::now_millis(), outcome)
+        .await
+    {
+        tracing::warn!(
+            child = %child,
+            error = %error,
+            "subagent outcome was not persisted on the child session"
+        );
+    }
+}
+
 pub(crate) async fn deliver_subagent_result(
     runtime: &Runtime,
     parent: &str,
@@ -263,6 +322,7 @@ pub(crate) async fn deliver_subagent_result(
     description: &str,
     (state, text, reason): (String, String, Option<String>),
 ) {
+    persist_child_outcome(runtime, child, &state).await;
     let text = if text.trim().is_empty() {
         "subagent failed".to_owned()
     } else {
@@ -386,11 +446,22 @@ pub(super) async fn finish_foreground(
             prompt_id.to_owned(),
             settings.timeout,
         );
-        return Ok(ToolResult::text(
-            json!({ "sessionID": child, "status": "running" }).to_string(),
-        )
-        .with_metadata(json!({ "sessionID": child, "status": "running" })));
+        // The timeout is a FAILURE for the caller: returning `Ok` here would be
+        // reported as `session.tool.success`, and the parent model would plan on
+        // a child that was just cancelled. The child id is in both the message
+        // and the metadata so the model can still tell which child timed out.
+        let error = ToolError::new(format!(
+            "subagent {child} timed out after {}s",
+            settings.timeout.as_secs()
+        ))
+        .with_metadata(json!({
+            "sessionID": child,
+            "status": "failed",
+            "reason": format!("timeout after {}s", settings.timeout.as_secs()),
+        }));
+        return Err(error);
     }
+    persist_child_outcome(runtime, child, &state).await;
     let body = envelope(&state, child, None, &text);
     Ok(ToolResult::text(body).with_metadata(json!({ "sessionID": child, "status": state })))
 }

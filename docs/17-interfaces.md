@@ -93,6 +93,27 @@ public surface; `cargo doc -p <crate> --no-deps` is the reference.
   (`ConfigEntry`, use `to_value()` for the wire), `merged()`, `agents()`,
   `agent(id)`, `evaluate(agent, action, resource)`, `skills_roots()`,
   `mcp_servers()`, `shell()`, `model()`, `diagnostics()`, `default_agent()`.
+- Skills: `skills()` and `skill(id)` are the load-time global snapshot;
+  `rescan_skills()` re-walks the same roots without updating it. Turns and the
+  `skill`/`skill_write`/`skill_lint` tools resolve through
+  `skills_for(directory) -> Arc<Vec<SkillInfo>>`, which scopes discovery to the
+  session directory: project-scope roots outside it are dropped and its own
+  `.opencode` ancestors are scanned instead, while global config roots,
+  `skills[]` directories and the per-user `.claude`/`.agents` roots stay
+  visible. An empty `directory` returns the snapshot; a relative one resolves
+  against the load directory. The result is cached per directory until
+  `invalidate_skills()`, which keeps the snapshot and drops the per-directory
+  entries after a `SKILL.md` write.
+- Instructions: `instructions()` is the load-time snapshot (the walk up from the
+  `ConfigService::load` directory, outermost first). Turns resolve through
+  `instructions_for(directory) -> Arc<Vec<InstructionFile>>`, which re-walks
+  that directory's ancestor chain for `AGENTS.md`, `CLAUDE.md` and
+  `.opencode/AGENTS.md`, outermost (most-shared) first, so a session never
+  inherits the server repository's files. An empty `directory` returns the
+  snapshot; a relative one resolves against the load directory. The result is
+  cached per directory until `invalidate_instructions()`, which keeps the
+  snapshot and drops the per-directory entries; edited contents are re-read
+  every turn, so only added or removed files need the invalidation.
 - Malformed files are diagnostics, not load failures.
 - `serde_json` `preserve_order` is enabled by this crate.
 

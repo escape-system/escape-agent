@@ -358,18 +358,33 @@ async fn subagent_foreground_timeout_cancels_the_child_once() {
                 "prompt": "work",
             }),
         )
-        .await
-        .expect("foreground spawn");
+        .await;
     let elapsed = started.elapsed();
     assert!(elapsed >= Duration::from_millis(900), "{elapsed:?}");
     assert!(
         elapsed < Duration::from_secs(2),
         "foreground wait must bound to one timeout: {elapsed:?}"
     );
-    let status: Value =
-        serde_json::from_str(result.output.as_deref().expect("output")).expect("json output");
-    assert_eq!(status["status"], "running");
-    let child = status["sessionID"].as_str().expect("child id").to_owned();
+    // A timeout is a FAILURE: the tool must not report a running child as a
+    // successful spawn.
+    let error = result.expect_err("a timed-out subagent must not report success");
+    assert!(
+        error.message.contains("timed out after 1s"),
+        "{}",
+        error.message
+    );
+    let metadata = error.metadata.as_ref().expect("timeout metadata");
+    assert_eq!(metadata["status"], "failed");
+    assert_eq!(metadata["reason"], "timeout after 1s");
+    let child = metadata["sessionID"]
+        .as_str()
+        .expect("the error names the timed-out child")
+        .to_owned();
+    assert!(
+        error.message.contains(&child),
+        "the model must be able to tell which child timed out: {}",
+        error.message
+    );
 
     // The failed synthetic must arrive within one short settle window, not a
     // second full timeout.
@@ -432,6 +447,101 @@ async fn subagent_foreground_timeout_cancels_the_child_once() {
 }
 
 #[tokio::test]
+async fn subagent_timeout_is_reported_as_failed_tool_outcome() {
+    // Regression: the timeout branch used to return `Ok(ToolResult)` with
+    // `{"status":"running"}`, which the turn loop maps to
+    // `ToolOutcome::Completed` and publishes `session.tool.success`. A child
+    // that was just cancelled must never be reported as a successful spawn.
+    let harness = Harness::new(
+        vec![
+            named_tool_script(
+                "subagent",
+                "call_timeout",
+                json!({
+                    "agent": "general",
+                    "description": "slow child",
+                    "prompt": "work",
+                    "background": false,
+                }),
+            ),
+            delayed_text_script("never arrives", Duration::from_secs(10)),
+            text_script("parent recovered"),
+        ],
+        Arc::new(AllowAll),
+        json!({"subagents": {"background_default": false, "timeout_seconds": 1}}),
+        None,
+    )
+    .await;
+    harness.prompt("spawn a slow child").await;
+
+    // The turn loop recorded a FAILED tool call, not a successful one.
+    assert!(
+        harness.sink.has("session.tool.failed"),
+        "timeout must publish session.tool.failed"
+    );
+    assert!(
+        !harness.sink.has("session.tool.success"),
+        "a timed-out subagent must not publish session.tool.success: {:?}",
+        harness.sink.kinds()
+    );
+    let failures = harness.sink.data("session.tool.failed");
+    assert_eq!(failures.len(), 1, "one failed tool call: {failures:?}");
+    assert_eq!(failures[0]["error"]["type"], "ToolError");
+    let message = failures[0]["error"]["message"]
+        .as_str()
+        .expect("error message");
+    assert!(message.contains("timed out after 1s"), "{message}");
+    assert_eq!(failures[0]["executed"], true);
+
+    // The persisted assistant part agrees with the event.
+    let messages = session_messages(&harness.store, &harness.session).await;
+    let assistant = messages
+        .iter()
+        .find(|message| message["type"] == "assistant")
+        .expect("parent assistant message");
+    let tool_part = assistant["content"]
+        .as_array()
+        .and_then(|parts| parts.iter().find(|part| part["type"] == "tool"))
+        .expect("parent tool part");
+    assert_eq!(tool_part["state"]["status"], "error");
+
+    // The out-of-band synthetic still reports the timeout exactly once.
+    let child = child_sessions(&harness.store, &harness.session)
+        .await
+        .first()
+        .expect("child created")
+        .clone();
+    let synthetic = tokio::time::timeout(Duration::from_millis(2_500), async {
+        loop {
+            let messages = session_messages(&harness.store, &harness.session).await;
+            if let Some(synthetic) = messages.into_iter().find(|message| {
+                message["type"] == "synthetic"
+                    && message["metadata"]["source"] == "subagent"
+                    && message["metadata"]["childID"] == child.as_str()
+            }) {
+                return synthetic;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("synthetic timeout report arrived");
+    assert_eq!(synthetic["metadata"]["state"], "failed");
+
+    // Defect 4: the durable child row must not claim success.
+    let child_row = harness
+        .store
+        .get_session(&child)
+        .await
+        .expect("child row")
+        .expect("child exists");
+    assert_eq!(
+        child_row["outcome"], "interrupted",
+        "the child session row must record the interruption"
+    );
+}
+
+#[tokio::test]
 async fn subagent_timeout_drops_a_pending_permission_ask() {
     let handler = Arc::new(PendingReadAsk::default());
     let harness = Harness::new(
@@ -458,17 +568,24 @@ async fn subagent_timeout_drops_a_pending_permission_ask() {
                 "prompt": "read the file",
             }),
         )
-        .await
-        .expect("foreground spawn");
+        .await;
     assert!(
         started.elapsed() < Duration::from_secs(2),
         "foreground wait must bound to one timeout: {:?}",
         started.elapsed()
     );
-    let status: Value =
-        serde_json::from_str(result.output.as_deref().expect("output")).expect("json output");
-    assert_eq!(status["status"], "running");
-    let child = status["sessionID"].as_str().expect("child id").to_owned();
+    let error = result.expect_err("a timed-out subagent must not report success");
+    assert!(
+        error.message.contains("timed out after 1s"),
+        "{}",
+        error.message
+    );
+    let metadata = error.metadata.as_ref().expect("timeout metadata");
+    assert_eq!(metadata["status"], "failed");
+    let child = metadata["sessionID"]
+        .as_str()
+        .expect("the error names the timed-out child")
+        .to_owned();
 
     let message = tokio::time::timeout(Duration::from_millis(2_500), async {
         loop {
@@ -622,6 +739,42 @@ async fn talk_allows_siblings_parent_and_child_but_rejects_strangers() {
         "{}",
         denied.message
     );
+}
+
+#[tokio::test]
+async fn roster_omits_parent_for_a_root_session() {
+    // Regression: a root caller used to serialize `"parent": null`, which
+    // violates AGENTS.md ("Optional JSON fields are omitted, never null") and
+    // the documented object shape in `docs/05-subagents.md`.
+    let harness = Harness::new(vec![], Arc::new(AllowAll), json!({}), None).await;
+    let child = create_child(
+        &harness,
+        &harness.session,
+        "ses_roster_root_child",
+        "general",
+    )
+    .await;
+    let tool = subagent_tool(&harness, "roster");
+    let result = tool
+        .execute(&tool_context(&harness, &harness.session), json!({}))
+        .await
+        .expect("roster");
+    let body: Value = serde_json::from_str(&result.output.expect("output")).expect("json");
+    let object = body.as_object().expect("roster body is an object");
+    assert!(
+        object.get("parent").is_none(),
+        "a root caller must omit `parent`, got {:?}",
+        object.get("parent")
+    );
+    assert!(
+        !body.to_string().contains("\"parent\""),
+        "the serialized body must not mention parent at all: {body}"
+    );
+    assert!(object.get("siblings").is_some(), "siblings stays present");
+    assert!(object.get("children").is_some(), "children stays present");
+    assert!(body["siblings"].as_array().expect("siblings").is_empty());
+    assert_eq!(body["children"].as_array().expect("children").len(), 1);
+    assert_eq!(body["children"][0]["id"], child.as_str());
 }
 
 #[tokio::test]

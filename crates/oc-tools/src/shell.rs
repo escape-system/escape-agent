@@ -26,7 +26,9 @@ pub struct ShellTool;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ShellKind {
     Posix,
+    #[cfg(windows)]
     PowerShell,
+    #[cfg(windows)]
     Cmd,
 }
 
@@ -111,7 +113,6 @@ impl Tool for ShellTool {
         let output_path = util::output_file("");
         let file = fs::OpenOptions::new()
             .create(true)
-            .write(true)
             .append(true)
             .open(&output_path)
             .map_err(|error| ToolError::new(format!("Unable to capture shell output: {error}")))?;
@@ -125,16 +126,33 @@ impl Tool for ShellTool {
 
         let mut process = Command::new(&shell);
         match kind {
+            #[cfg(windows)]
             ShellKind::Cmd => {
+                // cmd.exe has no pipefail: `exit` stays the last segment's
+                // status, matching what a user sees in a normal cmd session.
                 process.arg("/c").arg(&command);
             }
+            #[cfg(windows)]
             ShellKind::PowerShell => {
+                // PowerShell has no pipefail either. `$LASTEXITCODE` reflects
+                // only the last native command, so the reported exit is the
+                // final pipeline stage's status.
                 process
                     .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"])
                     .arg(&command);
             }
             ShellKind::Posix => {
-                process.arg("-c").arg(&command);
+                // Without pipefail a pipeline reports the *last* segment's
+                // status, so `cargo clippy … | tail` looks like a success even
+                // when clippy failed. pipefail makes the pipeline report the
+                // last non-zero status, which is the status a reader expects.
+                if util::shell_supports_pipefail(&shell) {
+                    process.args(["-o", "pipefail", "-c"]).arg(&command);
+                } else {
+                    // A POSIX sh without pipefail support keeps the historical
+                    // last-segment behaviour rather than refusing to run.
+                    process.arg("-c").arg(&command);
+                }
             }
         }
         process
@@ -393,6 +411,9 @@ fn shell_kind(_path: &Path) -> ShellKind {
     ShellKind::Posix
 }
 
+/// Locate an executable on `PATH`. Windows shell discovery is the only caller:
+/// on unix the shell is chosen by absolute path from `$SHELL` or a fixed list.
+#[cfg(windows)]
 fn find_in_path(name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     for directory in std::env::split_paths(&path) {

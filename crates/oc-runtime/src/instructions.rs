@@ -5,7 +5,7 @@
 //! code-mode → MCP → references → skills → discovery → builtins → memory →
 //! goal → session.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -123,8 +123,16 @@ impl InstructionSet {
     /// Stabilize volatile sources (`date` and an already-established
     /// `oc/memory` block) within an active epoch so UTC midnight rollovers or
     /// per-turn FTS query churn never invalidate the provider prompt cache.
+    ///
+    /// The memory pin only holds while every memory line it rendered is still
+    /// rendered by `next` (see [`Self::memory_pin_holds`]). Once a memory is
+    /// forgotten or edited out of the block, the freshly assembled block
+    /// replaces the pin so the cached prefix stops re-sending it; the next turn
+    /// pins that fresh block again, so the prefix changes once per membership
+    /// change, not once per turn.
     #[must_use]
     pub fn stabilize_epoch_sources(&self, next: &[InstructionSource]) -> Vec<InstructionSource> {
+        let pin_memory = self.memory_pin_holds(next);
         let mut out: Vec<InstructionSource> = next
             .iter()
             .map(|source| {
@@ -133,7 +141,8 @@ impl InstructionSet {
                 {
                     return pinned.clone();
                 }
-                if source.key == "oc/memory"
+                if pin_memory
+                    && source.key == "oc/memory"
                     && let Some(pinned) = self.sources.get("oc/memory")
                 {
                     return pinned.clone();
@@ -141,7 +150,8 @@ impl InstructionSet {
                 source.clone()
             })
             .collect();
-        if let Some(pinned_memory) = self.sources.get("oc/memory")
+        if pin_memory
+            && let Some(pinned_memory) = self.sources.get("oc/memory")
             && !out.iter().any(|source| source.key == "oc/memory")
         {
             out.push(pinned_memory.clone());
@@ -150,6 +160,30 @@ impl InstructionSet {
             (left.kind, left.key.as_str()).cmp(&(right.kind, right.key.as_str()))
         });
         out
+    }
+
+    /// Whether the pinned `oc/memory` block may be carried forward.
+    ///
+    /// The epoch pin exists to keep the prompt-cache prefix byte-stable, so it
+    /// must not follow the per-turn retrieval ranking: memories may be *added*
+    /// at the conversation tail through [`Self::memory_supplement`] without
+    /// touching the prefix. Removal is different. When a pinned memory line is
+    /// no longer rendered (it was forgotten, edited, or fell out of the token
+    /// budget), keeping the pin would re-send text the model should no longer
+    /// see on every step, so the pin is dropped and the fresh block replaces
+    /// it. A pinned block whose memories are all gone is dropped too: the
+    /// prefix then changes once for that membership change instead of staying
+    /// stale for the rest of the epoch.
+    #[must_use]
+    pub fn memory_pin_holds(&self, next: &[InstructionSource]) -> bool {
+        let Some(pinned) = self.sources.get("oc/memory") else {
+            return true;
+        };
+        let Some(candidate) = next.iter().find(|source| source.key == "oc/memory") else {
+            return false;
+        };
+        let fresh: BTreeSet<&str> = memory_lines(&candidate.text).collect();
+        memory_lines(&pinned.text).all(|line| fresh.contains(line))
     }
 
     /// Extract any newly retrieved memory lines in `next` that are not already
@@ -217,6 +251,17 @@ impl InstructionSet {
         }
         delta
     }
+}
+
+/// Every `- [...]` line rendered in a memory block, trimmed for comparison.
+///
+/// Rendering is the only thing both the pin and a fresh assembly share: the
+/// line carries the id in parentheses (`- [fact] text (mem_…)`), so comparing
+/// rendered lines detects a forgotten memory without re-reading the store.
+fn memory_lines(text: &str) -> impl Iterator<Item = &str> {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("- ["))
 }
 
 #[cfg(test)]

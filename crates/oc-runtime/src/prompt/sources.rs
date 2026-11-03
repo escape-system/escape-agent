@@ -1,4 +1,5 @@
 use std::fmt::Write as _;
+use std::path::Path;
 
 use oc_config::{ConfigService, Effect};
 use oc_memory::{DEFAULT_TOKEN_BUDGET, MemoryService, RetrieveRequest};
@@ -59,20 +60,21 @@ pub struct InstructionAssembly {
 
 /// Instruction sources for this request in canonical order.
 ///
-/// Discovery files are re-read from the paths `ConfigService::instructions()`
-/// recorded so an edited `AGENTS.md` is visible on the next turn without
-/// rebuilding the config snapshot. The skill index is re-scanned on every turn
-/// for the same reason. Memory retrieval is the only async step; a retrieval
-/// failure is logged and the block is omitted rather than failing the turn.
+/// Discovery files are resolved from the session directory
+/// (`ConfigService::instructions_for`) and re-read from the recorded paths so an
+/// edited `AGENTS.md` is visible on the next turn without rebuilding the config
+/// snapshot. The skill index is re-scanned on every turn for the same reason.
+/// Memory retrieval is the only async step; a retrieval failure is logged and
+/// the block is omitted rather than failing the turn.
 pub async fn instruction_sources(context: &InstructionContext<'_>) -> Vec<InstructionSource> {
     assemble_instructions(context).await.sources
 }
 
 /// Resolve every cache-stable instruction source, including memory ids.
 pub async fn assemble_instructions(context: &InstructionContext<'_>) -> InstructionAssembly {
-    let mut sources = discovery_sources(context.config);
+    let mut sources = discovery_sources(context.config, context.directory);
     sources.extend(builtin_sources(context.directory));
-    if let Some(skill) = skill_source(context.config, context.agent_id) {
+    if let Some(skill) = skill_source(context.config, context.agent_id, context.directory) {
         sources.push(skill);
     }
     if let Some(goal) = context.goal {
@@ -99,9 +101,12 @@ pub async fn assemble_instructions(context: &InstructionContext<'_>) -> Instruct
     }
 }
 
-fn discovery_sources(config: &ConfigService) -> Vec<InstructionSource> {
+fn discovery_sources(config: &ConfigService, directory: &str) -> Vec<InstructionSource> {
+    // Scope the walk to the session's own directory. The config service was
+    // loaded for the *server* directory (crates/oc-cli/src/serve.rs), so using
+    // its snapshot here served one repository's `AGENTS.md` to every project.
     config
-        .instructions()
+        .instructions_for(Path::new(directory))
         .iter()
         .map(|file| {
             let text = std::fs::read_to_string(&file.path).unwrap_or_else(|_| file.text.clone());
@@ -114,11 +119,16 @@ fn discovery_sources(config: &ConfigService) -> Vec<InstructionSource> {
         .collect()
 }
 
-fn skill_source(config: &ConfigService, agent_id: &str) -> Option<InstructionSource> {
-    // Re-scan roots so a skill written after config load is visible on the
-    // next execution; fall back to the loaded snapshot when scanning finds
-    // nothing (e.g. an in-memory test config).
-    let mut current = config.rescan_skills();
+fn skill_source(
+    config: &ConfigService,
+    agent_id: &str,
+    directory: &str,
+) -> Option<InstructionSource> {
+    // Scope the index to the session directory for the same reason discovery
+    // files are scoped: the config service was loaded for the *server*
+    // directory, so its snapshot advertised another repository's skills to
+    // every project.
+    let mut current = config.skills_for(Path::new(directory)).as_ref().clone();
     if current.is_empty() {
         current = config.skills().to_vec();
     }

@@ -583,6 +583,7 @@ fn node_status(
     match outcome {
         Some("failed") => "failed",
         Some("interrupted") => "interrupted",
+        Some("succeeded" | "completed") => "completed",
         _ => "idle",
     }
     .to_owned()

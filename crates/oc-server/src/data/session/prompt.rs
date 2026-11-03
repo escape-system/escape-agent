@@ -26,13 +26,12 @@ fn parse_mode_slash_command(raw: &str) -> Option<(&'static str, Option<u32>, &st
             }
             if rest.starts_with(char::is_whitespace) {
                 let rest = rest.trim();
-                if let Some(first_word) = rest.split_whitespace().next() {
-                    if let Ok(depth) = first_word.parse::<u32>() {
-                        if (1..=10).contains(&depth) {
-                            let remainder = rest[first_word.len()..].trim();
-                            return Some((mode, Some(depth), remainder));
-                        }
-                    }
+                if let Some(first_word) = rest.split_whitespace().next()
+                    && let Ok(depth) = first_word.parse::<u32>()
+                    && (1..=10).contains(&depth)
+                {
+                    let remainder = rest[first_word.len()..].trim();
+                    return Some((mode, Some(depth), remainder));
                 }
                 return Some((mode, None, rest));
             }
@@ -103,7 +102,9 @@ async fn apply_subagent_mode(
             "Subagent mode switched to /complex ({max_depth}-level orchestrator: max_depth = {max_depth}; root agent delegates via subagent and coordinator agents)."
         )
     } else {
-        format!("Subagent mode switched to /basic (single-level subagents: max_depth = {max_depth}).")
+        format!(
+            "Subagent mode switched to /basic (single-level subagents: max_depth = {max_depth})."
+        )
     };
     let now = now_millis();
     store
@@ -263,11 +264,10 @@ fn normalize_prompt_files(files: Vec<Value>) -> Vec<Value> {
                         .to_owned();
                     if mime_candidate.is_empty() {
                         if let Some(ref n) = name {
-                            mime_candidate = mime_guess::from_path(n)
-                                .first_or_octet_stream()
-                                .to_string();
+                            mime_candidate =
+                                mime_guess::from_path(n).first_or_octet_stream().to_string();
                         } else {
-                            mime_candidate = "application/octet-stream".to_owned();
+                            "application/octet-stream".clone_into(&mut mime_candidate);
                         }
                     }
                     map.remove("uri");
@@ -278,17 +278,18 @@ fn normalize_prompt_files(files: Vec<Value>) -> Vec<Value> {
                 }
 
                 if !uri.is_empty() {
-                    let mime = map
-                        .get("mime")
-                        .and_then(Value::as_str)
-                        .map(ToOwned::to_owned)
-                        .unwrap_or_else(|| {
+                    let mime = map.get("mime").and_then(Value::as_str).map_or_else(
+                        || {
                             if let Some(ref n) = name {
                                 mime_guess::from_path(n).first_or_octet_stream().to_string()
                             } else {
-                                mime_guess::from_path(&uri).first_or_octet_stream().to_string()
+                                mime_guess::from_path(&uri)
+                                    .first_or_octet_stream()
+                                    .to_string()
                             }
-                        });
+                        },
+                        ToOwned::to_owned,
+                    );
                     let data = map
                         .get("data")
                         .and_then(Value::as_str)
@@ -533,13 +534,12 @@ pub async fn command(
         };
         let mut arguments = body.text.unwrap_or_default();
         let mut depth_override = None;
-        if let Some(first_word) = arguments.split_whitespace().next() {
-            if let Ok(depth) = first_word.parse::<u32>() {
-                if (1..=10).contains(&depth) {
-                    depth_override = Some(depth);
-                    arguments = arguments[first_word.len()..].trim().to_owned();
-                }
-            }
+        if let Some(first_word) = arguments.split_whitespace().next()
+            && let Ok(depth) = first_word.parse::<u32>()
+            && (1..=10).contains(&depth)
+        {
+            depth_override = Some(depth);
+            arguments = arguments[first_word.len()..].trim().to_owned();
         }
         apply_subagent_mode(&state, &session_id, mode, depth_override).await?;
         if !arguments.trim().is_empty() {

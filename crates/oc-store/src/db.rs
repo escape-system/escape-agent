@@ -291,8 +291,7 @@ fn process_alive(pid: u32) -> bool {
         .arg("-0")
         .arg(pid.to_string())
         .status()
-        .map(|status| status.success())
-        .unwrap_or(true)
+        .map_or(true, |status| status.success())
 }
 
 fn open_file(path: PathBuf) -> Result<Store, StoreError> {

@@ -3,6 +3,8 @@
 //! Every test uses a temp SQLite database, a temp config tree and a scripted
 //! model client; no network credentials or HTTP servers are involved.
 
+#[path = "runtime/instruction_scope.rs"]
+mod instruction_scope;
 #[path = "runtime/memory.rs"]
 mod memory;
 #[path = "runtime/observer.rs"]

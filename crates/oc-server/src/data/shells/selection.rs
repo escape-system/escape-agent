@@ -14,7 +14,16 @@ pub(super) enum ShellKind {
 }
 
 impl ShellKind {
-    pub(super) fn args(self, command: &str) -> Vec<String> {
+    /// Argument vector for `command`.
+    ///
+    /// A POSIX shell that accepts `-o pipefail` gets it, so a pipeline reports
+    /// its last non-zero segment instead of the last segment's status: without
+    /// it `cargo clippy … | tail` looks like a success when clippy failed.
+    ///
+    /// POSIX does not require the option, so the shell is probed once (see
+    /// [`oc_tools::util::shell_supports_pipefail`]). A shell that rejects it
+    /// keeps the historical last-segment semantics instead of failing to start.
+    pub(super) fn args(self, shell: &Path, command: &str) -> Vec<String> {
         match self {
             Self::Cmd => vec!["/c".to_owned(), command.to_owned()],
             Self::PowerShell => vec![
@@ -22,6 +31,12 @@ impl ShellKind {
                 "-NoProfile".to_owned(),
                 "-NonInteractive".to_owned(),
                 "-Command".to_owned(),
+                command.to_owned(),
+            ],
+            Self::Posix if oc_tools::util::shell_supports_pipefail(shell) => vec![
+                "-o".to_owned(),
+                "pipefail".to_owned(),
+                "-c".to_owned(),
                 command.to_owned(),
             ],
             Self::Posix => vec!["-c".to_owned(), command.to_owned()],

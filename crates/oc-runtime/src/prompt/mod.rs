@@ -83,9 +83,20 @@ pub fn default_system_prompt_with_memory(
             "- When the user explicitly asks you to spawn subagents, call `subagent` before reading \
              files or running commands; give each child a self-contained prompt. Otherwise delegate \
              self-contained parallel work with `subagent` instead of doing everything yourself; omit \
-             `agent` to use the configured default, and use `explore` for read-only searches. Several \
-             independent spawns may be issued in one step; `background: true` returns immediately and \
-             reports the result later as a synthetic message.\n",
+             `agent` to use the configured default, and use `explore` for read-only searches. For complex \
+             multi-phase work, delegate to a coordinator (`role: \"coordinator\"`) to manage sub-tasks \
+             hierarchically. Use `sessionID` to continue an existing child rather than spawning duplicates. \
+             Several independent spawns may be issued in one step; `background: true` returns immediately \
+             and reports the result later as a synthetic message.\n",
+        );
+    }
+    if tool_names
+        .iter()
+        .any(|name| name == "goal_complete" || name == "goal_update")
+    {
+        prompt.push_str(
+            "- When working under an active goal, call `goal_complete` with evidence references \
+             (tool or message IDs) when finishing a criterion, or `goal_update` to record progress for the observer.\n",
         );
     }
     if has_memory {

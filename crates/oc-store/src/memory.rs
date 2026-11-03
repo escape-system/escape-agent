@@ -105,6 +105,7 @@ impl Store {
     /// normalized text (trimmed, whitespace-collapsed, lowercased). An
     /// equivalent write updates importance, confidence and `updated`, clears a
     /// soft delete, and returns the existing row (its id wins).
+    #[allow(clippy::too_many_lines)]
     pub async fn write_memory(&self, new: NewMemory) -> Result<Value, StoreError> {
         if !SCOPES.contains(&new.scope.as_str()) {
             return Err(StoreError::Invalid(format!(
@@ -147,21 +148,23 @@ impl Store {
         let stored_id = self
             .write(move |connection| {
                 in_tx(connection, |transaction| {
-                    let existing: Option<String> = transaction
+                    let existing: Option<(String, i64)> = transaction
                         .query_row(
-                            "SELECT id FROM memory
+                            "SELECT id, deleted FROM memory
                              WHERE scope = ?1 AND coalesce(scope_id, '') = coalesce(?2, '')
                                AND hash = ?3",
                             params![&scope, &scope_id, &hash],
-                            |row| row.get(0),
+                            |row| Ok((row.get(0)?, row.get(1)?)),
                         )
                         .optional()?;
-                    if let Some(existing) = existing {
+                    if let Some((existing, is_deleted)) = existing {
+                        let new_deleted =
+                            i32::from(is_deleted != 0 && source.as_str() == "scribe");
                         transaction.execute(
                             "UPDATE memory
-                             SET importance = ?2, confidence = ?3, updated = ?4, deleted = 0
+                             SET importance = ?2, confidence = ?3, updated = ?4, deleted = ?5
                              WHERE id = ?1",
-                            params![&existing, importance, confidence, time],
+                            params![&existing, importance, confidence, time, new_deleted],
                         )?;
                         return Ok(existing);
                     }

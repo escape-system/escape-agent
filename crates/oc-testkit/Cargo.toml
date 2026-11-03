@@ -11,12 +11,18 @@ description = "opencode-rust oc-testkit crate"
 [dependencies]
 anyhow.workspace = true
 axum.workspace = true
+base64.workspace = true
 bytes.workspace = true
 futures-util.workspace = true
+oc-store.workspace = true
 reqwest.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
+
+[[bin]]
+name = "oc-bench"
+path = "src/bin/oc_bench.rs"
 
 [lints]
 workspace = true

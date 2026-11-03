@@ -353,11 +353,11 @@ impl Runtime {
                         .add_session_usage(
                             session,
                             cost,
-                            i64::try_from(tokens.input).unwrap_or(i64::MAX),
-                            i64::try_from(tokens.output).unwrap_or(i64::MAX),
-                            i64::try_from(tokens.reasoning).unwrap_or(i64::MAX),
-                            i64::try_from(tokens.cache.read).unwrap_or(i64::MAX),
-                            i64::try_from(tokens.cache.write).unwrap_or(i64::MAX),
+                            tokens.input,
+                            tokens.output,
+                            tokens.reasoning,
+                            tokens.cache.read,
+                            tokens.cache.write,
                         )
                         .await?;
                     self.persist_assistant(session, &state).await?;

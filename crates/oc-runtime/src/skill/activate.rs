@@ -65,7 +65,7 @@ impl Tool for SkillTool {
                 "permission denied for skill `{id}`"
             )));
         }
-        let skill = find_skill(config, &id)
+        let skill = find_skill(config, &ctx.directory, &id)
             .ok_or_else(|| ToolError::new(format!("unknown skill `{id}`")))?;
 
         let created = now_millis();
@@ -183,13 +183,16 @@ fn walk_files(directory: &Path, depth: usize, out: &mut Vec<String>) {
     }
 }
 
-pub(super) fn find_skill(config: &ConfigService, id: &str) -> Option<SkillInfo> {
-    config.skill(id).cloned().or_else(|| {
-        config
-            .rescan_skills()
-            .into_iter()
-            .find(|skill| skill.id == id)
-    })
+/// Resolve a skill id from the session directory, the same source of truth the
+/// prompt index uses ([`ConfigService::skills_for`]). An empty directory falls
+/// back to the load-time snapshot, so the loader and the index agree on what is
+/// visible: project-scope skills outside the session tree are not loadable.
+pub(super) fn find_skill(config: &ConfigService, directory: &Path, id: &str) -> Option<SkillInfo> {
+    config
+        .skills_for(directory)
+        .iter()
+        .find(|skill| skill.id == id)
+        .cloned()
 }
 
 async fn session_agent(runtime: &Runtime, session: &str) -> Result<String, ToolError> {

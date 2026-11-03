@@ -114,16 +114,8 @@ impl Runtime {
             };
             let joined = match wait {
                 ToolStepWait::Cancelled => {
-                    set.abort_all();
-                    while set.join_next().await.is_some() {}
-                    settle_open(observer.as_deref(), &mut open, "cancelled");
-                    self.clear_background_request(session);
-                    self.schedule_finalizer(
-                        session.to_owned(),
-                        turn.directory.clone(),
-                        state.clone(),
-                    )
-                    .await;
+                    self.abort_cancelled_tools(session, turn, state, &mut open, &mut set)
+                        .await;
                     return Err(RuntimeError::Cancelled);
                 }
                 ToolStepWait::Progress((index, call_id, metadata)) => {
@@ -139,27 +131,12 @@ impl Runtime {
             }
             match joined {
                 Some(Ok((_index, ToolOutcome::Cancelled))) => {
-                    set.abort_all();
-                    while set.join_next().await.is_some() {}
-                    settle_open(observer.as_deref(), &mut open, "cancelled");
-                    self.clear_background_request(session);
-                    self.schedule_finalizer(
-                        session.to_owned(),
-                        turn.directory.clone(),
-                        state.clone(),
-                    )
-                    .await;
+                    self.abort_cancelled_tools(session, turn, state, &mut open, &mut set)
+                        .await;
                     return Err(RuntimeError::Cancelled);
                 }
                 Some(Ok((index, outcome))) => {
-                    if let Some(engine) = observer.as_deref()
-                        && let Some(call) = calls.iter().find(|call| call.index == index)
-                    {
-                        let (strip_state, strip_outcome) = crate::observer::strip_result(&outcome);
-                        engine.observe_settle(&call.id, strip_state, strip_outcome.as_deref());
-                        let call_id = call.id.clone();
-                        open.retain(|id| id != &call_id);
-                    }
+                    settle_flight_strip(observer.as_deref(), calls, &mut open, index, &outcome);
                     self.apply_tool_outcome(session, turn, state, outcome)
                         .await?;
                 }
@@ -173,6 +150,29 @@ impl Runtime {
         }
         self.clear_background_request(session);
         Ok(())
+    }
+
+    /// Abort every in-flight tool task and settle the turn as cancelled.
+    ///
+    /// Both cancellation paths (a cancelled turn and a tool that reports
+    /// `Cancelled`) need the identical sequence: abort the live tasks, settle
+    /// their flight strips, drop any pending background request and schedule
+    /// the finalizer once. Extracted so the two paths cannot drift apart.
+    async fn abort_cancelled_tools(
+        &self,
+        session: &str,
+        turn: &ResolvedTurn,
+        state: &mut AssistantState,
+        open: &mut Vec<String>,
+        set: &mut tokio::task::JoinSet<(usize, ToolOutcome)>,
+    ) {
+        set.abort_all();
+        while set.join_next().await.is_some() {}
+        let observer = self.observer();
+        settle_open(observer.as_deref(), open, "cancelled");
+        self.clear_background_request(session);
+        self.schedule_finalizer(session.to_owned(), turn.directory.clone(), state.clone())
+            .await;
     }
 
     async fn apply_tool_progress(
@@ -403,6 +403,24 @@ async fn run_tool(
             executed: true,
         },
     }
+}
+
+fn settle_flight_strip(
+    engine: Option<&oc_observer::ObserverEngine>,
+    calls: &[PendingToolCall],
+    open: &mut Vec<String>,
+    index: usize,
+    outcome: &ToolOutcome,
+) {
+    let Some(engine) = engine else {
+        return;
+    };
+    let Some(call) = calls.iter().find(|call| call.index == index) else {
+        return;
+    };
+    let (strip_state, strip_outcome) = crate::observer::strip_result(outcome);
+    engine.observe_settle(&call.id, strip_state, strip_outcome.as_deref());
+    open.retain(|id| id != &call.id);
 }
 
 fn settle_open(

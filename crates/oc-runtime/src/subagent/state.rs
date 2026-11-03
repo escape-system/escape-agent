@@ -21,9 +21,12 @@ impl SubagentState {
         limits: &Limits,
         current_children: u32,
     ) -> &mut SpawnBudget {
-        self.spawn.entry(session.to_owned()).or_insert_with(|| {
-            SpawnBudget::with_default_rate(limits.max_children.saturating_sub(current_children))
-        })
+        let budget = self
+            .spawn
+            .entry(session.to_owned())
+            .or_insert_with(|| SpawnBudget::with_default_rate(limits.max_children));
+        budget.sync_active(current_children);
+        budget
     }
 
     pub(super) fn sibling_budget(&mut self, session: &str, limits: &Limits) -> &mut SiblingBudget {

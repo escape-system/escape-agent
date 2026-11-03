@@ -58,6 +58,12 @@ impl Runtime {
     /// [`oc_observer::ObserverEngine::check_now`] and applies the verdict through the normal
     /// run path. Missing observer configuration is a [`RuntimeError::Config`];
     /// store/engine failures are [`RuntimeError::Task`].
+    ///
+    /// When the root has a goal the goal judge runs too, in the goal's own
+    /// strict verdict format (`check_goal`). That is the decision `goal_complete`
+    /// waits for: its transition is published as `ObserverNotice::Goal`, which
+    /// the host persists as `goal.updated`. A terminal goal is skipped, so a
+    /// goal cannot be closed twice by two overlapping checks.
     pub async fn request_goal_check(&self, root_id: &str) -> Result<(), RuntimeError> {
         let Some(host) = self.observer_host() else {
             return Err(RuntimeError::Config(
@@ -74,6 +80,23 @@ impl Runtime {
             .load(root_id)
             .await
             .map_err(|error| RuntimeError::Task(format!("goal check load failed: {error}")))?;
+        if let Some(goal) = goal.as_ref()
+            && !goal.status.is_terminal()
+        {
+            let recent = host.engine.recent_outcomes(root_id, 12);
+            let known = self.recent_message_ids(root_id).await;
+            if let Some(transition) = host.engine.check_goal(root_id, goal, &recent, &known).await {
+                // Persist synchronously: the notifier's own write is spawned,
+                // so without this the caller could read the goal row before
+                // the decided status is committed. Same values, so the later
+                // notifier write is a no-op in status/rounds/stalls/evidence.
+                host.goals.save(&transition.goal).await.map_err(|error| {
+                    RuntimeError::Task(format!("goal check save failed: {error}"))
+                })?;
+                self.record_evaluation(root_id, "goal", transition.applied, &transition.reason)
+                    .await;
+            }
+        }
         let run = host.engine.check_now(root_id, tree, goal).await;
         self.apply_observer_run(root_id, run).await;
         Ok(())
@@ -118,6 +141,11 @@ impl Runtime {
     }
 
     async fn apply_observer_run(&self, root: &str, run: Option<ObserverRun>) {
+        // Persist exactly one `observation` row for the evaluation this run
+        // represents; a coalesced `Skipped` tick performed no evaluation and
+        // records nothing. This is the only write for an observer run, so a
+        // goal check records its row separately (see `request_goal_check`).
+        self.record_observer_evaluation(root, run.as_ref()).await;
         match run {
             Some(ObserverRun::Verdict { verdict }) => match verdict.action {
                 ObserverAction::Nudge => {
@@ -170,6 +198,96 @@ impl Runtime {
                 tracing::trace!(root = %root, reason = ?reason, "observer tick skipped");
             }
             None => {}
+        }
+    }
+
+    /// Persist one `observation` row for one model-backed evaluation.
+    ///
+    /// `observation` is documented as the flight-strip ledger, but before this
+    /// write it stayed empty no matter how many ticks ran: the registry is
+    /// memory-only and nothing ever mirrored a strip to a row. One row is
+    /// written per evaluation, never per event; a coalesced tick performed no
+    /// evaluation and is not recorded.
+    ///
+    /// The row is honest about what it is: `tool = "observer"`, `synthetic`
+    /// (no agent declared it), no tool call, and zero expectation clocks, since
+    /// an evaluation has no declared duration. It is settled immediately so the
+    /// ledger does not fill with rows stuck in `running`.
+    async fn record_evaluation(&self, root: &str, kind: &str, ok: bool, reason: &str) {
+        let id = oc_types::ObservationId::new().into_inner();
+        let now = oc_types::now_millis();
+        let store = &self.inner.config.store;
+        let new = oc_store::NewObservation {
+            id: id.clone(),
+            root_id: root.to_owned(),
+            session_id: root.to_owned(),
+            tool_call_id: String::new(),
+            tool: "observer".to_owned(),
+            why: format!("observer evaluation: {kind}"),
+            expect_s: 0,
+            intervene_s: 0,
+            started: now,
+            parent_call: None,
+            synthetic: true,
+        };
+        if let Err(error) = store.record_observation(new).await {
+            tracing::warn!(root = %root, %error, "observer evaluation row write failed");
+            return;
+        }
+        let state = if ok { "ok" } else { "error" };
+        if let Err(error) = store
+            .settle_observation(&id, state, Some(reason), now)
+            .await
+        {
+            tracing::warn!(root = %root, %error, "observer evaluation row settle failed");
+        }
+    }
+
+    /// Record the evaluation a [`ObserverRun`] represents, if any.
+    async fn record_observer_evaluation(&self, root: &str, run: Option<&ObserverRun>) {
+        let Some(run) = run else {
+            return;
+        };
+        let (kind, reason, ok) = match run {
+            // Coalescing means no evaluation happened; nothing to record.
+            ObserverRun::Skipped { .. } => return,
+            ObserverRun::Verdict { verdict } => {
+                (verdict.action.as_str(), verdict.reason.as_str(), true)
+            }
+            ObserverRun::Repair { verdict, outcome } => {
+                ("repair", verdict.reason.as_str(), outcome.applied)
+            }
+            ObserverRun::Rejected { action, reason } => (action.as_str(), reason.as_str(), false),
+            ObserverRun::Escalated { reason, .. } => ("escalated", reason.as_str(), false),
+            ObserverRun::Unavailable { reason } => ("unavailable", reason.as_str(), false),
+        };
+        self.record_evaluation(root, kind, ok, reason).await;
+    }
+
+    /// Recent message ids of a root, as goal-evidence candidates.
+    ///
+    /// `goal_complete` evidence is usually a message id; without this the judge
+    /// would reject every `done` verdict because [`oc_observer::GoalSnapshot`]
+    /// only knows tool-call ids.
+    async fn recent_message_ids(&self, root: &str) -> Vec<String> {
+        let query = oc_store::MessageQuery {
+            session_id: root.to_owned(),
+            limit: 50,
+            order: oc_store::Order::Desc,
+            cursor: None,
+            kind: None,
+        };
+        match self.inner.config.store.list_messages(query).await {
+            Ok(page) => page
+                .items
+                .iter()
+                .filter_map(|item| item.get("id").and_then(serde_json::Value::as_str))
+                .map(str::to_owned)
+                .collect(),
+            Err(error) => {
+                tracing::warn!(root = %root, %error, "goal check: message id lookup failed");
+                Vec::new()
+            }
         }
     }
 

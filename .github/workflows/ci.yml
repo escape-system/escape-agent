@@ -25,3 +25,12 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+      # `oc-bench` drives the real server, so it needs a release `opencode`
+      # binary; without this build it cannot resolve one and measures nothing.
+      - name: Build release server binary for performance gates
+        run: cargo build --release -p oc-cli --bin opencode
+      # Blocking gate: the idle-RSS budget is met (see
+      # docs/15-performance.md "Measured"), so this must fail a PR that
+      # regresses it. `idle-rss` reports SKIP on non-Linux runners.
+      - name: Performance gates
+        run: cargo run --release -p oc-testkit --bin oc-bench -- idle-rss

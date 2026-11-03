@@ -152,6 +152,7 @@ fn which(program: &str) -> Option<PathBuf> {
     None
 }
 
+#[allow(clippy::vec_init_then_push)]
 fn candidates(directory: &Path, program: &str) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
     #[cfg(windows)]

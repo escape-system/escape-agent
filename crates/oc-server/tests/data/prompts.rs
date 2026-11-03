@@ -315,4 +315,3 @@ async fn prompt_normalizes_data_url_file_attachments() {
     assert_eq!(f.mime, "image/png");
     assert_eq!(f.name.as_deref(), Some("pixel.png"));
 }
-

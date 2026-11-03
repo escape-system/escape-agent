@@ -438,6 +438,12 @@ fn spawn_budget_allows_eight_per_minute() {
         capped.try_spawn(0),
         Err(BudgetError::SessionLimit { max: 2 })
     );
+    capped.sync_active(1);
+    assert!(capped.try_spawn(0).is_ok());
+    assert_eq!(
+        capped.try_spawn(0),
+        Err(BudgetError::SessionLimit { max: 2 })
+    );
 }
 
 #[test]

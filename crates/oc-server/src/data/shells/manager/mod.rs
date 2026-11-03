@@ -1,7 +1,7 @@
 //! Shell registry, lifecycle and the process-global [`manager`] singleton.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
@@ -226,7 +226,7 @@ impl ShellManager {
         }
         let id = self.generate_id();
         let (shell, kind) = resolve_shell(req.shell.as_deref());
-        let args = kind.args(&req.command);
+        let args = kind.args(Path::new(&shell), &req.command);
         let cwd = if req.cwd.as_os_str().is_empty() {
             std::env::current_dir().map_err(|error| {
                 ApiError::internal(format!("unable to resolve the working directory: {error}"))

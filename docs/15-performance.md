@@ -1,8 +1,13 @@
 # 15 — Performance and memory
 
 Budgets are release gates, not aspirations. Every number is measured by
-`oc-bench` on a Release build, warm cache, Windows 11 x64 and Linux x64; a PR
-that regresses a gate fails CI.
+`oc-bench` on a Release build, warm cache, Windows 11 x64 and Linux x64.
+
+CI runs the idle-RSS gate as a blocking step, so a PR that regresses that budget
+fails the build. The remaining budgets are measured by `oc-bench` on demand and
+are not yet wired as blocking gates. With a release server, `history.walk.p95`
+still measures above its 2 ms budget (3.07 ms over 500 messages), so it is not a
+green gate and is not reported as one.
 
 ## Budgets
 
@@ -102,3 +107,23 @@ that regresses a gate fails CI.
 - Run the JS sidecar by default "just in case".
 - Bundle an embedding model or a language server.
 - Trade durability for speed on durable events (terminal events after commit).
+
+## Measured
+
+Measured 2026-11-01 with `oc-bench` on a Release build, Linux x86_64.
+
+| Gate | Budget | Measured | Status |
+|---|---|---|---|
+| Idle RSS, no session, no LSP, no plugins (after 60 s) | ≤ 60 MB | 54.39 MB | PASS |
+| Idle RSS, repeat run | ≤ 60 MB | 54.56 MB | PASS |
+| Idle RSS, fresh release binary | ≤ 60 MB | 53.32 MB | PASS |
+
+The documented condition is met. For reference, the long-lived production server
+(pid 1112807, 213-message transcript, active sessions) sits at ~712 MB, which is a
+different workload than the budget describes and is not the gate this table measures.
+
+`oc-bench` is wired into CI as a blocking `idle-rss` gate. A measurement is only
+comparable when it uses the documented condition: a freshly spawned server on a
+temporary data directory with no session. Sampling a long-lived server that carries
+a live transcript measures a different thing and must not be reported against this
+budget.

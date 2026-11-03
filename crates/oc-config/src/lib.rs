@@ -22,6 +22,7 @@ mod substitute;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
 
 use serde::Serialize;
 use serde_json::{Map, Value};
@@ -45,6 +46,11 @@ pub enum ConfigError {
     #[error("configuration load failed: {0}")]
     Io(#[from] std::io::Error),
 }
+
+/// Upper bound on cached per-directory instruction sets. Reaching it clears the
+/// map instead of evicting one entry; a re-walk is cheap and correctness does
+/// not depend on the cache.
+const MAX_INSTRUCTION_CACHE: usize = 128;
 
 #[derive(Debug, Clone)]
 pub struct LoadOptions {
@@ -152,7 +158,21 @@ pub struct ConfigService {
     skills_roots: Vec<PathBuf>,
     skills: Vec<SkillInfo>,
     commands: Vec<CommandInfo>,
-    instructions: Vec<InstructionFile>,
+    /// Instruction files discovered from the load directory. Shared so
+    /// [`ConfigService::instructions_for`] can hand it out without cloning.
+    instructions: Arc<Vec<InstructionFile>>,
+    /// Per-directory instruction discovery, keyed by [`discovery::path_key`] so
+    /// `dir`, `dir/` and `dir/.` share one entry.
+    ///
+    /// Discovery walks the filesystem (up to three `is_file`/`metadata` probes
+    /// per ancestor), so it runs at most once per directory per process.
+    /// Entries are stable until [`ConfigService::invalidate_instructions`].
+    instruction_cache: RwLock<HashMap<String, Arc<Vec<InstructionFile>>>>,
+    /// Per-directory skill discovery, keyed like [`Self::instruction_cache`].
+    /// This scan is heavier than the instruction walk (it walks every skill
+    /// root), so the cache matters more here. Dropped by
+    /// [`ConfigService::invalidate_skills`].
+    skill_cache: RwLock<HashMap<String, Arc<Vec<SkillInfo>>>>,
     mcp_servers: Value,
     shell: String,
     model: Option<String>,
@@ -190,7 +210,10 @@ impl ConfigService {
             &mut diagnostics,
         );
         let commands = commands::discover(&config_roots, &mut diagnostics);
-        let instructions = instructions::discover(&discovery.location, &mut diagnostics);
+        let instructions = Arc::new(instructions::discover(
+            &discovery.location,
+            &mut diagnostics,
+        ));
         let markdown_agents =
             markdown_agents::discover(&config_roots, &discovery, &mut diagnostics);
 
@@ -228,6 +251,8 @@ impl ConfigService {
             skills,
             commands,
             instructions,
+            instruction_cache: RwLock::new(HashMap::new()),
+            skill_cache: RwLock::new(HashMap::new()),
             mcp_servers,
             shell,
             model,
@@ -321,18 +346,105 @@ impl ConfigService {
     #[must_use]
     pub fn rescan_skills(&self) -> Vec<SkillInfo> {
         let mut diagnostics = Vec::new();
-        let (config_roots, extra_roots) = collect_skill_roots(
-            &self.entries,
-            &self.documents,
-            &self.discovery,
-            &mut diagnostics,
-        );
+        let (config_roots, extra_roots) = self.skill_roots();
         skills::discover(
             &config_roots,
             &extra_roots,
             &self.discovery,
             &mut diagnostics,
         )
+    }
+
+    /// Skills visible from `directory`, using the same roots and precedence as
+    /// [`ConfigService::skills`].
+    ///
+    /// Scoping is the point: a server started in one repository must not hand
+    /// its `.opencode/skill/*` to sessions whose `location.directory` is another
+    /// project. Project-scope roots outside the session tree are dropped and
+    /// the session tree's own `.opencode` directories are scanned, so the index
+    /// matches the project the session actually works in. Global configuration
+    /// roots, configured `skills[]` directories and the per-user
+    /// `.claude`/`.agents` roots stay visible: they are not project-scoped.
+    ///
+    /// An empty `directory` returns the load-time snapshot. A relative path is
+    /// resolved against the load directory. The result is cached per directory
+    /// until [`ConfigService::invalidate_skills`]; a skill file written after
+    /// the first call is picked up only after invalidation (skill ids already
+    /// loaded in a session are unaffected, since the index is frozen into the
+    /// instruction prefix).
+    #[must_use]
+    pub fn skills_for(&self, directory: &Path) -> Arc<Vec<SkillInfo>> {
+        if directory.as_os_str().is_empty() {
+            return Arc::new(self.skills.clone());
+        }
+        let resolved = if directory.is_absolute() {
+            directory.to_path_buf()
+        } else {
+            self.discovery.location.join(directory)
+        };
+        let resolved = std::path::absolute(&resolved).unwrap_or(resolved);
+        let key = discovery::path_key(&resolved);
+        if key == discovery::path_key(&self.discovery.location) {
+            return Arc::new(self.skills.clone());
+        }
+        if let Some(cached) = self.cached_skills(&key) {
+            return cached;
+        }
+
+        let mut diagnostics = Vec::new();
+        let (config_roots, extra_roots) = self.skill_roots();
+        let found = Arc::new(skills::discover_for(
+            &config_roots,
+            &extra_roots,
+            &self.discovery,
+            &resolved,
+            &mut diagnostics,
+        ));
+        // Session-scoped diagnostics stay off the wire, like instructions_for.
+        drop(diagnostics);
+        self.cache_skills(key, Arc::clone(&found));
+        found
+    }
+
+    /// Drop every cached per-directory skill set, keeping the load-time
+    /// snapshot. Call after writing a `SKILL.md` so the next turn's index sees
+    /// it.
+    pub fn invalidate_skills(&self) {
+        let mut cache = self
+            .skill_cache
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cache.clear();
+    }
+
+    fn skill_roots(&self) -> (Vec<PathBuf>, Vec<PathBuf>) {
+        let mut diagnostics = Vec::new();
+        collect_skill_roots(
+            &self.entries,
+            &self.documents,
+            &self.discovery,
+            &mut diagnostics,
+        )
+    }
+
+    fn cached_skills(&self, key: &str) -> Option<Arc<Vec<SkillInfo>>> {
+        let cache = self
+            .skill_cache
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cache.get(key).cloned()
+    }
+
+    fn cache_skills(&self, key: String, skills: Arc<Vec<SkillInfo>>) {
+        let mut cache = self
+            .skill_cache
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Same bound as the instruction cache: clear rather than evict one.
+        if cache.len() >= MAX_INSTRUCTION_CACHE && !cache.contains_key(&key) {
+            cache.clear();
+        }
+        cache.insert(key, skills);
     }
 
     /// The global configuration directory (`$XDG_CONFIG_HOME/opencode` or
@@ -355,9 +467,88 @@ impl ConfigService {
 
     /// `AGENTS.md`/`CLAUDE.md`/`.opencode/AGENTS.md` from the location upward,
     /// outermost first.
+    ///
+    /// This is the load-time snapshot for the directory passed to
+    /// [`ConfigService::load`]. Turns must call
+    /// [`ConfigService::instructions_for`] with the session directory so a
+    /// session in another project never inherits this snapshot.
     #[must_use]
     pub fn instructions(&self) -> &[InstructionFile] {
-        &self.instructions
+        self.instructions.as_slice()
+    }
+
+    /// Instruction files for `directory`, using the same upward walk and
+    /// precedence as [`ConfigService::instructions`].
+    ///
+    /// Scoping is the point: a server started in one repository must not hand
+    /// its `AGENTS.md` to sessions whose `location.directory` is another
+    /// project. An empty or relative `directory` is resolved against the load
+    /// directory (relative) or falls back to the load-time snapshot (empty), so
+    /// the historical behavior is preserved when the session has no directory
+    /// of its own.
+    ///
+    /// The result is cached per directory. Adding, removing or renaming an
+    /// `AGENTS.md` after the first call is picked up only after
+    /// [`ConfigService::invalidate_instructions`]; edited file contents are
+    /// re-read by the runtime on every turn and are not stale.
+    #[must_use]
+    pub fn instructions_for(&self, directory: &Path) -> Arc<Vec<InstructionFile>> {
+        if directory.as_os_str().is_empty() {
+            return Arc::clone(&self.instructions);
+        }
+        let resolved = if directory.is_absolute() {
+            directory.to_path_buf()
+        } else {
+            self.discovery.location.join(directory)
+        };
+        let resolved = std::path::absolute(&resolved).unwrap_or(resolved);
+        let key = discovery::path_key(&resolved);
+        if key == discovery::path_key(&self.discovery.location) {
+            return Arc::clone(&self.instructions);
+        }
+        if let Some(cached) = self.cached_instructions(&key) {
+            return cached;
+        }
+
+        let mut diagnostics = Vec::new();
+        let files = Arc::new(instructions::discover(&resolved, &mut diagnostics));
+        // Session-scoped diagnostics stay off the wire: `GET /api/config`
+        // reports the load-time set, and a turn must not mutate it.
+        drop(diagnostics);
+        self.cache_instructions(key, Arc::clone(&files));
+        files
+    }
+
+    /// Drop every cached per-directory instruction set, keeping the load-time
+    /// snapshot. Call after the host reloads a location or writes an
+    /// instruction file, so the next turn re-walks the filesystem.
+    pub fn invalidate_instructions(&self) {
+        let mut cache = self
+            .instruction_cache
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cache.clear();
+    }
+
+    fn cached_instructions(&self, key: &str) -> Option<Arc<Vec<InstructionFile>>> {
+        let cache = self
+            .instruction_cache
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cache.get(key).cloned()
+    }
+
+    fn cache_instructions(&self, key: String, files: Arc<Vec<InstructionFile>>) {
+        let mut cache = self
+            .instruction_cache
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Bound the map: a long-lived server sees one entry per project
+        // directory. Clearing is cheaper than an LRU and only costs a re-walk.
+        if cache.len() >= MAX_INSTRUCTION_CACHE && !cache.contains_key(&key) {
+            cache.clear();
+        }
+        cache.insert(key, files);
     }
 
     /// Merged `mcp.servers` object (empty when unconfigured).

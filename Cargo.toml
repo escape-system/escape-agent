@@ -98,3 +98,7 @@ module_name_repetitions = "allow"
 must_use_candidate = "allow"
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"
+# rustc 1.99 added assert_is_empty, which proposes `assert_ne!(x, [] as [T; 0])`
+# for idiomatic `assert!(x.is_empty())`. The rewrite is less readable and the
+# assertion is already correct, so the lint is disabled workspace-wide on purpose.
+assert_is_empty = "allow"

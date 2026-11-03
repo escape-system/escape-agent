@@ -7,6 +7,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use reqwest::Client;
 use tempfile::TempDir;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -50,6 +52,22 @@ impl ServerHarness {
     /// Returns an error when the process cannot be spawned or does not become
     /// ready within five seconds.
     pub async fn start(binary: impl Into<PathBuf>, config: TestConfig) -> anyhow::Result<Self> {
+        let mut harness = Self::prepare(binary, config)?;
+        harness.launch().await?;
+        harness.wait_ready().await?;
+        Ok(harness)
+    }
+
+    /// Create the isolated temporary tree and configuration without spawning.
+    ///
+    /// Combine with [`Self::launch`] when the database must be prepared (for
+    /// example seeded with a transcript) before the server opens it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the temp tree, config or HTTP client cannot be
+    /// created.
+    pub fn prepare(binary: impl Into<PathBuf>, config: TestConfig) -> anyhow::Result<Self> {
         let root = tempfile::tempdir().context("create harness temp dir")?;
         let work = root.path().join("work");
         let tmp = root.path().join("tmp");
@@ -69,7 +87,7 @@ impl ServerHarness {
             .build()
             .context("build harness HTTP client")?;
 
-        let mut harness = Self {
+        Ok(Self {
             root,
             binary: binary.into(),
             config,
@@ -79,9 +97,36 @@ impl ServerHarness {
             client,
             stderr: Arc::new(Mutex::new(VecDeque::new())),
             running: None,
-        };
-        harness.spawn().await?;
-        Ok(harness)
+        })
+    }
+
+    /// Spawn the server without waiting for it to answer.
+    ///
+    /// [`Self::wait_ready`] must be called before requests are issued.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the process cannot be spawned or exits before
+    /// printing its listen URL.
+    pub async fn launch(&mut self) -> anyhow::Result<()> {
+        self.spawn().await
+    }
+
+    /// Poll `/api/info` until it answers or the ready timeout elapses.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the server does not become ready in time.
+    pub async fn wait_ready(&self) -> anyhow::Result<()> {
+        let running = self.running.as_ref().context("server is not running")?;
+        let url = running.url.clone();
+        self.await_ready(&url).await
+    }
+
+    /// OS process id of the running server, if any.
+    #[must_use]
+    pub fn pid(&self) -> Option<u32> {
+        self.running.as_ref().and_then(|running| running.child.id())
     }
 
     /// URL printed by the server (`http://127.0.0.1:<port>`).
@@ -238,8 +283,20 @@ impl ServerHarness {
     async fn await_ready(&self, url: &str) -> anyhow::Result<()> {
         let deadline = Instant::now() + READY_TIMEOUT;
         let info = format!("{url}/api/info");
+        // A password-protected server answers `/api/info` with 401 until the
+        // request carries a credential, so the readiness probe must send the
+        // same Basic header the bench client sends. The credential comes from
+        // the config that already drives the spawn, not from a second source.
+        let authorization = self.config.env().iter().find_map(|(key, value)| {
+            (key.as_str() == "OPENCODE_SERVER_PASSWORD" && !value.is_empty())
+                .then(|| format!("Basic {}", BASE64.encode(format!("opencode:{value}"))))
+        });
         loop {
-            match self.client.get(&info).send().await {
+            let mut request = self.client.get(&info);
+            if let Some(authorization) = authorization.as_deref() {
+                request = request.header(reqwest::header::AUTHORIZATION, authorization);
+            }
+            match request.send().await {
                 Ok(response) if response.status().is_success() => return Ok(()),
                 _ => {}
             }

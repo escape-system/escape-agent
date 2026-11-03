@@ -56,11 +56,77 @@ pub(crate) fn discover(
     discovery: &Discovery,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> Vec<SkillInfo> {
+    collect(
+        config_roots,
+        extra_roots,
+        discovery,
+        &discovery.location,
+        false,
+        diagnostics,
+    )
+}
+
+/// Discover skills as seen from `location` rather than the load directory.
+///
+/// Used by [`crate::ConfigService::skills_for`]: a session in another project
+/// must not inherit the server directory's project skills. Global
+/// configuration roots, `skills[]` entries and the per-user compatibility
+/// directories stay visible because they are not project-scoped; project
+/// `.opencode` roots and `.claude`/`.agents` ancestors are resolved from
+/// `location` so only the session's own tree contributes them.
+pub(crate) fn discover_for(
+    config_roots: &[PathBuf],
+    extra_roots: &[PathBuf],
+    discovery: &Discovery,
+    location: &Path,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Vec<SkillInfo> {
+    collect(
+        config_roots,
+        extra_roots,
+        discovery,
+        location,
+        true,
+        diagnostics,
+    )
+}
+
+fn collect(
+    config_roots: &[PathBuf],
+    extra_roots: &[PathBuf],
+    discovery: &Discovery,
+    location: &Path,
+    scoped: bool,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Vec<SkillInfo> {
     let mut targets: Vec<(PathBuf, SkillSource)> = Vec::new();
     for root in config_roots {
         let source = source_for(root, discovery);
+        // Scope project-scope roots to the session tree. A root outside
+        // `location` is the server's project, not this session's. A root is in
+        // scope when it is an ancestor of the session directory (its config
+        // applies) or a directory inside it (the session's own `.opencode`).
+        if source == SkillSource::Project && !shares_tree(location, root) {
+            continue;
+        }
         targets.push((root.join("skill"), source));
         targets.push((root.join("skills"), source));
+    }
+
+    // The load-time roots only cover the server directory. A session in
+    // another project brings its own `.opencode` trees, discovered from
+    // `location` exactly like a load would discover them (outermost first, so
+    // the innermost wins).
+    let mut ancestors = discovery::ancestors(location);
+    ancestors.reverse();
+    if scoped {
+        for directory in &ancestors {
+            let candidate = directory.join(".opencode");
+            if candidate.is_dir() {
+                targets.push((candidate.join("skill"), SkillSource::Project));
+                targets.push((candidate.join("skills"), SkillSource::Project));
+            }
+        }
     }
 
     let home = &discovery.home;
@@ -68,8 +134,6 @@ pub(crate) fn discover(
         targets.push((home.join(".claude").join("skills"), SkillSource::Claude));
         targets.push((home.join(".agents").join("skills"), SkillSource::Agents));
     }
-    let mut ancestors = discovery::ancestors(&discovery.location);
-    ancestors.reverse();
     for directory in ancestors {
         targets.push((
             directory.join(".claude").join("skills"),
@@ -105,6 +169,12 @@ pub(crate) fn discover(
     }
     skills.sort_by(|left, right| left.id.cmp(&right.id));
     skills
+}
+
+/// Whether `root` is an ancestor of `location` or lives inside it. Only such a
+/// root's configuration applies to the session.
+fn shares_tree(location: &Path, root: &Path) -> bool {
+    discovery::is_under(location, root) || discovery::is_under(root, location)
 }
 
 fn source_for(root: &Path, discovery: &Discovery) -> SkillSource {

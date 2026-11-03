@@ -16,7 +16,9 @@ use serde::{Deserialize, Serialize};
 use crate::clock::Clock;
 use crate::config::ObserverConfig;
 use crate::error::ObserverError;
-use crate::goal::{self, GoalSnapshot, GoalStatus, GoalTransition, GoalVerdict, GoalVerdictKind};
+use crate::goal::{
+    self, GoalSnapshot, GoalStatus, GoalTransition, GoalVerdict, GoalVerdictKind, RecentOutcome,
+};
 use crate::input::{self, ActiveStrip, ObserverInput, RecentStrip, RootInput, TreeRow};
 use crate::registry::{ExpectationRegistry, FlightStrip, RegistryCaps, StripState};
 use crate::verdict::{self, ObserverAction, ObserverVerdict, RepairKind};
@@ -384,6 +386,83 @@ impl ObserverEngine {
             prune_all(state, now, &self.cfg);
             budget_from(state, &self.cfg)
         })
+    }
+
+    /// Judge a goal and report the applied transition.
+    ///
+    /// This is the production goal decision: `goal_complete` requests it and
+    /// the host persists the result from [`ObserverNotice::Goal`]. The judge
+    /// document is [`crate::goal::judge_prompt`] and the reply is parsed by
+    /// [`crate::goal::parse_goal_verdict`], so a verdict that is not a goal
+    /// verdict can never be mistaken for one.
+    ///
+    /// `known_ids` are ids this goal may additionally cite as evidence (the
+    /// host passes recent message ids, because `goal_complete` evidence is
+    /// usually a `msg_…`); the registry's recent tool-call ids are always
+    /// accepted.
+    ///
+    /// Terminal goals are not judged again, so one completion cannot flip a
+    /// goal twice. A model failure fails open: no verdict, one
+    /// `observer.unavailable` notice, goal unchanged.
+    pub async fn check_goal(
+        &self,
+        root_id: &str,
+        goal: &GoalSnapshot,
+        recent: &[RecentOutcome],
+        known_ids: &[String],
+    ) -> Option<GoalTransition> {
+        if !self.cfg.enabled || goal.status.is_terminal() {
+            return None;
+        }
+        let mut snapshot = goal.clone();
+        for id in known_ids {
+            if !snapshot.known_ids.contains(id) {
+                snapshot.known_ids.push(id.clone());
+            }
+        }
+        for strip in self.registry.recent(root_id, 32) {
+            if !snapshot.known_ids.contains(&strip.tool_call_id) {
+                snapshot.known_ids.push(strip.tool_call_id);
+            }
+        }
+        let prompt = goal::judge_prompt(&snapshot, recent);
+        let text = match self.model.judge(&prompt, &self.cfg).await {
+            Ok(text) => text,
+            Err(error) => {
+                self.notify_unavailable(root_id, &error.to_string());
+                return None;
+            }
+        };
+        let verdict = match goal::parse_goal_verdict(&text) {
+            Ok(verdict) => verdict,
+            Err(error) => {
+                self.notify_unavailable(root_id, &error.to_string());
+                return None;
+            }
+        };
+        let transition = goal::apply_verdict(&snapshot, &verdict, self.clock.now_ms());
+        self.notifier.notify(ObserverNotice::Goal {
+            root_id: root_id.to_owned(),
+            goal_id: transition.goal.id.clone(),
+            status: transition.goal.status,
+            reason: transition.reason.clone(),
+            goal: transition.goal.clone(),
+        });
+        Some(transition)
+    }
+
+    /// Settled strips of a root, shaped as goal evidence candidates.
+    #[must_use]
+    pub fn recent_outcomes(&self, root_id: &str, limit: usize) -> Vec<RecentOutcome> {
+        self.registry
+            .recent(root_id, limit)
+            .into_iter()
+            .map(|strip| RecentOutcome {
+                id: strip.tool_call_id,
+                tool: strip.tool,
+                outcome: strip.outcome,
+            })
+            .collect()
     }
 
     /// Timer-driven tick. Calls the model only when a wake condition holds.

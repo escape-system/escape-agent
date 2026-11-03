@@ -1,9 +1,6 @@
 //! Classifier coverage: every command family, flags and chain handling.
 
-use std::{
-    fs,
-    path::{Path, PathBuf},
-};
+use std::{fs, path::Path};
 
 use oc_lanes::classify;
 
@@ -213,6 +210,8 @@ fn missing_manifest_falls_back_to_canonical_cwd() {
 #[cfg(windows)]
 #[test]
 fn windows_paths_and_executables() {
+    use std::path::PathBuf;
+
     let temp = tempfile::tempdir().expect("tempdir");
     write(temp.path(), "Cargo.toml", "[workspace]\n");
     let expected = format!("cargo:{}", canonical(temp.path()));

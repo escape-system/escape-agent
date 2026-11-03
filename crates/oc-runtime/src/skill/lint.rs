@@ -59,7 +59,7 @@ impl Tool for SkillLintTool {
                 path
             }
         } else if let Some(id) = id_hint {
-            find_skill(config, &id)
+            find_skill(config, &ctx.directory, &id)
                 .ok_or_else(|| ToolError::new(format!("unknown skill `{id}`")))?
                 .path
         } else {

@@ -1,3 +1,4 @@
+#[cfg(windows)]
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
 use std::io;
@@ -127,7 +128,7 @@ impl LaneRunner for ProcessLaneRunner {
 
             let (shell, kind) = select_shell();
             let mut command = Command::new(&shell);
-            kind.apply(&mut command, &ticket.command);
+            kind.apply(&mut command, &shell, &ticket.command);
             command
                 .current_dir(&ticket.cwd)
                 .stdin(Stdio::null())
@@ -276,23 +277,42 @@ async fn kill_tree(pid: u32) {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ShellKind {
     Posix,
+    #[cfg(windows)]
     PowerShell,
+    #[cfg(windows)]
     Cmd,
 }
 
 impl ShellKind {
-    fn apply(self, command: &mut Command, source: &str) {
+    fn apply(self, command: &mut Command, shell: &Path, source: &str) {
         match self {
+            #[cfg(windows)]
             Self::Cmd => {
+                // cmd.exe has no pipefail: `exit` stays the last segment's
+                // status, matching a normal cmd session.
                 command.arg("/c").arg(source);
             }
+            #[cfg(windows)]
             Self::PowerShell => {
+                // PowerShell has no pipefail either; `$LASTEXITCODE` covers
+                // only the last native command, so the reported exit is the
+                // final pipeline stage's status.
                 command
                     .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"])
                     .arg(source);
             }
             Self::Posix => {
-                command.arg("-c").arg(source);
+                // Without pipefail a pipeline reports the *last* segment's
+                // status, so `cargo clippy … | tail` would finish as a success
+                // even when clippy failed. The ticket exit code is what the
+                // lane reports to callers, so it must reflect a failed segment.
+                if util::shell_supports_pipefail(shell) {
+                    command.args(["-o", "pipefail", "-c"]).arg(source);
+                } else {
+                    // A POSIX sh without pipefail support keeps the historical
+                    // last-segment behaviour rather than refusing to run.
+                    command.arg("-c").arg(source);
+                }
             }
         }
     }
@@ -348,6 +368,9 @@ fn allowed_shell(path: &Path) -> bool {
     matches!(name.as_str(), "bash" | "sh" | "zsh" | "ksh")
 }
 
+/// Locate an executable on `PATH`. Windows shell discovery is the only caller:
+/// on unix the shell is chosen by absolute path from `$SHELL` or a fixed list.
+#[cfg(windows)]
 fn find_in_path(name: &str) -> Option<PathBuf> {
     let path: OsString = std::env::var_os("PATH")?;
     for directory in std::env::split_paths(&path) {
@@ -368,4 +391,48 @@ fn find_in_path(name: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use oc_lanes::{LaneRunner, TicketState};
+
+    fn ticket(command: &str) -> Ticket {
+        let cwd = std::env::temp_dir();
+        Ticket {
+            id: format!("tkt_{:016x}", util::unique()),
+            lane: "cargo:test".to_owned(),
+            command: command.to_owned(),
+            cwd,
+            priority: 0,
+            owner_session: None,
+            state: TicketState::Queued,
+            queued_ms: 0,
+            started_ms: None,
+            finished_ms: None,
+            output_path: None,
+        }
+    }
+
+    /// Regression: a failed pipeline segment must fail the ticket. Before
+    /// pipefail, `exit 3 | cat` produced `exit: 0` and a successful ticket,
+    /// so a failing `cargo clippy … | tail` looked like a pass.
+    #[tokio::test]
+    async fn failing_pipeline_fails_the_ticket() {
+        let runner = ProcessLaneRunner::unbound();
+        let result = runner.run(&ticket("exit 3 | cat")).await;
+        assert_ne!(
+            result.exit, 0,
+            "a failed pipeline segment must not be reported as success: {result:?}"
+        );
+        assert_eq!(result.exit, 3);
+    }
+
+    #[tokio::test]
+    async fn succeeding_pipeline_succeeds_the_ticket() {
+        let runner = ProcessLaneRunner::unbound();
+        let result = runner.run(&ticket("true | true")).await;
+        assert_eq!(result.exit, 0, "{result:?}");
+    }
 }

@@ -137,6 +137,84 @@ async fn memory_from_another_project_is_not_injected() {
 }
 
 #[tokio::test]
+async fn forgetting_a_pinned_memory_drops_it_from_the_epoch_prefix() {
+    let harness = Harness::new(
+        vec![text_script("one"), text_script("two"), text_script("three")],
+        Arc::new(AllowAll),
+        json!({}),
+        None,
+    )
+    .await;
+    let memory = Arc::new(MemoryService::new(Arc::clone(&harness.store)));
+    // Importance 5 pins both memories, so retrieval includes them regardless of
+    // the query and the test never depends on FTS ranking.
+    seed_memory(
+        &memory,
+        "Pinned lemon memory that stays live.",
+        "project",
+        Some("prj_runtime_test"),
+        5,
+    )
+    .await;
+    seed_memory(
+        &memory,
+        "Forgotten apricot memory that must vanish.",
+        "project",
+        Some("prj_runtime_test"),
+        5,
+    )
+    .await;
+    let harness = harness.attach_memory(Arc::clone(&memory));
+
+    harness.prompt("first turn").await;
+    let first = &harness.model.requests()[0].system[1];
+    assert!(first.contains("Pinned lemon"), "got {first:?}");
+    assert!(first.contains("Forgotten apricot"), "got {first:?}");
+
+    let apricot = all_memories(&harness.store)
+        .await
+        .into_iter()
+        .find(|row| {
+            row["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("apricot"))
+        })
+        .and_then(|row| row["id"].as_str().map(str::to_owned))
+        .expect("seeded apricot memory");
+    assert!(memory.forget(&apricot).await.expect("forget"));
+
+    harness.prompt("second turn").await;
+    let second = &harness.model.requests()[1];
+    assert!(
+        !second.system[1].contains("Forgotten apricot"),
+        "the epoch pin re-sent a forgotten memory: {:?}",
+        second.system[1]
+    );
+    assert!(
+        second.system[1].contains("Pinned lemon"),
+        "the live memory must survive the re-pin: {:?}",
+        second.system[1]
+    );
+    assert!(
+        !request_contains(second, "Forgotten apricot"),
+        "a forgotten memory must not ride along in the tail supplement"
+    );
+    assert_eq!(harness.sink.count("session.instructions.updated"), 1);
+
+    harness.prompt("third turn").await;
+    let third = &harness.model.requests()[2];
+    assert_eq!(
+        third.system[1], second.system[1],
+        "a stable memory set must not rebuild the pinned prefix"
+    );
+    assert_eq!(
+        harness.sink.count("session.instructions.updated"),
+        1,
+        "only the membership change republishes the prefix"
+    );
+}
+
+#[tokio::test]
 async fn skill_index_filters_and_escapes() {
     let harness = Harness::new_with_setup(
         vec![text_script("ok")],

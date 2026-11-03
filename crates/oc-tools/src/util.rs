@@ -2,10 +2,13 @@
 //! writes, line-ending preservation, glob matching and identifiers.
 
 use std::cmp::Ordering as CmpOrdering;
+use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
+use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use globset::{GlobBuilder, GlobMatcher};
@@ -32,6 +35,46 @@ pub fn unique() -> u64 {
 /// Saturating `u64` to `usize` conversion for model-provided limits.
 pub fn to_usize(value: u64) -> usize {
     usize::try_from(value).unwrap_or(usize::MAX)
+}
+
+/// Whether `shell` accepts `-o pipefail`, which makes a pipeline report the
+/// last non-zero segment instead of the last segment's status.
+///
+/// bash, zsh and ksh support it. A POSIX `sh` may or may not: dash 0.5.12 does,
+/// but POSIX does not require it and a shell built without it (for example a
+/// stripped-down `ash`) may reject the option. The shell binary is therefore
+/// probed once and the answer cached per path, so a shell that does not
+/// understand the option keeps last-segment semantics instead of failing to
+/// start. The probe runs a fixed string, never user input, and only inspects
+/// whether the option was accepted.
+pub fn shell_supports_pipefail(shell: &Path) -> bool {
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, bool>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(known) = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(shell)
+    {
+        return *known;
+    }
+    let supported = probe_pipefail(shell);
+    cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(shell.to_path_buf(), supported);
+    supported
+}
+
+fn probe_pipefail(shell: &Path) -> bool {
+    let output = std::process::Command::new(shell)
+        .args(["-o", "pipefail", "-c", "printf ok"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output();
+    match output {
+        Ok(output) => output.status.success() && output.stdout == b"ok",
+        Err(_) => false,
+    }
 }
 
 pub fn resolve(ctx: &ToolContext, input: &str) -> PathBuf {

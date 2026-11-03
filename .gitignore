@@ -18,3 +18,4 @@
 /.tree*.json
 
 /.test-server/
+/.opencode/tool-output/

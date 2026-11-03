@@ -236,7 +236,9 @@ impl Runtime {
         let ceiling = if turn.context_window == 0 {
             u64::MAX
         } else {
-            tokens::compaction_ceiling(turn.context_window)
+            // Cap at 150_000 so models with huge context windows (e.g. 1M) do not run
+            // hundreds of thousands of uncompacted tokens per step, burning tens of millions of tokens.
+            tokens::compaction_ceiling(turn.context_window).min(150_000)
         };
 
         loop {

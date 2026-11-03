@@ -204,22 +204,39 @@ impl Runtime {
         Ok(())
     }
 
-    /// Cancel the session's current execution. Returns `false` when idle.
-    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
+    /// Cancel the session's current execution and all its descendants. Returns `false` when idle.
+    #[allow(clippy::unused_async_trait_impl)]
     pub async fn interrupt(&self, session_id: &str) -> Result<bool, RuntimeError> {
+        let mut cancelled_any = self.interrupt_single(session_id);
+        let mut queue = std::collections::VecDeque::new();
+        queue.push_back(session_id.to_owned());
+        while let Some(parent) = queue.pop_front() {
+            if let Ok(children) = self.inner.config.store.children(&parent).await {
+                for child in children {
+                    if self.interrupt_single(&child.id) {
+                        cancelled_any = true;
+                    }
+                    queue.push_back(child.id);
+                }
+            }
+        }
+        Ok(cancelled_any)
+    }
+
+    fn interrupt_single(&self, session_id: &str) -> bool {
         let handle = {
             let actors = self.inner.actors.lock().expect("actor map");
             actors.get(session_id).cloned()
         };
         let Some(handle) = handle else {
-            return Ok(false);
+            return false;
         };
         let token = handle.cancel.lock().expect("cancel slot").clone();
         if let Some(token) = token {
             token.cancel(InterruptReason::User);
-            Ok(true)
+            true
         } else {
-            Ok(false)
+            false
         }
     }
 

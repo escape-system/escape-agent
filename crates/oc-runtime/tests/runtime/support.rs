@@ -256,7 +256,7 @@ impl ScribeModel for FakeScribe {
 }
 
 pub(crate) struct Harness {
-    pub(crate) _root: TempDir,
+    pub(crate) root: TempDir,
     pub(crate) work: PathBuf,
     pub(crate) runtime: Runtime,
     pub(crate) config: RuntimeConfig,
@@ -344,7 +344,7 @@ impl Harness {
         };
         let runtime = Runtime::new_with_model_client(config.clone(), Arc::clone(&model) as _);
         Self {
-            _root: root,
+            root,
             work,
             runtime,
             config,

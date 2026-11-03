@@ -109,7 +109,7 @@ impl Tool for SkillWriteTool {
                 .join("SKILL.md"),
         };
 
-        let existing = find_skill(config, &id);
+        let existing = find_skill(config, &ctx.directory, &id);
         let created = existing.is_none() && !target.exists();
         if !overwrite {
             if let Some(existing) = &existing
@@ -131,6 +131,10 @@ impl Tool for SkillWriteTool {
 
         let document = compose_document(&name, &description, autoinvoke, body);
         write_atomic(&target, &document)?;
+        // The next turn's index is resolved through `skills_for(directory)`,
+        // which caches per directory; drop the cached sets so the skill just
+        // written is advertised instead of only becoming visible on restart.
+        config.invalidate_skills();
         publish(
             &self.runtime,
             ctx,

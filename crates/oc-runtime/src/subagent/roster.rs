@@ -59,9 +59,12 @@ impl Tool for RosterTool {
         let mut siblings: Vec<SessionNodeRow> = siblings;
         siblings.sort_by(|left, right| left.id.cmp(&right.id));
 
-        let mut parent_value = Value::Null;
+        // Optional JSON fields are omitted, never null (AGENTS.md). A root
+        // caller has no parent, so the key is absent rather than `null`;
+        // `docs/05-subagents.md` documents `parent` as an object.
+        let mut body = Map::new();
         if let Some(parent) = &parent {
-            parent_value = roster_entry(runtime, parent).await?;
+            body.insert("parent".to_owned(), roster_entry(runtime, parent).await?);
         }
         let mut sibling_values = Vec::new();
         for sibling in &siblings {
@@ -71,11 +74,9 @@ impl Tool for RosterTool {
         for child in &children {
             child_values.push(roster_entry(runtime, child).await?);
         }
-        let body = json!({
-            "parent": parent_value,
-            "siblings": sibling_values,
-            "children": child_values,
-        });
+        body.insert("siblings".to_owned(), Value::Array(sibling_values));
+        body.insert("children".to_owned(), Value::Array(child_values));
+        let body = Value::Object(body);
         Ok(ToolResult::text(body.to_string()).with_metadata(body))
     }
 }

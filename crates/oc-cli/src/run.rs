@@ -31,7 +31,7 @@ pub(crate) async fn run_once(options: RunOptions) -> anyhow::Result<()> {
         json: json_mode,
     } = options;
 
-    let text = resolve_prompt_text(prompt)?;
+    let text = resolve_prompt_text(&prompt)?;
     let directory = resolve_directory(directory)?;
     let host = boot_terminal_host(&directory, db).await?;
 
@@ -61,6 +61,7 @@ pub(crate) async fn run_once(options: RunOptions) -> anyhow::Result<()> {
 }
 
 /// Start an interactive multi-turn terminal chat session.
+#[allow(clippy::too_many_lines)]
 pub(crate) async fn run_chat(options: ChatOptions) -> anyhow::Result<()> {
     let ChatOptions {
         model,
@@ -278,7 +279,7 @@ fn resolve_directory(directory: Option<PathBuf>) -> anyhow::Result<PathBuf> {
     std::path::absolute(&dir).with_context(|| format!("resolve directory {}", dir.display()))
 }
 
-fn resolve_prompt_text(parts: Vec<String>) -> anyhow::Result<String> {
+fn resolve_prompt_text(parts: &[String]) -> anyhow::Result<String> {
     let joined = parts.join(" ");
     if !joined.trim().is_empty() {
         return Ok(joined);
@@ -324,27 +325,25 @@ async fn ensure_session(
     agent: Option<&str>,
     model: Option<&ModelRef>,
 ) -> anyhow::Result<String> {
-    if let Some(id) = existing_id {
-        if host.services.store.get_session(id).await?.is_some() {
-            if agent.is_some() || model.is_some() {
-                host.services
-                    .store
-                    .patch_session(
-                        id,
-                        SessionPatch {
-                            agent: agent.map(str::to_owned),
-                            model: model.map(|m| json!(m)),
-                            ..SessionPatch::default()
-                        },
-                    )
-                    .await?;
-            }
-            return Ok(id.to_owned());
+    if let Some(id) = existing_id
+        && host.services.store.get_session(id).await?.is_some()
+    {
+        if agent.is_some() || model.is_some() {
+            host.services
+                .store
+                .patch_session(
+                    id,
+                    SessionPatch {
+                        agent: agent.map(str::to_owned),
+                        model: model.map(|m| json!(m)),
+                        ..SessionPatch::default()
+                    },
+                )
+                .await?;
         }
+        return Ok(id.to_owned());
     }
-    let id = existing_id
-        .map(str::to_owned)
-        .unwrap_or_else(|| SessionId::new().into_inner());
+    let id = existing_id.map_or_else(|| SessionId::new().into_inner(), str::to_owned);
     let dir_str = directory.to_string_lossy().into_owned();
     let canonical = std::fs::canonicalize(directory)
         .map_or_else(|_| dir_str.clone(), |p| p.to_string_lossy().into_owned());
@@ -435,6 +434,7 @@ async fn publish_inbox(
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 async fn stream_turn(
     host: &TerminalHost,
     session_id: &str,

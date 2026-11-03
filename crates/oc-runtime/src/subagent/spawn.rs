@@ -137,17 +137,15 @@ impl Tool for SubagentTool {
                 limits.max_children = max_children;
             }
         }
-        if parent.child_count >= limits.max_children {
-            let active = runtime
-                .inner
-                .config
-                .store
-                .active_child_count(&caller)
-                .await
-                .unwrap_or(parent.child_count);
-            if active < limits.max_children {
-                parent.child_count = active;
-            }
+        let active = runtime
+            .inner
+            .config
+            .store
+            .active_child_count(&caller)
+            .await
+            .unwrap_or(parent.child_count);
+        if active < parent.child_count {
+            parent.child_count = active;
         }
         let available = available_agents(&runtime.inner.config.config);
         let policy = Policy::new(limits.clone());

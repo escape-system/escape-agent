@@ -561,3 +561,79 @@ fn global_config_dir_is_the_discovered_global_root() {
     let global = service.global_config_dir().expect("global config dir");
     assert_eq!(global, fixture.path("xdg/opencode"));
 }
+
+#[test]
+fn instructions_for_scopes_discovery_to_the_requested_directory() {
+    let fixture = Fixture::new();
+
+    // The server process would load from `server`; a session lives in
+    // `project`, a sibling directory with its own contract.
+    let server = fixture.make_dir("server");
+    let project = fixture.make_dir("project/sub");
+    fixture.write("server/AGENTS.md", "SERVER_CONTRACT_TOKEN");
+    fixture.write("project/AGENTS.md", "PROJECT_CONTRACT_TOKEN");
+    fixture.write("project/sub/AGENTS.md", "SUB_CONTRACT_TOKEN");
+
+    let service = fixture.load(&server);
+
+    let ours = |files: &[oc_config::InstructionFile]| -> Vec<String> {
+        files
+            .iter()
+            .filter(|file| file.path.starts_with(fixture.root.path()))
+            .map(|file| file.text.clone())
+            .collect()
+    };
+
+    assert_eq!(
+        ours(service.instructions()),
+        ["SERVER_CONTRACT_TOKEN"],
+        "the load-time snapshot stays scoped to the load directory"
+    );
+    assert_eq!(
+        ours(&service.instructions_for(&project)),
+        ["PROJECT_CONTRACT_TOKEN", "SUB_CONTRACT_TOKEN"],
+        "the session directory gets its own ancestors, outermost first"
+    );
+
+    // Same-directory requests reuse the load-time snapshot, and repeated
+    // requests are cached rather than re-walking.
+    assert_eq!(
+        ours(&service.instructions_for(&server)),
+        ["SERVER_CONTRACT_TOKEN"]
+    );
+    let first = service.instructions_for(&project);
+    let second = service.instructions_for(&project.join("."));
+    assert!(
+        std::sync::Arc::ptr_eq(&first, &second),
+        "the same directory resolves through one cached entry"
+    );
+
+    // A file added after the first call appears once the cache is invalidated.
+    fixture.write("project/.opencode/AGENTS.md", "LATE_CONTRACT_TOKEN");
+    service.invalidate_instructions();
+    assert_eq!(
+        ours(&service.instructions_for(&project)),
+        [
+            "PROJECT_CONTRACT_TOKEN",
+            "LATE_CONTRACT_TOKEN",
+            "SUB_CONTRACT_TOKEN"
+        ],
+        "invalidation picks up a newly added instruction file"
+    );
+}
+
+#[test]
+fn instructions_for_falls_back_to_the_load_snapshot_without_a_directory() {
+    let fixture = Fixture::new();
+    let server = fixture.make_dir("server");
+    fixture.write("server/AGENTS.md", "SERVER_CONTRACT_TOKEN");
+    let service = fixture.load(&server);
+
+    let fallback = service.instructions_for(Path::new(""));
+    assert!(
+        fallback
+            .iter()
+            .any(|file| file.text == "SERVER_CONTRACT_TOKEN"),
+        "an empty session directory keeps the historical snapshot"
+    );
+}
