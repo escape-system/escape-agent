@@ -310,8 +310,12 @@ For every durable change:
 
 Consequences:
 
-- `seq` is dense per session across durable event types; gaps are normal
-  because ephemeral events never reserve a seq.
+- `seq` comes from one per-session counter (`event_sequence`) shared by
+  `event`, `session_message` and `session_inbox`, so every durable write
+  consumes a number regardless of table. The `event` log therefore has gaps:
+  message and inbox inserts take numbers it never shows, and a delivered inbox
+  row is deleted, orphaning its number for good. Order by `seq`; never assume
+  contiguity.
 - A crash cannot produce a message whose seq is not committed.
 - Ephemeral deltas never touch disk. Text/reasoning/tool-input fragments are
   persisted once at `*.ended` (or step end), not per delta.

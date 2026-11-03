@@ -73,7 +73,6 @@ pub async fn view(
     };
     let store = require_store(&state)?;
     require_session(store, &session_id).await?;
-    store.touch_session_viewed(&session_id, idle).await?;
     publish_durable(
         &state,
         &session_id,

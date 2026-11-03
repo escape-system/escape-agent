@@ -62,6 +62,20 @@ async fn context_environment_and_view() {
     let (_, session_body) = call(&app, Method::GET, &format!("/api/session/{sid}"), None).await;
     assert_eq!(session_body.unwrap()["data"]["time"]["viewed"], idle);
 
+    // `time_viewed` is written by the `session.viewed` projector alone, inside
+    // the event transaction, and the projector keeps it monotonic. A second
+    // view with an earlier `idle` must not regress the watermark.
+    let (status, _) = call(
+        &app,
+        Method::POST,
+        &format!("/api/session/{sid}/view"),
+        Some(json!({"idle": idle - 1_000})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, session_body) = call(&app, Method::GET, &format!("/api/session/{sid}"), None).await;
+    assert_eq!(session_body.unwrap()["data"]["time"]["viewed"], idle);
+
     let (status, _) = call(
         &app,
         Method::PUT,
