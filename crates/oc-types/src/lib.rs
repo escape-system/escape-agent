@@ -46,8 +46,9 @@ pub use message::{
     ToolContent, ToolPart, ToolState, ToolTime, UserMessage,
 };
 pub use payload::{
-    EventPayload, InterruptReason, SessionAgentSelected, SessionArchived, SessionCreated,
-    SessionDeleted, SessionExecutionFailed, SessionExecutionInterrupted, SessionExecutionStarted,
+    EventPayload, InterruptReason, SessionAgentSelected, SessionArchived, SessionCompactionEnded,
+    SessionCompactionFailed, SessionCompactionStarted, SessionCreated, SessionDeleted,
+    SessionExecutionFailed, SessionExecutionInterrupted, SessionExecutionStarted,
     SessionExecutionSucceeded, SessionIdle, SessionInboxCancelled, SessionInboxDelivered,
     SessionInboxDeliveryChanged, SessionInboxEnqueued, SessionMetadataUpdated,
     SessionModelSelected, SessionMoved, SessionPermissions, SessionReasoningDelta,

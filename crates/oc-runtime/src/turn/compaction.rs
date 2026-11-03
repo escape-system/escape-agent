@@ -4,6 +4,10 @@ use futures_util::StreamExt;
 use oc_llm::{LlmMessage, LlmOptions, LlmRequest};
 use oc_store::NewMessage;
 use oc_types::MessageId;
+use oc_types::message::StructuredError;
+use oc_types::payload::{
+    SessionCompactionEnded, SessionCompactionFailed, SessionCompactionStarted,
+};
 use serde_json::{Value, json};
 
 use crate::runtime::{CancelToken, Runtime, RuntimeError};
@@ -130,6 +134,16 @@ impl Runtime {
                 time_created: created,
             })
             .await?;
+        self.emit(
+            session,
+            &turn.directory,
+            SessionCompactionStarted {
+                session_id: Runtime::session_id(session),
+                reason: event_reason(reason).to_owned(),
+                input_id: Some(id.clone()),
+            },
+        )
+        .await?;
 
         let system = if turn.system.is_empty() {
             crate::prompt::system_parts(
@@ -162,8 +176,15 @@ impl Runtime {
             result = self.inner.model.stream(request) => Some(result),
         };
         let Some(stream_result) = stream_result else {
-            self.fail_compaction(session, &id, created, reason, "compaction was cancelled")
-                .await?;
+            self.fail_compaction(
+                session,
+                &turn.directory,
+                &id,
+                created,
+                reason,
+                "compaction was cancelled",
+            )
+            .await?;
             return Err(RuntimeError::Cancelled);
         };
         let mut stream = match stream_result {
@@ -191,13 +212,21 @@ impl Runtime {
                 match retry_result {
                     Some(Ok(stream)) => stream,
                     Some(Err(retry_err)) => {
-                        self.fail_compaction(session, &id, created, reason, &retry_err.to_string())
-                            .await?;
+                        self.fail_compaction(
+                            session,
+                            &turn.directory,
+                            &id,
+                            created,
+                            reason,
+                            &retry_err.to_string(),
+                        )
+                        .await?;
                         return Err(RuntimeError::Llm(retry_err));
                     }
                     None => {
                         self.fail_compaction(
                             session,
+                            &turn.directory,
                             &id,
                             created,
                             reason,
@@ -209,20 +238,35 @@ impl Runtime {
                 }
             }
             Err(error) => {
-                self.fail_compaction(session, &id, created, reason, &error.to_string())
-                    .await?;
+                self.fail_compaction(
+                    session,
+                    &turn.directory,
+                    &id,
+                    created,
+                    reason,
+                    &error.to_string(),
+                )
+                .await?;
                 return Err(RuntimeError::Llm(error));
             }
         };
 
         let mut summary = String::new();
+        let mut usage = None;
         let mut failure = None;
         loop {
             let event = tokio::select! {
                 biased;
                 () = cancel.cancelled() => {
-                    self.fail_compaction(session, &id, created, reason, "compaction was cancelled")
-                        .await?;
+                    self.fail_compaction(
+                        session,
+                        &turn.directory,
+                        &id,
+                        created,
+                        reason,
+                        "compaction was cancelled",
+                    )
+                    .await?;
                     return Err(RuntimeError::Cancelled);
                 }
                 event = stream.next() => event,
@@ -233,6 +277,7 @@ impl Runtime {
             match event {
                 oc_llm::LlmEvent::TextDelta { delta } => summary.push_str(&delta),
                 oc_llm::LlmEvent::TextEnd { text } => summary = text,
+                oc_llm::LlmEvent::Finish { usage: finish, .. } => usage = Some(finish),
                 oc_llm::LlmEvent::ProviderError { message } => {
                     failure = Some(message);
                     break;
@@ -241,13 +286,20 @@ impl Runtime {
             }
         }
         if let Some(message) = failure {
-            self.fail_compaction(session, &id, created, reason, &message)
+            self.fail_compaction(session, &turn.directory, &id, created, reason, &message)
                 .await?;
             return Err(RuntimeError::Llm(oc_llm::LlmError::Provider { message }));
         }
         if summary.trim().is_empty() {
-            self.fail_compaction(session, &id, created, reason, "the summary was empty")
-                .await?;
+            self.fail_compaction(
+                session,
+                &turn.directory,
+                &id,
+                created,
+                reason,
+                "the summary was empty",
+            )
+            .await?;
             return Err(RuntimeError::Config(
                 "compaction returned an empty summary".to_owned(),
             ));
@@ -267,6 +319,21 @@ impl Runtime {
             .store
             .update_message(session, id.as_str(), completed)
             .await?;
+        let tokens = usage.as_ref().map(super::types::tokens_from_usage);
+        self.emit(
+            session,
+            &turn.directory,
+            SessionCompactionEnded {
+                session_id: Runtime::session_id(session),
+                reason: event_reason(reason).to_owned(),
+                model: Some(turn.model_ref.clone()),
+                native: None,
+                text: summary,
+                cost: usage.as_ref().and_then(|usage| usage.cost),
+                tokens,
+            },
+        )
+        .await?;
         Ok(())
     }
 
@@ -360,6 +427,7 @@ impl Runtime {
     async fn fail_compaction(
         &self,
         session: &str,
+        directory: &str,
         id: &MessageId,
         created: i64,
         reason: &str,
@@ -379,7 +447,29 @@ impl Runtime {
             .store
             .update_message(session, id.as_str(), failed)
             .await?;
+        self.emit(
+            session,
+            directory,
+            SessionCompactionFailed {
+                session_id: Runtime::session_id(session),
+                reason: event_reason(reason).to_owned(),
+                error: StructuredError::new("CompactionError", message),
+                input_id: Some(id.clone()),
+                cost: None,
+                tokens: None,
+            },
+        )
+        .await?;
         Ok(())
+    }
+}
+
+/// Map the stored compaction `reason` to the wire literal. Upstream defines
+/// only `auto` and `manual`; a context-overflow compaction is automatic.
+fn event_reason(reason: &str) -> &str {
+    match reason {
+        "manual" => "manual",
+        _ => "auto",
     }
 }
 

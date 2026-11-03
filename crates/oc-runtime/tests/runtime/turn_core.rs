@@ -621,6 +621,111 @@ async fn auto_compaction_records_reason_auto() {
 }
 
 #[tokio::test]
+async fn auto_compaction_publishes_durable_lifecycle_events() {
+    let harness = Harness::new(
+        vec![
+            text_script("## Objective\nhandoff summary"),
+            text_script("answer from the summary"),
+        ],
+        Arc::new(AllowAll),
+        json!({}),
+        None,
+    )
+    .await;
+    harness
+        .store
+        .enqueue(NewInbox {
+            id: MessageId::new().into_inner(),
+            session_id: harness.session.clone(),
+            kind: "user".to_owned(),
+            payload: json!({"text": "a".repeat(360_000)}),
+            delivery: Delivery::Steer,
+        })
+        .await
+        .expect("enqueued");
+    harness
+        .runtime
+        .notify(&harness.session)
+        .await
+        .expect("notify");
+    harness
+        .runtime
+        .wait_idle(&harness.session, Duration::from_secs(10))
+        .await
+        .expect("idle");
+
+    let logged = harness
+        .store
+        .events_after(&harness.session, 0, 1_000)
+        .await
+        .expect("event log");
+    let started = logged
+        .iter()
+        .find(|event| event.kind == "session.compaction.started")
+        .expect("durable session.compaction.started persisted");
+    let ended = logged
+        .iter()
+        .find(|event| event.kind == "session.compaction.ended")
+        .expect("durable session.compaction.ended persisted");
+    assert!(
+        started.seq < ended.seq,
+        "started commits before ended: {} < {}",
+        started.seq,
+        ended.seq
+    );
+    assert_eq!(started.version, 1);
+    assert_eq!(ended.version, 1);
+    assert_eq!(started.data["sessionID"], harness.session);
+    assert_eq!(ended.data["sessionID"], harness.session);
+    assert_eq!(started.data["reason"], "auto");
+    assert_eq!(ended.data["reason"], "auto");
+
+    // The started event names the compaction message whose row was inserted
+    // before it was published.
+    let compaction_id = harness
+        .messages()
+        .await
+        .iter()
+        .find(|message| message.get("type").and_then(Value::as_str) == Some("compaction"))
+        .and_then(|message| message.get("id"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .expect("compaction row");
+    assert_eq!(started.data["inputID"], compaction_id);
+    assert_eq!(
+        ended.data["text"], "## Objective\nhandoff summary",
+        "ended carries the stored summary"
+    );
+    assert!(
+        !started.data.to_string().contains("null"),
+        "started omits its optional inputID when absent and never emits null: {}",
+        started.data
+    );
+
+    // Published only after commit: every durable envelope carries the seq that
+    // the log allocated for the same event id.
+    for (kind, stored) in [
+        ("session.compaction.started", started),
+        ("session.compaction.ended", ended),
+    ] {
+        let envelope = harness
+            .sink
+            .events
+            .lock()
+            .expect("events")
+            .iter()
+            .find(|event| event.kind == kind && event.id.as_str() == stored.id)
+            .cloned()
+            .unwrap_or_else(|| panic!("{kind} published"));
+        let durable = envelope.durable.expect("compaction events are durable");
+        assert_eq!(
+            durable.seq, stored.seq,
+            "{kind} publishes its committed seq"
+        );
+    }
+}
+
+#[tokio::test]
 async fn small_context_writes_no_compaction_row() {
     let harness = Harness::new(vec![text_script("ok")], Arc::new(AllowAll), json!({}), None).await;
     harness.prompt("a short prompt").await;
