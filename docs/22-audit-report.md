@@ -105,12 +105,12 @@ gap is not mistaken for an unexamined area.
 
 **Supplement memory.** The scope list is built per session from `project_id` and
 `agent_id`, and the `session` scope is added only for subagents, keyed to the
-current session id (`oc-runtime/src/prompt/sources.rs:188-195`). Row filtering is
+current session id (`oc-runtime/src/prompt/sources.rs:185-192`). Row filtering is
 `(m.scope = ? AND m.scope_id = ?)` (`oc-store/src/memory.rs:440`), the
 comparison baseline is per actor (`oc-runtime/src/runtime/actor.rs:24`), and
 deleted rows are excluded by SQL (`oc-store/src/memory.rs:273,388,418`).
 Independently of the SQL, a stale pin is dropped and the supplement is suppressed
-(`oc-runtime/src/turn/session.rs:218-224`, `instructions.rs:186`). Pinned by
+(`oc-runtime/src/turn/session.rs:218-224`, `oc-runtime/src/instructions.rs:178-187`). Pinned by
 `forgetting_a_pinned_memory_drops_it_from_the_epoch_prefix`
 (`crates/oc-runtime/tests/runtime/memory.rs:198-201`) and
 `memory_from_another_project_is_not_injected` (`:135-136`). The residual gaps are
