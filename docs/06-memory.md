@@ -96,11 +96,11 @@ memory_list   { scope?, kind?, limit?, cursor? }
 - Text is capped at 500 chars. Longer "notes" belong in files, not memory.
 - Writes are idempotent by `(scope, scope_id, hash)`; a repeat updates
   importance/confidence instead of duplicating. A soft-deleted row still
-  occupies that key. A forgotten memory cannot be revived by a later write: a
-  write that targets the soft-deleted row is rejected as a `Conflict` and the
-  row stays soft-deleted, so neither an explicit rewrite nor an automatic
-  scribe retry can undo an explicit `memory_forget`
-  (`oc-store/src/memory.rs:155-175`).
+  occupies that key. An explicit `memory_write` restores it (`deleted = 0`) and
+  returns the original id, so a user/agent rewrite does revive a forgotten
+  memory. A `scribe` write is the exception: it is rejected as a
+  `Conflict` and the row stays deleted, so an automatic retry cannot undo an
+  explicit `memory_forget` (`oc-store/src/memory.rs:163-180`).
 - `memory_search` returns id, kind, text, score; no provenance dump.
 
 ## Auto-scribe
