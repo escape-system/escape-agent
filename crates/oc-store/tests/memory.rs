@@ -287,6 +287,95 @@ async fn soft_delete_hides_memories_until_rewritten() {
 }
 
 #[tokio::test]
+async fn scribe_write_cannot_resurrect_a_forgotten_memory() {
+    let store = Store::open_memory().await.expect("store");
+    store
+        .write_memory(new_memory(
+            "mem_forgotten",
+            "global",
+            None,
+            "gotcha",
+            "cargo test locks the target directory",
+            3,
+        ))
+        .await
+        .expect("seed");
+    assert!(store.forget_memory("mem_forgotten").await.expect("forget"));
+
+    let scribe = store
+        .write_memory(NewMemory {
+            id: "mem_scribe_retry".to_owned(),
+            importance: 5,
+            source: "scribe".to_owned(),
+            ..new_memory(
+                "mem_scribe_retry",
+                "global",
+                None,
+                "gotcha",
+                "cargo test locks the target directory",
+                5,
+            )
+        })
+        .await;
+    assert!(
+        matches!(scribe, Err(StoreError::Conflict(_))),
+        "a scribe rewrite of a forgotten memory must not report success: {scribe:?}"
+    );
+    let listed = store
+        .list_memories(MemoryQuery::default())
+        .await
+        .expect("list");
+    assert!(
+        listed.is_empty(),
+        "the forgotten memory must stay hidden: {listed:?}"
+    );
+    let search = store
+        .search_memories(MemoryQuery {
+            query: Some("cargo".to_owned()),
+            limit: 10,
+            ..Default::default()
+        })
+        .await
+        .expect("search");
+    assert!(
+        search.is_empty(),
+        "the forgotten memory must stay unsearchable: {search:?}"
+    );
+
+    let rewritten = store
+        .write_memory(new_memory(
+            "mem_user_rewrite",
+            "global",
+            None,
+            "gotcha",
+            "cargo test locks the target directory",
+            4,
+        ))
+        .await
+        .expect("user rewrite");
+    assert_eq!(rewritten["id"], "mem_forgotten");
+    assert_eq!(rewritten["importance"], 4);
+    let listed = store
+        .list_memories(MemoryQuery::default())
+        .await
+        .expect("list after rewrite");
+    assert_eq!(
+        listed.len(),
+        1,
+        "an explicit rewrite restores the row: {listed:?}"
+    );
+    let search = store
+        .search_memories(MemoryQuery {
+            query: Some("cargo".to_owned()),
+            limit: 10,
+            ..Default::default()
+        })
+        .await
+        .expect("search after rewrite");
+    assert_eq!(ids_of(&search), vec!["mem_forgotten"]);
+}
+
+#[tokio::test]
 async fn search_limit_and_pinned_rows() {
     let store = Store::open_memory().await.expect("store");
     for index in 0..5 {

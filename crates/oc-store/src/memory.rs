@@ -104,7 +104,10 @@ impl Store {
     /// The identity is `(scope, scope_id, hash)` where `hash` is SHA-256 of the
     /// normalized text (trimmed, whitespace-collapsed, lowercased). An
     /// equivalent write updates importance, confidence and `updated`, clears a
-    /// soft delete, and returns the existing row (its id wins).
+    /// soft delete, and returns the existing row (its id wins). The exception is
+    /// a `scribe` write of a forgotten row: the scribe must not undo an explicit
+    /// `memory_forget`, so that write fails with [`StoreError::Conflict`]
+    /// instead of returning a row every read keeps filtering out.
     #[allow(clippy::too_many_lines)]
     pub async fn write_memory(&self, new: NewMemory) -> Result<Value, StoreError> {
         if !SCOPES.contains(&new.scope.as_str()) {
@@ -158,13 +161,21 @@ impl Store {
                         )
                         .optional()?;
                     if let Some((existing, is_deleted)) = existing {
-                        let new_deleted =
-                            i32::from(is_deleted != 0 && source.as_str() == "scribe");
+                        if is_deleted != 0 {
+                            // A forgotten row is invisible to every read. Only
+                            // an explicit rewrite may restore it; a scribe retry
+                            // must not undo the forget or claim it succeeded.
+                            if source.as_str() == "scribe" {
+                                return Err(StoreError::Conflict(format!(
+                                    "memory {existing} was forgotten; the scribe must not recreate it"
+                                )));
+                            }
+                        }
                         transaction.execute(
                             "UPDATE memory
-                             SET importance = ?2, confidence = ?3, updated = ?4, deleted = ?5
+                             SET importance = ?2, confidence = ?3, updated = ?4, deleted = 0
                              WHERE id = ?1",
-                            params![&existing, importance, confidence, time, new_deleted],
+                            params![&existing, importance, confidence, time],
                         )?;
                         return Ok(existing);
                     }
