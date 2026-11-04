@@ -92,8 +92,18 @@ impl Runtime {
     pub(super) fn ensure_actor(&self, session_id: &str) {
         let mut actors = self.inner.actors.lock().expect("actor map");
         if let Some(handle) = actors.get(session_id) {
-            handle.wake.notify_one();
-            return;
+            // A finished task can never be woken again: `wake.notify_one()` on a
+            // dead handle is lost and the session stays busy forever. Reap it and
+            // spawn a fresh actor below instead of trusting the map entry.
+            let finished = match handle.join.lock().expect("join slot").as_ref() {
+                Some(join) => join.is_finished(),
+                None => true,
+            };
+            if !finished {
+                handle.wake.notify_one();
+                return;
+            }
+            actors.remove(session_id);
         }
         let handle = Arc::new(ActorHandle::new());
         actors.insert(session_id.to_owned(), Arc::clone(&handle));
@@ -118,6 +128,18 @@ impl Runtime {
             self.inner.idle.notify_waiters();
             if let Err(error) = result {
                 tracing::error!(session = %session, error = %error, "session actor stopped");
+                // Best effort: never leave the session marked busy. Part A makes
+                // the next request start a fresh actor even if this write fails.
+                let now = oc_types::now_millis();
+                if let Err(idle) = self
+                    .inner
+                    .config
+                    .store
+                    .mark_session_idle(&session, now, "failed")
+                    .await
+                {
+                    tracing::error!(session = %session, error = %idle, "failed to clear busy after actor death");
+                }
                 break;
             }
             if self.inner.shutdown.is_cancelled() {
