@@ -128,10 +128,7 @@ fn skill_source(
     // files are scoped: the config service was loaded for the *server*
     // directory, so its snapshot advertised another repository's skills to
     // every project.
-    let mut current = config.skills_for(Path::new(directory)).as_ref().clone();
-    if current.is_empty() {
-        current = config.skills().to_vec();
-    }
+    let current = config.skills_for(Path::new(directory)).as_ref().clone();
     let mut skills: Vec<_> = current
         .into_iter()
         .filter(|skill| skill.description.is_some())
