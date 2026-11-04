@@ -352,17 +352,15 @@ impl Store {
     pub async fn active_child_count(&self, parent_id: &str) -> Result<u32, StoreError> {
         let parent_id = parent_id.to_owned();
         self.read(move |connection| {
-            let count: i64 = connection
-                .query_row(
-                    "SELECT COUNT(*) FROM session_v2 
+            let count: i64 = connection.query_row(
+                "SELECT COUNT(*) FROM session_v2 
                      WHERE parent_id = ?1 
                        AND time_archived IS NULL
                        AND idle_outcome IS NULL
                        AND (time_idle IS NULL OR (time_busy IS NOT NULL AND time_busy > time_idle))",
-                    [&parent_id],
-                    |row| row.get(0),
-                )
-                .unwrap_or(0);
+                [&parent_id],
+                |row| row.get(0),
+            )?;
             Ok(u32::try_from(count).unwrap_or(u32::MAX))
         })
         .await

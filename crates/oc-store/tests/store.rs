@@ -945,3 +945,37 @@ async fn a_database_is_owned_by_one_server_at_a_time() {
     let reopened = Store::open(&path).await.expect("reopen after drop");
     drop(reopened);
 }
+
+#[tokio::test]
+async fn active_child_count_propagates_a_sql_failure() {
+    let dir = TempDir::new().expect("temp dir");
+    let path = dir.path().join("count.sqlite");
+    let store = Store::open(&path).await.expect("open store");
+    store
+        .create_session(new_session("ses_parent", "prj_1", "/tmp/one", 1_000))
+        .await
+        .expect("parent");
+    assert_eq!(
+        store.active_child_count("ses_parent").await.expect("count"),
+        0,
+        "a session without children counts zero"
+    );
+
+    // A second connection to the same file drops the table the count reads.
+    // The store's read pool then hits a real `no such table` from SQLite.
+    {
+        let attacker = rusqlite::Connection::open(&path).expect("second connection");
+        attacker
+            .execute_batch("PRAGMA foreign_keys=OFF; DROP TABLE session_v2;")
+            .expect("drop the table the count reads");
+    }
+
+    let error = store
+        .active_child_count("ses_parent")
+        .await
+        .expect_err("a missing table must not read as zero children");
+    assert!(
+        matches!(error, StoreError::Sqlite(_)),
+        "expected a propagated sqlite error, got {error:?}"
+    );
+}
