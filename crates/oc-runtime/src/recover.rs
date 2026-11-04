@@ -6,11 +6,20 @@
 //! published, then sessions with deliverable inbox rows are woken with at most
 //! eight concurrent notifications.
 
+use oc_types::message::ToolContent;
 use oc_types::payload::SessionExecutionInterrupted;
 use oc_types::{InterruptReason, StructuredError};
 use serde_json::{Map, Value, json};
 
 use crate::runtime::{Runtime, RuntimeError};
+
+/// Event kinds that close a session's execution. A second one for the same
+/// session contradicts the first.
+const TERMINAL_EXECUTIONS: [&str; 3] = [
+    "session.execution.succeeded",
+    "session.execution.failed",
+    "session.execution.interrupted",
+];
 
 impl Runtime {
     pub(crate) async fn recover(&self) -> Result<(), RuntimeError> {
@@ -29,7 +38,7 @@ impl Runtime {
             let mut changed = false;
             for message in self.list_all_messages(id).await? {
                 let repaired = match message.get("type").and_then(Value::as_str) {
-                    Some("assistant") => repair_assistant(&message),
+                    Some("assistant") => self.repair_assistant(&message).await?,
                     Some("compaction") => repair_compaction(&message),
                     _ => None,
                 };
@@ -43,15 +52,21 @@ impl Runtime {
                 }
             }
             if changed {
-                self.emit(
-                    id,
-                    &directory,
-                    SessionExecutionInterrupted {
-                        session_id: Self::session_id(id),
-                        reason: InterruptReason::Shutdown,
-                    },
-                )
-                .await?;
+                // A terminal event may already be durable for this session: the
+                // crashed process published it before dying, or an earlier boot
+                // already recovered it. Publishing `interrupted` on top would
+                // give the session two contradicting terminals.
+                if !self.has_terminal_execution(id).await? {
+                    self.emit(
+                        id,
+                        &directory,
+                        SessionExecutionInterrupted {
+                            session_id: Self::session_id(id),
+                            reason: InterruptReason::Shutdown,
+                        },
+                    )
+                    .await?;
+                }
                 repaired.push(id.to_owned());
             }
         }
@@ -212,6 +227,21 @@ fn message_id(message: &Value) -> &str {
         .unwrap_or_default()
 }
 
+/// Child session id recorded on a `subagent` tool part.
+///
+/// The live executor writes `sessionID` into the running state's metadata
+/// (`subagent/spawn.rs` progress report and `subagent/wait.rs`
+/// `finish_foreground`); continuing an existing child also carries it in the
+/// input.
+fn subagent_child(part: &Value) -> Option<&str> {
+    part.pointer("/state/metadata/sessionID")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            part.pointer("/state/input/sessionID")
+                .and_then(Value::as_str)
+        })
+}
+
 fn body(mut message: Value) -> Value {
     if let Some(object) = message.as_object_mut() {
         object.remove("id");
@@ -221,59 +251,192 @@ fn body(mut message: Value) -> Value {
     message
 }
 
-fn repair_assistant(message: &Value) -> Option<Value> {
-    let mut body = body(message.clone());
-    let object = body.as_object_mut()?;
-    let now = oc_types::now_millis();
-    let incomplete = object
-        .get("time")
-        .and_then(|time| time.get("completed"))
-        .is_none();
-    let mut repaired = false;
-
-    if let Some(content) = object.get_mut("content").and_then(Value::as_array_mut) {
-        for part in content {
-            if part.get("type").and_then(Value::as_str) != Some("tool") {
-                continue;
-            }
-            let Some(state) = part.get_mut("state") else {
-                continue;
+impl Runtime {
+    /// `true` when the session's event log already holds a durable terminal
+    /// execution event.
+    async fn has_terminal_execution(&self, session: &str) -> Result<bool, RuntimeError> {
+        let mut after = 0;
+        loop {
+            let events = self
+                .inner
+                .config
+                .store
+                .events_after(session, after, 1_000)
+                .await?;
+            let Some(last) = events.last() else {
+                return Ok(false);
             };
-            let status = state.get("status").and_then(Value::as_str);
-            if matches!(status, Some("streaming" | "running")) {
-                let input = state
-                    .get("input")
+            if events
+                .iter()
+                .any(|event| TERMINAL_EXECUTIONS.contains(&event.kind.as_str()))
+            {
+                return Ok(true);
+            }
+            after = last.seq;
+        }
+    }
+
+    /// Repairs one assistant message, reporting a settled child's real outcome
+    /// for an in-flight `subagent` tool part instead of a blanket abort error.
+    async fn repair_assistant(&self, message: &Value) -> Result<Option<Value>, RuntimeError> {
+        let mut body = body(message.clone());
+        let Some(object) = body.as_object_mut() else {
+            return Ok(None);
+        };
+        let now = oc_types::now_millis();
+        let incomplete = object
+            .get("time")
+            .and_then(|time| time.get("completed"))
+            .is_none();
+        let mut repaired = false;
+
+        if let Some(content) = object.get_mut("content").and_then(Value::as_array_mut) {
+            for part in content {
+                if part.get("type").and_then(Value::as_str) != Some("tool") {
+                    continue;
+                }
+                let status = part.pointer("/state/status").and_then(Value::as_str);
+                if !matches!(status, Some("streaming" | "running")) {
+                    continue;
+                }
+                let input = part
+                    .pointer("/state/input")
                     .and_then(Value::as_object)
                     .cloned()
                     .unwrap_or_else(Map::new);
-                *state = tool_error_state(&input);
+                let child = (part.get("name").and_then(Value::as_str) == Some("subagent"))
+                    .then(|| subagent_child(part).map(str::to_owned))
+                    .flatten();
+                let settled = match child.as_deref() {
+                    Some(child) => self.recovered_child_outcome(child).await?,
+                    None => None,
+                };
+                let repaired_state = match settled {
+                    Some(settled) => {
+                        settled.into_state(child.as_deref().unwrap_or_default(), &input)
+                    }
+                    None => tool_error_state(&input),
+                };
+                if let Some(state) = part.get_mut("state") {
+                    *state = repaired_state;
+                }
                 if let Some(time) = part.get_mut("time").and_then(Value::as_object_mut) {
                     time.insert("completed".to_owned(), Value::from(now));
                 }
                 repaired = true;
             }
         }
+
+        if incomplete {
+            let time = object
+                .entry("time")
+                .or_insert_with(|| json!({ "created": now }));
+            if let Some(time) = time.as_object_mut() {
+                time.insert("completed".to_owned(), Value::from(now));
+            }
+            object.insert("finish".to_owned(), Value::String("error".to_owned()));
+            object.insert(
+                "error".to_owned(),
+                serde_json::to_value(StructuredError::new(
+                    "MessageAbortedError",
+                    "The server restarted before this step completed (STEP_INTERRUPTED).",
+                ))
+                .expect("structured error is serializable"),
+            );
+            repaired = true;
+        }
+        Ok(repaired.then_some(body))
     }
 
-    if incomplete {
-        let time = object
-            .entry("time")
-            .or_insert_with(|| json!({ "created": now }));
-        if let Some(time) = time.as_object_mut() {
-            time.insert("completed".to_owned(), Value::from(now));
-        }
-        object.insert("finish".to_owned(), Value::String("error".to_owned()));
-        object.insert(
-            "error".to_owned(),
-            serde_json::to_value(StructuredError::new(
-                "MessageAbortedError",
-                "The server restarted before this step completed (STEP_INTERRUPTED).",
-            ))
-            .expect("structured error is serializable"),
-        );
-        repaired = true;
+    /// The child's durable terminal state, when it has one.
+    ///
+    /// The session row is authoritative, exactly as in
+    /// `subagent/protocol.rs::child_state` (A3): no row outcome means the child
+    /// never settled, and recovery must not invent one.
+    async fn recovered_child_outcome(
+        &self,
+        child: &str,
+    ) -> Result<Option<RecoveredChild>, RuntimeError> {
+        let Some(session) = self.inner.config.store.get_session(child).await? else {
+            return Ok(None);
+        };
+        let state = match session.get("outcome").and_then(Value::as_str) {
+            Some("succeeded") => "completed",
+            Some("failed") => "failed",
+            Some("interrupted") => "cancelled",
+            _ => return Ok(None),
+        };
+        let messages = self.list_all_messages(child).await?;
+        Ok(Some(RecoveredChild {
+            state,
+            text: final_assistant_text(&messages),
+        }))
     }
-    repaired.then_some(body)
+}
+
+/// A child whose last turn settled, as recovered from durable rows.
+struct RecoveredChild {
+    state: &'static str,
+    text: String,
+}
+
+impl RecoveredChild {
+    fn into_state(self, child: &str, input: &Map<String, Value>) -> Value {
+        let text = if self.text.trim().is_empty() {
+            format!("subagent {}", self.state)
+        } else {
+            self.text
+        };
+        let envelope = envelope(self.state, child, &text);
+        if self.state == "completed" {
+            let content = ToolContent::Text { text: envelope };
+            json!({
+                "status": "completed",
+                "input": input,
+                "content": [content],
+                "metadata": { "sessionID": child, "status": self.state }
+            })
+        } else {
+            json!({
+                "status": "error",
+                "input": input,
+                "error": { "type": "ToolError", "message": envelope },
+                "metadata": { "sessionID": child, "status": self.state }
+            })
+        }
+    }
+}
+
+/// `<subagent>` envelope, matching `subagent/protocol.rs::envelope`.
+fn envelope(state: &str, child: &str, text: &str) -> String {
+    format!("<subagent sessionID=\"{child}\" state=\"{state}\">{text}</subagent>")
+}
+
+fn final_assistant_text(messages: &[Value]) -> String {
+    for message in messages.iter().rev() {
+        if message.get("type").and_then(Value::as_str) != Some("assistant") {
+            continue;
+        }
+        let text = message
+            .get("content")
+            .and_then(Value::as_array)
+            .map(|parts| {
+                parts
+                    .iter()
+                    .filter_map(|part| match part.get("type").and_then(Value::as_str) {
+                        Some("text") => part.get("text").and_then(Value::as_str),
+                        _ => None,
+                    })
+                    .filter(|text| !text.trim().is_empty())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default();
+        if !text.trim().is_empty() {
+            return text;
+        }
+    }
+    String::new()
 }
 
 fn tool_error_state(input: &Map<String, Value>) -> Value {

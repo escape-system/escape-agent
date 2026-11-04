@@ -3,10 +3,196 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use oc_store::{NewMessage, NewSession, NewSessionTree};
+use oc_store::{NewEvent, NewMessage, NewSession, NewSessionTree};
 use serde_json::{Value, json};
 
 use crate::support::*;
+
+/// Counts the durable terminal execution events stored for `session`.
+async fn terminals(store: &oc_store::Store, session: &str) -> Vec<String> {
+    let mut after = 0;
+    let mut kinds = Vec::new();
+    loop {
+        let events = store
+            .events_after(session, after, 1_000)
+            .await
+            .expect("events");
+        let Some(last) = events.last() else {
+            return kinds;
+        };
+        let seq = last.seq;
+        kinds.extend(events.into_iter().map(|event| event.kind).filter(|kind| {
+            matches!(
+                kind.as_str(),
+                "session.execution.succeeded"
+                    | "session.execution.failed"
+                    | "session.execution.interrupted"
+            )
+        }));
+        after = seq;
+    }
+}
+
+#[tokio::test]
+async fn recovery_does_not_add_a_terminal_to_an_already_terminal_session() {
+    let harness = Harness::new(vec![], Arc::new(AllowAll), json!({}), None).await;
+    let now = oc_types::now_millis();
+    harness
+        .store
+        .append_event(NewEvent {
+            id: "evt_recovery_succeeded".to_owned(),
+            aggregate_id: harness.session.clone(),
+            kind: "session.execution.succeeded".to_owned(),
+            data: json!({ "sessionID": harness.session }),
+            durable: true,
+            version: 1,
+            created: now,
+        })
+        .await
+        .expect("terminal event");
+    // The crashed process left a step without its completion stamp, so
+    // recovery has to repair the row.
+    harness
+        .store
+        .append_message(NewMessage {
+            id: "msg_unfinished".to_owned(),
+            session_id: harness.session.clone(),
+            kind: "assistant".to_owned(),
+            data: json!({
+                "time": {"created": now},
+                "agent": "build",
+                "model": {"providerID": "test", "id": "alpha"},
+                "content": [{"type": "text", "text": "half an answer"}]
+            }),
+            time_created: now,
+        })
+        .await
+        .expect("unfinished assistant");
+    // Control: a second session with no prior terminal must keep the normal
+    // `interrupted` recovery terminal.
+    create_unrelated_root(&harness, "ses_never_terminal").await;
+    harness
+        .store
+        .append_message(NewMessage {
+            id: "msg_never_finished".to_owned(),
+            session_id: "ses_never_terminal".to_owned(),
+            kind: "assistant".to_owned(),
+            data: json!({
+                "time": {"created": now},
+                "agent": "build",
+                "model": {"providerID": "test", "id": "alpha"},
+                "content": [{"type": "text", "text": "unfinished"}]
+            }),
+            time_created: now,
+        })
+        .await
+        .expect("control assistant");
+
+    let runtime = harness.restart();
+    runtime.start().await.expect("start");
+
+    let repaired = harness
+        .store
+        .get_message(&harness.session, "msg_unfinished")
+        .await
+        .expect("read repaired")
+        .expect("repaired row");
+    assert!(repaired["time"]["completed"].is_i64());
+    assert_eq!(repaired["finish"], "error");
+
+    let terminal = terminals(&harness.store, &harness.session).await;
+    assert_eq!(
+        terminal,
+        vec!["session.execution.succeeded".to_owned()],
+        "recovery must not add a terminal to an already-terminal session"
+    );
+    assert_eq!(
+        terminals(&harness.store, "ses_never_terminal").await,
+        vec!["session.execution.interrupted".to_owned()],
+        "a session with no terminal is still interrupted exactly once"
+    );
+}
+
+#[tokio::test]
+async fn recovery_reports_a_settled_childs_real_outcome() {
+    let harness = Harness::new(vec![], Arc::new(AllowAll), json!({}), None).await;
+    let child = "ses_settled_child";
+    create_child(&harness, &harness.session, child, "general").await;
+    let now = oc_types::now_millis();
+    harness
+        .store
+        .mark_session_idle(child, now, "succeeded")
+        .await
+        .expect("child settled");
+    harness
+        .store
+        .append_message(NewMessage {
+            id: "msg_child_final".to_owned(),
+            session_id: child.to_owned(),
+            kind: "assistant".to_owned(),
+            data: json!({
+                "time": {"created": now, "streamed": now, "completed": now},
+                "agent": "general",
+                "model": {"providerID": "test", "id": "alpha"},
+                "finish": "stop",
+                "content": [{"type": "text", "text": "child final answer"}]
+            }),
+            time_created: now,
+        })
+        .await
+        .expect("child answer");
+    // The parent's in-flight subagent call points at the settled child.
+    harness
+        .store
+        .append_message(NewMessage {
+            id: "msg_parent_running".to_owned(),
+            session_id: harness.session.clone(),
+            kind: "assistant".to_owned(),
+            data: json!({
+                "time": {"created": now},
+                "agent": "build",
+                "model": {"providerID": "test", "id": "alpha"},
+                "content": [{
+                    "type": "tool",
+                    "id": "call_subagent",
+                    "name": "subagent",
+                    "state": {
+                        "status": "running",
+                        "input": {"description": "child task", "prompt": "do the work"},
+                        "metadata": {"sessionID": child, "status": "running"}
+                    },
+                    "time": {"created": now}
+                }]
+            }),
+            time_created: now,
+        })
+        .await
+        .expect("parent message");
+
+    let runtime = harness.restart();
+    runtime.start().await.expect("start");
+
+    let parent = harness
+        .store
+        .get_message(&harness.session, "msg_parent_running")
+        .await
+        .expect("read parent")
+        .expect("parent row");
+    let state = &parent["content"][0]["state"];
+    assert_ne!(state["status"], "error", "{state:?}");
+    assert_ne!(
+        state["error"]["type"], "ToolAbortedError",
+        "a child that succeeded must not be reported as cancelled by the restart: {state:?}"
+    );
+    let text = state["content"][0]["text"]
+        .as_str()
+        .expect("completed content text");
+    assert!(
+        text.contains(&format!("sessionID=\"{child}\" state=\"completed\"")),
+        "{text}"
+    );
+    assert!(text.contains("child final answer"), "{text}");
+}
 
 #[tokio::test]
 #[allow(clippy::too_many_lines)]

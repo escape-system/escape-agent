@@ -247,7 +247,7 @@ dir. The coordinator is the optimization layer, not the safety layer.
 | Failure | Behavior |
 |---|---|
 | Child crashes mid-turn | Parent gets `<subagent state="failed">`; observer may `restart_subagent` |
-| Parent dies | Children are interrupted (`reason:"shutdown"`), durable claims remain; on boot each repaired child is settled to the parent as failed exactly once (no automatic resume; observers may `restart_subagent`) |
+| Parent dies | Children are interrupted (`reason:"shutdown"`); on boot each repaired child is settled to the parent as failed exactly once (no automatic resume; observers may `restart_subagent`) |
 | Sibling message to a deleted session | Tool error `SessionNotFoundError`; sender is notified |
 | Depth/child limit hit | Tool error before session creation; no partial state |
 | Model unavailable | Resolution fails before spawn; error lists the resolved candidate chain |
