@@ -95,7 +95,12 @@ memory_list   { scope?, kind?, limit?, cursor? }
   `ask`); writes from the scribe do not.
 - Text is capped at 500 chars. Longer "notes" belong in files, not memory.
 - Writes are idempotent by `(scope, scope_id, hash)`; a repeat updates
-  importance/confidence instead of duplicating.
+  importance/confidence instead of duplicating. A soft-deleted row still
+  occupies that key. A forgotten memory cannot be revived by a later write: a
+  write that targets the soft-deleted row is rejected as a `Conflict` and the
+  row stays soft-deleted, so neither an explicit rewrite nor an automatic
+  scribe retry can undo an explicit `memory_forget`
+  (`oc-store/src/memory.rs:155-175`).
 - `memory_search` returns id, kind, text, score; no provenance dump.
 
 ## Auto-scribe
