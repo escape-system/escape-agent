@@ -8,11 +8,29 @@
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
+use crate::read::MAX_FILE_BYTES;
 use crate::util;
 use crate::{Tool, ToolContext, ToolError, ToolResult};
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct EditTool;
+
+/// Refuse to load a target larger than [`MAX_FILE_BYTES`]: reading it whole
+/// would blow the memory budget, and editing a prefix is never correct.
+fn reject_oversized(path: &std::path::Path, display: &str) -> Result<(), ToolError> {
+    let size = match std::fs::metadata(path) {
+        Ok(metadata) => metadata.len(),
+        // Let `read_file` produce the canonical not-found/permission message.
+        Err(_) => return Ok(()),
+    };
+    if size > MAX_FILE_BYTES {
+        return Err(ToolError::new(format!(
+            "File too large to edit: {display} is {size} bytes, which exceeds the {MAX_FILE_BYTES} byte edit limit; use grep and a bounded rewrite instead"
+        ))
+        .with_metadata(json!({"code": "file_too_large", "size": size, "limit": MAX_FILE_BYTES})));
+    }
+    Ok(())
+}
 
 const UNAMBIGUOUS_HINT: &str = "Add more surrounding context to make oldString unique, or set replaceAll to true to replace every occurrence.";
 
@@ -64,6 +82,7 @@ impl Tool for EditTool {
         }
 
         let absolute = util::resolve(ctx, &path);
+        reject_oversized(&absolute, &path)?;
         let bytes = util::read_file(&absolute, &path)?;
         let (source_bom, source) = util::decode_bytes(&bytes);
 
