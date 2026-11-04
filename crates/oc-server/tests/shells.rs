@@ -981,3 +981,71 @@ async fn shell_unknown_ids_are_404() {
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
+
+/// A shell record belongs to the project that created it: a caller scoped to
+/// another project can neither read it nor kill it, and the owner keeps both.
+#[tokio::test]
+async fn shell_is_scoped_to_its_creating_location() {
+    let harness = harness().await;
+    let Some(created) = create_shell(&harness.state, sleeper()).await else {
+        return;
+    };
+    let id = created["data"]["id"].as_str().expect("shell id").to_owned();
+    let foreign = "foreign-shell-location";
+    std::fs::create_dir_all(harness.state.directory().join(foreign)).unwrap();
+    let query = format!("?location%5Bdirectory%5D={foreign}");
+
+    let (status, missing) = call(
+        &harness.state,
+        Method::GET,
+        &format!("/api/shell/{id}{query}"),
+        None,
+        false,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{missing}");
+    assert_eq!(missing["_tag"], "ShellNotFoundError");
+
+    let (status, missing) = call(
+        &harness.state,
+        Method::DELETE,
+        &format!("/api/shell/{id}{query}"),
+        None,
+        false,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{missing}");
+    assert_eq!(missing["_tag"], "ShellNotFoundError");
+
+    // The foreign delete attempt did not kill the shell.
+    let (status, own) = call(
+        &harness.state,
+        Method::GET,
+        &format!("/api/shell/{id}"),
+        None,
+        false,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{own}");
+    assert_eq!(own["data"]["status"], "running", "{own}");
+
+    // The creating location still deletes it.
+    let (status, _) = call(
+        &harness.state,
+        Method::DELETE,
+        &format!("/api/shell/{id}"),
+        None,
+        false,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, _) = call(
+        &harness.state,
+        Method::GET,
+        &format!("/api/shell/{id}"),
+        None,
+        false,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}

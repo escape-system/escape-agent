@@ -96,6 +96,9 @@ pub async fn get_one(
 ) -> Result<Json<LocationEnvelope<Value>>, ErrorResponse> {
     let Query(params) = params.map_err(|error| ErrorResponse::from(query_error(error)))?;
     let resolved = location::resolve(&state, &headers, None, params.directory.as_deref());
+    if !manager().owned_by(&id, &resolved.directory) {
+        return Err(ErrorResponse::from(shell_not_found(&id)));
+    }
     let info = manager()
         .get(&id)
         .ok_or_else(|| ErrorResponse::from(shell_not_found(&id)))?;
@@ -136,7 +139,10 @@ pub async fn remove(
     params: Result<Query<LocationQuery>, QueryRejection>,
 ) -> Result<Response, ErrorResponse> {
     let Query(params) = params.map_err(|error| ErrorResponse::from(query_error(error)))?;
-    let _resolved = location::resolve(&state, &headers, None, params.directory.as_deref());
+    let resolved = location::resolve(&state, &headers, None, params.directory.as_deref());
+    if !manager().owned_by(&id, &resolved.directory) {
+        return Err(ErrorResponse::from(shell_not_found(&id)));
+    }
     manager().remove(&id).await.map_err(ErrorResponse::from)?;
     Ok(no_content())
 }

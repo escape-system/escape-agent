@@ -365,6 +365,16 @@ impl ShellManager {
             .map(|shell| shell.wire_info())
     }
 
+    /// Whether `id` belongs to `directory`. A shell created without a location
+    /// (only possible through the crate API) is owned by nobody over HTTP.
+    #[must_use]
+    pub fn owned_by(&self, id: &str, directory: &str) -> bool {
+        lock(&self.registry)
+            .shells
+            .get(id)
+            .is_some_and(|shell| shell.location_directory.as_deref() == Some(directory))
+    }
+
     /// Pages captured output. `cursor` defaults to `0` and `limit` to 64 KiB.
     pub fn output(&self, id: &str, cursor: u64, limit: usize) -> Result<Value, ApiError> {
         let shell = self.entry(id)?;
