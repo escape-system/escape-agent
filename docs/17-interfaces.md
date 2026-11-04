@@ -283,6 +283,29 @@ integrations, worktrees, PTY, WebSocket upgrades.
   `fired`; failures record `failed` so the same due instant is not retried on
   every tick.
 
+## Local conventions inside `Session.Metadata`
+
+`Session.Metadata` is the only open object on the upstream wire
+(`types.ts:65`, `openapi.json:22808-22809`; `Session.Info` itself is closed at
+`openapi.json:21926-21927`). Locally defined keys live there and are documented
+here so no crate invents a competing encoding:
+
+- `subagentMode`, `maxDepth` (`oc-server/src/data/session/prompt.rs:76-77`),
+  `environment` (`oc-server/src/data/session_ext/view.rs:37-51`), `lane`
+  (spawn hint, `oc-runtime/src/subagent/spawn.rs:203`).
+- `group` — an optional **non-empty string** label used to mark sessions that
+  belong to the same logical wave across coordinators. Omitted when absent,
+  never `null`; `""` is invalid and readers treat it as absent. It is
+  descriptive only: no permission, policy, routing or lifecycle effect, not
+  globally unique. There is **no** server-side `group` filter (the upstream
+  `session.list` parameter list is fixed, `openapi.json:919-1068`;
+  `SessionListInput` is `types.ts:3180-3190`), and no new wire field, column or
+  table. See `docs/21-grouping.md`.
+
+Because `PATCH /api/session/:sid` replaces the whole metadata object
+(`oc-server/src/data/session/crud.rs:176-186`, `oc-store/src/session.rs:547-550`),
+callers adding a local key must send the merged object.
+
 ## Ownership map (wave 1)
 
 | Owner | Crate | Files it may create/edit |

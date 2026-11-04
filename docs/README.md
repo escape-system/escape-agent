@@ -34,6 +34,7 @@ scope; the TUI must keep working against our server.
 | 18 | [status](18-status.md) | Live implementation snapshot + resume protocol |
 | 19 | [agentic integration](19-agentic-integration.md) | Memory/observer/subagents/lanes wiring plan |
 | 20 | [session handoff](20-handoff.md) | State at session stop, remaining work, pitfalls |
+| 21 | [grouping](21-grouping.md) | `metadata.group` label convention, rejected alternatives |
 
 ## Rules that apply to every doc
 
