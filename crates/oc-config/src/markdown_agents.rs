@@ -22,6 +22,9 @@ pub(crate) struct MarkdownAgent {
     pub frontmatter: Map<String, Value>,
     pub body: String,
     pub forced_mode: Option<String>,
+    /// True when the `---` block existed but could not be parsed; permissions
+    /// from this file must not be trusted.
+    pub frontmatter_invalid: bool,
 }
 
 pub(crate) fn discover(
@@ -110,12 +113,13 @@ fn load(
         }
     };
     let parsed = markdown::parse(&text);
+    let frontmatter_invalid = parsed.error.is_some();
     if let Some(error) = &parsed.error {
         diagnostics.push(Diagnostic::new(
             Some(&source),
             DiagnosticKind::Invalid,
             "$.frontmatter",
-            format!("unparsable frontmatter: {error}"),
+            format!("unparsable frontmatter: {error}; agent loads with every permission denied"),
         ));
     }
     Some(MarkdownAgent {
@@ -124,5 +128,6 @@ fn load(
         frontmatter: parsed.meta,
         body: parsed.body,
         forced_mode: forced_primary.then(|| "primary".to_owned()),
+        frontmatter_invalid,
     })
 }

@@ -352,6 +352,12 @@ pub(crate) fn apply_markdown(
         let existed = agents.iter().any(|agent| agent.id == entry.id);
         let source = entry.path.to_string_lossy().into_owned();
         let state = resolve(agents, &entry.id, home, document_permissions);
+        if entry.frontmatter_invalid {
+            // Fail closed: a file that declared permissions it could not
+            // parse must not inherit the permissive defaults. Regression:
+            // tests/agent_frontmatter.rs::unparsable_frontmatter_denies_everything
+            state.permissions = vec![deny("*", "*")];
+        }
         if !existed {
             "all".clone_into(&mut state.mode);
         }
