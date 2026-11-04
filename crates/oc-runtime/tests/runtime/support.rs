@@ -273,12 +273,12 @@ impl Harness {
         config_content: Value,
         session_permissions: Option<Value>,
     ) -> Self {
-        Self::new_with_setup(
+        Self::new_with_tools(
             scripts,
             permissions,
             config_content,
             session_permissions,
-            |_| {},
+            Arc::new(ToolRegistry::with_defaults()),
         )
         .await
     }
@@ -289,6 +289,43 @@ impl Harness {
         config_content: Value,
         session_permissions: Option<Value>,
         setup: impl FnOnce(&Path),
+    ) -> Self {
+        Self::new_with_setup_and_tools(
+            scripts,
+            permissions,
+            config_content,
+            session_permissions,
+            setup,
+            Arc::new(ToolRegistry::with_defaults()),
+        )
+        .await
+    }
+
+    pub(crate) async fn new_with_tools(
+        scripts: Vec<Script>,
+        permissions: Arc<dyn PermissionHandler>,
+        config_content: Value,
+        session_permissions: Option<Value>,
+        tools: Arc<ToolRegistry>,
+    ) -> Self {
+        Self::new_with_setup_and_tools(
+            scripts,
+            permissions,
+            config_content,
+            session_permissions,
+            |_| {},
+            tools,
+        )
+        .await
+    }
+
+    async fn new_with_setup_and_tools(
+        scripts: Vec<Script>,
+        permissions: Arc<dyn PermissionHandler>,
+        config_content: Value,
+        session_permissions: Option<Value>,
+        setup: impl FnOnce(&Path),
+        tools: Arc<ToolRegistry>,
     ) -> Self {
         let root = tempfile::tempdir().expect("temp dir");
         let work = root.path().join("work");
@@ -338,7 +375,7 @@ impl Harness {
             config: Arc::new(config),
             catalog,
             client,
-            tools: Arc::new(ToolRegistry::with_defaults()),
+            tools,
             sink: Arc::new(sink.clone()),
             permissions,
         };
