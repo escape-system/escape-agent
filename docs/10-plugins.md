@@ -51,9 +51,11 @@ pub trait Plugin: Send + Sync {
 - RAM budget: 90 MB RSS, 5 s startup timeout, restart on crash with backoff
   (1 s, 5 s, 30 s; max 3 per hour). After that, all JS plugins are `failed`
   until manual reload. `oc-plugin` enforces the startup/request deadlines,
-  detects the crash and kills the tree; RSS accounting and the restart
+  detects the crash and kills the direct child; RSS accounting and the restart
   supervisor live in `oc-server`.
-- Shutdown: `plugin.shutdown` RPC, 2 s grace, then kill the process tree.
+- Shutdown: `plugin.shutdown` RPC, 2 s grace, then kill the direct child process
+  (`kill_on_drop` on the sidecar). Grandchildren are not tracked and may outlive
+  it; killing the whole process tree is not implemented.
 
 ### RPC surface
 

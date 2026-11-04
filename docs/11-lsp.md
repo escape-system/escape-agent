@@ -57,8 +57,9 @@ Cold → Spawning(shared future) → Ready(Arc<Client>) → Broken{backoff}
   request in flight.
 - Failure: `Broken` with exponential backoff (60 s → 5 min → 15 min); no
   permanent blacklist. A missing binary never retries until config changes.
-- Shutdown: `shutdown` request (2 s) → `exit` → 1 s wait → kill the process
-  tree (Job Object on Windows, process group on Unix).
+- Shutdown: `shutdown` request (2 s) → `exit` → 1 s wait → kill the direct child
+  process only (`kill_on_drop`). Grandchildren are not tracked and may outlive
+  it; killing the whole process tree is a known limitation, not a guarantee.
 - One client per root, single-root workspace folder; multi-root is out of
   scope until a server requires it.
 

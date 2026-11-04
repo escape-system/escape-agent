@@ -156,7 +156,8 @@ public surface; `cargo doc -p <crate> --no-deps` is the reference.
   catch), `Domain`, `Hook` + `HookEvent`/`TransformDoc` JSON envelopes,
   `PluginInfo`, `RpcNamespace`, `plugin_inventory`.
 - `Sidecar` speaks newline JSON-RPC over stdio, 8 MiB frames, 5 s request
-  timeout, crash detection, `HostServices` callbacks, kill tree. Fake sidecar
+  timeout, crash detection, `HostServices` callbacks. Shutdown kills only the
+  direct child (`kill_on_drop`); grandchildren are not tracked. Fake sidecar
   binary for tests. Unsupported live-object hooks (`aisdk.*`, `experimental.ws.*`)
   are rejected at load.
 
