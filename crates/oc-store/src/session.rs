@@ -908,6 +908,20 @@ pub(crate) fn delete_tree(
         .optional()?
         .flatten();
     for id in &ids {
+        transaction.execute(
+            "DELETE FROM memory WHERE scope = 'session' AND scope_id = ?1",
+            [id],
+        )?;
+        transaction.execute("DELETE FROM goal WHERE root_id = ?1", [id])?;
+        transaction.execute(
+            "DELETE FROM observation WHERE root_id = ?1 OR session_id = ?1",
+            [id],
+        )?;
+        transaction.execute(
+            "DELETE FROM observer_repair WHERE root_id = ?1 OR target_id = ?1",
+            [id],
+        )?;
+        transaction.execute("DELETE FROM permission_request WHERE session_id = ?1", [id])?;
         transaction.execute("DELETE FROM session_v2 WHERE id = ?1", [id])?;
     }
     if let Some(parent) = parent {

@@ -584,3 +584,58 @@ async fn reopen_keeps_memories_and_index() {
         .expect("list");
     assert_eq!(listed.len(), 1);
 }
+
+#[tokio::test]
+async fn deleting_a_session_removes_session_scoped_memories_and_preserves_project_memories() {
+    let store = Store::open_memory().await.expect("store");
+    store
+        .create_session(oc_store::NewSession {
+            id: "ses_clean".to_owned(),
+            parent_id: None,
+            project_id: "prj_clean".to_owned(),
+            directory: "/tmp/clean".to_owned(),
+            title: Some("clean".to_owned()),
+            agent: None,
+            model: None,
+            metadata: None,
+            permissions: None,
+            time_created: 1,
+        })
+        .await
+        .expect("session");
+
+    store
+        .write_memory(new_memory(
+            "mem_ses_clean",
+            "session",
+            Some("ses_clean"),
+            "fact",
+            "ephemeral session memory removed on delete",
+            3,
+        ))
+        .await
+        .expect("session memory");
+    store
+        .write_memory(new_memory(
+            "mem_prj_keep",
+            "project",
+            Some("prj_clean"),
+            "fact",
+            "durable project memory kept across session delete",
+            4,
+        ))
+        .await
+        .expect("project memory");
+
+    store.delete_session("ses_clean").await.expect("delete");
+
+    let listed = store
+        .list_memories(MemoryQuery {
+            limit: 10,
+            ..Default::default()
+        })
+        .await
+        .expect("list");
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0]["id"], "mem_prj_keep");
+}
