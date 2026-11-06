@@ -196,6 +196,7 @@ impl Runtime {
             agent_id: &turn.agent_id,
             project_id: info.project_id.as_ref(),
             session_id: session,
+            root_id: &root,
             depth,
             query: &query,
             skill_ids: &skill_ids,
@@ -205,8 +206,14 @@ impl Runtime {
         .await;
 
         let live_memory_ids = if memory.is_some() {
-            self.live_memory_ids(session, info.project_id.as_ref(), &turn.agent_id, depth)
-                .await
+            self.live_memory_ids(
+                session,
+                &root,
+                info.project_id.as_ref(),
+                &turn.agent_id,
+                depth,
+            )
+            .await
         } else {
             std::collections::BTreeSet::new()
         };
@@ -280,6 +287,7 @@ impl Runtime {
     async fn live_memory_ids(
         &self,
         session: &str,
+        root: &str,
         project_id: &str,
         agent_id: &str,
         depth: u32,
@@ -290,7 +298,10 @@ impl Runtime {
             ("agent".to_owned(), Some(agent_id.to_owned())),
         ];
         if depth > 0 {
-            scopes.push(("session".to_owned(), Some(session.to_owned())));
+            scopes.push(("session".to_owned(), Some(root.to_owned())));
+            if session != root {
+                scopes.push(("session".to_owned(), Some(session.to_owned())));
+            }
         }
         self.inner
             .config
@@ -341,6 +352,11 @@ impl Runtime {
         let (Some(scribe), Some(memory)) = (self.scribe_model(), self.memory()) else {
             return;
         };
+        if let Ok(Some(node)) = self.inner.config.store.session_node(session).await
+            && node.depth > 0
+        {
+            return;
+        }
         if stats.tool_calls == 0 && !self.has_goal(session).await {
             return;
         }

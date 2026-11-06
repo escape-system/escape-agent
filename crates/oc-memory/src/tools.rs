@@ -27,7 +27,7 @@ const DEFAULT_SEARCH_LIMIT: usize = 8;
 
 const WRITE_DESCRIPTION: &str = "Store one durable memory that survives sessions: a project fact, decision, preference, \
      pattern or gotcha. Prefer memories a future session cannot derive from the repository. \
-     Text is capped at 500 characters; credentials are rejected. Write at most one memory per \
+     Text is capped at 2000 characters; credentials are rejected. Write at most one memory per \
      turn unless the user asks for more.";
 
 const SEARCH_DESCRIPTION: &str = "Search durable memories visible to this session (global, project, agent and session \

@@ -3,7 +3,7 @@
 //! [`MemoryService`] wraps [`oc_store::Store`]: retrieval merges the caller's
 //! visible scopes, ranks pinned rows first, removes exact and near duplicates,
 //! then renders a `<memory>` block trimmed to a token budget. Writes apply the
-//! 500-character cap, the secret detector and the documented defaults.
+//! 2000-character cap, the secret detector and the documented defaults.
 
 use std::collections::{BTreeSet, HashSet};
 use std::fmt;

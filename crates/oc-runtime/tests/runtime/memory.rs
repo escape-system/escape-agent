@@ -671,3 +671,84 @@ async fn fts_ranking_churn_and_mid_epoch_goal_keep_the_system_prefix_cached() {
         "mid-epoch goal state is delivered in the tail supplement"
     );
 }
+
+#[tokio::test]
+async fn child_subagents_inherit_root_session_memories_and_goal_query_matches() {
+    let harness = Harness::new(
+        vec![
+            named_tool_script(
+                "subagent",
+                "call_sub",
+                json!({
+                    "agent": "general",
+                    "description": "inspect worker",
+                    "prompt": "devam et",
+                    "background": false,
+                    "expectation": expectation(),
+                }),
+            ),
+            named_tool_script(
+                "read",
+                "call_child_read",
+                json!({"path": "hello.txt", "expectation": expectation()}),
+            ),
+            text_script("child finished"),
+            text_script("parent finished"),
+        ],
+        Arc::new(AllowAll),
+        json!({"subagents": {"background_default": false}}),
+        None,
+    )
+    .await;
+    let memory = Arc::new(MemoryService::new(Arc::clone(&harness.store)));
+    seed_memory(
+        &memory,
+        "Root session scribe note: quartz shard uses port 9091.",
+        "session",
+        Some(&harness.session),
+        3,
+    )
+    .await;
+    harness
+        .store
+        .set_goal(oc_store::NewGoal {
+            id: "gol_quartz".to_owned(),
+            root_id: harness.session.clone(),
+            objective: "verify quartz shard port configuration".to_owned(),
+            criteria: vec!["port 9091 confirmed".to_owned()],
+            model: None,
+            time_created: oc_types::now_millis(),
+        })
+        .await
+        .expect("set goal");
+    let scribe = FakeScribe::new(
+        r#"[{"text":"Root turn extracted durable note after subagent completed.","kind":"fact","tags":["root"],"importance":3,"confidence":0.9}]"#,
+    );
+    let prompts = Arc::clone(&scribe);
+    let harness = harness
+        .attach_memory(Arc::clone(&memory))
+        .attach_scribe(scribe);
+
+    harness.prompt("devam et").await;
+
+    let requests = harness.model.requests();
+    // Request 0 is the root turn; Request 1 is the child subagent's first step.
+    assert!(
+        requests[1].system[1].contains("quartz shard uses port 9091"),
+        "child subagent (depth=1) must inherit root session memories matched via goal objective: {:?}",
+        requests[1].system[1]
+    );
+
+    let rows = wait_for_memories(&harness.store, "scribe").await;
+    assert_eq!(
+        rows.len(),
+        1,
+        "only the root turn should persist scribe memories: {rows:?}"
+    );
+    assert_eq!(rows[0]["scopeID"], harness.session);
+    assert_eq!(
+        prompts.prompts.lock().expect("prompts").len(),
+        1,
+        "child subagent turn must not trigger a second scribe completion"
+    );
+}

@@ -7,7 +7,7 @@
 //! - [`MemoryService::retrieve`] merges the caller's visible scopes, ranks
 //!   pinned rows first, removes exact and near duplicates and renders a
 //!   `<memory scope="…">` block trimmed to a token budget.
-//! - [`MemoryService::write`] enforces the 500-character cap, the secret
+//! - [`MemoryService::write`] enforces the 2000-character cap, the secret
 //!   detector and the documented defaults (`importance = 3`,
 //!   `confidence = 0.7`, `mem_…` ids).
 //! - [`MemoryTools::registry`] exposes `memory_write`, `memory_search`,

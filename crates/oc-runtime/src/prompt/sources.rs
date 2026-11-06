@@ -39,6 +39,8 @@ pub struct InstructionContext<'a> {
     pub agent_id: &'a str,
     pub project_id: &'a str,
     pub session_id: &'a str,
+    /// Root session id for the session tree (`session_id` at the root).
+    pub root_id: &'a str,
     /// Session depth; the session memory scope is visible only below the root.
     pub depth: u32,
     /// Last user text for memory retrieval.
@@ -188,12 +190,15 @@ async fn memory_source(
         ("agent".to_owned(), Some(context.agent_id.to_owned())),
     ];
     if context.depth > 0 {
-        scopes.push(("session".to_owned(), Some(context.session_id.to_owned())));
+        scopes.push(("session".to_owned(), Some(context.root_id.to_owned())));
+        if context.session_id != context.root_id {
+            scopes.push(("session".to_owned(), Some(context.session_id.to_owned())));
+        }
     }
 
     let request = RetrieveRequest {
         scopes,
-        query: memory_query(context.query, context.skill_ids),
+        query: memory_query(context.query, context.goal, context.skill_ids),
         kinds: Vec::new(),
         tags: Vec::new(),
         limit: 8,
@@ -212,10 +217,24 @@ async fn memory_source(
     }
 }
 
-fn memory_query(last_user: &str, skill_ids: &[String]) -> String {
+fn memory_query(
+    last_user: &str,
+    goal: Option<&oc_observer::GoalSnapshot>,
+    skill_ids: &[String],
+) -> String {
     let mut query: String = last_user.trim().chars().take(400).collect();
     let trimmed = query.trim_end().len();
     query.truncate(trimmed);
+    if let Some(objective) = goal
+        .map(|goal| goal.objective.trim())
+        .filter(|objective| !objective.is_empty())
+    {
+        if !query.is_empty() {
+            query.push(' ');
+        }
+        let goal_text: String = objective.chars().take(200).collect();
+        query.push_str(goal_text.trim_end());
+    }
     if !skill_ids.is_empty() {
         if !query.is_empty() {
             query.push(' ');

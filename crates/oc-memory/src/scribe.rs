@@ -83,8 +83,9 @@ pub fn scribe_prompt(recent: &str) -> String {
 /// confidence are clamped, missing values use the defaults, and duplicate texts
 /// (normalized) are collapsed. At most [`MAX_CANDIDATES`] survive.
 pub fn parse_candidates(json: &str) -> Result<Vec<MemoryCandidate>, MemoryError> {
-    let value: Value = serde_json::from_str(json.trim())
-        .map_err(|error| MemoryError::ModelJson(error.to_string()))?;
+    let cleaned = strip_code_fence(json);
+    let value: Value =
+        serde_json::from_str(cleaned).map_err(|error| MemoryError::ModelJson(error.to_string()))?;
     let items = value
         .as_array()
         .ok_or_else(|| MemoryError::ModelJson("expected a top-level JSON array".to_owned()))?;
@@ -174,6 +175,17 @@ pub async fn run_scribe(
 ) -> Result<Vec<MemoryCandidate>, MemoryError> {
     let raw = model.complete(&scribe_prompt(input)).await?;
     Ok(filter_candidates(parse_candidates(&raw)?))
+}
+
+fn strip_code_fence(raw: &str) -> &str {
+    let trimmed = raw.trim();
+    if let Some(rest) = trimmed.strip_prefix("```") {
+        let after_header = rest.find('\n').map_or(rest, |newline| &rest[newline + 1..]);
+        if let Some(body) = after_header.trim_end().strip_suffix("```") {
+            return body.trim();
+        }
+    }
+    trimmed
 }
 
 fn normalize(text: &str) -> String {
@@ -312,6 +324,18 @@ mod tests {
         assert!(matches!(error, MemoryError::ModelJson(_)), "{error:?}");
         let error = parse_candidates("not json at all").unwrap_err();
         assert!(matches!(error, MemoryError::ModelJson(_)), "{error:?}");
+    }
+
+    #[test]
+    fn parser_strips_markdown_code_fences() {
+        let fenced = "```json\n[\n  {\"text\": \"fenced durable fact about the sqlite writer\", \"kind\": \"fact\", \"importance\": 4, \"confidence\": 0.85}\n]\n```";
+        let candidates = parse_candidates(fenced).expect("fenced json array");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(
+            candidates[0].text,
+            "fenced durable fact about the sqlite writer"
+        );
+        assert_eq!(candidates[0].importance, 4);
     }
 
     #[test]
