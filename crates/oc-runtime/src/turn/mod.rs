@@ -269,7 +269,12 @@ impl Runtime {
                             return Ok(ExecutionOutcome::Interrupted(cancel.reason()));
                         }
                         Err(error) => {
-                            return Ok(ExecutionOutcome::Failed(error.structured()));
+                            tracing::warn!(
+                                session = %session,
+                                %error,
+                                "auto-compaction failed; continuing turn without wedging"
+                            );
+                            last_compacted_len = Some(context.len());
                         }
                     }
                 }
@@ -285,6 +290,17 @@ impl Runtime {
             }
             if final_call {
                 messages.push(LlmMessage::user(MAX_STEPS_PROMPT));
+            } else if turn.max_steps >= 10 {
+                let remaining = turn.max_steps - step_number;
+                if remaining == 5 || remaining == 1 {
+                    messages.push(LlmMessage::user(format!(
+                        "<system-reminder>\nStep budget notice: {remaining} tool-enabled step(s) remain \
+                         before the hard step limit ({}/{}) disables tools. Finish any pending \
+                         verification or git commit now and prepare your final summary.\n</system-reminder>",
+                        step_number + 1,
+                        turn.max_steps
+                    )));
+                }
             }
             let mut step = match self
                 .stream_step(session, turn, &messages, final_call, cancel)

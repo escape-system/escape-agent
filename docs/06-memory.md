@@ -93,7 +93,7 @@ memory_list   { scope?, kind?, limit?, cursor? }
 
 - `memory_write` from an agent requires permission `memory:write` (default
   `ask`); writes from the scribe do not.
-- Text is capped at 500 chars. Longer "notes" belong in files, not memory.
+- Text is capped at 2000 chars. Longer "notes" belong in files, not memory.
 - Writes are idempotent by `(scope, scope_id, hash)`; a repeat updates
   importance/confidence instead of duplicating. A soft-deleted row still
   occupies that key. An explicit `memory_write` restores it (`deleted = 0`) and
@@ -113,7 +113,7 @@ recent user intent + assistant final text + tool outcomes (one line each)
 → [{"text","kind","tags","importance","confidence"}]  (max 5)
 ```
 
-Filters: confidence ≥ 0.6, text 20–500 chars, not a duplicate, not a secret
+Filters: confidence ≥ 0.6, text 20–2000 chars, not a duplicate, not a secret
 (regex for keys/tokens), not transient ("currently running…"). Scribe writes
 are marked `source:"scribe"` and are visible/deletable in the UI. The scribe
 never blocks the turn and is skipped when the session has no goal and no tools

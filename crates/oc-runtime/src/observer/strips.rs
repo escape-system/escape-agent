@@ -7,17 +7,23 @@ use super::MAX_TREE_ROWS;
 
 /// Breadth-first tree rows, root first, capped at [`MAX_TREE_ROWS`].
 pub(super) async fn build_tree(
-    store: &oc_store::Store,
+    runtime: &crate::runtime::Runtime,
     root: &str,
 ) -> Result<Vec<TreeRow>, oc_store::StoreError> {
+    let store = &runtime.inner.config.store;
     let mut rows = Vec::new();
     let mut queue = VecDeque::new();
     if let Some(node) = store.session_node(root).await? {
+        let state = if node.status == "busy" && runtime.is_waiting_permission(&node.id) {
+            "waiting_permission".to_owned()
+        } else {
+            node.status
+        };
         rows.push(TreeRow {
             sid: node.id.clone(),
             parent: None,
             agent: node.agent,
-            state: node.status,
+            state,
             depth: node.depth,
         });
         queue.push_back(node.id);
@@ -31,11 +37,16 @@ pub(super) async fn build_tree(
                 break;
             }
             let id = child.id.clone();
+            let state = if child.status == "busy" && runtime.is_waiting_permission(&id) {
+                "waiting_permission".to_owned()
+            } else {
+                child.status
+            };
             rows.push(TreeRow {
                 sid: id.clone(),
                 parent: child.parent_id,
                 agent: child.agent,
-                state: child.status,
+                state,
                 depth: child.depth,
             });
             queue.push_back(id);

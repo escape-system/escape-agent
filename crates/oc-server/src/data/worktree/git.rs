@@ -43,26 +43,32 @@ pub(super) async fn run_git(
             ApiError::internal("Internal error")
         }
     })?;
-    let Some(mut stdout) = child.stdout.take() else {
+    let Some(stdout) = child.stdout.take() else {
         return Err(ApiError::internal("Internal error"));
     };
-    let Some(mut stderr) = child.stderr.take() else {
+    let Some(stderr) = child.stderr.take() else {
         return Err(ApiError::internal("Internal error"));
     };
 
     let mut out = Vec::new();
     let mut err = Vec::new();
-    let mut out_take = (&mut stdout).take(MAX_STDOUT as u64);
-    let mut err_take = (&mut stderr).take(MAX_STDERR as u64);
-    let read = async {
-        tokio::join!(
-            out_take.read_to_end(&mut out),
-            err_take.read_to_end(&mut err)
-        )
+    let read_stdout = async {
+        let mut out_take = stdout.take(MAX_STDOUT as u64);
+        let res = out_take.read_to_end(&mut out).await;
+        drop(out_take);
+        res
     };
-    let (out_result, err_result) = tokio::time::timeout(GIT_TIMEOUT, read)
-        .await
-        .map_err(|_| ApiError::service_unavailable("git command timed out after 30 s"))?;
+    let read_stderr = async {
+        let mut err_take = stderr.take(MAX_STDERR as u64);
+        let res = err_take.read_to_end(&mut err).await;
+        drop(err_take);
+        res
+    };
+    let (out_result, err_result) = tokio::time::timeout(GIT_TIMEOUT, async {
+        tokio::join!(read_stdout, read_stderr)
+    })
+    .await
+    .map_err(|_| ApiError::service_unavailable("git command timed out after 30 s"))?;
     let read_error = |error: std::io::Error| {
         tracing::error!(error = %error, "failed to read git output");
         ApiError::internal("Internal error")

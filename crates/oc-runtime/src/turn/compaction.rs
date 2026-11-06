@@ -117,7 +117,7 @@ impl Runtime {
         let mut running = json!({
             "time": {"created": created},
             "status": "running",
-            "reason": reason,
+            "reason": event_reason(reason),
             "summary": ""
         });
         if let Some(keep_id) = &keep_id {
@@ -307,7 +307,7 @@ impl Runtime {
         let mut completed = json!({
             "time": {"created": created},
             "status": "completed",
-            "reason": reason,
+            "reason": event_reason(reason),
             "model": turn.model_ref.clone(),
             "summary": summary
         });
@@ -436,7 +436,7 @@ impl Runtime {
         let failed = json!({
             "time": {"created": created},
             "status": "failed",
-            "reason": reason,
+            "reason": event_reason(reason),
             "error": {
                 "type": "CompactionError",
                 "message": message

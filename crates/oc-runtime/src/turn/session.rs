@@ -204,25 +204,26 @@ impl Runtime {
         })
         .await;
 
+        let live_memory_ids = if memory.is_some() {
+            self.live_memory_ids(session, info.project_id.as_ref(), &turn.agent_id, depth)
+                .await
+        } else {
+            std::collections::BTreeSet::new()
+        };
+
         let (initial, delta, has_memory, supplement) = {
             let mut guard = handle.instructions.lock().expect("instruction set");
             if let Some(set) = guard.as_mut() {
-                // The pinned `oc/memory` block may only be carried forward while
-                // every memory line it rendered is still rendered by the fresh
-                // assembly (`InstructionSet::memory_pin_holds`). A forgotten
-                // memory leaves the fresh block, so the pin is dropped and the
-                // prefix re-pins from fresh state instead of re-sending deleted
-                // text on every step through the tail supplement. A superset (a
-                // new memory appeared) stays pinned and is announced through the
-                // tail supplement, unchanged.
-                let supplement = if set.memory_pin_holds(&assembly.sources) {
-                    set.memory_supplement(&assembly.sources)
-                } else {
-                    // The pin is dropped, so the whole fresh block lands in the
-                    // prefix this turn: a tail supplement would duplicate it.
-                    None
-                };
-                let stabilized = set.stabilize_epoch_sources(&assembly.sources);
+                // The pinned `oc/memory` block is carried forward while every
+                // memory ID it rendered is still live (`deleted = 0`) in the
+                // store. A memory that merely fell out of the top-8 FTS ranking
+                // on a new user prompt stays pinned so the cached prefix does
+                // not churn, while novel hits and mid-epoch goal updates are
+                // delivered via the tail supplement.
+                let pin_memory =
+                    set.memory_pin_holds_with_live_ids(&assembly.sources, &live_memory_ids);
+                let supplement = set.epoch_supplement(&assembly.sources, pin_memory);
+                let stabilized = set.stabilize_epoch_sources_with(&assembly.sources, pin_memory);
                 let delta = set.commit(&stabilized);
                 let has_memory = set.source("oc/memory").is_some();
                 (
@@ -274,6 +275,36 @@ impl Runtime {
             turn.system.push(mode_block);
         }
         Ok(())
+    }
+
+    async fn live_memory_ids(
+        &self,
+        session: &str,
+        project_id: &str,
+        agent_id: &str,
+        depth: u32,
+    ) -> std::collections::BTreeSet<String> {
+        let mut scopes = vec![
+            ("global".to_owned(), None),
+            ("project".to_owned(), Some(project_id.to_owned())),
+            ("agent".to_owned(), Some(agent_id.to_owned())),
+        ];
+        if depth > 0 {
+            scopes.push(("session".to_owned(), Some(session.to_owned())));
+        }
+        self.inner
+            .config
+            .store
+            .list_memories(oc_store::MemoryQuery {
+                scopes,
+                limit: 200,
+                ..oc_store::MemoryQuery::default()
+            })
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|row| row.get("id").and_then(Value::as_str).map(str::to_owned))
+            .collect()
     }
 
     /// Bump `uses`/`last_used` for the memories injected into this turn.

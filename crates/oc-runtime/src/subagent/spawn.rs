@@ -95,7 +95,8 @@ impl Tool for SubagentTool {
                     },
                     "additionalProperties": false
                 },
-                "lane": { "type": "string", "description": "Lane hint recorded for the lane service." }
+                "lane": { "type": "string", "description": "Lane hint recorded for the lane service." },
+                "group": { "type": "string", "description": "Optional group label recorded in session metadata (docs/21-grouping.md)." }
             },
             "required": ["description", "prompt"],
             "additionalProperties": false
@@ -200,7 +201,26 @@ impl Tool for SubagentTool {
         let child = SessionId::new().into_inner();
         let role = requested_role(&input, &settings, &agent);
         let lane = optional_str(&input, "lane");
-        let metadata = lane.map(|lane| json!({ "lane": lane }));
+        let group = optional_str(&input, "group").and_then(|g| {
+            let trimmed = g.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_owned())
+            }
+        });
+        let mut meta = serde_json::Map::new();
+        if let Some(lane) = lane {
+            meta.insert("lane".to_owned(), Value::String(lane));
+        }
+        if let Some(group) = group {
+            meta.insert("group".to_owned(), Value::String(group));
+        }
+        let metadata = if meta.is_empty() {
+            None
+        } else {
+            Some(Value::Object(meta))
+        };
         let created_metadata = metadata.as_ref().and_then(Value::as_object).cloned();
         runtime
             .inner

@@ -218,12 +218,15 @@ pub fn parse_verdict(text: &str, cfg: &ObserverConfig) -> Result<ObserverVerdict
         return Err(VerdictError::MissingField("target"));
     }
 
-    let message = optional_string(object.get("message"))?.filter(|value| !value.is_empty());
+    let mut message = optional_string(object.get("message"))?.filter(|value| !value.is_empty());
     if action == ObserverAction::Nudge {
-        let message = message.as_deref().ok_or(VerdictError::MissingMessage)?;
-        let length = message.chars().count();
-        if length > cfg.nudge_max_chars {
-            return Err(VerdictError::MessageTooLong(length, cfg.nudge_max_chars));
+        let text = message.as_deref().ok_or(VerdictError::MissingMessage)?;
+        // A nudge a few characters over the cap is still a usable nudge.
+        // Rejecting the whole verdict turned a slightly long message into an
+        // `observer.unavailable` outage, so the text is cut on a character
+        // boundary instead, the same way strip `why`/`outcome` are capped.
+        if text.chars().count() > cfg.nudge_max_chars {
+            message = Some(truncate_chars(text, cfg.nudge_max_chars));
         }
     }
 
@@ -267,6 +270,18 @@ pub(crate) fn unwrap_fence(text: &str) -> &str {
         }
     }
     trimmed
+}
+
+/// Cut `text` to at most `max` characters, ending in `…` when shortened.
+fn truncate_chars(text: &str, max: usize) -> String {
+    if max == 0 {
+        return String::new();
+    }
+    let mut out: String = text.chars().take(max.saturating_sub(1)).collect();
+    let trimmed = out.trim_end().len();
+    out.truncate(trimmed);
+    out.push('…');
+    out
 }
 
 fn parse_action(name: &str) -> Result<ObserverAction, VerdictError> {
@@ -431,14 +446,16 @@ mod tests {
             parse_verdict(r#"{"action":"nudge","reason":"needs a nudge"}"#, &cfg()),
             Err(VerdictError::MissingField("target"))
         ));
-        assert!(matches!(
-            parse_verdict(
-                r#"{"action":"nudge","target":"ses_1","reason":"slow",
-                    "message":"012345678901234567890123456789012345678901"}"#,
-                &cfg()
-            ),
-            Err(VerdictError::MessageTooLong(_, 40))
-        ));
+        let long = parse_verdict(
+            r#"{"action":"nudge","target":"ses_1","reason":"slow",
+                "message":"012345678901234567890123456789012345678901"}"#,
+            &cfg(),
+        )
+        .expect("an over-long nudge is truncated, not rejected");
+        let text = long.message.expect("nudge message");
+        assert_eq!(text.chars().count(), 40);
+        assert!(text.ends_with('…'));
+        assert!(text.starts_with("0123456789"));
         let long_reason = "word ".repeat(21);
         assert!(matches!(
             parse_verdict(

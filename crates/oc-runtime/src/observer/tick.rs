@@ -38,11 +38,24 @@ impl Runtime {
 
     async fn observer_ticker(&self, host: Arc<ObserverHost>, root: String) {
         let interval = Duration::from_millis(host.engine.config().tick_ms.max(MIN_TICK_MS));
+        let mut idle_passes = 0_u32;
         loop {
             if self.inner.shutdown.is_cancelled() {
                 return;
             }
-            self.observer_pass(&host, &root).await;
+            if self.observer_pass(&host, &root).await {
+                idle_passes = 0;
+            } else {
+                idle_passes = idle_passes.saturating_add(1);
+                if idle_passes >= 10 {
+                    let mut tickers = host.tickers.lock().expect("observer tickers");
+                    if host.engine.registry().active(&root).is_empty() {
+                        tickers.remove(&root);
+                        return;
+                    }
+                    idle_passes = 0;
+                }
+            }
             tokio::select! {
                 biased;
                 () = self.inner.shutdown.cancelled() => return,
@@ -70,11 +83,9 @@ impl Runtime {
                 "observer is not configured; cannot run a goal check".to_owned(),
             ));
         };
-        let tree = build_tree(&self.inner.config.store, root_id)
-            .await
-            .map_err(|error| {
-                RuntimeError::Task(format!("goal check tree lookup failed: {error}"))
-            })?;
+        let tree = build_tree(self, root_id).await.map_err(|error| {
+            RuntimeError::Task(format!("goal check tree lookup failed: {error}"))
+        })?;
         let goal = host
             .goals
             .load(root_id)
@@ -84,7 +95,12 @@ impl Runtime {
             && !goal.status.is_terminal()
         {
             let recent = host.engine.recent_outcomes(root_id, 12);
-            let known = self.recent_message_ids(root_id).await;
+            let mut known = self.recent_message_ids(root_id).await;
+            for row in &tree {
+                if !known.contains(&row.sid) {
+                    known.push(row.sid.clone());
+                }
+            }
             if let Some(transition) = host.engine.check_goal(root_id, goal, &recent, &known).await {
                 // Persist synchronously: the notifier's own write is spawned,
                 // so without this the caller could read the goal row before
@@ -102,16 +118,16 @@ impl Runtime {
         Ok(())
     }
 
-    async fn observer_pass(&self, host: &ObserverHost, root: &str) {
+    async fn observer_pass(&self, host: &ObserverHost, root: &str) -> bool {
         let node = match self.inner.config.store.session_node(root).await {
             Ok(node) => node,
             Err(error) => {
                 tracing::warn!(root = %root, error = %error, "observer tick: session node lookup failed");
-                return;
+                return false;
             }
         };
         let Some(node) = node else {
-            return;
+            return false;
         };
         host.engine.set_root_context(
             root,
@@ -122,13 +138,17 @@ impl Runtime {
                 state: Some(node.status.clone()),
             },
         );
-        let tree = match build_tree(&self.inner.config.store, root).await {
+        let tree = match build_tree(self, root).await {
             Ok(tree) => tree,
             Err(error) => {
                 tracing::warn!(root = %root, error = %error, "observer tick: tree lookup failed");
-                return;
+                return false;
             }
         };
+        let any_active_session = tree
+            .iter()
+            .any(|row| row.state == "busy" || row.state == "waiting_permission");
+        let any_active_strips = !host.engine.registry().active(root).is_empty();
         let goal: Option<GoalSnapshot> = match host.goals.load(root).await {
             Ok(goal) => goal,
             Err(error) => {
@@ -137,7 +157,9 @@ impl Runtime {
             }
         };
         let run = host.engine.tick(root, tree, goal).await;
+        let had_run = run.is_some();
         self.apply_observer_run(root, run).await;
+        any_active_session || any_active_strips || had_run
     }
 
     async fn apply_observer_run(&self, root: &str, run: Option<ObserverRun>) {
@@ -155,6 +177,23 @@ impl Runtime {
                         tracing::warn!(root = %root, "observer nudge without target or message");
                         return;
                     }
+                    if let Some(host) = self.observer_host() {
+                        let active = host.engine.registry().active(root);
+                        let waiting_on_subagent = active
+                            .iter()
+                            .any(|strip| strip.session_id == target && strip.tool == "subagent")
+                            && !active.iter().any(|strip| {
+                                strip.session_id == target && strip.tool != "subagent"
+                            });
+                        if waiting_on_subagent {
+                            tracing::debug!(
+                                root = %root,
+                                target = %target,
+                                "skipping observer nudge while session waits on a foreground subagent"
+                            );
+                            return;
+                        }
+                    }
                     if let Err(error) = self.observer_synthetic(&target, &text, root).await {
                         tracing::warn!(root = %root, target = %target, error = %error, "observer nudge enqueue failed");
                         return;
@@ -166,14 +205,8 @@ impl Runtime {
                     }
                 }
                 ObserverAction::Inspect => {
-                    // Gap: `digest` is not in the runtime yet. A digest result
-                    // would be the only legitimate way to feed the observer
-                    // more context; inventing one here would fake data.
-                    tracing::warn!(
-                        root = %root,
-                        target = %verdict.target.unwrap_or_default(),
-                        "observer inspect requested but digest is not wired; no digest produced"
-                    );
+                    let target = verdict.target.unwrap_or_default();
+                    self.observer_inspect(root, &target, &verdict.reason).await;
                 }
                 _ => {}
             },
@@ -310,5 +343,65 @@ impl Runtime {
             HostFlag::ExecutionInterrupted
         };
         engine.note_host_event(&root, flag);
+        self.ensure_observer_ticker(&root).await;
+    }
+
+    /// Produce a compact status digest for `target` and record it as a settled
+    /// `"digest"` strip in the observer registry so the next tick sees it.
+    async fn observer_inspect(&self, root: &str, target: &str, reason: &str) {
+        let Some(engine) = self.observer() else {
+            return;
+        };
+        let target_session = if target.is_empty() { root } else { target };
+        let status = match self.inner.config.store.session_node(target_session).await {
+            Ok(Some(node)) => format!("state={} agent={}", node.status, node.agent),
+            Ok(None) => "state=unknown".to_owned(),
+            Err(_) => "state=error".to_owned(),
+        };
+        let query = oc_store::MessageQuery {
+            session_id: target_session.to_owned(),
+            limit: 5,
+            order: oc_store::Order::Desc,
+            cursor: None,
+            kind: None,
+        };
+        let latest = match self.inner.config.store.list_messages(query).await {
+            Ok(page) => page
+                .items
+                .first()
+                .and_then(|msg| {
+                    let kind = msg.get("type").and_then(serde_json::Value::as_str)?;
+                    let id = msg
+                        .get("id")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("");
+                    Some(format!("latest={kind}({id}) count={}", page.items.len()))
+                })
+                .unwrap_or_else(|| "latest=none".to_owned()),
+            Err(_) => "latest=error".to_owned(),
+        };
+        let summary = format!("{status} {latest}");
+        let call_id = format!("inspect_{}", oc_types::ObservationId::new().into_inner());
+        let strip = oc_observer::FlightStrip {
+            id: oc_types::ObservationId::new().into_inner(),
+            root_id: root.to_owned(),
+            session_id: target_session.to_owned(),
+            agent: "observer".to_owned(),
+            tool_call_id: call_id.clone(),
+            tool: "digest".to_owned(),
+            why: format!("inspect {target_session}: {reason}"),
+            expect_s: 1,
+            intervene_s: 3,
+            started_ms: oc_types::now_millis(),
+            settled_ms: None,
+            state: oc_observer::StripState::Running,
+            outcome: None,
+            parent_call: None,
+            depth: 0,
+            retryable: true,
+            retry_of: None,
+        };
+        engine.observe_start(strip);
+        engine.observe_settle(&call_id, oc_observer::StripState::Ok, Some(&summary));
     }
 }

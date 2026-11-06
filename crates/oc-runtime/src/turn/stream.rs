@@ -394,7 +394,15 @@ impl Runtime {
                 .await;
             return Err(RuntimeError::Cancelled);
         }
-        state.finish.get_or_insert(FinishReason::Unknown);
+        if state.finish.is_none() {
+            let message = "stream closed before finish event".to_string();
+            let error = StructuredError::new("ProviderError", message.clone());
+            let tokens = state.tokens.clone().unwrap_or_default();
+            let cost = state.cost.unwrap_or(0.0);
+            self.fail_step(session, turn, state, error, Some(tokens), cost)
+                .await?;
+            return Err(RuntimeError::Llm(oc_llm::LlmError::Provider { message }));
+        }
         self.persist_assistant(session, &state).await?;
         Ok(StepRun {
             tokens: state.tokens.clone().unwrap_or_default(),

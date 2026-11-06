@@ -263,7 +263,7 @@ mod tests {
         assert!(prompt.contains("JSON array"), "{prompt}");
         assert!(prompt.contains("at most 5"), "{prompt}");
         assert!(prompt.contains("fact|decision|preference|pattern|gotcha"));
-        assert!(prompt.contains("20-500 characters"));
+        assert!(prompt.contains(&format!("{MIN_TEXT_CHARS}-{TEXT_CAP} characters")));
         assert!(prompt.contains("Session digest:\nuser asked for X"));
         assert!(prompt.contains("Return [] when nothing is durable"));
     }

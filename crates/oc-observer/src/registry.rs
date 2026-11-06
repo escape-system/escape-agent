@@ -430,10 +430,18 @@ impl ExpectationRegistry {
         }
     }
 
-    /// Look up a strip by tool-call id.
+    /// Look up a strip by tool-call id or session id.
     #[must_use]
-    pub fn strip(&self, tool_call_id: &str) -> Option<FlightStrip> {
-        self.data.lock().strips.get(tool_call_id).cloned()
+    pub fn strip(&self, target: &str) -> Option<FlightStrip> {
+        let data = self.data.lock();
+        if let Some(strip) = data.strips.get(target) {
+            return Some(strip.clone());
+        }
+        data.strips
+            .values()
+            .find(|s| s.session_id == target && s.state == StripState::Running)
+            .or_else(|| data.strips.values().find(|s| s.session_id == target))
+            .cloned()
     }
 
     /// Number of retained strips (running + settled).

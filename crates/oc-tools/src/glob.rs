@@ -11,7 +11,7 @@ use crate::util;
 use crate::{Tool, ToolContext, ToolError, ToolResult};
 
 pub const DEFAULT_LIMIT: usize = 100;
-pub const SEARCH_TIMEOUT: Duration = Duration::from_secs(30);
+pub const SEARCH_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct GlobTool;

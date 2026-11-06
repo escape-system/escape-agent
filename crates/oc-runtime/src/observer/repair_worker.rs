@@ -16,9 +16,25 @@ impl Runtime {
         text: &str,
         root: &str,
     ) -> Result<(), RuntimeError> {
+        if let Ok(pending) = self.inner.config.store.list_inbox(session).await {
+            let already_pending = pending.iter().any(|item| {
+                item.get("kind").and_then(Value::as_str) == Some("synthetic")
+                    && item
+                        .pointer("/payload/metadata/observer")
+                        .and_then(Value::as_bool)
+                        == Some(true)
+            });
+            if already_pending {
+                tracing::debug!(
+                    session = %session,
+                    "observer synthetic already pending in inbox; dropping duplicate"
+                );
+                return Ok(());
+            }
+        }
         let payload = json!({
             "text": text,
-            "metadata": { "observer": true, "target": root },
+            "metadata": { "observer": true, "target": root, "sessionID": session },
             "time": { "created": now_millis() },
         });
         self.enqueue_and_emit(NewInbox {
@@ -128,10 +144,13 @@ impl Runtime {
                 }
             }
             RepairCommand::CancelTool { tool_call_id } => {
-                tracing::warn!(
-                    tool_call_id = %tool_call_id,
-                    "cancel_tool repair is not supported: the runtime has no per-tool token; use interrupt"
-                );
+                let cancelled = self.cancel_tool_call(&tool_call_id);
+                if cancelled == 0 {
+                    tracing::debug!(
+                        tool_call_id = %tool_call_id,
+                        "observer cancel_tool found no running tool call"
+                    );
+                }
             }
             RepairCommand::RestartSubagent { session_id, note } => {
                 if !self.interrupt(&session_id).await? {

@@ -45,15 +45,26 @@ fn lane_config_from_value(value: Option<&serde_json::Value>) -> oc_lanes::LaneCo
     lanes
 }
 
-/// Publishes lane lifecycle changes as ephemeral SSE events.
+/// Publishes lane lifecycle changes as ephemeral SSE events and persists ticket
+/// transitions to SQLite when a store is attached.
 #[derive(Clone)]
 pub(crate) struct BusLaneEvents {
     pub(crate) bus: tokio::sync::broadcast::Sender<Arc<EventEnvelope>>,
     pub(crate) directory: String,
+    pub(crate) store: Option<Arc<oc_store::Store>>,
 }
 
 impl oc_lanes::LaneEvents for BusLaneEvents {
     fn changed(&self, ticket: &oc_lanes::Ticket) {
+        if let Some(store) = self.store.clone()
+            && let Ok(value) = serde_json::to_value(ticket)
+        {
+            tokio::spawn(async move {
+                if let Err(error) = store.save_lane_ticket(&value).await {
+                    tracing::warn!(%error, "lane ticket persistence failed");
+                }
+            });
+        }
         let mut data = serde_json::json!({
             "lane": &ticket.lane,
             "ticket": ticket,

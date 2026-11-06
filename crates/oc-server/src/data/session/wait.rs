@@ -28,7 +28,13 @@ pub async fn wait(
     let Some(runtime) = state.runtime() else {
         return Err(runtime_unavailable().into());
     };
-    let timeout = Duration::from_secs_f64(params.timeout.unwrap_or(30.0).clamp(0.0, 600.0));
+    let raw_timeout = params.timeout.unwrap_or(30.0);
+    let timeout_secs = if raw_timeout.is_finite() {
+        raw_timeout.clamp(0.0, 600.0)
+    } else {
+        30.0
+    };
+    let timeout = Duration::from_secs_f64(timeout_secs);
     runtime
         .wait_idle(&session_id, timeout)
         .await

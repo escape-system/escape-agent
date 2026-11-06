@@ -120,41 +120,69 @@ impl InstructionSet {
         self.sources.get(key)
     }
 
-    /// Stabilize volatile sources (`date` and an already-established
-    /// `oc/memory` block) within an active epoch so UTC midnight rollovers or
-    /// per-turn FTS query churn never invalidate the provider prompt cache.
+    /// Stabilize volatile sources (`date`, an already-established `oc/memory`
+    /// block, and `oc/goal`) within an active epoch so UTC midnight rollovers,
+    /// per-turn FTS query churn, or goal progress updates never invalidate the
+    /// provider prompt cache.
     ///
-    /// The memory pin only holds while every memory line it rendered is still
-    /// rendered by `next` (see [`Self::memory_pin_holds`]). Once a memory is
-    /// forgotten or edited out of the block, the freshly assembled block
-    /// replaces the pin so the cached prefix stops re-sending it; the next turn
-    /// pins that fresh block again, so the prefix changes once per membership
-    /// change, not once per turn.
+    /// The memory pin holds while every memory ID it rendered is still live in
+    /// the store (see [`Self::memory_pin_holds_with_live_ids`]). Once a memory
+    /// is forgotten, the freshly assembled block replaces the pin so the cached
+    /// prefix stops re-sending it; the next turn pins that fresh block again,
+    /// so the prefix changes once per membership deletion, not once per turn.
     #[must_use]
     pub fn stabilize_epoch_sources(&self, next: &[InstructionSource]) -> Vec<InstructionSource> {
-        let pin_memory = self.memory_pin_holds(next);
-        let mut out: Vec<InstructionSource> = next
-            .iter()
-            .map(|source| {
-                if source.key == "date"
-                    && let Some(pinned) = self.sources.get("date")
-                {
-                    return pinned.clone();
+        self.stabilize_epoch_sources_with(next, self.memory_pin_holds(next))
+    }
+
+    /// Stabilize volatile sources with an explicit `pin_memory` decision.
+    #[must_use]
+    pub fn stabilize_epoch_sources_with(
+        &self,
+        next: &[InstructionSource],
+        pin_memory: bool,
+    ) -> Vec<InstructionSource> {
+        let mut out: Vec<InstructionSource> = Vec::with_capacity(next.len() + 2);
+        for source in next {
+            if source.key == "date"
+                && let Some(pinned) = self.sources.get("date")
+            {
+                out.push(pinned.clone());
+                continue;
+            }
+            if source.key == "oc/memory" {
+                if pin_memory {
+                    if let Some(pinned) = self.sources.get("oc/memory") {
+                        out.push(pinned.clone());
+                    } else {
+                        out.push(source.clone());
+                    }
+                } else {
+                    out.push(source.clone());
                 }
-                if pin_memory
-                    && source.key == "oc/memory"
-                    && let Some(pinned) = self.sources.get("oc/memory")
-                {
-                    return pinned.clone();
+                continue;
+            }
+            if source.key == "oc/goal" {
+                if let Some(pinned) = self.sources.get("oc/goal") {
+                    out.push(pinned.clone());
                 }
-                source.clone()
-            })
-            .collect();
+                // When the epoch started without `oc/goal`, keep it out of the
+                // system prefix and deliver it via `epoch_supplement` so mid-session
+                // goal creation does not bust the prompt cache.
+                continue;
+            }
+            out.push(source.clone());
+        }
         if pin_memory
             && let Some(pinned_memory) = self.sources.get("oc/memory")
             && !out.iter().any(|source| source.key == "oc/memory")
         {
             out.push(pinned_memory.clone());
+        }
+        if let Some(pinned_goal) = self.sources.get("oc/goal")
+            && !out.iter().any(|source| source.key == "oc/goal")
+        {
+            out.push(pinned_goal.clone());
         }
         out.sort_by(|left, right| {
             (left.kind, left.key.as_str()).cmp(&(right.kind, right.key.as_str()))
@@ -162,18 +190,8 @@ impl InstructionSet {
         out
     }
 
-    /// Whether the pinned `oc/memory` block may be carried forward.
-    ///
-    /// The epoch pin exists to keep the prompt-cache prefix byte-stable, so it
-    /// must not follow the per-turn retrieval ranking: memories may be *added*
-    /// at the conversation tail through [`Self::memory_supplement`] without
-    /// touching the prefix. Removal is different. When a pinned memory line is
-    /// no longer rendered (it was forgotten, edited, or fell out of the token
-    /// budget), keeping the pin would re-send text the model should no longer
-    /// see on every step, so the pin is dropped and the fresh block replaces
-    /// it. A pinned block whose memories are all gone is dropped too: the
-    /// prefix then changes once for that membership change instead of staying
-    /// stale for the rest of the epoch.
+    /// Whether the pinned `oc/memory` block may be carried forward based solely
+    /// on the freshly rendered sources.
     #[must_use]
     pub fn memory_pin_holds(&self, next: &[InstructionSource]) -> bool {
         let Some(pinned) = self.sources.get("oc/memory") else {
@@ -186,30 +204,80 @@ impl InstructionSet {
         memory_lines(&pinned.text).all(|line| fresh.contains(line))
     }
 
+    /// Whether the pinned `oc/memory` block may be carried forward when
+    /// `live_ids` is the set of non-deleted memory IDs in the store.
+    ///
+    /// A memory that merely fell out of the top-8 FTS ranking on a new user
+    /// prompt is still live in the store, so keeping the pin avoids mutating
+    /// the 80k-token system prefix while novel hits are delivered at the tail.
+    #[must_use]
+    pub fn memory_pin_holds_with_live_ids(
+        &self,
+        next: &[InstructionSource],
+        live_ids: &BTreeSet<String>,
+    ) -> bool {
+        if self.memory_pin_holds(next) {
+            return true;
+        }
+        let Some(pinned) = self.sources.get("oc/memory") else {
+            return true;
+        };
+        let ids: Vec<&str> = memory_lines(&pinned.text)
+            .filter_map(memory_line_id)
+            .collect();
+        !ids.is_empty() && ids.into_iter().all(|id| live_ids.contains(id))
+    }
+
     /// Extract any newly retrieved memory lines in `next` that are not already
     /// present in the epoch's pinned `oc/memory` source, so they can be
     /// injected at the conversation tail without mutating the system prefix.
     #[must_use]
     pub fn memory_supplement(&self, next: &[InstructionSource]) -> Option<String> {
-        let pinned = self.sources.get("oc/memory")?;
-        let candidate = next.iter().find(|source| source.key == "oc/memory")?;
-        if candidate.text == pinned.text {
-            return None;
-        }
-        let mut novel = Vec::new();
-        for line in candidate.text.lines() {
-            let trimmed = line.trim();
-            if trimmed.starts_with("- [") && !pinned.text.contains(trimmed) {
-                novel.push(trimmed);
+        self.epoch_supplement(next, true)
+    }
+
+    /// Extract tail supplements for `oc/memory` and `oc/goal` changes within an
+    /// active epoch so the model sees newly retrieved memories and updated goal
+    /// state without mutating the cached system prefix.
+    #[must_use]
+    pub fn epoch_supplement(&self, next: &[InstructionSource], pin_memory: bool) -> Option<String> {
+        let mut blocks = Vec::new();
+        if pin_memory
+            && let Some(pinned) = self.sources.get("oc/memory")
+            && let Some(candidate) = next.iter().find(|source| source.key == "oc/memory")
+            && candidate.text != pinned.text
+        {
+            let mut novel = Vec::new();
+            for line in candidate.text.lines() {
+                let trimmed = line.trim();
+                if trimmed.starts_with("- [") && !pinned.text.contains(trimmed) {
+                    novel.push(trimmed);
+                }
+            }
+            if !novel.is_empty() {
+                blocks.push(format!(
+                    "<memory scope=\"supplement\">\n{}\n</memory>",
+                    novel.join("\n")
+                ));
             }
         }
-        if novel.is_empty() {
-            return None;
+        if let Some(candidate_goal) = next.iter().find(|source| source.key == "oc/goal") {
+            let changed = self
+                .sources
+                .get("oc/goal")
+                .is_none_or(|pinned| pinned.text != candidate_goal.text);
+            if changed {
+                blocks.push(candidate_goal.text.trim().to_owned());
+            }
         }
-        Some(format!(
-            "<system-reminder>\n<memory scope=\"supplement\">\n{}\n</memory>\n</system-reminder>",
-            novel.join("\n")
-        ))
+        if blocks.is_empty() {
+            None
+        } else {
+            Some(format!(
+                "<system-reminder>\n{}\n</system-reminder>",
+                blocks.join("\n\n")
+            ))
+        }
     }
 
     /// Compute the delta to `next` without mutating self.
@@ -262,6 +330,13 @@ fn memory_lines(text: &str) -> impl Iterator<Item = &str> {
     text.lines()
         .map(str::trim)
         .filter(|line| line.starts_with("- ["))
+}
+
+fn memory_line_id(line: &str) -> Option<&str> {
+    let open = line.rfind(" (")?;
+    let rest = &line[open + 2..];
+    let id = rest.strip_suffix(')')?;
+    (!id.is_empty()).then_some(id)
 }
 
 #[cfg(test)]

@@ -141,7 +141,25 @@ impl LlmError {
     #[must_use]
     pub fn is_retryable(&self) -> bool {
         match self {
-            LlmError::Http { status, .. } => {
+            LlmError::Http {
+                status,
+                message,
+                retry_after_ms,
+            } => {
+                if *status == 429 {
+                    if retry_after_ms.is_some_and(|ms| ms > 60_000) {
+                        return false;
+                    }
+                    let lower = message.to_ascii_lowercase();
+                    if lower.contains("usage limit")
+                        || lower.contains("quota")
+                        || lower.contains("credit")
+                        || lower.contains("balance")
+                        || lower.contains("exceeded")
+                    {
+                        return false;
+                    }
+                }
                 matches!(status, 408 | 409 | 425 | 429) || (500..=599).contains(status)
             }
             LlmError::Transport { .. } => true,

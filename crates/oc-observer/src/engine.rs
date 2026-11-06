@@ -243,7 +243,17 @@ struct RootState {
     nudges: HashMap<String, Vec<i64>>,
     inspects: Vec<i64>,
     compacts: HashMap<String, i64>,
+    /// Overdue strips already evaluated, keyed by tool-call id, with the time
+    /// before which the same strip must not wake the observer again.
+    ///
+    /// Without this an overdue strip stays overdue on every tick, so one long
+    /// `subagent` or `shell` call re-woke the model every `min_interval_ms`
+    /// for as long as it ran.
+    snoozed: HashMap<String, i64>,
 }
+
+/// Minimum re-evaluation backoff for an overdue strip.
+const MIN_OVERDUE_BACKOFF_MS: i64 = 30_000;
 
 /// Per-root observer engine.
 pub struct ObserverEngine {
@@ -274,6 +284,7 @@ enum Gate {
 
 enum Reserve {
     Ok { used: u32, left: u32 },
+    TargetExhausted,
     Exhausted { reason: String, budget: BudgetState },
 }
 
@@ -420,6 +431,11 @@ impl ObserverEngine {
                 snapshot.known_ids.push(id.clone());
             }
         }
+        for ev in &snapshot.evidence {
+            if !snapshot.known_ids.contains(ev) {
+                snapshot.known_ids.push(ev.clone());
+            }
+        }
         for strip in self.registry.recent(root_id, 32) {
             if !snapshot.known_ids.contains(&strip.tool_call_id) {
                 snapshot.known_ids.push(strip.tool_call_id);
@@ -486,6 +502,7 @@ impl ObserverEngine {
         self.run(root_id, tree, goal, true).await
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn run(
         &self,
         root_id: &str,
@@ -516,10 +533,23 @@ impl ObserverEngine {
                     .last_activity_ms
                     .is_some_and(|last| now.saturating_sub(last) >= self.cfg.stall_seconds * 1_000)
             });
-        let overdue = self
-            .registry
-            .earliest_deadline(root_id)
-            .is_some_and(|deadline| deadline <= now);
+        let overdue_ids: Vec<(String, u32)> = self.with_root(root_id, |state| {
+            state
+                .snoozed
+                .retain(|id, _| active_strips.iter().any(|strip| &strip.tool_call_id == id));
+            active_strips
+                .iter()
+                .filter(|strip| is_strip_overdue(strip, &tree, now))
+                .filter(|strip| {
+                    state
+                        .snoozed
+                        .get(&strip.tool_call_id)
+                        .is_none_or(|until| *until <= now)
+                })
+                .map(|strip| (strip.tool_call_id.clone(), strip.intervene_s))
+                .collect()
+        });
+        let overdue = !overdue_ids.is_empty();
         let pending = self.with_root(root_id, |state| {
             state.pending_wake || state.error_streak >= 3
         });
@@ -531,10 +561,21 @@ impl ObserverEngine {
         let gate = self.with_root(root_id, |state| {
             prune_all(state, now, &self.cfg);
             if state.escalated {
-                return Gate::Escalated {
-                    reason: "repair budget exhausted".to_owned(),
-                    budget: budget_from(state, &self.cfg),
-                };
+                let root_used = u32::try_from(state.repairs.len()).unwrap_or(u32::MAX);
+                if root_used < self.cfg.max_repairs_per_10min {
+                    // The repair window rolled over: escalation is a budget
+                    // state, not a permanent latch.
+                    state.escalated = false;
+                } else {
+                    // Consume the wake so an escalated root does not re-enter
+                    // this branch on every tick.
+                    state.pending_wake = false;
+                    state.error_streak = 0;
+                    return Gate::Escalated {
+                        reason: "repair budget exhausted".to_owned(),
+                        budget: budget_from(state, &self.cfg),
+                    };
+                }
             }
             let calls = state.calls.len();
             let rate_limited = u32::try_from(calls).unwrap_or(u32::MAX)
@@ -556,12 +597,24 @@ impl ObserverEngine {
             state.last_call_ms = Some(now);
             state.calls.push(now);
             state.last_activity_ms = Some(now);
+            for (id, intervene_s) in &overdue_ids {
+                let backoff = (i64::from(*intervene_s) * 1_000).max(MIN_OVERDUE_BACKOFF_MS);
+                state
+                    .snoozed
+                    .insert(id.clone(), now.saturating_add(backoff));
+            }
             Gate::Proceed
         });
 
         match gate {
             Gate::Skip(reason) => return Some(ObserverRun::Skipped { reason }),
             Gate::Escalated { reason, budget } => {
+                // A timer tick against an escalated root is not an evaluation:
+                // report it only to explicit checks so hosts do not log one
+                // escalation row per tick.
+                if !force {
+                    return None;
+                }
                 return Some(ObserverRun::Escalated { reason, budget });
             }
             Gate::Proceed => {}
@@ -601,7 +654,7 @@ impl ObserverEngine {
             .into_iter()
             .map(|strip| {
                 let age_s = strip.elapsed_s(now);
-                let overdue = strip.is_overdue(now);
+                let overdue = is_strip_overdue(&strip, tree, now);
                 ActiveStrip {
                     sid: strip.session_id,
                     agent: strip.agent,
@@ -742,6 +795,7 @@ impl ObserverEngine {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn apply_repair(
         &self,
         root_id: &str,
@@ -769,20 +823,18 @@ impl ObserverEngine {
                     .map_or(0, std::vec::Vec::len),
             )
             .unwrap_or(u32::MAX);
-            if state.escalated
-                || root_used >= self.cfg.max_repairs_per_10min
-                || target_used >= self.cfg.max_repairs_per_target_10min
-            {
+            let root_exhausted = state.escalated || root_used >= self.cfg.max_repairs_per_10min;
+            let target_exhausted = target_used >= self.cfg.max_repairs_per_target_10min;
+            if root_exhausted || target_exhausted {
+                // Only the root budget escalates the whole tree; one exhausted
+                // target is a rejected repair and must not stop supervision of
+                // every other session under the root.
+                if !root_exhausted {
+                    return Reserve::TargetExhausted;
+                }
                 state.escalated = true;
-                let reason = if state.escalated && root_used >= self.cfg.max_repairs_per_10min {
-                    "repair budget for this root is exhausted".to_owned()
-                } else if target_used >= self.cfg.max_repairs_per_target_10min {
-                    "repair budget for this target is exhausted".to_owned()
-                } else {
-                    "repair budget exhausted".to_owned()
-                };
                 return Reserve::Exhausted {
-                    reason,
+                    reason: "repair budget for this root is exhausted".to_owned(),
                     budget: budget_from(state, &self.cfg),
                 };
             }
@@ -806,6 +858,12 @@ impl ObserverEngine {
 
         let (used, left) = match reserve {
             Reserve::Ok { used, left } => (used, left),
+            Reserve::TargetExhausted => {
+                return ObserverRun::Rejected {
+                    action: verdict.action,
+                    reason: "repair budget for this target is exhausted".to_owned(),
+                };
+            }
             Reserve::Exhausted { reason, budget } => {
                 self.notifier.notify(ObserverNotice::Escalated {
                     root_id: root_id.to_owned(),
@@ -832,6 +890,22 @@ impl ObserverEngine {
                 }
             }
             Err(error) => {
+                // Nothing was repaired, so the reservation is returned: an
+                // unsupported or failing executor must not drain the budget
+                // and escalate the root on its own.
+                self.with_root(root_id, |state| {
+                    if let Some(position) = state.repairs.iter().rposition(|at| *at == now) {
+                        state.repairs.remove(position);
+                    }
+                    if let Some(repairs) = state.target_repairs.get_mut(&target)
+                        && let Some(position) = repairs.iter().rposition(|at| *at == now)
+                    {
+                        repairs.remove(position);
+                    }
+                    if kind == RepairKind::CompactContext {
+                        state.compacts.remove(&target);
+                    }
+                });
                 let reason = error.to_string();
                 self.notifier.notify(ObserverNotice::RepairFailed {
                     root_id: root_id.to_owned(),
@@ -861,10 +935,15 @@ impl ObserverEngine {
         }
         match kind {
             RepairKind::RetryTool => {
-                let strip = self
-                    .registry
-                    .strip(target)
-                    .ok_or_else(|| format!("unknown tool call target: {target}"))?;
+                let strip =
+                    self.registry
+                        .strip(target)
+                        .or_else(|| {
+                            self.registry.recent(root_id, 32).into_iter().find(|strip| {
+                                strip.session_id == target && strip.state.is_failure()
+                            })
+                        })
+                        .ok_or_else(|| format!("unknown tool call target: {target}"))?;
                 if !strip.state.is_failure() {
                     return Err("retry_tool requires a failed tool call".to_owned());
                 }
@@ -876,6 +955,12 @@ impl ObserverEngine {
                 let strip = self
                     .registry
                     .strip(target)
+                    .or_else(|| {
+                        self.registry
+                            .active(root_id)
+                            .into_iter()
+                            .find(|strip| strip.session_id == target)
+                    })
                     .ok_or_else(|| format!("unknown tool call target: {target}"))?;
                 if strip.state != StripState::Running {
                     return Err("cancel_tool requires a running tool call".to_owned());
@@ -998,6 +1083,20 @@ impl ObserverEngine {
     }
 }
 
+fn is_strip_overdue(strip: &FlightStrip, tree: &[TreeRow], now: i64) -> bool {
+    if !strip.is_overdue(now) {
+        return false;
+    }
+    if strip.tool == "subagent"
+        && tree.iter().any(|row| {
+            row.parent.as_deref() == Some(strip.session_id.as_str()) && row.state == "busy"
+        })
+    {
+        return false;
+    }
+    true
+}
+
 fn prune_all(state: &mut RootState, now: i64, cfg: &ObserverConfig) {
     prune_vec(&mut state.calls, now, 60_000);
     prune_vec(&mut state.repairs, now, cfg.budget_window_ms);
@@ -1012,6 +1111,12 @@ fn prune_all(state: &mut RootState, now: i64, cfg: &ObserverConfig) {
         .target_repairs
         .retain(|_, repairs| !repairs.is_empty());
     state.nudges.retain(|_, nudges| !nudges.is_empty());
+    // Escalation is a budget state: it ends when the window rolls over.
+    if state.escalated
+        && u32::try_from(state.repairs.len()).unwrap_or(u32::MAX) < cfg.max_repairs_per_10min
+    {
+        state.escalated = false;
+    }
 }
 
 fn prune_vec(values: &mut Vec<i64>, now: i64, window_ms: i64) {

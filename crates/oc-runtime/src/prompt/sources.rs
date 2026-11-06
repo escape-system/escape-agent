@@ -119,7 +119,7 @@ fn discovery_sources(config: &ConfigService, directory: &str) -> Vec<Instruction
         .collect()
 }
 
-fn skill_source(
+pub(crate) fn skill_source(
     config: &ConfigService,
     agent_id: &str,
     directory: &str,

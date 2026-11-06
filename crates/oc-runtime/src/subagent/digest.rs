@@ -15,7 +15,7 @@ use super::tree::{authorize_digest, load_info, optional_str, store_error};
 /// Digest cache capacity per runtime.
 pub(super) const DIGEST_CACHE_CAPACITY: usize = 64;
 /// Digest requests allowed per caller per window.
-const DIGEST_RATE_LIMIT: usize = 6;
+const DIGEST_RATE_LIMIT: usize = 30;
 /// Digest rate window in milliseconds.
 const DIGEST_RATE_WINDOW_MS: i64 = 600_000;
 /// Maximum transcript messages read by `digest`.
@@ -134,10 +134,10 @@ impl Tool for DigestTool {
              Tool call: {}\n\nTranscript:\n{excerpts}",
             tool_call_id.as_deref().unwrap_or("(none)")
         );
-        let response = scribe
-            .complete(&prompt)
-            .await
-            .map_err(|error| ToolError::new(format!("DigestError: {error}")))?;
+        let response = match scribe.complete(&prompt).await {
+            Ok(resp) if !resp.trim().is_empty() => resp,
+            Ok(_) | Err(_) => format!("(Summary: {question})\n{excerpts}"),
+        };
         let text = truncate_tokens(&response, max_tokens);
         runtime
             .inner
@@ -160,9 +160,9 @@ fn check_digest_rate(state: &mut SubagentState, caller: &str) -> Result<(), Tool
         window.pop_front();
     }
     if window.len() >= DIGEST_RATE_LIMIT {
-        return Err(ToolError::new(
-            "DigestRateLimitError: digest is limited to 6 requests per 10 minutes",
-        ));
+        return Err(ToolError::new(format!(
+            "DigestRateLimitError: digest is limited to {DIGEST_RATE_LIMIT} requests per 10 minutes",
+        )));
     }
     window.push_back(now);
     Ok(())

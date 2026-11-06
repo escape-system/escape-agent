@@ -26,20 +26,60 @@ use crate::types::LaneRequest;
 ///
 /// Returns `None` when no segment names a supported build/test command.
 pub fn classify(command: &str, cwd: &Path) -> Option<LaneRequest> {
-    let family = split_segments(command)
-        .into_iter()
-        .find_map(|segment| parse_segment(segment).and_then(|tokens| classify_tokens(&tokens)))?;
+    let mut effective_cwd = cwd.to_path_buf();
+    let mut matched = None;
+    for segment in split_segments(command) {
+        let Some(tokens) = parse_segment(segment) else {
+            continue;
+        };
+        if let Some(dir) = cd_target(&tokens) {
+            effective_cwd = effective_cwd.join(dir);
+            continue;
+        }
+        if let Some(family) = classify_tokens(&tokens) {
+            if family == Family::Cargo
+                && let Some(manifest_dir) = cargo_manifest_dir(&tokens)
+            {
+                effective_cwd = effective_cwd.join(manifest_dir);
+            }
+            matched = Some(family);
+            break;
+        }
+    }
+    let family = matched?;
     let root = match family {
-        Family::Cargo => cargo_workspace(cwd),
-        Family::Node => node_workspace(cwd),
+        Family::Cargo => cargo_workspace(&effective_cwd),
+        Family::Node => node_workspace(&effective_cwd),
         Family::Go | Family::Python | Family::Dotnet | Family::Gradle | Family::Maven => {
-            canonical_or_self(cwd)
+            canonical_or_self(&effective_cwd)
         }
     };
     Some(LaneRequest {
         lane: format!("{}:{}", family.prefix(), root.to_string_lossy()),
         command: command.to_owned(),
     })
+}
+
+fn cd_target(tokens: &[String]) -> Option<&str> {
+    if tokens.first().map(String::as_str) != Some("cd") {
+        return None;
+    }
+    first_non_option(tokens.get(1..)?).filter(|target| *target != "-")
+}
+
+fn cargo_manifest_dir(tokens: &[String]) -> Option<PathBuf> {
+    let mut index = 0;
+    while let Some(token) = tokens.get(index) {
+        if let Some(path) = token.strip_prefix("--manifest-path=") {
+            return Path::new(path).parent().map(Path::to_path_buf);
+        }
+        if token == "--manifest-path" {
+            let path = tokens.get(index + 1)?;
+            return Path::new(path).parent().map(Path::to_path_buf);
+        }
+        index += 1;
+    }
+    None
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

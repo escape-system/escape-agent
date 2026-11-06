@@ -408,6 +408,57 @@ async fn vcs_status_branch_and_diff() {
 }
 
 #[tokio::test]
+async fn vcs_diff_large_output_does_not_deadlock() {
+    if !git_available() {
+        return;
+    }
+    let harness = harness().await;
+    let directory = harness.directory.path();
+    git(directory, &["init", "-q"]);
+    git(directory, &["config", "user.name", "Test"]);
+    git(directory, &["config", "user.email", "test@test.local"]);
+
+    std::fs::write(directory.join("large.txt"), "initial\n").unwrap();
+    git(directory, &["add", "large.txt"]);
+    git(directory, &["commit", "-m", "init", "-q"]);
+
+    // 2 MB of content to overflow the 1 MB diff cap and 64 KB OS pipe buffer
+    let line = "a".repeat(100) + "\n";
+    let mut content = String::with_capacity(20_000 * 101);
+    for _ in 0..20_000 {
+        content.push_str(&line);
+    }
+    std::fs::write(directory.join("large.txt"), &content).unwrap();
+
+    let app = router(harness.state.clone());
+    let (status, body) = call(
+        &app,
+        Method::GET,
+        "/api/vcs/diff?mode=working",
+        None,
+        Some(directory),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    let rows = body.unwrap()["data"].clone();
+    assert!(rows.is_array());
+
+    // Also verify large UNTRACKED file (> 256 KB MAX_FILE_PATCH_BYTES) does not fail
+    std::fs::write(directory.join("untracked_large.txt"), &content).unwrap();
+    let (status, body) = call(
+        &app,
+        Method::GET,
+        "/api/vcs/diff?mode=working",
+        None,
+        Some(directory),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    let rows = body.unwrap()["data"].clone();
+    assert!(rows.is_array());
+}
+
+#[tokio::test]
 async fn vcs_diff_before_first_commit() {
     if !git_available() {
         return;

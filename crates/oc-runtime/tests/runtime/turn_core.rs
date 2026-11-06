@@ -998,6 +998,47 @@ async fn shutdown_preserves_a_queued_row_for_the_restarted_runtime() {
     assert_eq!(interrupted[0]["reason"], "shutdown");
 }
 
+#[tokio::test]
+async fn malformed_tool_arguments_become_a_tool_error_and_turn_recovers() {
+    let harness = Harness::new(
+        vec![
+            Script::Events(vec![
+                LlmEvent::StepStart,
+                LlmEvent::ToolInputStart {
+                    id: "call_bad_json".to_owned(),
+                    name: "read".to_owned(),
+                },
+                LlmEvent::ToolInputEnd {
+                    id: "call_bad_json".to_owned(),
+                    text: "{\"path\": \"hello.txt\"".to_owned(),
+                },
+                LlmEvent::ToolCall {
+                    id: "call_bad_json".to_owned(),
+                    name: "read".to_owned(),
+                    input: Value::String("{\"path\": \"hello.txt\"".to_owned()),
+                },
+                LlmEvent::Finish {
+                    reason: "tool-calls".to_owned(),
+                    usage: usage(),
+                },
+            ]),
+            text_script("recovered after malformed tool json"),
+        ],
+        Arc::new(AllowAll),
+        json!({}),
+        None,
+    )
+    .await;
+    harness.prompt("read hello.txt").await;
+
+    let failures = harness.sink.data("session.tool.failed");
+    assert_eq!(failures.len(), 1);
+    assert_eq!(failures[0]["error"]["type"], "InvalidToolArgumentsError");
+    assert_eq!(failures[0]["executed"], false);
+    assert!(harness.sink.has("session.execution.succeeded"));
+    assert!(!harness.sink.has("session.execution.failed"));
+}
+
 // ---------------------------------------------------------------------------
 // Observer wiring
 // ---------------------------------------------------------------------------

@@ -234,6 +234,11 @@ async fn coalesces_and_rate_limits_instead_of_calling() {
     ));
     assert_eq!(h.model.calls(), 1);
 
+    // A new wake (here an execution failure) inside `min_interval_ms` is
+    // coalesced and served once the interval passes; the already-evaluated
+    // overdue strip alone does not re-wake.
+    h.engine
+        .note_host_event("ses_root", HostFlag::ExecutionFailed);
     assert!(matches!(
         h.engine.tick("ses_root", tree(), None).await,
         Some(ObserverRun::Skipped {
@@ -265,6 +270,8 @@ async fn per_minute_rate_limit_returns_skipped() {
         Some(ObserverRun::Verdict { .. })
     ));
     h.clock.set(11_000);
+    h.engine
+        .note_host_event("ses_root", HostFlag::ExecutionFailed);
     assert!(matches!(
         h.engine.tick("ses_root", tree(), None).await,
         Some(ObserverRun::Skipped {
@@ -447,4 +454,244 @@ async fn goal_change_wakes_and_done_requires_recent_evidence() {
         })
         .expect("goal notice");
     assert_eq!(goal_notice, oc_observer::GoalStatus::Done);
+}
+
+// ---------------------------------------------------------------------------
+// Regressions from session ses_e4e727e0bffdL4Id0eSw2qUdSM
+// ---------------------------------------------------------------------------
+
+#[derive(Default)]
+struct FailingExecutor {
+    calls: AtomicUsize,
+}
+
+impl RepairExecutor for FailingExecutor {
+    fn apply<'a>(
+        &'a self,
+        _verdict: &'a ObserverVerdict,
+    ) -> BoxFuture<'a, Result<RepairOutcome, ObserverError>> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async {
+            Err(ObserverError::Executor(
+                "cancel_tool is not supported".to_owned(),
+            ))
+        })
+    }
+}
+
+fn cancel_repair() -> String {
+    r#"{"action":"repair","target":"tc_1","reason":"hung shell",
+        "repair":{"kind":"cancel_tool","args":{}}}"#
+        .to_owned()
+}
+
+#[tokio::test]
+async fn an_overdue_strip_wakes_the_observer_once_per_backoff() {
+    let cfg = ObserverConfig {
+        min_interval_ms: 2_000,
+        max_calls_per_min: 100,
+        ..ObserverConfig::default()
+    };
+    let none = r#"{"action":"none","reason":"still working"}"#.to_owned();
+    let h = harness(cfg, vec![Ok(none.clone()), Ok(none)]);
+    // A foreground subagent: intervene after 602 s.
+    h.engine.observe_start(strip("tc_1", 0, 602));
+    h.clock.set(602_000);
+    assert!(matches!(
+        h.engine.tick("ses_root", tree(), None).await,
+        Some(ObserverRun::Verdict { .. })
+    ));
+    // Before the fix every tick after `min_interval_ms` called the model again
+    // for as long as the subagent ran (hundreds of calls).
+    for second in 1..600 {
+        h.clock.set(602_000 + second * 1_000);
+        assert!(
+            h.engine.tick("ses_root", tree(), None).await.is_none(),
+            "tick {second}s after the evaluation re-woke the observer"
+        );
+    }
+    assert_eq!(h.model.calls(), 1);
+    h.clock.set(602_000 + 602_000);
+    assert!(matches!(
+        h.engine.tick("ses_root", tree(), None).await,
+        Some(ObserverRun::Verdict { .. })
+    ));
+    assert_eq!(
+        h.model.calls(),
+        2,
+        "the strip is re-checked after its backoff"
+    );
+}
+
+#[tokio::test]
+async fn an_escalated_root_goes_quiet_on_ticks() {
+    let cfg = ObserverConfig {
+        min_interval_ms: 0,
+        max_repairs_per_10min: 1,
+        ..ObserverConfig::default()
+    };
+    let h = harness(cfg, vec![Ok(retry_repair()), Ok(retry_repair())]);
+    h.engine.observe_start(strip("tc_1", 0, 60));
+    h.engine
+        .observe_settle("tc_1", StripState::Error, Some("exit 1"));
+    assert!(matches!(
+        h.engine.check_now("ses_root", tree(), None).await,
+        Some(ObserverRun::Repair { .. })
+    ));
+    h.engine
+        .note_host_event("ses_root", HostFlag::ExecutionFailed);
+    h.clock.set(1_000);
+    assert!(matches!(
+        h.engine.check_now("ses_root", tree(), None).await,
+        Some(ObserverRun::Escalated { .. })
+    ));
+    // A pending wake survived escalation before the fix, so every 1 s tick
+    // produced another `Escalated` run (16 562 observation rows in the field).
+    h.engine
+        .note_host_event("ses_root", HostFlag::ExecutionFailed);
+    for second in 2..120 {
+        h.clock.set(second * 1_000);
+        assert!(
+            h.engine.tick("ses_root", tree(), None).await.is_none(),
+            "escalated tick at {second}s must stay silent"
+        );
+    }
+}
+
+#[tokio::test]
+async fn escalation_expires_with_the_repair_window() {
+    let cfg = ObserverConfig {
+        min_interval_ms: 0,
+        max_repairs_per_10min: 1,
+        ..ObserverConfig::default()
+    };
+    let window = cfg.budget_window_ms;
+    let h = harness(
+        cfg,
+        vec![Ok(retry_repair()), Ok(retry_repair()), Ok(retry_repair())],
+    );
+    h.engine.observe_start(strip("tc_1", 0, 60));
+    h.engine
+        .observe_settle("tc_1", StripState::Error, Some("exit 1"));
+    h.engine.check_now("ses_root", tree(), None).await;
+    h.clock.set(1_000);
+    assert!(matches!(
+        h.engine.check_now("ses_root", tree(), None).await,
+        Some(ObserverRun::Escalated { .. })
+    ));
+    h.clock.set(window + 1_000);
+    assert!(!h.engine.budget("ses_root").exhausted);
+    assert!(matches!(
+        h.engine.check_now("ses_root", tree(), None).await,
+        Some(ObserverRun::Repair { .. })
+    ));
+}
+
+#[tokio::test]
+async fn one_exhausted_target_does_not_escalate_the_root() {
+    let cfg = ObserverConfig {
+        min_interval_ms: 0,
+        max_repairs_per_10min: 10,
+        max_repairs_per_target_10min: 1,
+        ..ObserverConfig::default()
+    };
+    let h = harness(cfg, vec![Ok(retry_repair()), Ok(retry_repair())]);
+    h.engine.observe_start(strip("tc_1", 0, 60));
+    h.engine
+        .observe_settle("tc_1", StripState::Error, Some("exit 1"));
+    h.engine.check_now("ses_root", tree(), None).await;
+    h.clock.set(1_000);
+    let run = h.engine.check_now("ses_root", tree(), None).await;
+    assert!(
+        matches!(run, Some(ObserverRun::Rejected { .. })),
+        "got {run:?}"
+    );
+    assert!(
+        !h.notifier
+            .notices()
+            .iter()
+            .any(|notice| matches!(notice, ObserverNotice::Escalated { .. }))
+    );
+}
+
+#[tokio::test]
+async fn a_failed_repair_does_not_consume_the_budget() {
+    let cfg = ObserverConfig {
+        min_interval_ms: 0,
+        max_repairs_per_10min: 2,
+        max_repairs_per_target_10min: 2,
+        ..ObserverConfig::default()
+    };
+    let clock = Arc::new(FakeClock::default());
+    let model = Arc::new(ScriptedModel::new(vec![
+        Ok(cancel_repair()),
+        Ok(cancel_repair()),
+        Ok(cancel_repair()),
+    ]));
+    let executor = Arc::new(FailingExecutor::default());
+    let notifier = Arc::new(RecordingNotifier::default());
+    let engine = ObserverEngine::new(cfg, clock.clone(), model, executor.clone(), notifier);
+    engine.observe_start(strip("tc_1", 0, 10));
+    for second in 0..3 {
+        clock.set(20_000 + second * 1_000);
+        let run = engine.check_now("ses_root", tree(), None).await;
+        assert!(
+            matches!(run, Some(ObserverRun::Unavailable { .. })),
+            "got {run:?}"
+        );
+    }
+    assert_eq!(executor.calls.load(Ordering::SeqCst), 3);
+    let budget = engine.budget("ses_root");
+    assert_eq!(budget.root_used, 0);
+    assert!(!budget.exhausted);
+}
+
+#[tokio::test]
+async fn subagent_strip_is_not_overdue_while_child_session_is_busy() {
+    let h = harness(ObserverConfig::default(), vec![Ok(nudge())]);
+    let mut subagent_strip = strip("tc_sub", 0, 10);
+    subagent_strip.tool = "subagent".to_owned();
+    h.engine.observe_start(subagent_strip);
+
+    h.clock.set(30_000);
+    let busy_tree = vec![
+        TreeRow {
+            sid: "ses_root".to_owned(),
+            parent: None,
+            agent: "build".to_owned(),
+            state: "busy".to_owned(),
+            depth: 0,
+        },
+        TreeRow {
+            sid: "ses_child".to_owned(),
+            parent: Some("ses_root".to_owned()),
+            agent: "general".to_owned(),
+            state: "busy".to_owned(),
+            depth: 1,
+        },
+    ];
+    assert!(
+        h.engine.tick("ses_root", busy_tree, None).await.is_none(),
+        "parent subagent strip must not wake observer while child session is busy"
+    );
+    assert_eq!(h.model.calls(), 0);
+}
+
+#[tokio::test]
+async fn cancel_tool_accepts_session_id_of_running_strip() {
+    let verdict = serde_json::json!({
+        "action": "repair",
+        "target": "ses_root",
+        "reason": "the running tool is wedged",
+        "repair": { "kind": "cancel_tool" }
+    })
+    .to_string();
+    let h = harness(ObserverConfig::default(), vec![Ok(verdict)]);
+    h.engine.observe_start(strip("tc_1", 0, 10));
+    h.clock.set(10_000);
+    let run = h.engine.tick("ses_root", tree(), None).await;
+    assert!(
+        matches!(run, Some(ObserverRun::Repair { .. })),
+        "got {run:?}"
+    );
 }

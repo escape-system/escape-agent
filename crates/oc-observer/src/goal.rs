@@ -234,7 +234,7 @@ pub fn judge_prompt(goal: &GoalSnapshot, recent_outcomes: &[RecentOutcome]) -> S
         "\nReply with JSON: {\"verdict\":\"done|continue|blocked|paused|wait\",\
          \"reason\":\"...\",\"next_step\":\"...\",\"evidence\":[\"tool_call_id\"],\
          \"wait_minutes\":30}\n\
-         Rules: done requires evidence ids from the recent list; wait at most the configured \
+         Rules: done requires evidence ids from the recent list or evidence so far; wait at most the configured \
          limit; use blocked only for a user or external dependency.\n",
     );
     out
@@ -373,11 +373,12 @@ pub fn apply_verdict(goal: &GoalSnapshot, verdict: &GoalVerdict, now: i64) -> Go
 }
 
 fn apply_done(next: &mut GoalSnapshot, goal: &GoalSnapshot, verdict: &GoalVerdict) -> bool {
-    let valid = !verdict.evidence.is_empty()
+    let valid = (!verdict.evidence.is_empty()
         && verdict
             .evidence
             .iter()
-            .all(|id| goal.known_ids.iter().any(|known| known == id));
+            .all(|id| goal.known_ids.iter().any(|known| known == id)))
+        || (!goal.evidence.is_empty() && goal.done == goal.total);
     next.rounds = next.rounds.saturating_add(1);
     if valid {
         for id in &verdict.evidence {

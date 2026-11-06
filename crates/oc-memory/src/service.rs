@@ -21,7 +21,7 @@ use crate::render::{
 use crate::secret::ensure_no_secret;
 
 /// Maximum stored text length, in characters.
-pub const TEXT_CAP: usize = 500;
+pub const TEXT_CAP: usize = 2000;
 /// Default importance for writes that omit it.
 pub const DEFAULT_IMPORTANCE: u8 = 3;
 /// Default confidence for writes that omit it.
@@ -776,9 +776,9 @@ mod tests {
         assert!(matches!(
             error,
             MemoryError::TextTooLong {
-                chars: 501,
+                chars,
                 cap: TEXT_CAP
-            }
+            } if chars == TEXT_CAP + 1
         ));
 
         let empty = service.write(NewMemoryInput::default()).await.unwrap_err();

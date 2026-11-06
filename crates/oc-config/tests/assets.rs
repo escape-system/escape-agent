@@ -176,6 +176,14 @@ fn discovers_skills_with_precedence_and_compatibility_roots() {
 
     // Compatibility roots.
     fixture.write(
+        &format!("{project}/.opencode/skill/claude-dupe/SKILL.md"),
+        &skill_file("name: Project Claude Dupe", "project wins over claude"),
+    );
+    fixture.write(
+        "home/.claude/skills/claude-dupe/SKILL.md",
+        &skill_file("name: Global Claude Dupe", "claude body"),
+    );
+    fixture.write(
         "home/.claude/skills/claude-one/SKILL.md",
         &skill_file("name: Claude One", "claude"),
     );
@@ -226,6 +234,10 @@ fn discovers_skills_with_precedence_and_compatibility_roots() {
     assert_eq!(dupe.name, "Project Dupe");
     assert_eq!(dupe.content, "project body");
     assert_eq!(dupe.source, SkillSource::Project);
+
+    let claude_dupe = service.skill("claude-dupe").expect("claude-dupe");
+    assert_eq!(claude_dupe.name, "Project Claude Dupe");
+    assert_eq!(claude_dupe.source, SkillSource::Project);
 
     assert_eq!(
         service.skill("claude-one").expect("claude").source,

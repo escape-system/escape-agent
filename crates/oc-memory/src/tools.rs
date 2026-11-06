@@ -223,7 +223,7 @@ impl Tool for MemoryWriteTool {
             "properties": {
                 "text": {
                     "type": "string",
-                    "description": "Memory text: one self-contained statement, at most 500 characters"
+                    "description": "Memory text: one self-contained statement, at most 2000 characters"
                 },
                 "kind": {
                     "type": "string",

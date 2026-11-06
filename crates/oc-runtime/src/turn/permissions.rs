@@ -116,6 +116,7 @@ impl Runtime {
                     resources: vec![resource.to_owned()],
                     message: Some(format!("Allow {action} on {resource}?")),
                 };
+                let _permission_wait = self.enter_permission_wait(turn.info.id.as_ref());
                 let decision = tokio::select! {
                     biased;
                     () = cancel.cancelled() => return Err(AuthFailure::Cancelled),
@@ -240,7 +241,12 @@ fn normalize_path(directory: &str, raw: &str) -> String {
 }
 
 pub(super) fn inside(directory: &str, path: &str) -> bool {
-    let base = directory.replace('\\', "/").to_lowercase();
-    let path = path.replace('\\', "/").to_lowercase();
+    #[cfg(windows)]
+    let (base, path) = (
+        directory.replace('\\', "/").to_lowercase(),
+        path.replace('\\', "/").to_lowercase(),
+    );
+    #[cfg(not(windows))]
+    let (base, path) = (directory.replace('\\', "/"), path.replace('\\', "/"));
     path == base || path.starts_with(&format!("{base}/"))
 }

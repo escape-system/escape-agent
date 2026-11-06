@@ -169,6 +169,15 @@ async fn session_crud_filters_and_pagination() {
         .expect("search");
     assert_eq!(ids(&searched.items), vec!["ses_child"]);
 
+    let by_subpath = store
+        .list_sessions(SessionQuery {
+            subpath: Some("crates".to_owned()),
+            ..Default::default()
+        })
+        .await
+        .expect("list subpath");
+    assert_eq!(by_subpath.items.len(), 0);
+
     // Ascending page of 2 plus the cursor chain (before any patch moves time_updated).
     let first = store
         .list_sessions(SessionQuery {

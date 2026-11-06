@@ -196,7 +196,10 @@ fn same_path(left: &Path, right: &Path) -> bool {
 }
 
 fn normalize_text(path: &Path) -> String {
+    #[cfg(windows)]
     let mut text = path.to_string_lossy().replace('\\', "/").to_lowercase();
+    #[cfg(not(windows))]
+    let mut text = path.to_string_lossy().replace('\\', "/");
     while text.len() > 1 && text.ends_with('/') && !text.ends_with(":/") {
         text.pop();
     }

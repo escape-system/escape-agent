@@ -49,6 +49,13 @@ const MAX_INLINE_TOOL_OUTPUT_CHARS: usize = 48_000;
 const SPILL_HEAD_CHARS: usize = 20_000;
 const SPILL_TAIL_CHARS: usize = 10_000;
 
+#[derive(Clone)]
+struct StripStartContext {
+    root_id: String,
+    depth: u32,
+    open: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
 impl Runtime {
     pub(super) async fn execute_tools(
         &self,
@@ -68,7 +75,7 @@ impl Runtime {
         } else {
             (String::new(), 0)
         };
-        let mut open: Vec<String> = Vec::new();
+        let open: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
         let mut set = tokio::task::JoinSet::new();
         let (progress_tx, mut progress_rx) =
             mpsc::unbounded_channel::<(usize, String, Map<String, Value>)>();
@@ -77,22 +84,15 @@ impl Runtime {
             while set.len() < MAX_TOOL_PARALLELISM && next < calls.len() {
                 let call = calls[next].clone();
                 let index = call.index;
-                if let Some(engine) = observer.as_deref()
-                    && let Some(strip) = crate::observer::flight_strip(
-                        &root_id,
-                        session,
-                        &turn.agent_id,
-                        depth,
-                        &call,
-                    )
-                {
-                    engine.observe_start(strip);
-                    open.push(call.id.clone());
-                }
                 let runtime = self.clone();
                 let turn = turn.clone();
                 let message_id = state.id.clone();
                 let token = Arc::clone(cancel);
+                let strip_ctx = StripStartContext {
+                    root_id: root_id.clone(),
+                    depth,
+                    open: Arc::clone(&open),
+                };
                 let sender = ToolProgressSender {
                     index,
                     call_id: call.id.clone(),
@@ -101,7 +101,7 @@ impl Runtime {
                 set.spawn(TOOL_PROGRESS.scope(sender, async move {
                     (
                         index,
-                        run_tool(runtime, turn, message_id, call, token).await,
+                        run_tool(runtime, turn, message_id, call, token, strip_ctx).await,
                     )
                 }));
                 next += 1;
@@ -114,7 +114,7 @@ impl Runtime {
             };
             let joined = match wait {
                 ToolStepWait::Cancelled => {
-                    self.abort_cancelled_tools(session, turn, state, &mut open, &mut set)
+                    self.abort_cancelled_tools(session, turn, state, &open, &mut set)
                         .await;
                     return Err(RuntimeError::Cancelled);
                 }
@@ -131,17 +131,27 @@ impl Runtime {
             }
             match joined {
                 Some(Ok((_index, ToolOutcome::Cancelled))) => {
-                    self.abort_cancelled_tools(session, turn, state, &mut open, &mut set)
+                    self.abort_cancelled_tools(session, turn, state, &open, &mut set)
                         .await;
                     return Err(RuntimeError::Cancelled);
                 }
                 Some(Ok((index, outcome))) => {
-                    settle_flight_strip(observer.as_deref(), calls, &mut open, index, &outcome);
+                    settle_flight_strip(
+                        observer.as_deref(),
+                        &root_id,
+                        session,
+                        &turn.agent_id,
+                        depth,
+                        calls,
+                        &open,
+                        index,
+                        &outcome,
+                    );
                     self.apply_tool_outcome(session, turn, state, outcome)
                         .await?;
                 }
                 Some(Err(error)) => {
-                    settle_open(observer.as_deref(), &mut open, "task failed");
+                    settle_open(observer.as_deref(), &open, "task failed");
                     self.clear_background_request(session);
                     return Err(RuntimeError::Task(error.to_string()));
                 }
@@ -163,7 +173,7 @@ impl Runtime {
         session: &str,
         turn: &ResolvedTurn,
         state: &mut AssistantState,
-        open: &mut Vec<String>,
+        open: &Arc<std::sync::Mutex<Vec<String>>>,
         set: &mut tokio::task::JoinSet<(usize, ToolOutcome)>,
     ) {
         set.abort_all();
@@ -296,12 +306,14 @@ impl Runtime {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn run_tool(
     runtime: Runtime,
     turn: ResolvedTurn,
     message_id: MessageId,
     call: PendingToolCall,
     cancel: Arc<CancelToken>,
+    strip_ctx: StripStartContext,
 ) -> ToolOutcome {
     if let Some(expectation) = &call.expectation {
         tracing::debug!(
@@ -361,11 +373,36 @@ async fn run_tool(
         };
     };
 
+    if let Some(engine) = runtime.observer().as_deref()
+        && let Some(strip) = crate::observer::flight_strip(
+            &strip_ctx.root_id,
+            turn.info.id.as_ref(),
+            &turn.agent_id,
+            strip_ctx.depth,
+            &call,
+        )
+    {
+        strip_ctx
+            .open
+            .lock()
+            .expect("open strips")
+            .push(call.id.clone());
+        engine.observe_start(strip);
+    }
+
+    let tool_token = cancel.token.child_token();
+    let _tool_cancel = runtime.register_tool_cancel(
+        &call.id,
+        turn.info.id.as_ref(),
+        &call.name,
+        tool_token.clone(),
+    );
+
     let context = ToolContext {
         session_id: turn.info.id.to_string(),
         directory: Path::new(&turn.directory).to_path_buf(),
         cwd: Path::new(&turn.directory).to_path_buf(),
-        cancel: Some(cancel.token.clone()),
+        cancel: Some(tool_token.clone()),
     };
     let input = Value::Object(call.input.clone());
     crate::snapshot::capture_before_tool(
@@ -381,8 +418,43 @@ async fn run_tool(
     let result = tokio::select! {
         biased;
         () = cancel.cancelled() => return ToolOutcome::Cancelled,
+        () = tool_token.cancelled() => {
+            if cancel.is_cancelled() {
+                return ToolOutcome::Cancelled;
+            }
+            return ToolOutcome::Failed {
+                index: call.index,
+                input: call.input,
+                error: StructuredError::new(
+                    "ToolCancelledError",
+                    format!(
+                        "Tool call {:?} ({}) was cancelled by observer repair.",
+                        call.id, call.name
+                    ),
+                ),
+                content: None,
+                metadata: None,
+                executed: true,
+            };
+        }
         result = tool.execute(&context, input) => result,
     };
+    if tool_token.is_cancelled() && !cancel.is_cancelled() {
+        return ToolOutcome::Failed {
+            index: call.index,
+            input: call.input,
+            error: StructuredError::new(
+                "ToolCancelledError",
+                format!(
+                    "Tool call {:?} ({}) was cancelled by observer repair.",
+                    call.id, call.name
+                ),
+            ),
+            content: None,
+            metadata: None,
+            executed: true,
+        };
+    }
     match result {
         Ok(result) => {
             let (tool_parts, tool_metadata) = tool_content(&result, &turn.directory, &call.id);
@@ -405,10 +477,15 @@ async fn run_tool(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn settle_flight_strip(
     engine: Option<&oc_observer::ObserverEngine>,
+    root_id: &str,
+    session: &str,
+    agent_id: &str,
+    depth: u32,
     calls: &[PendingToolCall],
-    open: &mut Vec<String>,
+    open: &Arc<std::sync::Mutex<Vec<String>>>,
     index: usize,
     outcome: &ToolOutcome,
 ) {
@@ -418,21 +495,37 @@ fn settle_flight_strip(
     let Some(call) = calls.iter().find(|call| call.index == index) else {
         return;
     };
+    let was_open = {
+        let mut guard = open.lock().expect("open strips");
+        let before = guard.len();
+        guard.retain(|id| id != &call.id);
+        guard.len() != before
+    };
+    if !was_open {
+        if matches!(outcome, ToolOutcome::Cancelled) {
+            return;
+        }
+        if let Some(strip) = crate::observer::flight_strip(root_id, session, agent_id, depth, call)
+        {
+            engine.observe_start(strip);
+        } else {
+            return;
+        }
+    }
     let (strip_state, strip_outcome) = crate::observer::strip_result(outcome);
     engine.observe_settle(&call.id, strip_state, strip_outcome.as_deref());
-    open.retain(|id| id != &call.id);
 }
 
 fn settle_open(
     engine: Option<&oc_observer::ObserverEngine>,
-    open: &mut Vec<String>,
+    open: &Arc<std::sync::Mutex<Vec<String>>>,
     outcome: &str,
 ) {
+    let ids: Vec<String> = open.lock().expect("open strips").drain(..).collect();
     let Some(engine) = engine else {
-        open.clear();
         return;
     };
-    for id in open.drain(..) {
+    for id in ids {
         engine.observe_settle(&id, oc_observer::StripState::Cancelled, Some(outcome));
     }
 }
@@ -459,18 +552,50 @@ pub(super) fn strip_expectation(
     Option<Expectation>,
     Option<StructuredError>,
 ) {
-    let mut value = input;
+    let mut value = match input {
+        Value::String(raw) => match serde_json::from_str::<Value>(&raw) {
+            Ok(parsed @ Value::Object(_)) => parsed,
+            Ok(_) => {
+                return (
+                    Map::new(),
+                    Some(Expectation::derived(tool)),
+                    Some(StructuredError::new(
+                        "InvalidToolArgumentsError",
+                        format!(
+                            "Tool arguments for {tool:?} must be a JSON object; re-invoke {tool:?} with valid JSON arguments."
+                        ),
+                    )),
+                );
+            }
+            Err(error) => {
+                return (
+                    Map::new(),
+                    Some(Expectation::derived(tool)),
+                    Some(StructuredError::new(
+                        "InvalidToolArgumentsError",
+                        format!(
+                            "Tool arguments for {tool:?} are not valid JSON ({error}); re-invoke {tool:?} with valid JSON arguments."
+                        ),
+                    )),
+                );
+            }
+        },
+        other => other,
+    };
     match expectation::extract(&mut value, tool) {
         Ok(expectation) => (
             value.as_object().cloned().unwrap_or_default(),
             Some(expectation),
             None,
         ),
-        Err(error) => (
-            value.as_object().cloned().unwrap_or_default(),
-            None,
-            Some(StructuredError::new("InvalidToolInput", error.to_string())),
-        ),
+        Err(error) => {
+            tracing::warn!(tool = %tool, error = %error, "invalid expectation; falling back to derived");
+            (
+                value.as_object().cloned().unwrap_or_default(),
+                Some(Expectation::derived(tool)),
+                None,
+            )
+        }
     }
 }
 

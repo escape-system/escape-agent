@@ -61,6 +61,7 @@ pub async fn list(
             directory: params.directory,
             project: params.project,
             cursor: params.cursor,
+            subpath: params.subpath,
         })
         .await?;
 

@@ -37,6 +37,51 @@ impl std::fmt::Debug for Runtime {
     }
 }
 
+pub(crate) struct ToolCancelEntry {
+    pub(crate) call_id: String,
+    pub(crate) session_id: String,
+    pub(crate) tool: String,
+    pub(crate) token: tokio_util::sync::CancellationToken,
+}
+
+pub(crate) struct ToolCancelGuard {
+    runtime: Runtime,
+    call_id: String,
+}
+
+impl Drop for ToolCancelGuard {
+    fn drop(&mut self) {
+        self.runtime
+            .inner
+            .tool_cancels
+            .lock()
+            .expect("tool cancels")
+            .remove(&self.call_id);
+    }
+}
+
+pub(crate) struct PermissionWaitGuard {
+    runtime: Runtime,
+    session_id: String,
+}
+
+impl Drop for PermissionWaitGuard {
+    fn drop(&mut self) {
+        let mut map = self
+            .runtime
+            .inner
+            .pending_permissions
+            .lock()
+            .expect("pending permissions");
+        if let Some(count) = map.get_mut(&self.session_id) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                map.remove(&self.session_id);
+            }
+        }
+    }
+}
+
 pub(crate) struct Inner {
     pub(crate) config: RuntimeConfig,
     pub(crate) model: Arc<dyn ModelClient>,
@@ -47,6 +92,8 @@ pub(crate) struct Inner {
     pub(crate) tool_providers: Mutex<Vec<Arc<dyn ToolProvider>>>,
     pub(crate) lanes: Mutex<Option<Arc<oc_lanes::LaneService>>>,
     pub(crate) subagents: Mutex<crate::subagent::SubagentState>,
+    pub(crate) tool_cancels: Mutex<HashMap<String, ToolCancelEntry>>,
+    pub(crate) pending_permissions: Mutex<HashMap<String, usize>>,
     pub(crate) shutdown: CancelToken,
     pub(crate) idle: Notify,
     pub(crate) started: AtomicBool,
@@ -76,6 +123,8 @@ impl Runtime {
                 tool_providers: Mutex::new(Vec::new()),
                 lanes: Mutex::new(None),
                 subagents: Mutex::new(crate::subagent::SubagentState::default()),
+                tool_cancels: Mutex::new(HashMap::new()),
+                pending_permissions: Mutex::new(HashMap::new()),
                 shutdown: CancelToken::new(),
                 idle: Notify::new(),
                 started: AtomicBool::new(false),
@@ -152,6 +201,78 @@ impl Runtime {
     #[must_use]
     pub fn lanes(&self) -> Option<Arc<oc_lanes::LaneService>> {
         self.inner.lanes.lock().expect("lanes slot").clone()
+    }
+
+    pub(crate) fn register_tool_cancel(
+        &self,
+        call_id: &str,
+        session_id: &str,
+        tool: &str,
+        token: tokio_util::sync::CancellationToken,
+    ) -> ToolCancelGuard {
+        self.inner
+            .tool_cancels
+            .lock()
+            .expect("tool cancels")
+            .insert(
+                call_id.to_owned(),
+                ToolCancelEntry {
+                    call_id: call_id.to_owned(),
+                    session_id: session_id.to_owned(),
+                    tool: tool.to_owned(),
+                    token,
+                },
+            );
+        ToolCancelGuard {
+            runtime: self.clone(),
+            call_id: call_id.to_owned(),
+        }
+    }
+
+    /// Cancel running tool call(s) matching `target` (either a `tool_call_id`
+    /// or a `session_id` with a running non-`subagent` tool call).
+    pub(crate) fn cancel_tool_call(&self, target: &str) -> usize {
+        let tokens: Vec<tokio_util::sync::CancellationToken> = self
+            .inner
+            .tool_cancels
+            .lock()
+            .expect("tool cancels")
+            .values()
+            .filter(|entry| {
+                entry.tool != "subagent" && (entry.call_id == target || entry.session_id == target)
+            })
+            .map(|entry| entry.token.clone())
+            .collect();
+        let count = tokens.len();
+        for token in tokens {
+            token.cancel();
+        }
+        count
+    }
+
+    pub(crate) fn enter_permission_wait(&self, session_id: &str) -> PermissionWaitGuard {
+        *self
+            .inner
+            .pending_permissions
+            .lock()
+            .expect("pending permissions")
+            .entry(session_id.to_owned())
+            .or_insert(0) += 1;
+        PermissionWaitGuard {
+            runtime: self.clone(),
+            session_id: session_id.to_owned(),
+        }
+    }
+
+    pub(crate) fn is_waiting_permission(&self, session_id: &str) -> bool {
+        self.inner
+            .pending_permissions
+            .lock()
+            .expect("pending permissions")
+            .get(session_id)
+            .copied()
+            .unwrap_or(0)
+            > 0
     }
 
     /// Recover stale executions and wake sessions with deliverable inbox rows.

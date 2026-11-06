@@ -18,8 +18,19 @@ fn split(text: &str) -> Vec<&str> {
     lines
 }
 
+/// Hard cap on the LCS matrix cells (e.g. 2,000 x 2,000 lines) to prevent
+/// quadratic memory blowup on massive files.
+const MAX_DIFF_CELLS: usize = 4_000_000;
+
 fn difference(before: &[&str], after: &[&str]) -> (Vec<&'static str>, usize, usize) {
     let width = after.len() + 1;
+    let cells = (before.len() + 1).saturating_mul(width);
+    if cells > MAX_DIFF_CELLS {
+        let mut ops = Vec::with_capacity(before.len() + after.len());
+        ops.resize(before.len(), "-");
+        ops.resize(before.len() + after.len(), "+");
+        return (ops, after.len(), before.len());
+    }
     let mut table = vec![0u32; (before.len() + 1) * width];
     for i in (0..before.len()).rev() {
         for j in (0..after.len()).rev() {
@@ -103,4 +114,19 @@ pub fn file_diff(file: &str, before: &str, after: &str, status: &str) -> Value {
         "additions": additions,
         "deletions": deletions,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn difference_caps_quadratic_growth() {
+        let before: Vec<&str> = (0..2005).map(|_| "old").collect();
+        let after: Vec<&str> = (0..2005).map(|_| "new").collect();
+        let (ops, additions, deletions) = difference(&before, &after);
+        assert_eq!(additions, 2005);
+        assert_eq!(deletions, 2005);
+        assert_eq!(ops.len(), 4010);
+    }
 }

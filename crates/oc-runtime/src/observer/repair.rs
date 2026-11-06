@@ -14,10 +14,9 @@ pub enum RepairCommand {
         /// Target session.
         session_id: String,
     },
-    /// Cancel one tool call. The runtime cancels whole executions, so this is
-    /// a typed no-op until per-call cancellation exists.
+    /// Cancel one running tool call (or the running tool call on a session).
     CancelTool {
-        /// Provider tool-call id.
+        /// Provider tool-call id or target session id.
         tool_call_id: String,
     },
     /// Restart a child session.

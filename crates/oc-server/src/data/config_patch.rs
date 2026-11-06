@@ -148,12 +148,19 @@ fn write_document(path: &std::path::Path, document: &Map<String, Value>) -> Resu
     let temp = path.with_extension(format!("tmp.{}", std::process::id()));
     std::fs::write(&temp, bytes)
         .map_err(|error| ApiError::internal(format!("write config temp: {error}")))?;
-    if path.exists() {
-        std::fs::remove_file(path)
-            .map_err(|error| ApiError::internal(format!("replace config: {error}")))?;
+    #[cfg(not(windows))]
+    {
+        std::fs::rename(&temp, path)
+            .map_err(|error| ApiError::internal(format!("install config: {error}")))
     }
-    std::fs::rename(&temp, path)
-        .map_err(|error| ApiError::internal(format!("install config: {error}")))
+    #[cfg(windows)]
+    {
+        if path.exists() {
+            let _ = std::fs::remove_file(path);
+        }
+        std::fs::rename(&temp, path)
+            .map_err(|error| ApiError::internal(format!("install config: {error}")))
+    }
 }
 
 #[cfg(test)]

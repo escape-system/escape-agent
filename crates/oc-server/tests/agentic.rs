@@ -201,7 +201,7 @@ async fn memory_crud_search_and_errors() {
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "secret: {body:?}");
 
-    let long = "x".repeat(501);
+    let long = "x".repeat(oc_memory::TEXT_CAP + 1);
     let (status, body) = call(
         &harness.app,
         Method::POST,

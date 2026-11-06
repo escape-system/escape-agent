@@ -39,11 +39,11 @@ async fn batch_patches(
 ) -> Result<HashMap<String, String>, ApiError> {
     let unified = format!("--unified={context}");
     let output = run_git(directory, &patch_args(&unified, reference, target), limit).await?;
-    if !output.ok() {
-        return Err(git_failure("git diff", &output));
-    }
     if output.truncated {
         return Ok(HashMap::new());
+    }
+    if !output.ok() {
+        return Err(git_failure("git diff", &output));
     }
     Ok(split_patch(&output.text()))
 }
@@ -117,15 +117,14 @@ async fn untracked_patch(
         limit,
     )
     .await?;
+    if output.truncated {
+        return Ok(String::new());
+    }
     // `git diff --no-index` exits 1 when the files differ.
     if !matches!(output.code, Some(0 | 1)) {
         return Err(git_failure("git diff --no-index", &output));
     }
-    Ok(if output.truncated {
-        String::new()
-    } else {
-        output.text()
-    })
+    Ok(output.text())
 }
 
 /// Line statistics for an untracked file. Binary files and files above the

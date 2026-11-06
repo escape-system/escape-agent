@@ -69,6 +69,8 @@ pub struct SessionQuery {
     pub project: Option<String>,
     /// Opaque cursor from a previous page.
     pub cursor: Option<String>,
+    /// Exact subpath match against `session_v2.path`.
+    pub subpath: Option<String>,
 }
 
 impl Default for SessionQuery {
@@ -82,6 +84,7 @@ impl Default for SessionQuery {
             directory: None,
             project: None,
             cursor: None,
+            subpath: None,
         }
     }
 }
@@ -150,6 +153,8 @@ struct CursorFilters {
     directory: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     project: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    subpath: Option<String>,
 }
 
 impl CursorFilters {
@@ -160,6 +165,7 @@ impl CursorFilters {
             archived: query.archived,
             directory: query.directory.clone(),
             project: query.project.clone(),
+            subpath: query.subpath.clone(),
         }
     }
 
@@ -170,6 +176,7 @@ impl CursorFilters {
             archived: merge_filter(self.archived, query.archived, "archived")?,
             directory: merge_filter(self.directory, query.directory.clone(), "directory")?,
             project: merge_filter(self.project, query.project.clone(), "project")?,
+            subpath: merge_filter(self.subpath, query.subpath.clone(), "subpath")?,
         })
     }
 }
@@ -428,6 +435,10 @@ impl Store {
         if let Some(project) = &filters.project {
             conditions.push("project_id = ?".to_owned());
             values.push(SqlValue::Text(project.clone()));
+        }
+        if let Some(subpath) = &filters.subpath {
+            conditions.push("path = ?".to_owned());
+            values.push(SqlValue::Text(subpath.clone()));
         }
         if let Some((time, id)) = &anchor {
             let comparator = if effective == Order::Asc { ">" } else { "<" };

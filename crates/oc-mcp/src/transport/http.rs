@@ -607,10 +607,14 @@ impl HttpTransport {
         }
         let transport = self.clone();
         tokio::spawn(async move {
-            if let Err(error) = transport.event_stream().await
+            let res = transport.event_stream().await;
+            transport.stream_started.store(false, Ordering::SeqCst);
+            if let Err(error) = res
                 && let Some(handler) = transport.handler()
             {
-                handler.on_error(format!("MCP event stream ended: {error}"));
+                handler
+                    .on_close(format!("MCP event stream ended: {error}"))
+                    .await;
             }
         });
     }

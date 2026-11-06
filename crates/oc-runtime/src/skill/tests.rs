@@ -157,4 +157,9 @@ fn find_skill_scopes_to_the_session_directory() {
             .all(|skill| skill.id != "server-only"),
         "the index and the loader must agree"
     );
+    assert!(
+        crate::prompt::skill_source(&config, "general", session.to_str().unwrap())
+            .is_none_or(|source| !source.text.contains("server-only")),
+        "the prompt index must not leak server skills to a session in another project"
+    );
 }

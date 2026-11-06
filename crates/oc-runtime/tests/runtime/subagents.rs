@@ -1197,6 +1197,7 @@ async fn subagent_schemas_match_the_documented_keys() {
             "agent",
             "background",
             "description",
+            "group",
             "lane",
             "model",
             "prompt",
@@ -1303,4 +1304,42 @@ async fn subagent_tool_is_filtered_out_for_agents_that_cannot_spawn() {
         names.contains(&"read"),
         "unrelated tools still reach the explore agent: {names:?}"
     );
+}
+
+#[tokio::test]
+async fn subagent_spawn_records_group_in_metadata() {
+    let harness = Harness::new(vec![], Arc::new(AllowAll), json!({}), None).await;
+    let tool = subagent_tool(&harness, "subagent");
+    let result = tool
+        .execute(
+            &tool_context(&harness, &harness.session),
+            json!({
+                "description": "grouped worker",
+                "prompt": "do work",
+                "background": true,
+                "group": "wave-alpha",
+                "lane": "cargo"
+            }),
+        )
+        .await
+        .expect("spawn grouped subagent");
+    let output = result.output.expect("output");
+    assert!(output.contains("\"status\":\"running\""));
+
+    let children = harness
+        .store
+        .children(&harness.session)
+        .await
+        .expect("children");
+    assert_eq!(children.len(), 1);
+    let child_id = &children[0].id;
+    let session = harness
+        .store
+        .get_session(child_id)
+        .await
+        .expect("get session")
+        .expect("session exists");
+    let metadata = session.get("metadata").expect("metadata exists");
+    assert_eq!(metadata["group"], "wave-alpha");
+    assert_eq!(metadata["lane"], "cargo");
 }

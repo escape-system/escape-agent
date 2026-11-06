@@ -302,22 +302,25 @@ pub fn format_errors(path: &Path, diagnostics: &[Value]) -> Option<String> {
     let mut text = String::from("LSP errors detected in this file:\n");
     let _ = writeln!(text, "<diagnostics file=\"{}\">", path.display());
     for error in errors {
-        let range = error.get("range");
-        let line = range
-            .and_then(|range| range.pointer("/start/line"))
-            .and_then(Value::as_u64)
-            .unwrap_or(0)
-            .saturating_add(1);
-        let character = range
-            .and_then(|range| range.pointer("/start/character"))
-            .and_then(Value::as_u64)
-            .unwrap_or(0)
-            .saturating_add(1);
         let message = error
             .get("message")
             .and_then(Value::as_str)
-            .unwrap_or_default();
-        let _ = writeln!(text, "ERROR [{line}:{character}] {message}");
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+            .unwrap_or("(no diagnostic message)");
+        if let Some(range) = error.get("range") {
+            let line = range
+                .pointer("/start/line")
+                .and_then(Value::as_u64)
+                .map_or(1, |l| l.saturating_add(1));
+            let character = range
+                .pointer("/start/character")
+                .and_then(Value::as_u64)
+                .map_or(1, |c| c.saturating_add(1));
+            let _ = writeln!(text, "ERROR [{line}:{character}] {message}");
+        } else {
+            let _ = writeln!(text, "ERROR {message}");
+        }
     }
     text.push_str("</diagnostics>");
     Some(text)
@@ -442,6 +445,18 @@ mod tests {
         let items = vec![json!({"severity": 2, "message": "warn"})];
         assert!(format_errors(Path::new("/a.rs"), &items).is_none());
         assert!(format_errors(Path::new("/a.rs"), &[]).is_none());
+    }
+
+    #[test]
+    fn unpositioned_or_empty_diagnostics_format_truthfully() {
+        let items = vec![
+            json!({"severity": 1, "message": "file error"}),
+            json!({"severity": 1, "message": ""}),
+        ];
+        let text = format_errors(Path::new("/a.rs"), &items).unwrap();
+        assert!(text.contains("ERROR file error"));
+        assert!(text.contains("ERROR (no diagnostic message)"));
+        assert!(!text.contains("[1:1]"));
     }
 
     #[test]

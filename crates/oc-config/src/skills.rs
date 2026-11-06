@@ -100,41 +100,24 @@ fn collect(
     diagnostics: &mut Vec<Diagnostic>,
 ) -> Vec<SkillInfo> {
     let mut targets: Vec<(PathBuf, SkillSource)> = Vec::new();
+    // 1. Global config roots.
     for root in config_roots {
         let source = source_for(root, discovery);
-        // Scope project-scope roots to the session tree. A root outside
-        // `location` is the server's project, not this session's. A root is in
-        // scope when it is an ancestor of the session directory (its config
-        // applies) or a directory inside it (the session's own `.opencode`).
-        if source == SkillSource::Project && !shares_tree(location, root) {
-            continue;
+        if source != SkillSource::Project {
+            targets.push((root.join("skill"), source));
+            targets.push((root.join("skills"), source));
         }
-        targets.push((root.join("skill"), source));
-        targets.push((root.join("skills"), source));
     }
 
-    // The load-time roots only cover the server directory. A session in
-    // another project brings its own `.opencode` trees, discovered from
-    // `location` exactly like a load would discover them (outermost first, so
-    // the innermost wins).
+    // 2. Global compatibility roots.
     let mut ancestors = discovery::ancestors(location);
     ancestors.reverse();
-    if scoped {
-        for directory in &ancestors {
-            let candidate = directory.join(".opencode");
-            if candidate.is_dir() {
-                targets.push((candidate.join("skill"), SkillSource::Project));
-                targets.push((candidate.join("skills"), SkillSource::Project));
-            }
-        }
-    }
-
     let home = &discovery.home;
     if !home.as_os_str().is_empty() {
         targets.push((home.join(".claude").join("skills"), SkillSource::Claude));
         targets.push((home.join(".agents").join("skills"), SkillSource::Agents));
     }
-    for directory in ancestors {
+    for directory in &ancestors {
         targets.push((
             directory.join(".claude").join("skills"),
             SkillSource::Claude,
@@ -143,6 +126,29 @@ fn collect(
             directory.join(".agents").join("skills"),
             SkillSource::Agents,
         ));
+    }
+
+    // 3. Project-scoped config roots.
+    for root in config_roots {
+        let source = source_for(root, discovery);
+        if source == SkillSource::Project {
+            if !shares_tree(location, root) {
+                continue;
+            }
+            targets.push((root.join("skill"), source));
+            targets.push((root.join("skills"), source));
+        }
+    }
+
+    // 4. Scoped ancestor project trees.
+    if scoped {
+        for directory in &ancestors {
+            let candidate = directory.join(".opencode");
+            if candidate.is_dir() {
+                targets.push((candidate.join("skill"), SkillSource::Project));
+                targets.push((candidate.join("skills"), SkillSource::Project));
+            }
+        }
     }
 
     // Configured `skills[]` directories have the highest precedence.

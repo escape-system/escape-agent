@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -67,6 +67,13 @@ impl Tool for PatchTool {
         if patch_text.is_empty() {
             return Err(ToolError::new("patchText is required"));
         }
+        if patch_text.len() as u64 > crate::read::MAX_FILE_BYTES {
+            return Err(ToolError::new(format!(
+                "Patch text too large: patch is {} bytes, which exceeds the {} byte limit",
+                patch_text.len(),
+                crate::read::MAX_FILE_BYTES
+            )));
+        }
         let hunks = parse(&patch_text)
             .map_err(|error| ToolError::new(format!("patch verification failed: {error}")))?;
         if hunks.is_empty() {
@@ -98,6 +105,7 @@ impl Tool for PatchTool {
                 Hunk::Delete { path } => {
                     let target = util::resolve(ctx, &path);
                     let resource = util::relative_display(&ctx.directory, &target);
+                    reject_oversized(&target, &resource)?;
                     let before = match state.get(&target) {
                         Some(None) => {
                             return Err(verification(format!(
@@ -129,6 +137,7 @@ impl Tool for PatchTool {
                 } => {
                     let target = util::resolve(ctx, &path);
                     let resource = util::relative_display(&ctx.directory, &target);
+                    reject_oversized(&target, &resource)?;
                     let original = match state.get(&target) {
                         Some(None) => {
                             return Err(verification(format!(
@@ -302,6 +311,20 @@ impl Prepared {
             }
         }
     }
+}
+
+fn reject_oversized(path: &Path, display: &str) -> Result<(), ToolError> {
+    let size = match fs::metadata(path) {
+        Ok(metadata) => metadata.len(),
+        Err(_) => return Ok(()),
+    };
+    if size > crate::read::MAX_FILE_BYTES {
+        return Err(verification(format!(
+            "File too large to patch: {display} is {size} bytes, which exceeds the {} byte limit",
+            crate::read::MAX_FILE_BYTES
+        )));
+    }
+    Ok(())
 }
 
 fn verification(message: impl Into<String>) -> ToolError {

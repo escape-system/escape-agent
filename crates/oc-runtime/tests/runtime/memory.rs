@@ -603,3 +603,71 @@ async fn runtime_without_memory_keeps_the_old_shape() {
     assert_eq!(harness.sink.count("session.instructions.updated"), 0);
     assert!(harness.sink.has("session.execution.succeeded"));
 }
+
+#[tokio::test]
+async fn fts_ranking_churn_and_mid_epoch_goal_keep_the_system_prefix_cached() {
+    let harness = Harness::new(
+        vec![text_script("turn one"), text_script("turn two")],
+        Arc::new(AllowAll),
+        json!({"memory": {"auto_scribe": false}}),
+        None,
+    )
+    .await;
+    let memory = Arc::new(MemoryService::new(Arc::clone(&harness.store)));
+    seed_memory(
+        &memory,
+        "Alpha indexing pipeline runs on worker shard zero.",
+        "project",
+        Some("prj_runtime_test"),
+        3,
+    )
+    .await;
+    let harness = harness.attach_memory(Arc::clone(&memory));
+
+    harness.prompt("alpha indexing pipeline").await;
+    let first_prefix = harness.model.requests()[0].system[1].clone();
+    assert!(first_prefix.contains("Alpha indexing pipeline"));
+
+    for index in 0..8 {
+        seed_memory(
+            &memory,
+            &format!("Beta migration step {index} updates schema version {index}."),
+            "project",
+            Some("prj_runtime_test"),
+            4,
+        )
+        .await;
+    }
+    harness
+        .store
+        .set_goal(oc_store::NewGoal {
+            id: "gol_mid_epoch".to_owned(),
+            root_id: harness.session.clone(),
+            objective: "finish the beta migration".to_owned(),
+            criteria: vec!["all beta steps pass".to_owned()],
+            model: None,
+            time_created: oc_types::now_millis(),
+        })
+        .await
+        .expect("set goal");
+
+    harness.prompt("beta migration step schema").await;
+    let requests = harness.model.requests();
+    assert_eq!(
+        requests[1].system[1], first_prefix,
+        "live non-pinned memories and mid-epoch goals must not invalidate the system prefix"
+    );
+    assert_eq!(
+        harness.sink.count("session.instructions.updated"),
+        0,
+        "no instruction delta should be published when pinned memories are still live"
+    );
+    assert!(
+        request_contains(&requests[1], "Beta migration step"),
+        "novel FTS hits are delivered in the tail supplement"
+    );
+    assert!(
+        request_contains(&requests[1], "finish the beta migration"),
+        "mid-epoch goal state is delivered in the tail supplement"
+    );
+}

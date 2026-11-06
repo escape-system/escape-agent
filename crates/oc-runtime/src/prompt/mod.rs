@@ -18,6 +18,8 @@ mod transcript;
 mod tests;
 
 pub use model::model_ref;
+#[cfg(test)]
+pub(crate) use sources::skill_source;
 pub use sources::{
     InstructionAssembly, InstructionContext, assemble_instructions, builtin_sources,
     instruction_sources,

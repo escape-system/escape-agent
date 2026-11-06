@@ -301,3 +301,182 @@ async fn goal_store_round_trips_a_snapshot() {
     assert_eq!(reloaded.status, GoalStatus::Done);
     assert_eq!(reloaded.done, 2);
 }
+
+struct GatePermission {
+    asked: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+impl oc_runtime::PermissionHandler for GatePermission {
+    fn resolve(
+        &self,
+        _request: oc_runtime::PermissionAsk,
+    ) -> futures_util::future::BoxFuture<'static, oc_runtime::PermissionDecision> {
+        let asked = Arc::clone(&self.asked);
+        let release = Arc::clone(&self.release);
+        Box::pin(async move {
+            asked.notify_one();
+            release.notified().await;
+            oc_runtime::PermissionDecision::Allow
+        })
+    }
+}
+
+#[tokio::test]
+async fn permission_wait_does_not_open_flight_strip_until_approved() {
+    let asked = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let harness = Harness::new(
+        vec![
+            tool_script(
+                "call_perm_wait",
+                json!({"path": "hello.txt", "expectation": expectation()}),
+            ),
+            text_script("done after approval"),
+        ],
+        Arc::new(GatePermission {
+            asked: Arc::clone(&asked),
+            release: Arc::clone(&release),
+        }),
+        json!({}),
+        Some(json!([{"action": "read", "resource": "*", "effect": "ask"}])),
+    )
+    .await;
+    let notifier = Arc::new(RecordingNotifier::default());
+    let (executor, repairs) = RepairChannel::new();
+    let engine = observer_engine(
+        FixedObserverModel::text(&json!({"action": "none"})),
+        Arc::clone(&notifier),
+        executor,
+    );
+    let runtime = harness.restart().with_observer(ObserverBinding {
+        engine: Arc::clone(&engine),
+        goals: goals(&harness),
+        repairs,
+    });
+    runtime.start().await.expect("start");
+
+    harness.enqueue("read with ask").await;
+    runtime.notify(&harness.session).await.expect("notify");
+    tokio::time::timeout(Duration::from_secs(5), asked.notified())
+        .await
+        .expect("permission asked");
+
+    assert!(
+        engine.registry().active(&harness.session).is_empty(),
+        "flight strip must not open while blocked on user permission approval"
+    );
+
+    release.notify_one();
+    runtime
+        .wait_idle(&harness.session, Duration::from_secs(10))
+        .await
+        .expect("idle");
+
+    let recent = engine.registry().recent(&harness.session, 10);
+    assert_eq!(recent.len(), 1);
+    assert_eq!(recent[0].tool_call_id, "call_perm_wait");
+    assert_eq!(recent[0].state, oc_observer::StripState::Ok);
+}
+
+struct HangingTool {
+    started: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait::async_trait]
+impl oc_tools::Tool for HangingTool {
+    fn name(&self) -> &'static str {
+        "hang_probe"
+    }
+
+    fn description(&self) -> &'static str {
+        "tool that waits indefinitely until cancelled"
+    }
+
+    fn schema(&self) -> Value {
+        json!({"type": "object", "properties": {}})
+    }
+
+    async fn execute(
+        &self,
+        _ctx: &oc_tools::ToolContext,
+        _input: Value,
+    ) -> Result<oc_tools::ToolResult, oc_tools::ToolError> {
+        self.started.notify_one();
+        futures_util::future::pending::<Result<oc_tools::ToolResult, oc_tools::ToolError>>().await
+    }
+}
+
+struct HangingProvider {
+    started: Arc<tokio::sync::Notify>,
+}
+
+impl oc_runtime::ToolProvider for HangingProvider {
+    fn tools(
+        &self,
+        _session: &oc_types::SessionInfo,
+        _agent: &str,
+    ) -> Vec<Arc<dyn oc_tools::Tool>> {
+        vec![Arc::new(HangingTool {
+            started: Arc::clone(&self.started),
+        })]
+    }
+}
+
+#[tokio::test]
+async fn cancel_tool_cancels_the_running_tool_without_interrupting_the_turn() {
+    let started = Arc::new(tokio::sync::Notify::new());
+    let harness = Harness::new(
+        vec![
+            named_tool_script(
+                "hang_probe",
+                "call_hang",
+                json!({"expectation": expectation()}),
+            ),
+            text_script("recovered after tool cancel"),
+        ],
+        Arc::new(AllowAll),
+        json!({}),
+        None,
+    )
+    .await;
+    let notifier = Arc::new(RecordingNotifier::default());
+    let engine = observer_engine(
+        FixedObserverModel::text(&json!({"action": "none"})),
+        notifier,
+        Arc::new(NeverExecutor),
+    );
+    let (sender, repairs) = mpsc::unbounded_channel();
+    let runtime = harness.restart().with_observer(ObserverBinding {
+        engine,
+        goals: goals(&harness),
+        repairs,
+    });
+    runtime.add_tool_provider(Arc::new(HangingProvider {
+        started: Arc::clone(&started),
+    }));
+    runtime.start().await.expect("start");
+
+    harness.enqueue("run hang_probe").await;
+    runtime.notify(&harness.session).await.expect("notify");
+    tokio::time::timeout(Duration::from_secs(5), started.notified())
+        .await
+        .expect("hang_probe started");
+
+    sender
+        .send(RepairCommand::CancelTool {
+            tool_call_id: "call_hang".to_owned(),
+        })
+        .expect("send cancel_tool");
+
+    runtime
+        .wait_idle(&harness.session, Duration::from_secs(10))
+        .await
+        .expect("idle");
+
+    let failures = harness.sink.data("session.tool.failed");
+    assert_eq!(failures.len(), 1);
+    assert_eq!(failures[0]["error"]["type"], "ToolCancelledError");
+    assert!(harness.sink.has("session.execution.succeeded"));
+    assert!(!harness.sink.has("session.execution.interrupted"));
+}

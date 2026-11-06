@@ -207,6 +207,34 @@ fn missing_manifest_falls_back_to_canonical_cwd() {
     );
 }
 
+#[test]
+fn cd_prefix_and_manifest_path_resolve_target_workspace() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    write(temp.path(), "host/Cargo.toml", "[workspace]\n");
+    write(temp.path(), "target_repo/Cargo.toml", "[workspace]\n");
+    let host = temp.path().join("host");
+    let target_repo = temp.path().join("target_repo");
+    let expected = format!("cargo:{}", canonical(&target_repo));
+
+    assert_eq!(
+        lane_for(
+            &format!("cd {} && cargo test --workspace", target_repo.display()),
+            &host
+        ),
+        expected
+    );
+    assert_eq!(
+        lane_for(
+            &format!(
+                "cargo test --manifest-path {}/Cargo.toml",
+                target_repo.display()
+            ),
+            &host
+        ),
+        expected
+    );
+}
+
 #[cfg(windows)]
 #[test]
 fn windows_paths_and_executables() {

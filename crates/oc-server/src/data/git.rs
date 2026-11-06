@@ -12,7 +12,7 @@ pub(crate) struct GitOutput {
 
 impl GitOutput {
     pub(crate) fn ok(&self) -> bool {
-        self.code == Some(0)
+        self.code == Some(0) || self.truncated
     }
 
     pub(crate) fn text(&self) -> String {

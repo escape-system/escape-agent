@@ -17,6 +17,7 @@ pub struct ListParams {
     pub(super) directory: Option<String>,
     pub(super) project: Option<String>,
     pub(super) cursor: Option<String>,
+    pub(super) subpath: Option<String>,
 }
 
 /// `POST /api/session`

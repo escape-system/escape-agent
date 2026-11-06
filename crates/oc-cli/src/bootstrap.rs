@@ -195,6 +195,7 @@ pub(crate) fn attach_extensions(
     let events: Arc<dyn oc_lanes::LaneEvents> = Arc::new(BusLaneEvents {
         bus: state.bus().clone(),
         directory: directory.to_string_lossy().into_owned(),
+        store: Some(Arc::clone(&services.store)),
     });
     // The service takes the erased runner; keep the concrete handle for `bind`.
     let runner_handle: Arc<dyn oc_lanes::LaneRunner> = runner.clone();

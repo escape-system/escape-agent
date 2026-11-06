@@ -182,6 +182,9 @@ pub(crate) fn strip_ansi(input: &[u8]) -> String {
                 if byte == 0x1B {
                     state = StripState::Esc;
                 } else if byte == b'\r' {
+                    while input.get(index + 1) == Some(&b'\r') {
+                        index += 1;
+                    }
                     if input.get(index + 1) != Some(&b'\n') {
                         out.push(b'\n');
                     }

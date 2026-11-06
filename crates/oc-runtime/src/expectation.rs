@@ -135,19 +135,98 @@ pub fn inject(schema: &mut Value) {
     }
 }
 
+fn parse_u32(value: &Value) -> Option<u32> {
+    if let Some(n) = value.as_u64() {
+        return u32::try_from(n).ok();
+    }
+    if let Some(s) = value.as_str() {
+        return s.trim().parse::<u32>().ok();
+    }
+    None
+}
+
 /// Remove and validate the expectation from a tool input.
 ///
-/// Returns the derived expectation when the model omitted the field.
+/// Returns the derived expectation when the model omitted the field, or parses
+/// leniently if the model sent string numbers or root-level expectation clocks.
 pub fn extract(input: &mut Value, tool: &str) -> Result<Expectation, ExpectationError> {
     let Some(object) = input.as_object_mut() else {
         return Ok(Expectation::derived(tool));
     };
+
+    // Clean up any stray top-level clocks models sometimes place at root.
+    let top_expect = object.remove("expect_seconds").and_then(|v| parse_u32(&v));
+    let top_intervene = object
+        .remove("intervene_after_seconds")
+        .and_then(|v| parse_u32(&v));
+
+    let derived = Expectation::derived(tool);
+
     let Some(raw) = object.remove("expectation") else {
-        return Ok(Expectation::derived(tool));
+        if top_expect.is_some() || top_intervene.is_some() {
+            let mut exp = derived;
+            if let Some(e) = top_expect {
+                exp.expect_seconds = e;
+            }
+            if let Some(i) = top_intervene {
+                exp.intervene_after_seconds = i;
+            }
+            return exp.normalize();
+        }
+        return Ok(derived);
     };
-    let expectation: Expectation =
-        serde_json::from_value(raw).map_err(|_| ExpectationError::Shape)?;
-    expectation.normalize()
+
+    if let Some(why_str) = raw.as_str() {
+        let mut exp = derived;
+        let trimmed = why_str.trim();
+        if !trimmed.is_empty() {
+            exp.why = trimmed.chars().take(MAX_WHY).collect();
+        }
+        if let Some(e) = top_expect {
+            exp.expect_seconds = e;
+        }
+        if let Some(i) = top_intervene {
+            exp.intervene_after_seconds = i;
+        }
+        return exp.normalize();
+    }
+
+    if raw.is_null() || raw.is_boolean() {
+        let mut exp = derived;
+        if let Some(e) = top_expect {
+            exp.expect_seconds = e;
+        }
+        if let Some(i) = top_intervene {
+            exp.intervene_after_seconds = i;
+        }
+        return exp.normalize();
+    }
+
+    if let Some(map) = raw.as_object() {
+        let mut exp = derived;
+        if let Some(why_val) = map.get("why").and_then(Value::as_str) {
+            if why_val.trim().is_empty() {
+                return Err(ExpectationError::Why);
+            }
+            exp.why = why_val.trim().chars().take(MAX_WHY).collect();
+        }
+        if let Some(e) = map.get("expect_seconds").and_then(parse_u32).or(top_expect) {
+            exp.expect_seconds = e;
+        }
+        if let Some(i) = map
+            .get("intervene_after_seconds")
+            .and_then(parse_u32)
+            .or(top_intervene)
+        {
+            exp.intervene_after_seconds = i;
+        }
+        return exp.normalize();
+    }
+
+    match serde_json::from_value::<Expectation>(raw) {
+        Ok(exp) => exp.normalize(),
+        Err(_) => Ok(derived),
+    }
 }
 
 #[cfg(test)]
@@ -236,5 +315,47 @@ mod tests {
         assert_eq!(Expectation::derived("skill_lint").expect_seconds, 10);
         assert_eq!(Expectation::derived("skill_write").expect_seconds, 30);
         assert_eq!(Expectation::derived("lane").expect_seconds, 600);
+    }
+
+    #[test]
+    fn extract_leniently_parses_strings_and_top_level_clocks() {
+        // String numbers in expectation object
+        let mut input1 = json!({
+            "command": "uptime",
+            "expectation": {
+                "why": "check load",
+                "expect_seconds": "2",
+                "intervene_after_seconds": "10"
+            }
+        });
+        let exp1 = extract(&mut input1, "shell").unwrap();
+        assert_eq!(exp1.expect_seconds, 2);
+        assert_eq!(exp1.intervene_after_seconds, 10);
+        assert_eq!(exp1.why, "check load");
+
+        // Top-level clocks and null expectation
+        let mut input2 = json!({
+            "command": "cat /proc/loadavg",
+            "expect_seconds": "2",
+            "intervene_after_seconds": "10",
+            "expectation": null
+        });
+        let exp2 = extract(&mut input2, "shell").unwrap();
+        assert_eq!(exp2.expect_seconds, 2);
+        assert_eq!(exp2.intervene_after_seconds, 10);
+        assert_eq!(exp2.why, "run a command and return its result");
+        assert!(input2.get("expect_seconds").is_none());
+        assert!(input2.get("intervene_after_seconds").is_none());
+        assert!(input2.get("expectation").is_none());
+        assert_eq!(input2["command"], "cat /proc/loadavg");
+
+        // String expectation
+        let mut input3 = json!({
+            "path": "test.txt",
+            "expectation": "read the config file"
+        });
+        let exp3 = extract(&mut input3, "read").unwrap();
+        assert_eq!(exp3.why, "read the config file");
+        assert_eq!(exp3.expect_seconds, 10);
     }
 }
