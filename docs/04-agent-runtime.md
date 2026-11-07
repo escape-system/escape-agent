@@ -98,6 +98,69 @@ memory block (ours) → goal block (ours) → per-session entries
   `retry-after` ≤ 15 min; transport timeout capped at 3 retries.
 - Timeouts: header 300 s, chunk 900 s (configurable per provider).
 
+## Guards and finalization (Hermes Agent ports)
+
+Three turn-level guards and one shell-level guard were ported from the Hermes
+Agent (`verify_on_stop`, `tool_guardrails`, `repetition_guard`,
+`terminal_tool_guards`). They are implemented in our crate; the paths below are
+ours, not upstream's.
+
+**Verify on stop** — `crates/oc-runtime/src/turn/verify.rs`, driven from
+`turn/mod.rs` (`verify_on_stop_enabled`, `build_verification_nudge`).
+Trigger: a turn wrote a code file (`write`/`edit` `path`, every path from a
+`patch` envelope) with no *later* shell command matching the verification
+list (`cargo test|check|clippy|build`, `npm/npx/yarn/pnpm test`, `pytest`,
+`python -m unittest`, `go test`, `make test|check`, `ctest`, `mvn test`,
+`gradle test`) in the same turn. Before the turn settles, the runtime appends a
+user-role system nudge naming up to five changed files and asking for a real
+verification command; the model gets at most **2** nudges per turn, then the
+turn settles regardless. Docs-only edits do not trigger it (`.md`, `.txt`,
+`.lock`, `README`, `LICENSE`, … are excluded by `is_code_file`).
+Disable: default is **off**; enable with `verify_on_stop: true` (or
+`agent.verify_on_stop`) in config, or `OPENCODE_VERIFY_ON_STOP=1|true|yes|on`,
+which wins over config. Nothing new is published to the client — the nudge is a
+synthetic message in the transcript.
+
+**Stall guard** — `crates/oc-runtime/src/turn/stall.rs` (`StallGuard`), recorded
+per tool call in `turn/mod.rs`. Trigger: the same tool name with byte-identical
+canonical-JSON input **3 times consecutively**, or a cycle of period 2–4
+repeated 3 times (A,B,A,B,A,B). History is capped at 32 calls and poller tools
+(`process_manage`, `*_poll`) are exempt. Effect: the next request includes a
+`[System: Stall Guard Warning: …]` user message telling the model to change
+strategy; execution is not blocked and no failure is published. Always on; it
+has no config or env switch.
+
+**Repetition guard** — `crates/oc-runtime/src/turn/repetition.rs`
+(`is_repetition_dominated`), consulted in `turn/mod.rs` before a
+`finish == "length"` continuation. Trigger: ≥ 400 chars and either one ≥ 10-char
+line repeated ≥ 4 times covering ≥ 50 % of the text, or a 60-char window
+(sampled every 20 chars) seen ≥ 4 times and covering ≥ 50 % of the samples.
+Effect: the synthetic `CONTINUE_AFTER_OUTPUT_LIMIT` retry is **suppressed**
+(logged as `suppressed length continuation…`) and the turn settles with the
+text it already has, instead of spending another step re-requesting a
+continuation. Always on; no config.
+
+**Shell hardline + foreground interceptor** —
+`crates/oc-tools/src/shell_guard.rs` (`check_shell_command`), called by
+`ShellTool::execute` before spawning anything (`crates/oc-tools/src/shell.rs`).
+Two layers:
+
+1. *Hardline blocklist* (irreversible): fork bombs; `shutdown -h/-r/now`,
+   `reboot`, `poweroff`, `init 0`; redirects/`dd` to raw `/dev/sd*`,
+   `/dev/nvme*`, `/dev/hd*`; recursive `rm` targeting `/`, `/*`, `~`, `$HOME`,
+   `${HOME}` (note: `-r` alone is enough to block — the force flag is not
+   required).
+2. *Foreground long-lived interceptor*: a trailing `&` (but not `&&`),
+   `nohup`/`disown`/`setsid` prefixes, known servers (`npm run dev`, `pnpm
+   [run] dev`, `yarn dev`, `bun dev`, `vite`, `next dev`, `python[3] -m
+   http.server`, `cargo watch`) and `docker compose up` without `-d`, because
+   they would hold the foreground turn until its 120 s timeout.
+
+`--help`/`--version`/`-h`/`-v` queries are exempt. A block is a normal
+`ToolError` — the model sees the reason string, no permission ask is created,
+and there is no config override; run bounded commands or the managed shell
+instead.
+
 ## Cancellation
 
 Cancellation is cooperative but the finalizer is uninterruptible:

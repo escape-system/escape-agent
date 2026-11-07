@@ -139,9 +139,9 @@ read *.env.example allow
 
 Built-in agents: `build` primary + `question allow`; `general` subagent, denies
 `question` and `subagent`; `explore` deny-all then allows
-shell/grep/glob/webfetch/websearch/read (env ask) + `external_directory`, denies
-`subagent`; `plan` denies edits except `~/.opencode/plan/*`; hidden
-`compaction`, `title`, `summary` deny all.
+shell/grep/glob/webfetch/websearch/read/code_map (env ask) +
+`external_directory`, denies `subagent`; `plan` denies edits except
+`~/.opencode/plan/*`; hidden `compaction`, `title`, `summary` deny all.
 
 Ask flow:
 

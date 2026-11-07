@@ -335,7 +335,7 @@ not depend on store/config/llm/tools.
 Names that downstream code will import:
 
 ```rust
-// ids.rs (already exists)
+// id.rs (already exists)
 pub struct EventId, SessionId, MessageId, ProjectId, PermissionRequestId, SavedPermissionId,
              ObservationId, GoalId, MemoryId, LaneId;
 
@@ -523,7 +523,14 @@ pub trait Tool: Send + Sync {
     fn schema(&self) -> Value;
     async fn execute(&self, ctx: &ToolContext, input: Value) -> Result<ToolResult, ToolError>;
 }
-pub struct ToolContext { pub session_id: String, pub directory: PathBuf, pub cwd: PathBuf }
+pub struct ToolContext {
+    pub session_id: String,
+    pub directory: PathBuf,
+    pub cwd: PathBuf,
+    /// Cancelled when the owning execution is interrupted; detached helpers
+    /// (the foreground subagent wait) stop through it instead of being orphaned.
+    pub cancel: Option<CancellationToken>,
+}
 #[derive(Default)]
 pub struct ToolResult { pub output: Option<String>, pub content: Option<Value>, pub metadata: Option<Value> }
 pub struct ToolError { pub message: String, pub metadata: Option<Value> }  // thiserror + helpers

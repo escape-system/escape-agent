@@ -93,6 +93,16 @@ Tool `skill_write` (permission `skill:write`, default `ask`):
 - `skill_lint {path|id}` validates frontmatter, length, description, and
   duplicate id; the tool refuses to overwrite a non-agent skill unless
   `overwrite: true` and the permission is `allow`.
+- `skill_lint` is a Hermes-style quality gate: a linter over the skill body,
+  not a writer. Its exact soft budget is **200 body lines / 12,000 body
+  characters** (`crates/oc-runtime/src/skill/lint.rs`, `MAX_BODY_LINES` /
+  `MAX_BODY_CHARS`); over-budget is a `body_too_long` **warning**, not an
+  error, so `ok` stays true. It also warns on a missing `---` block or `name`,
+  a missing/empty description, a missing `## When to use` section, raw shell
+  utilities (`grep`/`rg`/`cat`/`head`/`tail`/`sed`/`awk`/`find .`), hype
+  adjectives, and references to `.env`/`.env.example`/`.gitignore`. Errors (and
+  therefore `ok:false`) are limited to unparsable frontmatter, an over-long
+  description (`MAX_DESCRIPTION_CHARS`), and an invalid or underivable id.
 - Skills cannot bundle executables; any `scripts/` folder is ignored by the
   index and never auto-run. A skill can *instruct* the agent to run a script,
   which then goes through the normal shell permission.

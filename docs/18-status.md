@@ -19,10 +19,10 @@ Smoke verification passes on isolated ports and databases across core surfaces: 
 | Workspace | 17 crates, edition 2024, `rust-version 1.90`; fmt/clippy clean, 803 tests / 80 suites / 0 ignored / 0 failed, `oc-cli` builds |
 | `oc-types` | full wire model (session/message/inbox/permission/agent/file/config/location/info/error) + typed event payloads (`SessionViewed` included; fork/form/instruction/skill payloads are typed locally in the runtime/server) |
 | `oc-store` | SQLite WAL, writer thread + 4-connection read pool, sessions/messages/inbox/events, dense-seq projection, memory FTS, goals/observations/repairs, subagent tree, forms, schedules, snapshots, instruction entries, saved permissions, lane tickets, credentials, worktrees, projects; migrations `0001`–`0010`; `register_project` upserts the `LocationRef` project on `GET /api/location` |
-| `oc-config` | discovery/JSONC/V1 aliases, agents, permissions, skills, commands, AGENTS.md, rescan |
+| `oc-config` | discovery/JSONC/V1 aliases, agents, permissions, skills, commands, AGENTS.md, rescan; the `explore` subagent can read-only `code_map` (`allow("code_map","*")`, `crates/oc-config/src/agents.rs:294`; regression `explore_toolset_allows_read_only_code_map_and_still_denies_edits`, `crates/oc-config/tests/config.rs:543`); 37 tests |
 | `oc-llm` | embedded models.dev snapshot, catalog/resolve/overlay, OpenAI/Anthropic/Gemini streaming, retries |
-| `oc-runtime` | session actors, turn loop, tools + permissions, auto/manual compaction (inbox `compaction` rows are consumed; manual rows write `reason:"manual"` and a failed inbox delete stops the actor instead of re-dispatching), mid-turn `steer` promotion at step boundaries (repost waits for idle; `switch_model` rejects a catalog-unknown target), cancellation/recovery, memory, observer strips, subagents (nested spawn for `general`, digest scoped to the caller's subtree with the child's full final answer and raw-answer cache honoring each caller's token budget, bounded watcher that cancels on timeout and delivers failed/timeout exactly once, parent cancellation interrupts a foreground child through `ToolContext.cancel`), `ToolProvider`, `GoalTools`/`SkillTools`/`LaneTools`, `ProcessLaneRunner`, lane events, pre-write snapshots, stored-credential key injection (active first, then any) |
-| `oc-tools` | `code_map`, `read`, `write`, `edit`, `patch`, `glob`, `grep`, `shell`, `todowrite`, `webfetch`; registry merge, `&str` names; `ToolContext.cancel` (`CancellationToken`) lets long-running tools stop detached helpers when the execution is interrupted |
+| `oc-runtime` | session actors, turn loop, tools + permissions, auto/manual compaction (inbox `compaction` rows are consumed; manual rows write `reason:"manual"` and a failed inbox delete stops the actor instead of re-dispatching), mid-turn `steer` promotion at step boundaries (repost waits for idle; `switch_model` rejects a catalog-unknown target), cancellation/recovery, memory, observer strips, subagents (nested spawn for `general`, digest scoped to the caller's subtree with the child's full final answer and raw-answer cache honoring each caller's token budget, bounded watcher that cancels on timeout and delivers failed/timeout exactly once, parent cancellation interrupts a foreground child through `ToolContext.cancel`), `ToolProvider`, `GoalTools`/`SkillTools`/`LaneTools`, `ProcessLaneRunner`, lane events, pre-write snapshots, stored-credential key injection (active first, then any); actor `Err` finalization: a drain-loop error repairs the rows the dead turn left open and then publishes `session.idle` + `session.execution.failed` through a per-item `TerminalState` guard so a settle that already ran is not duplicated, and the actor retires from the map and respawns when durable input is already waiting (`crates/oc-runtime/src/runtime/actor.rs:185`, `crates/oc-runtime/src/turn/mod.rs:648`); regression `actor_error_publishes_one_terminal_pair_and_closes_the_rows` (`crates/oc-runtime/tests/runtime/actor_error_terminal.rs`); 178 tests |
+| `oc-tools` | `code_map`, `read`, `write`, `edit`, `patch`, `glob`, `grep`, `shell`, `todowrite`, `webfetch`, `websearch` (72 tests); registry merge, `&str` names; `ToolContext.cancel` (`CancellationToken`) lets long-running tools stop detached helpers when the execution is interrupted; `code_map` `map` delegates to ripwire whenever the binary is found (mode-dependent argv: empty query `--max-tokens`/`--top-k`, query `--for`/`--token-budget`), captures stderr into `metadata.ripwire_stderr`, enforces a 30 s timeout (`OPENCODE_RIPWIRE_TIMEOUT_MS`) as a hard error, and discovers `RIPWIRE_PATH` → `$HOME/.local/bin/ripwire` → `PATH` requiring a regular executable file (`crates/oc-tools/src/code_map.rs`); hermetic delegation tests in `crates/oc-tools/tests/code_map_ripwire.rs` |
 | `oc-observer` | registry, terse input, strict verdicts, budgets, goal state machine, repairs; judge credentials resolved per request from the credential store or provider env (declared-but-unset env no longer disables it), failures publish `observer.unavailable`; goal verdicts persist to the store before `goal.updated`; switch_model falls back to `observer.escalation_model`, repost replays the last user prompt (with a pending-input guard), restart_subagent re-enqueues the original child prompt |
 | `oc-subagents` | session-tree policy, spawn limits, sibling/coordinator scope, write policy, model chain, budgets |
 | `oc-lanes` | cargo/node/test classifier, priority lanes, semaphores, cancel/reorder/wait, max queue |
@@ -31,12 +31,67 @@ Smoke verification passes on isolated ports and databases across core surfaces: 
 | `oc-lsp` | supervisor, stdio framing, sync, push/pull diagnostics, tool ops (`lsp`, `lsp_diagnostics`), eviction/shutdown, `LspToolProvider` |
 | `oc-plugin` | native registry/domains/hooks, JSON-RPC stdio sidecar, inventory/RPC |
 | `oc-pty` | in-process ConPTY/PTY, 1 MiB ring, rows/snapshot/replay |
-| `oc-server` | HTTP/SSE/WS, auth/pairing (password from `--password`/`OPENCODE_PASSWORD`/`OPENCODE_SERVER_PASSWORD`; explicit empty disables; Basic/session token/`auth_token`/same-origin cookie; static shell public so the connect screen loads), static app, sessions/messages/inbox/log, forms, fork/revert/context/diff/view/environment, export/import/stats/instructions, permissions (request + saved; `always` persists to `permission_saved`, auto-resolves covered asks, `reject` drains every pending ask of the session, saved rules use wildcard matching and answer the admission route too), builtin `compress` command + raw `/compress` prompt alias, model/provider (only available providers), config, fs (list can navigate outside the location for the picker; reads/finds stay confined), vcs, project, shell manager, persistent PTY, MCP/LSP/plugin/RPC, lanes, observer, goal, memory, subagent, credential/integration (catalog providers connectable via key+env), worktree (refresh takes the main tree from git's first porcelain record, excludes the project's own checkout and the main tree, self-heals stale rows), duplicate synthetic message ids are 409, default location resolution does not double a relative server directory, static directory paths are 404 not 503 |
+| `oc-server` | HTTP/SSE/WS, auth/pairing (password from `--password`/`OPENCODE_PASSWORD`/`OPENCODE_SERVER_PASSWORD`; explicit empty disables; Basic/session token/`auth_token`/same-origin cookie; static shell public so the connect screen loads), static app, sessions/messages/inbox/log, forms, fork/revert/context/diff/view/environment, export/import/stats/instructions, permissions (request + saved; `always` persists to `permission_saved`, auto-resolves covered asks, `reject` drains every pending ask of the session, saved rules use wildcard matching and answer the admission route too), builtin `compress` command + raw `/compress` prompt alias, model/provider (only available providers), config, fs (list can navigate outside the location for the picker; reads/finds stay confined), vcs, project, shell manager, persistent PTY, MCP/LSP/plugin/RPC, lanes, observer, goal, memory, subagent, credential/integration (catalog providers connectable via key+env), worktree (refresh takes the main tree from git's first porcelain record, excludes the project's own checkout and the main tree, self-heals stale rows), duplicate synthetic message ids are 409, default location resolution does not double a relative server directory, static directory paths are 404 not 503; 230 tests |
 | `oc-cli` | `serve` with store/config/catalog, password resolution (flag/env alias, empty disables, service reuses registration or generates), `service get <url|password|pid|id|version>`, runtime + LLM scribe attach (model chain normalizes null/empty `subagents.digest_model` so it still falls through to `observer.digest_model`/`observer.model`), memory, observer host, MCP/LSP, PTY, plugins, lanes, service registration |
 | `oc-testkit` | fake provider/process harness + binary-level scenarios |
 | UI | vendored SolidJS source (`ui/vendor/opencode`, MIT) built into `web/dist`; **Escape Agent brand layer** (dark default, gold/charcoal `oc-2` theme, glass panels/composer/tabs, centered home hero, six-letter wordmark + matching pin grid, branded connect/about, favicon/PWA/brand assets); settings tabs (memory, goals, observer, subagents, lanes) and session agent panels (subagent tree, peer drawer, observer repairs/budget, goal chip, lane pill); models with `time.released = 0` stay pickable (`0003`); missing tool metadata no longer crashes the session page (`0004`); `/compress` appears in the slash menu from `GET /api/command`; connect/login screen appears on a 401 and logs in with the configured password; live Playwright readiness suite in `packages/app/e2e/escape-agent` (**6/6** on 4096 + password 4097) |
 
-### Route groups landed
+### Wave: code_map/ripwire, explore toolset, actor finalization
+
+Per-crate counts below were verified in this wave; they are not a new
+workspace total, and the `803` snapshot above predates these entries.
+
+- **`oc-tools` rewrite.** `code_map`'s `map` operation delegates to `ripwire`
+  whenever discovery finds an executable binary — including an empty query,
+  which previously fell back to the native engine. The argv is
+  mode-dependent: empty query sends `--max-tokens=<N> --top-k=<limit>`,
+  a query sends `--for=<query> --token-budget=<N>`; ripwire 0.6.8 silently
+  ignores `--max-tokens`/`--top-k` under `--for` (measured: identical 6825 B
+  output for 300/1200/absent and a stderr warning), so those flags are omitted
+  in that mode (`crates/oc-tools/src/code_map.rs:599-644`). stderr is captured
+  and surfaced as `metadata.ripwire_stderr`, exit 0 with stderr is still
+  success, and the 30 s timeout (`OPENCODE_RIPWIRE_TIMEOUT_MS`) is a hard
+  error rather than a masked native fallback (`:409-465`, `:662-765`).
+  Discovery is `RIPWIRE_PATH` → `$HOME/.local/bin/ripwire` → `PATH`, each
+  candidate required to be a regular file with the executable bit
+  (`:852-924`). The install tip and `ripwire_install_command` metadata are
+  emitted only when no binary was found (`:581-593`). New hermetic test
+  `crates/oc-tools/tests/code_map_ripwire.rs` re-execs its own binary to
+  control `RIPWIRE_PATH`/`HOME`/`PATH`/timeout without `set_var`, and asserts
+  the measured argv contract, stderr surfacing, timeout error, and install-tip
+  gating. `oc-tools` carries 72 tests.
+- **`oc-config`.** The `explore` subagent now allows the read-only `code_map`
+  tool (`crates/oc-config/src/agents.rs:294`, with the comment explaining its
+  action is the tool name, not `edit`). Regression
+  `explore_toolset_allows_read_only_code_map_and_still_denies_edits`
+  (`crates/oc-config/tests/config.rs:543`) also pins that
+  `edit`/`write`/`patch` stay denied. `oc-config` carries 37 tests.
+- **`oc-runtime`.** The drain-loop `Err` path no
+  longer just marks the session idle and exits: `actor_loop` calls
+  `finalize_actor_failure` (`crates/oc-runtime/src/runtime/actor.rs:185-192`),
+  which repairs the assistant/compaction rows the dead turn left open and then
+  publishes `session.idle` followed by `session.execution.failed`
+  (`crates/oc-runtime/src/turn/mod.rs:637-706`). A per-item `TerminalState`
+  guard (`crates/oc-runtime/src/runtime/actor.rs:56-96`) makes the path
+  idempotent with a settle that already ran, and `drain` arms it only for real
+  executions, not `compaction` rows (`:222-226`). The actor also retires from
+  the map and respawns itself when durable input is already waiting
+  (`:206-211`, `:242-273`). Regression
+  `crates/oc-runtime/tests/runtime/actor_error_terminal.rs::actor_error_publishes_one_terminal_pair_and_closes_the_rows`
+  pins that a panicking tool publishes exactly one `session.idle` then one
+  `session.execution.failed`, closes the dead assistant/tool rows, and the next
+  prompt is served by a respawned actor; `crates/oc-runtime/tests/runtime/actor_death.rs`
+  covers the respawn half. `oc-runtime` carries 178 tests.
+- **Docs.** `docs/04-agent-runtime.md` gained "Guards and finalization (Hermes
+  Agent ports)" describing verify-on-stop (`turn/verify.rs`), the stall guard
+  (`turn/stall.rs`), the repetition guard (`turn/repetition.rs`) and the shell
+  hardline (`oc-tools/src/shell_guard.rs`). `docs/17-interfaces.md` fixed
+  `ids.rs`→`id.rs` and the `ToolContext` drift (added `cancel`).
+  `docs/07-skills.md` attributes the `skill_lint` soft budget
+  (`crates/oc-runtime/src/skill/lint.rs:15-16`) and its warning/error split.
+  `docs/14-config-permissions.md` now lists `code_map` in the `explore`
+  toolset.
+
 
 - **Sessions**: list/create/get/patch/delete/active, agent/model/move,
   interrupt/background, prompt/synthetic/compact/command, fork,
