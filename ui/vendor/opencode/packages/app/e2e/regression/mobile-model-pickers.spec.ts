@@ -255,6 +255,27 @@ test("model dialog toggles a favorite from the keyboard and leads with favorite 
   await expect(dialog.locator('[data-option-key="opencode:mobile-c"]')).toHaveAttribute("data-active", "")
 })
 
+test("model dialog collapses a provider section from its header", async ({ page }) => {
+  const { model, dialog } = await openDesktopPicker(page, "ltr")
+  const sections = dialog.locator('[data-slot="search-list-header"]')
+  const toggle = sections.filter({ hasText: /^OpenCode$/ }).locator('[data-slot="model-dialog-header-trigger"]')
+  const row = dialog.locator('[data-option-key="opencode:mobile-c"]')
+  await model.click()
+  await expect(toggle).toHaveAttribute("aria-expanded", "true")
+  await expect(row).toBeVisible()
+
+  // Collapsing keeps the header (so it can be reopened) and drops every model of that provider.
+  await toggle.click()
+  await expect(toggle).toHaveAttribute("aria-expanded", "false")
+  await expect(sections).toHaveText(["OpenCode"])
+  await expect(row).toHaveCount(0)
+  await expect(dialog).toBeVisible()
+
+  await toggle.click()
+  await expect(toggle).toHaveAttribute("aria-expanded", "true")
+  await expect(row).toBeVisible()
+})
+
 test("model dialog opens Manage models from its search row with Enter", async ({ page }) => {
   const { model, dialog } = await openDesktopPicker(page, "ltr")
   await model.click()

@@ -1045,6 +1045,24 @@ test("marks a Console provider with its workspace only when it is also connected
   await expect(headings.filter({ hasText: /^OpenAI$/ })).toHaveCount(1)
   await expect(headings.filter({ hasText: /^OpenCode$/ })).toHaveCount(1)
   await expect(menu.getByText(/Anomaly \//)).toHaveCount(0)
+
+  // Every provider section collapses from its header: the section keeps its header and the dialog stays open, while
+  // its models leave the list so arrows and Enter cannot reach them.
+  const google = headings.filter({ hasText: /^Google$/ })
+  const toggle = google.locator('[data-slot="model-dialog-header-trigger"]')
+  await expect(toggle).toHaveAttribute("aria-expanded", "true")
+  await toggle.click()
+  await expect(toggle).toHaveAttribute("aria-expanded", "false")
+  await expect(headings).toHaveCount(4)
+  await expect(menu.getByRole("option", { name: "Direct Gemini", exact: true })).toHaveCount(0)
+  await expect(menu).toBeVisible()
+
+  // A focused header takes Enter as its own toggle, never as a model choice.
+  await toggle.focus()
+  await page.keyboard.press("Enter")
+  await expect(toggle).toHaveAttribute("aria-expanded", "true")
+  await expect(menu.getByRole("option", { name: "Direct Gemini", exact: true })).toBeVisible()
+  await expect(menu).toBeVisible()
 })
 
 test("shows thinking on hover or a non-default selection while preserving keyboard access", async ({ page }) => {

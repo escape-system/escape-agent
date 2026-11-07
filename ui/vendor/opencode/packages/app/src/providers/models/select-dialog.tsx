@@ -628,6 +628,7 @@ export function DialogSelectModel(props: { provider?: string; model?: ModelState
     navigated: false,
     warm: false,
     position: { left: 0, top: 0 },
+    collapsed: {} as Record<string, boolean>,
   })
 
   const [staged, setStaged] = createStore<Record<string, string | null>>({})
@@ -653,6 +654,9 @@ export function DialogSelectModel(props: { provider?: string; model?: ModelState
   const rows = createMemo(() =>
     groups().flatMap((group) => group.items.map((item): ModelRow => ({ id: modelKey(item), item, group }))),
   )
+
+  // A search force-expands every group, as the mobile list does; otherwise each header remembers its own state.
+  const expanded = (key: string) => store.search.trim().length > 0 || !store.collapsed[key]
 
   const rowItem = (id: string) => rows().find((row) => row.id === id)?.item
   const flyoutItem = () => (store.flyout ? rowItem(store.flyout) : undefined)
@@ -839,6 +843,9 @@ export function DialogSelectModel(props: { provider?: string; model?: ModelState
   const searchButton = (target: EventTarget | null) =>
     target instanceof Element && !!scroller?.contains(target.closest('[data-slot="text-input-v2-trailing"]'))
 
+  const headerTrigger = (target: EventTarget | null) =>
+    target instanceof Element && !!target.closest('[data-slot="model-dialog-header-trigger"]')
+
   const inDialog = (target: EventTarget | null) =>
     target instanceof Node &&
     (!!scroller?.closest('[data-slot="dialog-container"]')?.contains(target) || !!flyoutRef?.contains(target))
@@ -853,7 +860,14 @@ export function DialogSelectModel(props: { provider?: string; model?: ModelState
   )
 
   createEventListener(document, "focusin", (event: FocusEvent) => {
-    if (inDialog(event.target) && event.target !== field() && !searchButton(event.target))
+    // The section header is a button: it must hold focus to collapse from the keyboard, so it is exempt like the
+    // search row's buttons. Every other target still hands focus back to the field.
+    if (
+      inDialog(event.target) &&
+      event.target !== field() &&
+      !searchButton(event.target) &&
+      !headerTrigger(event.target)
+    )
       field()?.focus({ preventScroll: true })
   })
 
@@ -1010,13 +1024,34 @@ export function DialogSelectModel(props: { provider?: string; model?: ModelState
             items={rows()}
             key={(row) => row.id}
             section={(row) => row.group.category}
+            collapsed={(section) => !expanded(section)}
             header={(row) => (
-              <span data-slot="model-dialog-header-label" class="flex min-w-0 items-center gap-1.5">
-                <span class="min-w-0 truncate">{row.group.title ?? labels.name(row.item.provider)}</span>
-                <Show when={!row.group.title && labels.workspace(row.item.provider)}>
-                  {(workspace) => <Badge class="shrink-0">{workspace()}</Badge>}
-                </Show>
-              </span>
+              <button
+                type="button"
+                data-slot="model-dialog-header-trigger"
+                aria-expanded={expanded(row.group.category)}
+                disabled={store.search.trim().length > 0}
+                onClick={(event) => {
+                  event.stopPropagation()
+                  // `expanded` is the negation of `collapsed` (minus the search override), so the new collapsed
+                  // value is the *current* expanded value; negating it again would write the state back unchanged.
+                  setStore("collapsed", row.group.category, expanded(row.group.category))
+                }}
+              >
+                <span data-slot="model-dialog-header-chevron" aria-hidden="true">
+                  <Icon
+                    name="chevron-down"
+                    size="small"
+                    class={expanded(row.group.category) ? undefined : "collapsed"}
+                  />
+                </span>
+                <span data-slot="model-dialog-header-label" class="flex min-w-0 items-center gap-1.5">
+                  <span class="min-w-0 truncate">{row.group.title ?? labels.name(row.item.provider)}</span>
+                  <Show when={!row.group.title && labels.workspace(row.item.provider)}>
+                    {(workspace) => <Badge class="shrink-0">{workspace()}</Badge>}
+                  </Show>
+                </span>
+              </button>
             )}
             empty={language.t("dialog.model.empty")}
             onSelect={(row) => choose(row.item)}

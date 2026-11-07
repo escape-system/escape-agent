@@ -74,6 +74,8 @@ export function SearchList<T>(props: {
   same?: (a: T, b: T) => boolean
   /** A section's header, from its first row. */
   header?: (item: T) => JSX.Element
+  /** Sections to render header-only; the rows of a collapsed section leave keyboard navigation and typeahead. */
+  collapsed?: (section: string) => boolean
   /** Shown in place of the rows when there are none. */
   empty: JSX.Element
   /** A note beneath the rows, such as a hint that more results are hidden. */
@@ -95,6 +97,7 @@ export function SearchList<T>(props: {
   let results: HTMLDivElement | undefined
 
   const sectionOf = (item: T) => props.section?.(item) ?? ""
+  const collapsed = (section: string) => props.collapsed?.(section) ?? false
   const open = () => props.open ?? true
 
   // Sections in the order their first row arrives; rows then list section by section, which is also the arrow order.
@@ -111,8 +114,11 @@ export function SearchList<T>(props: {
     return all
   })
 
-  const rows = createMemo(() => [...groups().values()].flat())
-  const byKey = createMemo(() => new Map(rows().map((item) => [props.key(item), item] as const)))
+  // Every row, so a collapsed section still resolves a header through `first()` and the list knows it is not empty.
+  // The filtered `rows` feed typeahead and arrow navigation, so a collapsed section's rows are skipped, not just hidden.
+  const allRows = createMemo(() => [...groups().values()].flat())
+  const rows = createMemo(() => allRows().filter((item) => !collapsed(sectionOf(item))))
+  const byKey = createMemo(() => new Map(allRows().map((item) => [props.key(item), item] as const)))
   const sectionKeys = createMemo<string[]>((previous) => stable(previous, [...groups().keys()]))
 
   const typeahead = createTypeahead<T>({
@@ -322,7 +328,7 @@ export function SearchList<T>(props: {
               id={typeahead.listID}
               data-slot="search-list-results"
               role="listbox"
-              hidden={rows().length === 0}
+              hidden={allRows().length === 0}
               aria-label={props.label ?? props.placeholder}
             >
               <For each={sectionKeys()}>
@@ -348,20 +354,22 @@ export function SearchList<T>(props: {
                           </div>
                         )}
                       </Show>
-                      <For each={keys()}>
-                        {(key) => {
-                          // A row that is leaving keeps its last item until it is removed.
-                          const item = createMemo<T>((previous) => byKey().get(key) ?? previous, byKey().get(key)!)
+                      <Show when={!collapsed(section)}>
+                        <For each={keys()}>
+                          {(key) => {
+                            // A row that is leaving keeps its last item until it is removed.
+                            const item = createMemo<T>((previous) => byKey().get(key) ?? previous, byKey().get(key)!)
 
-                          return props.children(item, row(key, item))
-                        }}
-                      </For>
+                            return props.children(item, row(key, item))
+                          }}
+                        </For>
+                      </Show>
                     </div>
                   )
                 }}
               </For>
             </div>
-            <Show when={rows().length === 0}>
+            <Show when={allRows().length === 0}>
               <div data-slot="search-list-empty">{props.empty}</div>
             </Show>
           </div>
