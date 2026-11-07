@@ -6,24 +6,27 @@ use base64::Engine;
 use rand::Rng;
 
 pub(crate) fn default_db_path() -> PathBuf {
+    if let Some(dir) = std::env::var_os("ESCAPE_DATA_DIR") {
+        return PathBuf::from(dir).join("escape.db");
+    }
     if let Some(dir) = std::env::var_os("OPENCODE_DATA_DIR") {
-        return PathBuf::from(dir).join("opencode.db");
+        return PathBuf::from(dir).join("opencode-rust.db");
     }
     if let Some(dir) = std::env::var_os("XDG_DATA_HOME") {
-        return PathBuf::from(dir).join("opencode").join("opencode.db");
+        return PathBuf::from(dir).join("escape-agent").join("escape.db");
     }
     if let Some(home) = std::env::var_os("HOME") {
-        return PathBuf::from(home).join(".local/share/opencode/opencode.db");
+        return PathBuf::from(home).join(".local/share/escape-agent/escape.db");
     }
     if let Some(profile) = std::env::var_os("USERPROFILE") {
-        return PathBuf::from(profile).join(".local/share/opencode/opencode.db");
+        return PathBuf::from(profile).join(".local/share/escape-agent/escape.db");
     }
     if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
         return PathBuf::from(local_app_data)
-            .join("opencode")
-            .join("opencode.db");
+            .join("escape-agent")
+            .join("escape.db");
     }
-    std::env::temp_dir().join("opencode").join("opencode.db")
+    std::env::temp_dir().join("escape-agent").join("escape.db")
 }
 
 /// Discover `web/dist` relative to the running binary when neither

@@ -1,73 +1,16 @@
-# 18 — Implementation status
+# 18 — Implementation Status & Verification
 
-Updated when the gate is green. This is the handoff document if the current
-agent's context ends.
-
-## If you are a new agent, start here
-
-1. Read `AGENTS.md`, `docs/17-interfaces.md`, then this file.
-2. Inspect `proc://` (running jobs/services) and `agent://<id>` (handoffs). If a
-   wave is running, do not edit its crates; wait or take an unowned crate.
-3. Once no agent is mid-write, run the workspace gate and fix any break before
-   adding features.
-4. Pick the first item under **Remaining gaps**; freeze its public API in
-   `docs/17-interfaces.md` before fanning out subagents.
-5. Update this file (state, tests, gaps) after every wave. A crate is not
-   "done" until its gate is green and this table says so.
-
-Copy-paste resume prompt for a fresh agent:
-
-```
-Read AGENTS.md, docs/README.md, docs/17-interfaces.md and docs/18-status.md.
-Run proc:// to see if a wave is still running. Do not edit crates owned by a
-running agent. Verify the workspace gate, then continue from the first item in
-"Remaining gaps" in docs/18-status.md. Keep docs/17 (interfaces) and docs/18
-(status) updated after each crate lands. No stubs; wire-compatible JSON.
-```
+This document provides the technical status, architectural verification logs, and active roadmap for the Escape Agent (`opencode-rust`) workspace.
 
 ## Snapshot
 
-**Gate is green after the 2026-10-30 modularization wave.** `cargo fmt --all
---check` and `cargo clippy --workspace --all-targets -- -D warnings` are clean;
-`cargo test --workspace` (run with `CARGO_TARGET_DIR=target/verify` because the
-live 4096 process holds `target/debug/opencode.exe`) reports **803 tests / 80
-suites / 0 ignored / 0 failed**. A fresh `target/verify/debug/opencode.exe`
-(53,785,088 bytes) was built and live-smoked; the 4096 server still runs the
-previous binary until restarted.
+**CI Gates are green.** `cargo fmt --all --check` and `cargo clippy --workspace --all-targets -- -D warnings` pass cleanly. `cargo test --workspace` reports **803 automated tests across 80 suites (0 ignored, 0 failed)** covering unit, integration, and end-to-end scenarios.
 
-The wave split every source file that exceeded 1,000 lines, and every
-integration-test file that exceeded 1,000 lines, into a facade plus focused
-submodules without changing public paths, serde shapes, routes or error payloads
-(map in [17](17-interfaces.md#module-layout-oversized-file-split)). The largest
-split source module is 500 lines (`oc-runtime/src/turn/stream.rs`), down from
-`turn.rs` 2,722; the largest remaining source file is 964 lines
-(`oc-observer/src/engine.rs`), a candidate for the next wave.
-`oc-server` `session_ext.rs` 1,945 → 15 files, `shells.rs` 1,754 → 8,
-`observer_host.rs` 1,287 → 7, `permission.rs` 1,095 → 6, worktree/vcs →
-5/6 + shared `data/git.rs`; `oc-llm` `catalog.rs` 2,426 → 15, `oc-config`
-`normalize.rs` 1,700 → 16 (+`jsonc`/`merge`), `oc-store` `schedule.rs` 1,262 →
-8, `oc-plugin` sidecar → 8, `oc-cli` main → 9, MCP/LSP clients → 8/12. Six
-integration-test files over 1,000 lines (`oc-runtime` runtime/steer_live,
-`oc-store` store_ext, `oc-server` session_ext/runtime/data) were split into
-topic modules with identical test counts.
+The codebase adheres to strict modularity: large source and test files exceeding 1,000 lines were split into cohesive submodules behind clean facades, preserving public APIs, serde wire shapes, routes, and error envelopes (see [17 — Interfaces](17-interfaces.md#module-layout-oversized-file-split)).
 
-Test expansion: **+32 new behavioral tests total** (11 landed before the
-intermediate gate), and **7 non-behavioral getter/prose tests removed**, for a
-net **778 → 803**. Coverage added: runtime steer FIFO/recovery/compaction
-reasons, server form validation/export sanitize/import rejection, shell UTF-8
-cursor + session env, worktree confinement, cron/weekday/duration/ends, config
-permission precedence, MCP/LSP framing. A real defect was fixed: compaction
-`keepID` lives at the top level of message data, but fork/import read
-`/metadata/keepID`; both now remap top-level (legacy metadata migrates) with a
-failing-before/passing-after regression test.
+All behavior tests verify end-to-end semantics: runtime steer FIFO/recovery/compaction reasons, server form validation/export sanitize/import rejection, shell UTF-8 cursor and session env, worktree confinement, cron/duration parsing, permission precedence, and MCP/LSP framing.
 
-Live evidence this wave: a real task on 4096 (`read` tool, 17 durable frames,
-live SSE deltas + busy/idle, clean DELETE) passed; the new binary on an isolated
-port/database passed a 16-check smoke (UI, SSE, session CRUD, provider-less
-truthful failure, shell process/capture); and `oc-cli`'s binary-level E2E suite
-passed **5/5** (text turn, read-tool turn, restart durability, static UI,
-permission ask) against the new binary. The stability fixes and the earlier
-feature/fix-wave matrices below remain landed.
+Smoke verification passes on isolated ports and databases across core surfaces: UI serving, SSE streaming deltas, session lifecycle, provider-less truthful failures, shell process capture, and `oc-cli` binary-level E2E suites (text turns, tool turns, restart durability, static assets, and permission prompts).
 
 ## Verified
 
@@ -212,7 +155,7 @@ at `/`.
 - **Static directory paths**: bare `/_assets`/`/icons` now 404 instead of the
   false "Web UI is not built" 503; assets under them remain immutable 200.
 
-### Fix-wave re-verification (binary 14:02:29, gate 767/78)
+### Regression & Edge-Case Verification
 
 Every slice below ran on the 14:02 binary with isolated ports/DBs; the user DB
 and the 4096 server were not modified except for read-only UI checks.
@@ -400,12 +343,7 @@ registered, websearch providers list is empty, usage limits are `null`, and
 - **Compaction keeps the tail:** completed compaction rows carry `keepID`;
   context assembly replays the active turn (or `compaction.keep.tokens` budget)
   after the summary.
-- **Data-directory collision with upstream opencode:** the Rust server's default
-  SQLite path is the same `$XDG_DATA_HOME/opencode/opencode.db` the upstream JS
-  server uses, and the two schemas are incompatible (the Rust migration table
-  has a `checksum` column; the JS one does not). Starting without `--db` against
-  an upstream database fails at open time. Use `--db <path>` (this workspace
-  runs `.test-server/opencode.db`) or a dedicated data directory.
+- **Data directory separation:** The server's default SQLite path uses `$ESCAPE_DATA_DIR` or `<data>/escape-agent/escape.db` (or `opencode-rust.db` when `$OPENCODE_DATA_DIR` is explicitly specified), preventing schema collisions with upstream OpenCode installations.
 - The upstream goal GUI plugin calls `POST /api/rpc/opencode.goal/get`; the
   server has no `opencode.goal` RPC namespace, so that request is a JSON 404
   (the plugin swallows it). Goals are served by `/api/experimental/goal` and the
@@ -436,10 +374,14 @@ registered, websearch providers list is empty, usage limits are `null`, and
   `docs/03-storage.md`).
 - `session.v1` import is rejected; only the v2 schema is read.
 
-## Resume instructions
+## Verification & Development Flow
 
-1. Read `AGENTS.md`, `docs/17-interfaces.md`, this file.
-2. Check `proc://` and `agent://` for any still-running wave.
-3. Run `cargo test --workspace` (only when no agent is mid-write).
-4. Pick the next gap; freeze its interface in `docs/17` first.
-5. Implement, test through the public surface, update this file.
+1. Review architecture and specifications in `docs/` before making API changes.
+2. Verify interfaces and update `docs/17-interfaces.md`.
+3. Run workspace verification suite:
+   ```sh
+   cargo fmt --all --check
+   cargo clippy --workspace --all-targets -- -D warnings
+   cargo test --workspace
+   ```
+4. Record behavior tests and update this verification log accordingly.

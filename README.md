@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo.png" alt="Escape Agent Logo" width="128" />
+</p>
+
 # Escape Agent (`opencode-rust`)
 
 [English](#english) | [Türkçe](#türkçe)
@@ -8,23 +12,26 @@
 ## English
 
 ### Overview
-**Escape Agent** is an enterprise-grade, high-performance, asynchronous Rust server and runtime designed for autonomous agent execution, interactive code assistance, and client applications (Web, CLI, and TUI). Built as a fully wire-compatible Rust reimplementation and extension of the Opencode server protocol, it pairs a native Rust backend with a tailored, modern glass-themed SolidJS frontend.
+**Escape Agent** is a high-performance, asynchronous Rust server and runtime designed for autonomous agent execution, interactive code assistance, and developer workflows. Built as a wire-compatible Rust reimplementation and extension of core OpenCode server protocols, it pairs a native Rust backend with a branded, glass-themed SolidJS web client.
 
-### Key Highlights & Capabilities
-- **High-Performance Asynchronous Runtime**: Built on Tokio and Axum with strict zero-cost abstractions, zero `unsafe_code`, deterministic error handling, and robust crash-recovery semantics (survives process kills without data corruption).
+> **Status:** Active Developer Preview (Alpha). Core session lifecycle, tools, persistent memory, and observer loops are fully functional with 800+ automated tests. Advanced features (such as Code Mode, V1 session imports, and JS sidecar bridge execution) are under active development and return truthful 501/503 statuses.
+
+### Key Capabilities & Highlights
+- **High-Performance Asynchronous Runtime**: Built on Tokio and Axum with zero `unsafe_code`, deterministic error handling, and crash-resilient persistence (survives process kills without state corruption).
 - **Multi-Agent Orchestration & Lanes**: Hierarchical subagent spawning, concurrency control, isolated workspaces, and execution lanes (`oc-lanes` / `oc-subagents`).
-- **Resilient Tool Execution**: Built-in, sandboxed execution of core engineering tools (`read`, `write`, `edit`, `patch`, `glob`, `grep`, `bash`/`shell`) with input size enforcement and output limits.
+- **Resilient Tool Sandbox**: Sandboxed execution of core engineering tools (`read`, `write`, `edit`, `patch`, `glob`, `grep`, `shell`) with strict input size enforcement and output limits.
 - **Protocol & Integration Support**:
   - **MCP (Model Context Protocol)**: stdio, HTTP, and OAuth client support.
   - **LSP (Language Server Protocol)**: Diagnostic integration and multi-language tool operations.
-  - **Plugins**: Extensible native host interface with JavaScript sidecar bridges.
+  - **Plugins**: Extensible native host interface with JavaScript sidecar bridge contracts.
 - **Autonomous Memory & Observer Loop**:
   - Persistent SQLite + FTS5 full-text search memory layer with auto-scribe capabilities.
   - Goal-tracking and self-healing observer loops (`oc-observer`) to detect and recover from task stalls or loops.
-- **Branded Modern UI**: Pinned SolidJS single-page application customized with the **Escape Agent** dark/glass aesthetic, integrated SSE streaming, and Playwright verification suites.
+- **Tailored Modern Web UI**: Adapted from OpenCode's SolidJS client with custom Escape Agent aurora/glass aesthetics, integrated SSE streaming, and Playwright verification suites.
+- **Conflict-Free Storage**: Stores SQLite state in a dedicated directory (`~/.local/share/escape-agent/escape.db`), preventing database or migration collisions with upstream OpenCode.
 
 ### Workspace Architecture
-The project is organized as a clean, modular Cargo workspace:
+The project is organized as a modular Cargo workspace:
 
 | Crate | Purpose |
 |---|---|
@@ -57,11 +64,12 @@ Detailed architecture and interface specifications are available in the [`docs/`
 - [08 — Goals & Observer Loop](docs/08-goals-observer.md)
 - [17 — Interfaces & Module Map](docs/17-interfaces.md)
 - [18 — Live Implementation Status](docs/18-status.md)
+- [20 — Engineering Guide](docs/20-handoff.md)
 
 ### Getting Started
 
 #### Prerequisites
-- Rust (stable toolchain)
+- Rust (stable toolchain, 1.85+)
 - Bun (for building the web UI)
 - SQLite3
 
@@ -70,7 +78,7 @@ Detailed architecture and interface specifications are available in the [`docs/`
 # Build the workspace
 cargo build
 
-# Start the server on port 4096
+# Start the server on default port 4096
 cargo run -p oc-cli -- serve --port 4096
 
 # Test server health and event stream
@@ -93,7 +101,7 @@ The compiled UI assets are written to `web/dist` and automatically served by `oc
 
 #### Testing & Verification
 ```sh
-# Run workspace unit and integration tests
+# Run workspace unit and integration tests (800+ tests)
 cargo test --workspace
 
 # Linting and formatting checks
@@ -101,26 +109,32 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 ```
 
+### License
+This project is licensed under the [MIT License](LICENSE). Portions of the web UI and wire contracts are adapted from [OpenCode](https://github.com/opencode-ai/opencode) under the MIT License.
+
 ---
 
 <a name="türkçe"></a>
 ## Türkçe
 
 ### Genel Bakış
-**Escape Agent**, otonom yazılım geliştirme ajanları, etkileşimli kod asistanları ve istemciler (Web, CLI ve TUI) için tasarlanmış yüksek performanslı, asenkron bir Rust sunucusu ve çalışma zamanıdır (runtime). Opencode sunucu protokolünün wire-uyumlu, bellek güvenli ve ölçeklenebilir bir Rust uygulamasıdır; modern koyu/cam (glass) temalı SolidJS web arayüzü ile birlikte çalışır.
+**Escape Agent**, otonom yazılım geliştirme ajanları, etkileşimli kod asistanları ve geliştirici iş akışları için tasarlanmış yüksek performanslı, asenkron bir Rust sunucusu ve çalışma zamanıdır (runtime). Temel OpenCode sunucu protokollerinin wire-uyumlu, bellek güvenli ve modüler bir Rust uygulamasıdır; koyu/cam (aurora/glass) temalı SolidJS web arayüzü ile birlikte çalışır.
+
+> **Durum:** Geliştirici Önizlemesi (Alfa). Oturum yaşam döngüsü, araçlar, kalıcı bellek ve gözlemci döngüleri 800+ otomatik test ile doğrulanmış olarak çalışmaktadır. Henüz tamamlanmamış gelişmiş özellikler (Code Mode, V1 oturum aktarımı, JS sidecar bridge çalıştırması vb.) aktif geliştirme aşamasındadır ve gerçeğe uygun şekilde 501/503 yanıtları döndürür.
 
 ### Temel Özellikler ve Yetenekler
-- **Yüksek Performanslı Asenkron Mimari**: Tokio ve Axum üzerine kurulu; `unsafe_code` içermeyen, tamamen güvenli, deterministik hata yönetimi sunan ve ani kapanmalara (`kill -9`) karşı dayanıklı veri saklama mimarisi.
+- **Yüksek Performanslı Asenkron Mimari**: Tokio ve Axum üzerine kurulu; `unsafe_code` içermeyen, deterministik hata yönetimi sunan ve ani süreç sonlandırmalarına (`kill -9`) karşı dayanıklı kalıcılık mimarisi.
 - **Çoklu Ajan ve Kulvar (Lanes) Yönetimi**: Alt ajanların hiyerarşik yönetimi, iş parçacığı/görev kulvarları (`oc-lanes`), eşzamanlılık kontrolü ve izole çalışma alanları.
-- **Güvenli Araç Yürütme (Tools)**: Kod okuma, yazma, akıllı düzenleme (edit/patch), dosya arama (glob/grep) ve terminal/kabuk komutları için boyut kotalı ve izole araç altyapısı.
+- **Güvenli Araç Yürütme (Tools)**: Kod okuma, yazma, akıllı düzenleme (edit/patch), dosya arama (glob/grep) ve kabuk komutları için boyut kotalı ve güvenli araç altyapısı.
 - **Protokol ve Genişleme Desteği**:
   - **MCP (Model Context Protocol)**: stdio, HTTP ve OAuth desteği.
-  - **LSP (Language Server Protocol)**: Otomatik dil sunucusu yönetimi, kod teşhisleri ve akıllı navigasyon.
-  - **Eklenti (Plugin) Sistemi**: Yerel Rust arayüzü ve JavaScript yan süreç (sidecar) köprüsü.
+  - **LSP (Language Server Protocol)**: Dil sunucusu gözetimi, tanılama ve kod zekası.
+  - **Eklenti (Plugin) Sistemi**: Yerel Rust arayüzü ve JavaScript yan süreç (sidecar) köprü sözleşmeleri.
 - **Kalıcı Bellek ve Gözlemci Döngüsü (Memory & Observer)**:
   - SQLite + FTS5 tam metin aramalı uzun vadeli bellek ve otomatik kayıt (auto-scribe) yeteneği.
   - Görev kilitlenmelerini, döngüleri ve hataları tespit edip kendi kendini onaran gözlemci döngüsü (`oc-observer`).
-- **Özelleştirilmiş Modern Kullanıcı Arayüzü**: SolidJS tabanlı, **Escape Agent** marka kimliğiyle uyumlu koyu/cam temalı arayüz, SSE üzerinden gerçek zamanlı canlı akış ve Playwright uçtan uca testleri.
+- **Özelleştirilmiş Modern Web Arayüzü**: OpenCode SolidJS istemcisi temel alınarak hazırlanan Escape Agent aurora/cam temalı arayüz, SSE üzerinden canlı akış ve Playwright testleri.
+- **Çakışmasız Veri Depolama**: Varsayılan SQLite veritabanı ayrılmış bir dizinde (`~/.local/share/escape-agent/escape.db`) saklanır; upstream OpenCode şemalarıyla çakışma yaşanmaz.
 
 ### Modüler Crate Mimarisi
 
@@ -155,11 +169,12 @@ Mimarinin derinlemesine incelendiği teknik şartnameler [`docs/`](docs/README.m
 - [08 — Hedefler ve Gözlemci Döngüsü](docs/08-goals-observer.md)
 - [17 — Arayüzler ve Modül Haritası](docs/17-interfaces.md)
 - [18 — Güncel Uygulama Durumu](docs/18-status.md)
+- [20 — Mühendislik Rehberi](docs/20-handoff.md)
 
 ### Başlarken
 
 #### Gereksinimler
-- Rust (güncel stable sürüm)
+- Rust (güncel stable sürüm, 1.85+)
 - Bun (Web arayüzünü derlemek için)
 - SQLite3
 
@@ -191,10 +206,13 @@ Derlenen arayüz dosyaları `web/dist` içerisine aktarılır ve `oc-server` tar
 
 #### Test ve Doğrulama
 ```sh
-# Çalışma alanı birim ve entegrasyon testleri
+# Çalışma alanı birim ve entegrasyon testleri (800+ test)
 cargo test --workspace
 
 # Biçimlendirme ve statik analiz kontrolleri
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 ```
+
+### Lisans
+Bu proje [MIT Lisansı](LICENSE) altında lisanslanmıştır. Web arayüzü ve protokol sözleşmelerinin ilgili kısımları MIT Lisansı kapsamında [OpenCode](https://github.com/opencode-ai/opencode) projesinden uyarlanmıştır.

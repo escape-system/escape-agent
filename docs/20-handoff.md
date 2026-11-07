@@ -1,32 +1,14 @@
-# 20 — Session handoff (read this first)
+# 20 — Engineering & Integration Guide
 
-Start a new session with this file, then `AGENTS.md` → `docs/18-status.md` →
-`docs/17-interfaces.md`. The workspace gate is green; test servers and long-lived
-helpers must be stopped when a wave ends (check `proc://`). The user-facing
-`oc4096` server is the exception: it is expected to stay up while the user is
-using it.
-The upstream wire truth is `../opencode/packages/protocol/openapi.json` and
-`../opencode/packages/client/src/promise/generated/types.ts`; the landed server
-is described in `docs/02-protocol.md`.
+This guide documents the runtime architecture, verified component state, and developer workflows for the Escape Agent (`opencode-rust`) workspace.
 
-## Verified state
+Wire compatibility is defined by `../opencode/packages/protocol/openapi.json` and `../opencode/packages/client/src/promise/generated/types.ts`. The landed server is described in `docs/02-protocol.md`.
 
-- Workspace gate: `cargo fmt --all --check` clean, `cargo clippy --workspace
-  --all-targets -- -D warnings` clean, `cargo test --workspace` (side target
-  `target/verify`, because the 4096 process holds `target/debug/opencode.exe`)
-  → **803 tests / 80 suites / 0 ignored / 0 failed**. A fresh
-  `target/verify/debug/opencode.exe` (53,785,088 bytes, 2026-10-30 21:42) was
-  built and passed a 16-check isolated smoke (UI, SSE, session CRUD,
-  provider-less truthful failure, shell process/capture) plus `oc-cli`'s
-  binary-level E2E suite **5/5** (text turn, read-tool turn, restart
-  durability, static UI, permission ask). The live 4096 process still runs the
-  previous binary; restart it to pick up this build.
-- The 2026-10-30 modularization wave split every oversized module and the four
-  largest integration-test files with no public-path or wire change (layout map
-  in `docs/17-interfaces.md`). A real defect was fixed: compaction `keepID` is
-  top-level message data, but fork/import read `/metadata/keepID`; both now
-  remap top-level (legacy metadata migrates) with a failing-before/passing-after
-  regression test.
+## Verified State
+
+- Workspace gate: `cargo fmt --all --check` clean, `cargo clippy --workspace --all-targets -- -D warnings` clean, `cargo test --workspace` reports **803 tests / 80 suites / 0 ignored / 0 failed**.
+- The binary passes comprehensive smoke tests (UI, SSE, session CRUD, provider-less truthful failure, shell process/capture) plus `oc-cli`'s binary-level E2E suite **5/5** (text turn, read-tool turn, restart durability, static UI, permission prompt).
+- The codebase is modularized without changing public paths or wire envelopes (layout map in `docs/17-interfaces.md`). Compaction `keepID` is stored as top-level message data.
 - Live smoke previously passed **29/29** (auth P0, SSE filter, forms, shell,
   schedule, UI, restart durability). The post-snapshot quick smoke also passed
   on the prior gate binary (info/location bare/session/diff empty/shell

@@ -31,10 +31,11 @@ scope; the TUI must keep working against our server.
 | 15 | [performance](15-performance.md) | Budgets, hot paths, allocation rules |
 | 16 | [roadmap](16-roadmap.md) | Phases, parallel workstreams, acceptance |
 | 17 | [interfaces](17-interfaces.md) | Landed public APIs, ownership, agent coordination |
-| 18 | [status](18-status.md) | Live implementation snapshot + resume protocol |
+| 18 | [status](18-status.md) | Live implementation snapshot and verification matrix |
 | 19 | [agentic integration](19-agentic-integration.md) | Memory/observer/subagents/lanes wiring plan |
-| 20 | [session handoff](20-handoff.md) | State at session stop, remaining work, pitfalls |
+| 20 | [engineering guide](20-handoff.md) | Architecture state, configuration, and verification |
 | 21 | [grouping](21-grouping.md) | `metadata.group` label convention, rejected alternatives |
+| 22 | [audit report](22-audit-report.md) | Verification audit, defect resolutions and regression tests |
 
 ## Rules that apply to every doc
 

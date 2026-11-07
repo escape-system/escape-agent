@@ -34,7 +34,7 @@ pub(crate) enum Command {
         /// Resume or target a specific session ID.
         #[arg(short, long)]
         session: Option<String>,
-        /// SQLite database path (default: `<data>/opencode.db` or `$OPENCODE_DB`).
+        /// SQLite database path (default: `<data>/escape.db` or `$OPENCODE_DB`).
         #[arg(long, env = "OPENCODE_DB")]
         db: Option<PathBuf>,
         /// Emit raw JSONL event envelopes to stdout instead of formatted text.
@@ -55,7 +55,7 @@ pub(crate) enum Command {
         /// Resume or target a specific session ID.
         #[arg(short, long)]
         session: Option<String>,
-        /// SQLite database path (default: `<data>/opencode.db` or `$OPENCODE_DB`).
+        /// SQLite database path (default: `<data>/escape.db` or `$OPENCODE_DB`).
         #[arg(long, env = "OPENCODE_DB")]
         db: Option<PathBuf>,
     },
@@ -82,7 +82,7 @@ pub(crate) enum Command {
         /// Register as a managed service and exit when the registration is lost.
         #[arg(long)]
         service: bool,
-        /// SQLite database path (default: `<data>/opencode.db` or `$OPENCODE_DB`).
+        /// SQLite database path (default: `<data>/escape.db` or `$OPENCODE_DB`).
         #[arg(long, env = "OPENCODE_DB")]
         db: Option<PathBuf>,
     },
