@@ -278,7 +278,10 @@ impl Runtime {
 
     /// Repairs one assistant message, reporting a settled child's real outcome
     /// for an in-flight `subagent` tool part instead of a blanket abort error.
-    async fn repair_assistant(&self, message: &Value) -> Result<Option<Value>, RuntimeError> {
+    pub(crate) async fn repair_assistant(
+        &self,
+        message: &Value,
+    ) -> Result<Option<Value>, RuntimeError> {
         let mut body = body(message.clone());
         let Some(object) = body.as_object_mut() else {
             return Ok(None);
@@ -450,7 +453,7 @@ fn tool_error_state(input: &Map<String, Value>) -> Value {
     })
 }
 
-fn repair_compaction(message: &Value) -> Option<Value> {
+pub(crate) fn repair_compaction(message: &Value) -> Option<Value> {
     if message.get("status").and_then(Value::as_str) != Some("running") {
         return None;
     }

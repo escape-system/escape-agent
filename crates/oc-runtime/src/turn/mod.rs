@@ -16,7 +16,7 @@ use oc_types::{MessageId, SessionStatus};
 use serde_json::{Map, Value, json};
 
 use crate::prompt::{self, MAX_STEPS_PROMPT};
-use crate::runtime::{ActorHandle, CancelToken, Runtime, RuntimeError};
+use crate::runtime::{ActorHandle, CancelToken, Runtime, RuntimeError, TerminalState};
 use crate::tokens;
 
 mod assistant;
@@ -109,6 +109,10 @@ pub(crate) async fn run_execution(
         .store
         .mark_session_busy(session, oc_types::now_millis())
         .await?;
+    // From this commit onward the session is durably busy: every exit from this
+    // function must publish the terminal pair, including the actor failure path
+    // that fires when an `Err` escapes the drain loop.
+    handle.terminal.begin(true);
     runtime
         .emit(
             session,
@@ -137,6 +141,7 @@ pub(crate) async fn run_execution(
                     session,
                     &directory,
                     ExecutionOutcome::Failed(error.structured()),
+                    &handle.terminal,
                 )
                 .await?;
             return Ok(());
@@ -151,6 +156,7 @@ pub(crate) async fn run_execution(
                 session,
                 &directory,
                 ExecutionOutcome::Failed(error.structured()),
+                &handle.terminal,
             )
             .await?;
         return Ok(());
@@ -164,7 +170,9 @@ pub(crate) async fn run_execution(
         runtime.touch_memory(&turn.memory_ids).await;
     }
     let succeeded = matches!(outcome, ExecutionOutcome::Succeeded);
-    runtime.settle(session, &directory, outcome).await?;
+    runtime
+        .settle(session, &directory, outcome, &handle.terminal)
+        .await?;
     if succeeded {
         runtime.spawn_scribe(session, &stats).await;
     }
@@ -489,6 +497,7 @@ impl Runtime {
         session: &str,
         directory: &str,
         outcome: ExecutionOutcome,
+        terminal: &TerminalState,
     ) -> Result<(), RuntimeError> {
         match &outcome {
             ExecutionOutcome::Failed(_) => self.note_observer_execution(session, true).await,
@@ -502,6 +511,33 @@ impl Runtime {
             ExecutionOutcome::Interrupted(_) => ("interrupted", None),
         };
         self.clear_background_request(session);
+        // The idle row and its event are committed/published before the outcome
+        // event, so a crash between them leaves a session without an
+        // `execution.*` terminal rather than a terminal followed by a busy row.
+        self.publish_idle_terminal(session, directory, now, name, error.as_ref(), terminal)
+            .await?;
+        self.publish_outcome_terminal(session, directory, outcome, terminal)
+            .await
+    }
+
+    /// Writes the idle row, then publishes `session.idle` and
+    /// `session.status{idle}`.
+    ///
+    /// Idempotent: the terminal guard records that the pair was published so a
+    /// later recovery pass (the actor failure path) does not duplicate the
+    /// ephemeral events.
+    async fn publish_idle_terminal(
+        &self,
+        session: &str,
+        directory: &str,
+        now: i64,
+        name: &str,
+        error: Option<&oc_types::StructuredError>,
+        terminal: &TerminalState,
+    ) -> Result<(), RuntimeError> {
+        if terminal.idle_published() {
+            return Ok(());
+        }
         self.inner
             .config
             .store
@@ -510,7 +546,7 @@ impl Runtime {
         let mut idle = Map::new();
         idle.insert("time".to_owned(), json!({ "created": now }));
         idle.insert("outcome".to_owned(), Value::String(name.to_owned()));
-        if let Some(error) = &error {
+        if let Some(error) = error {
             idle.insert(
                 "error".to_owned(),
                 serde_json::to_value(error).expect("structured error is serializable"),
@@ -545,6 +581,21 @@ impl Runtime {
             },
         )
         .await?;
+        terminal.mark_idle();
+        Ok(())
+    }
+
+    /// Publishes the `session.execution.*` outcome exactly once per turn.
+    async fn publish_outcome_terminal(
+        &self,
+        session: &str,
+        directory: &str,
+        outcome: ExecutionOutcome,
+        terminal: &TerminalState,
+    ) -> Result<(), RuntimeError> {
+        if terminal.outcome_published() {
+            return Ok(());
+        }
         match outcome {
             ExecutionOutcome::Succeeded => {
                 self.emit(
@@ -578,6 +629,104 @@ impl Runtime {
                 )
                 .await?;
             }
+        }
+        terminal.mark_outcome();
+        Ok(())
+    }
+
+    /// Terminal repair after an error escaped the drain loop.
+    ///
+    /// The turn died before `settle` could run, so two things are missing: the
+    /// assistant/tool rows the step left open, and the terminal event pair.
+    /// Repair the rows first (durable), then publish `session.idle` and
+    /// `session.execution.failed` — in that order, matching [`settle`] — so a
+    /// consumer never sees a terminal execution event for a still-busy session.
+    ///
+    /// Idempotent with a settle that already ran: the shared [`TerminalState`]
+    /// guard suppresses duplicate `session.idle` / `execution.*` publications
+    /// and a fully settled turn has no open rows to repair.
+    pub(crate) async fn finalize_actor_failure(
+        &self,
+        session: &str,
+        error: &RuntimeError,
+        terminal: &TerminalState,
+    ) {
+        let directory = match self.inner.config.store.get_session(session).await {
+            Ok(Some(value)) => value
+                .pointer("/location/directory")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+            Ok(None) => String::new(),
+            Err(lookup) => {
+                tracing::warn!(session = %session, error = %lookup, "actor failure: session lookup failed");
+                String::new()
+            }
+        };
+        if let Err(repair) = self.repair_open_turn_rows(session).await {
+            tracing::error!(
+                session = %session,
+                error = %repair,
+                "actor failure: could not repair the rows left open by the stopped turn"
+            );
+        }
+        if !terminal.is_owed() {
+            return;
+        }
+        self.note_observer_execution(session, true).await;
+        self.clear_background_request(session);
+        let structured = error.structured();
+        let now = oc_types::now_millis();
+        if let Err(idle) = self
+            .publish_idle_terminal(
+                session,
+                &directory,
+                now,
+                "failed",
+                Some(&structured),
+                terminal,
+            )
+            .await
+        {
+            // No committed idle row means the busy flag may still be set and no
+            // terminal can be published ahead of it.
+            tracing::error!(session = %session, error = %idle, "actor failure: session.idle was not published");
+            return;
+        }
+        if let Err(failed) = self
+            .publish_outcome_terminal(
+                session,
+                &directory,
+                ExecutionOutcome::Failed(structured),
+                terminal,
+            )
+            .await
+        {
+            tracing::error!(session = %session, error = %failed, "actor failure: session.execution.failed was not published");
+        }
+    }
+
+    /// Closes every assistant/tool/compaction row the crashed turn left open,
+    /// reusing the boot-recovery repair so the two paths cannot drift.
+    async fn repair_open_turn_rows(&self, session: &str) -> Result<(), RuntimeError> {
+        for message in self.list_all_messages(session).await? {
+            let repaired = match message.get("type").and_then(Value::as_str) {
+                Some("assistant") => self.repair_assistant(&message).await?,
+                Some("compaction") => crate::recover::repair_compaction(&message),
+                _ => None,
+            };
+            let Some(body) = repaired else {
+                continue;
+            };
+            let id = message
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            self.inner
+                .config
+                .store
+                .update_message(session, id, body)
+                .await?;
         }
         Ok(())
     }

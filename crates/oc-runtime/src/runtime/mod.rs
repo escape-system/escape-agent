@@ -16,7 +16,7 @@ use crate::turn;
 mod actor;
 mod traits;
 
-pub(crate) use actor::{ActorHandle, CancelToken};
+pub(crate) use actor::{ActorHandle, CancelToken, TerminalState};
 pub use traits::{
     EventSink, LlmClientAdapter, ModelClient, PermissionAsk, PermissionDecision, PermissionHandler,
     RuntimeConfig, RuntimeError, ToolProvider,

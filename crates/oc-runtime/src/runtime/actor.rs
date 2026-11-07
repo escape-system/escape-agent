@@ -22,6 +22,8 @@ pub(crate) struct ActorHandle {
     /// Frozen instruction prefix for this session; deltas are computed against
     /// it so a turn never splices memory or skills per step.
     pub(crate) instructions: Mutex<Option<crate::instructions::InstructionSet>>,
+    /// Terminal-event guard for the inbox item currently being drained.
+    pub(crate) terminal: TerminalState,
 }
 
 impl ActorHandle {
@@ -34,7 +36,61 @@ impl ActorHandle {
             cancel: Mutex::new(None),
             join: Mutex::new(None),
             instructions: Mutex::new(None),
+            terminal: TerminalState::default(),
         }
+    }
+}
+
+/// Per-item terminal-event publication guard.
+///
+/// `owed` is armed by [`Runtime::drain`] when the item it is about to run is a
+/// real execution (a `compaction` row runs outside one). [`Runtime::settle`]
+/// clears it once the `session.execution.*` outcome event is durable.
+///
+/// The two `*_published` flags make the actor's failure path idempotent: a
+/// settle can fail half-way, and re-running it must not publish the terminal
+/// pair twice. `session.idle` and `session.status` are ephemeral, so the only
+/// way to duplicate them is to reach them again after they were already
+/// published; the flag makes that impossible.
+#[derive(Debug, Default)]
+pub(crate) struct TerminalState {
+    owed: AtomicBool,
+    idle_published: AtomicBool,
+    outcome_published: AtomicBool,
+}
+
+impl TerminalState {
+    /// Arm the guard for one inbox item. Called before the item runs.
+    pub(crate) fn begin(&self, owed: bool) {
+        self.owed.store(owed, Ordering::SeqCst);
+        self.idle_published.store(false, Ordering::SeqCst);
+        self.outcome_published.store(false, Ordering::SeqCst);
+    }
+
+    /// `true` while the current item still needs its terminal events.
+    pub(crate) fn is_owed(&self) -> bool {
+        self.owed.load(Ordering::SeqCst)
+    }
+
+    /// `true` once `session.idle` was published for the current item.
+    pub(crate) fn idle_published(&self) -> bool {
+        self.idle_published.load(Ordering::SeqCst)
+    }
+
+    /// `true` once the `session.execution.*` outcome was published.
+    pub(crate) fn outcome_published(&self) -> bool {
+        self.outcome_published.load(Ordering::SeqCst)
+    }
+
+    /// Records that the idle row and `session.idle` are committed/published.
+    pub(crate) fn mark_idle(&self) {
+        self.idle_published.store(true, Ordering::SeqCst);
+    }
+
+    /// Records that the execution outcome event is durable and clears `owed`.
+    pub(crate) fn mark_outcome(&self) {
+        self.outcome_published.store(true, Ordering::SeqCst);
+        self.owed.store(false, Ordering::SeqCst);
     }
 }
 
@@ -128,18 +184,11 @@ impl Runtime {
             self.inner.idle.notify_waiters();
             if let Err(error) = result {
                 tracing::error!(session = %session, error = %error, "session actor stopped");
-                // Best effort: never leave the session marked busy. Part A makes
-                // the next request start a fresh actor even if this write fails.
-                let now = oc_types::now_millis();
-                if let Err(idle) = self
-                    .inner
-                    .config
-                    .store
-                    .mark_session_idle(&session, now, "failed")
-                    .await
-                {
-                    tracing::error!(session = %session, error = %idle, "failed to clear busy after actor death");
-                }
+                // The turn may have died before `settle` ran. Repair the rows
+                // it left open and publish the terminal pair exactly once
+                // before the actor exits.
+                self.finalize_actor_failure(&session, &error, &handle.terminal)
+                    .await;
                 break;
             }
             if self.inner.shutdown.is_cancelled() {
@@ -154,6 +203,12 @@ impl Runtime {
         handle.running.store(false, Ordering::SeqCst);
         handle.idle.notify_waiters();
         self.inner.idle.notify_waiters();
+        // Leave the map before returning: a caller that raced this actor's
+        // death either found the live handle (its wake permit dies with us)
+        // or the empty map (fresh actor). The durable check below then covers
+        // the lost permit by respawning when input is already waiting.
+        self.retire_actor(&session, &handle);
+        self.respawn_if_input_waiting(&session).await;
     }
 
     async fn drain(&self, session: &str, handle: &Arc<ActorHandle>) -> Result<(), RuntimeError> {
@@ -164,6 +219,11 @@ impl Runtime {
             let Some(item) = self.next_deliverable(session).await? else {
                 return Ok(());
             };
+            // Reset the terminal guard. `run_execution` arms it after it
+            // publishes `session.execution.started`, so a row that never became
+            // an execution (a compaction, a swallowed doorbell) never owes
+            // `session.execution.*` events.
+            handle.terminal.begin(false);
             let token = Arc::new(CancelToken::new());
             *handle.cancel.lock().expect("cancel slot") = Some(Arc::clone(&token));
             // A detach request applies to the execution that is about to run;
@@ -176,6 +236,39 @@ impl Runtime {
             };
             *handle.cancel.lock().expect("cancel slot") = None;
             result?;
+        }
+    }
+
+    /// Removes this actor from the map when it is still the registered one.
+    fn retire_actor(&self, session: &str, handle: &Arc<ActorHandle>) {
+        let mut actors = self.inner.actors.lock().expect("actor map");
+        if actors
+            .get(session)
+            .is_some_and(|current| Arc::ptr_eq(current, handle))
+        {
+            actors.remove(session);
+        }
+    }
+
+    /// Starts a replacement actor when durable input is already waiting.
+    ///
+    /// A `notify` that lands while this actor is still alive stores a wake
+    /// permit that is lost when the loop breaks. Without this check the inbox
+    /// row would sit there until an unrelated request checks the session.
+    async fn respawn_if_input_waiting(&self, session: &str) {
+        if self.inner.shutdown.is_cancelled() {
+            return;
+        }
+        match self.next_deliverable(session).await {
+            Ok(Some(_)) => self.ensure_actor(session),
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(
+                    session = %session,
+                    error = %error,
+                    "could not check for waiting input while retiring the actor"
+                );
+            }
         }
     }
 }
