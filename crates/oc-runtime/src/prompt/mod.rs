@@ -108,6 +108,13 @@ pub fn default_system_prompt_with_memory(
              memory for things the repository already records.\n",
         );
     }
+    if tool_names.iter().any(|name| name == "code_map") {
+        prompt.push_str(
+            "- Use `code_map` to extract file outlines, search symbol definitions, or get a task-focused \
+             structural map before reading large files. For deep call-graph ranking, ripwire can be \
+             installed via: curl -fsSL https://raw.githubusercontent.com/redhat-et/ripwire/main/install.sh | sh\n",
+        );
+    }
     let _ = write!(
         prompt,
         "\n\
