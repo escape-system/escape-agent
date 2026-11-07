@@ -23,6 +23,7 @@ use tokio_util::sync::CancellationToken;
 use serde::Serialize;
 use serde_json::Value;
 
+pub mod code_map;
 pub mod diff;
 pub mod edit;
 pub mod glob;
@@ -36,6 +37,7 @@ pub mod webfetch;
 pub mod websearch;
 pub mod write;
 
+pub use code_map::CodeMapTool;
 pub use edit::EditTool;
 pub use glob::GlobTool;
 pub use grep::GrepTool;
@@ -166,6 +168,7 @@ impl ToolRegistry {
     /// Register the built-in tools.
     pub fn with_defaults() -> Self {
         let mut registry = Self::new();
+        registry.register(Arc::new(CodeMapTool));
         registry.register(Arc::new(PatchTool));
         registry.register(Arc::new(EditTool));
         registry.register(Arc::new(GlobTool));
@@ -345,7 +348,7 @@ mod tests {
         memory.register(Arc::new(FakeTool("memory_write")));
 
         base.extend(&memory);
-        assert_eq!(base.len(), 11);
+        assert_eq!(base.len(), 12);
         assert!(base.contains("memory_write"));
         assert_eq!(
             base.names()
@@ -361,7 +364,7 @@ mod tests {
         assert_eq!(names, sorted, "registry names stay sorted");
 
         let merged = ToolRegistry::with_defaults().merged(&memory);
-        assert_eq!(merged.len(), 11);
+        assert_eq!(merged.len(), 12);
         assert!(merged.contains("memory_write"));
         assert_eq!(
             merged

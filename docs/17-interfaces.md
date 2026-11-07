@@ -138,8 +138,8 @@ public surface; `cargo doc -p <crate> --no-deps` is the reference.
   an optional `cancel: Option<CancellationToken>`; the runtime cancels that
   token when the execution is interrupted, and tools that spawn detached
   helpers (the foreground subagent wait) use it to stop them instead of
-  orphaning work when the tool future is dropped. Nine built-ins (`read`,
-  `write`, `edit`, `patch`, `glob`, `grep`, `shell`, `todowrite`, `webfetch`);
+  orphaning work when the tool future is dropped. Built-ins: `code_map`, `read`,
+  `write`, `edit`, `patch`, `glob`, `grep`, `shell`, `todowrite`, `webfetch`;
   no permission/expectation logic (the runtime adds it).
 
 ### `oc-mcp`
@@ -529,7 +529,7 @@ pub struct ToolResult { pub output: Option<String>, pub content: Option<Value>, 
 pub struct ToolError { pub message: String, pub metadata: Option<Value> }  // thiserror + helpers
 ```
 
-Landed built-ins: `read`, `write`, `edit`, `patch`, `glob`, `grep`, `shell`,
+Landed built-ins: `code_map`, `read`, `write`, `edit`, `patch`, `glob`, `grep`, `shell`,
 `todowrite`, `webfetch`. Exact schemas/limits/error strings per
 `docs/12-tools.md`; tests cover edit three-tier matching, CRLF, patch grammar,
 glob/grep limits, shell timeout/kill, webfetch SSRF guards. No `expectation`

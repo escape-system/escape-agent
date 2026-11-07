@@ -22,6 +22,7 @@ namespace exists. `execute` is reserved for Code Mode.
 
 | id | Params | Semantics | Limits |
 |---|---|---|---|
+| `code_map` | `operation`, `path?`, `query?`, `limit?`, `max_tokens?` | Structural code intelligence: `outline` (signatures/symbols of a file or directory), `map` (ranked structural code map for a query/task), `symbol` (symbol definition lookup), `references` (symbol usage/call sites). Pure-Rust native parser for Rust, TS/JS, Python, Go, C/C++, Markdown/Config; accelerates with Ripwire if present on PATH. | 100 default limit, 1200 tokens default cap |
 | `read` | `path`, `offset?`, `limit?` | File (numbered lines) or directory listing; images/PDF as media | 2000 lines, 50 KiB, 2000 chars/line, media ≤ 20 MiB |
 | `write` | `path`, `content` | Overwrite/create, parent dirs, BOM preserved, formatter run | — |
 | `edit` | `path`, `oldString`, `newString`, `replaceAll?` | Three-tier replace (exact → Unicode-normalized → line-trimmed) | 0 matches/ambiguous ⇒ error |
@@ -48,7 +49,7 @@ Code Mode (when enabled): `execute {code}` with a JS sandbox and a catalog of
 tool; Code Mode is a tool transport, not an extra loop.
 
 Our additions: `talk`, `roster`, `session_write`, `digest`, `memory_*`,
-`goal_*`, `lane`, `skill_write`, `skill_lint` — see their docs.
+`goal_*`, `lane`, `skill_write`, `skill_lint`, `code_map` — see their docs.
 
 ## Input repair and validation
 

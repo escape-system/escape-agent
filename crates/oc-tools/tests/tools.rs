@@ -6,8 +6,8 @@ use serde_json::json;
 use tempfile::TempDir;
 
 use oc_tools::{
-    EditTool, GlobTool, GrepTool, PatchTool, ReadTool, ShellTool, Tool, ToolContext, ToolRegistry,
-    WriteTool,
+    CodeMapTool, EditTool, GlobTool, GrepTool, PatchTool, ReadTool, ShellTool, Tool, ToolContext,
+    ToolRegistry, WriteTool,
 };
 
 fn ctx(dir: &Path) -> ToolContext {
@@ -30,6 +30,7 @@ async fn registry_definitions_are_sorted_without_expectation() {
     assert_eq!(
         names,
         vec![
+            "code_map",
             "edit",
             "glob",
             "grep",
@@ -417,4 +418,171 @@ async fn shell_exports_session_environment() {
         .await
         .unwrap();
     assert_eq!(result.output.unwrap().trim(), "ses_test");
+}
+
+#[tokio::test]
+async fn code_map_outline_and_symbol_operations() {
+    let dir = TempDir::new().unwrap();
+    let file = dir.path().join("server.rs");
+    fs::write(
+        &file,
+        r#"
+/// HTTP Server supervisor.
+pub struct HttpServer {
+    port: u16,
+}
+
+impl HttpServer {
+    pub async fn start(&self) {
+        println!("listening");
+    }
+}
+
+fn internal_worker() {
+    println!("work");
+}
+"#,
+    )
+    .unwrap();
+
+    let tool = CodeMapTool;
+
+    // Test outline
+    let outline_res = tool
+        .execute(
+            &ctx(dir.path()),
+            json!({
+                "operation": "outline",
+                "path": "server.rs"
+            }),
+        )
+        .await
+        .unwrap();
+    let outline_text = outline_res.output.unwrap();
+    assert!(outline_text.contains("HttpServer"));
+    assert!(outline_text.contains("pub struct HttpServer"));
+    assert!(outline_text.contains("pub async fn start"));
+    assert!(outline_text.contains("fn internal_worker"));
+
+    // Test symbol search
+    let sym_res = tool
+        .execute(
+            &ctx(dir.path()),
+            json!({
+                "operation": "symbol",
+                "query": "HttpServer"
+            }),
+        )
+        .await
+        .unwrap();
+    let sym_text = sym_res.output.unwrap();
+    assert!(sym_text.contains("server.rs"));
+    assert!(sym_text.contains("[struct]"));
+
+    // Test references search
+    let ref_res = tool
+        .execute(
+            &ctx(dir.path()),
+            json!({
+                "operation": "references",
+                "query": "listening"
+            }),
+        )
+        .await
+        .unwrap();
+    let ref_text = ref_res.output.unwrap();
+    assert!(ref_text.contains("server.rs"));
+    assert!(ref_text.contains("listening"));
+
+    // Test map operation
+    let map_res = tool
+        .execute(
+            &ctx(dir.path()),
+            json!({
+                "operation": "map",
+                "query": "server start"
+            }),
+        )
+        .await
+        .unwrap();
+    let map_text = map_res.output.unwrap();
+    assert!(map_text.contains("<code_map") || map_text.contains("<ctx"));
+    assert!(map_text.contains("server.rs"));
+    assert!(map_text.contains("start"));
+}
+
+#[tokio::test]
+async fn code_map_native_directory_outline_and_search() {
+    let dir = TempDir::new().unwrap();
+    let sub = dir.path().join("src");
+    fs::create_dir_all(&sub).unwrap();
+    fs::write(
+        sub.join("client.ts"),
+        r"
+export interface ClientOptions { timeout: number; }
+export class ApiClient {
+    async connect(): Promise<void> {}
+}
+",
+    )
+    .unwrap();
+    fs::write(
+        sub.join("app.py"),
+        r"
+class AppController:
+    def bootstrap(self):
+        pass
+",
+    )
+    .unwrap();
+
+    let tool = CodeMapTool;
+
+    // Test directory outline across languages
+    let outline_res = tool
+        .execute(
+            &ctx(dir.path()),
+            json!({
+                "operation": "outline",
+                "path": "src"
+            }),
+        )
+        .await
+        .unwrap();
+    let outline_text = outline_res.output.unwrap();
+    assert!(outline_text.contains("client.ts"));
+    assert!(outline_text.contains("ClientOptions"));
+    assert!(outline_text.contains("ApiClient"));
+    assert!(outline_text.contains("app.py"));
+    assert!(outline_text.contains("AppController"));
+
+    // Test symbol search for TS interface
+    let sym_res = tool
+        .execute(
+            &ctx(dir.path()),
+            json!({
+                "operation": "symbol",
+                "query": "ClientOptions"
+            }),
+        )
+        .await
+        .unwrap();
+    let sym_text = sym_res.output.unwrap();
+    assert!(sym_text.contains("client.ts"));
+    assert!(sym_text.contains("[interface]"));
+
+    // Test symbol search for Python method
+    let py_sym_res = tool
+        .execute(
+            &ctx(dir.path()),
+            json!({
+                "operation": "symbol",
+                "query": "bootstrap"
+            }),
+        )
+        .await
+        .unwrap();
+    let py_sym_text = py_sym_res.output.unwrap();
+    assert!(py_sym_text.contains("app.py"));
+    assert!(py_sym_text.contains("[method]"));
 }
