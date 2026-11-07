@@ -147,6 +147,7 @@ impl Tool for SkillWriteTool {
             }),
         );
 
+        let findings = super::lint::lint(config, &target, Some(&id), &document);
         Ok(ToolResult::text(
             serde_json::to_string_pretty(&json!({
                 "id": id,
@@ -156,6 +157,7 @@ impl Tool for SkillWriteTool {
                 "path": target.to_string_lossy(),
                 "source": "agent",
                 "created": created,
+                "findings": findings,
             }))
             .unwrap_or_else(|_| target.to_string_lossy().into_owned()),
         ))

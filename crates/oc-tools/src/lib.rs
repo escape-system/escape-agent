@@ -31,6 +31,7 @@ pub mod grep;
 pub mod patch;
 pub mod read;
 pub mod shell;
+pub mod shell_guard;
 pub mod todowrite;
 pub mod util;
 pub mod webfetch;

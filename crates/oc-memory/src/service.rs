@@ -347,12 +347,17 @@ fn pinned(hit: &MemoryHit) -> u8 {
     u8::from(hit.importance >= PINNED_IMPORTANCE)
 }
 
-/// Pinned first, then hybrid score, then importance; exact ids and near
+fn preference(hit: &MemoryHit) -> u8 {
+    u8::from(hit.kind == "preference")
+}
+
+/// Pinned first, then preferences, then hybrid score, then importance; exact ids and near
 /// duplicates (Jaccard `>= 0.85`) keep the higher-ranked entry.
 fn rank_and_dedupe(mut hits: Vec<MemoryHit>) -> Vec<MemoryHit> {
     hits.sort_by(|left, right| {
         pinned(right)
             .cmp(&pinned(left))
+            .then_with(|| preference(right).cmp(&preference(left)))
             .then_with(|| right.score.total_cmp(&left.score))
             .then_with(|| right.importance.cmp(&left.importance))
     });
@@ -574,6 +579,46 @@ mod tests {
             .expect("retrieve");
         assert_eq!(block.ids.first(), Some(&pinned), "{:?}", block.ids);
         assert!(block.ids.contains(&matched));
+    }
+
+    #[tokio::test]
+    async fn preferences_rank_above_standard_facts() {
+        let service = service().await;
+        let pref = service
+            .write(NewMemoryInput {
+                text: "User prefers async tokio and functional stream pipelines".to_owned(),
+                kind: Some("preference".to_owned()),
+                scope: Some("project".to_owned()),
+                scope_id: Some("prj_a".to_owned()),
+                importance: Some(3),
+                ..NewMemoryInput::default()
+            })
+            .await
+            .expect("write pref");
+        let fact = service
+            .write(NewMemoryInput {
+                text: "Pipelines module is implemented in src/stream_pipelines.rs".to_owned(),
+                kind: Some("fact".to_owned()),
+                scope: Some("project".to_owned()),
+                scope_id: Some("prj_a".to_owned()),
+                importance: Some(4),
+                ..NewMemoryInput::default()
+            })
+            .await
+            .expect("write fact");
+
+        let block = service
+            .retrieve(RetrieveRequest {
+                scopes: scopes("prj_a"),
+                query: "pipelines".to_owned(),
+                ..RetrieveRequest::default()
+            })
+            .await
+            .expect("retrieve");
+        let pref_id = pref["id"].as_str().expect("pref id").to_owned();
+        let fact_id = fact["id"].as_str().expect("fact id").to_owned();
+        assert_eq!(block.ids.first(), Some(&pref_id));
+        assert!(block.ids.contains(&fact_id));
     }
 
     #[tokio::test]

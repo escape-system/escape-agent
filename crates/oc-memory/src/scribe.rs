@@ -71,6 +71,13 @@ pub fn scribe_prompt(recent: &str) -> String {
          (currently, running, just now), secrets, or task progress. Return [] when nothing \
          is durable.\n\
          \n\
+         Guidelines per kind:\n\
+         - preference: developer coding style, language, formatting, or behavioral preferences (importance 4-5)\n\
+         - pattern: successful repeatable workflows, procedural steps, or build/test idioms\n\
+         - decision: architectural, library, schema, or system design choices\n\
+         - gotcha: subtle failure modes, bugs, edge cases, or platform quirks\n\
+         - fact: permanent project-specific facts not derivable from git status alone\n\
+         \n\
          Session digest:\n\
          {recent}\n"
     )

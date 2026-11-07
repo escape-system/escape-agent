@@ -115,6 +115,13 @@ pub fn default_system_prompt_with_memory(
              installed via: curl -fsSL https://raw.githubusercontent.com/redhat-et/ripwire/main/install.sh | sh\n",
         );
     }
+    if tool_names.iter().any(|name| name == "skill_write") {
+        prompt.push_str(
+            "- When you discover or complete a repeatable multi-step engineering workflow or \
+             project-specific convention that future sessions will repeat, persist it as a reusable \
+             skill using `skill_write`. Keep bodies under 200 lines and include a '## When to use' section.\n",
+        );
+    }
     let _ = write!(
         prompt,
         "\n\

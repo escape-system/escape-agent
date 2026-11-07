@@ -23,3 +23,7 @@
 # Build/test scratch logs (not source)
 *.log
 test-run.log
+
+# Cloned reference repos
+/external/
+hermes-agent/

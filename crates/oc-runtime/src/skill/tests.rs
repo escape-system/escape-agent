@@ -163,3 +163,65 @@ fn find_skill_scopes_to_the_session_directory() {
         "the prompt index must not leak server skills to a session in another project"
     );
 }
+
+#[test]
+fn linter_enforces_hermes_style_quality_standards() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path();
+    let config = scoped_config(root);
+    let path = root.join("skill/demo/SKILL.md");
+
+    // 1. Missing "When to use" section and banned shell tool
+    let bad_text = "---\nname: Demo\ndescription: A demo skill\n---\nRun `grep -rn 'foo' .` to inspect code.\nThis cutting-edge tool is powerful.\nCheck .env file for secrets.\n";
+    let findings = super::lint::lint(&config, &path, Some("demo"), bad_text);
+
+    let codes: Vec<&str> = findings
+        .iter()
+        .filter_map(|f| f.get("code").and_then(|c| c.as_str()))
+        .collect();
+
+    assert!(codes.contains(&"missing_when_to_use"), "{codes:?}");
+    assert!(codes.contains(&"banned_shell_utility"), "{codes:?}");
+    assert!(codes.contains(&"marketing_buzzwords"), "{codes:?}");
+    assert!(codes.contains(&"forbidden_files"), "{codes:?}");
+
+    // 2. Well-formed skill passes without these warnings
+    let good_text = "---\nname: Good Skill\ndescription: A focused procedural skill\n---\n## Overview\nUse lanes for testing.\n\n## When to use\nUse when compiling Rust workspace tests.\n\n## Instructions\nCall the native test runner.\n";
+    let clean_findings = super::lint::lint(&config, &path, Some("good-skill"), good_text);
+    let clean_codes: Vec<&str> = clean_findings
+        .iter()
+        .filter_map(|f| f.get("code").and_then(|c| c.as_str()))
+        .collect();
+
+    assert!(
+        !clean_codes.contains(&"missing_when_to_use"),
+        "{clean_codes:?}"
+    );
+    assert!(
+        !clean_codes.contains(&"banned_shell_utility"),
+        "{clean_codes:?}"
+    );
+    assert!(
+        !clean_codes.contains(&"marketing_buzzwords"),
+        "{clean_codes:?}"
+    );
+    assert!(!clean_codes.contains(&"forbidden_files"), "{clean_codes:?}");
+    assert!(!clean_codes.contains(&"body_too_long"), "{clean_codes:?}");
+}
+
+#[test]
+fn linter_flags_body_too_long() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path();
+    let config = scoped_config(root);
+    let path = root.join("skill/long/SKILL.md");
+
+    let long_body = "## When to use\n".to_string() + &"line\n".repeat(205);
+    let doc = format!("---\nname: Long\ndescription: Long skill\n---\n{long_body}");
+    let findings = super::lint::lint(&config, &path, Some("long"), &doc);
+    let codes: Vec<&str> = findings
+        .iter()
+        .filter_map(|f| f.get("code").and_then(|c| c.as_str()))
+        .collect();
+    assert!(codes.contains(&"body_too_long"), "{codes:?}");
+}

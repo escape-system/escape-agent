@@ -24,6 +24,15 @@ fn delegation_guidance_appears_only_with_the_subagent_tool() {
 }
 
 #[test]
+fn skill_write_guidance_appears_with_tool() {
+    let with = default_system_prompt(&["read".to_owned(), "skill_write".to_owned()], "/work");
+    assert!(with.contains("`skill_write`"), "{with}");
+    assert!(with.contains("repeatable"), "{with}");
+    let without = default_system_prompt(&["read".to_owned()], "/work");
+    assert!(!without.contains("`skill_write`"), "{without}");
+}
+
+#[test]
 fn system_prefix_is_two_parts() {
     let parts = system_parts(Some("custom"), &[], "/work");
     assert_eq!(parts.len(), 2);

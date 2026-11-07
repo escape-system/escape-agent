@@ -82,6 +82,10 @@ impl Tool for ShellTool {
             ));
         }
 
+        if let Err(reason) = crate::shell_guard::check_shell_command(&command) {
+            return Err(ToolError::new(reason));
+        }
+
         let workdir = match workdir_input {
             Some(value) => util::resolve_from(&ctx.cwd, &value),
             None => ctx.cwd.clone(),

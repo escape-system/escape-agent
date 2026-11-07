@@ -1039,6 +1039,180 @@ async fn malformed_tool_arguments_become_a_tool_error_and_turn_recovers() {
     assert!(!harness.sink.has("session.execution.failed"));
 }
 
+#[tokio::test]
+async fn verify_on_stop_nudges_when_code_file_changed_without_test() {
+    let harness = Harness::new(
+        vec![
+            // Step 1: LLM writes to a code file (src/main.rs)
+            named_tool_script(
+                "write",
+                "call_write_code",
+                json!({
+                    "path": "src/main.rs",
+                    "content": "fn main() {}\n",
+                    "expectation": expectation(),
+                }),
+            ),
+            // Step 2: LLM tries to stop with text without running tests -> runtime intercepts and nudges
+            text_script("I have written the code!"),
+            // Step 3: LLM receives verification nudge and runs cargo test via shell
+            named_tool_script(
+                "shell",
+                "call_run_test",
+                json!({
+                    "command": "echo cargo test ok",
+                    "expectation": expectation(),
+                }),
+            ),
+            // Step 4: LLM summarizes test pass and finishes cleanly
+            text_script("Tests passed successfully."),
+        ],
+        Arc::new(AllowAll),
+        json!({"verify_on_stop": true}),
+        None,
+    )
+    .await;
+
+    harness.prompt("implement main function").await;
+
+    assert!(harness.sink.has("session.execution.succeeded"));
+    assert_eq!(harness.model.calls(), 4);
+
+    let requests = harness.model.requests();
+    // Request 3 should have received the synthetic verification nudge
+    let third_req = &requests[2];
+    let nudge_msg = third_req.messages.iter().find(|m| {
+        m.role == Role::User
+            && m.content.iter().any(|c| match c {
+                oc_llm::ContentPart::Text { text } => text.contains("verification evidence"),
+                _ => false,
+            })
+    });
+    assert!(
+        nudge_msg.is_some(),
+        "third request must contain verification nudge"
+    );
+}
+
+#[tokio::test]
+async fn verify_on_stop_stops_after_nudge_cap_if_unverified() {
+    let harness = Harness::new(
+        vec![
+            // Step 1: LLM writes code
+            named_tool_script(
+                "write",
+                "call_write_code",
+                json!({
+                    "path": "src/main.rs",
+                    "content": "fn main() {}\n",
+                    "expectation": expectation(),
+                }),
+            ),
+            // Step 2: LLM tries to stop -> Nudge 1
+            text_script("Done without test."),
+            // Step 3: LLM tries to stop again -> Nudge 2
+            text_script("Still no test."),
+            // Step 4: LLM tries to stop again -> Nudge cap reached (2), settles successfully
+            text_script("I cannot test right now."),
+        ],
+        Arc::new(AllowAll),
+        json!({"verify_on_stop": true}),
+        None,
+    )
+    .await;
+
+    harness.prompt("implement main function").await;
+
+    assert!(harness.sink.has("session.execution.succeeded"));
+    assert_eq!(harness.model.calls(), 4);
+}
+
+#[tokio::test]
+async fn stall_guard_nudges_on_identical_consecutive_calls() {
+    let harness = Harness::new(
+        vec![
+            // Step 1: LLM reads hello.txt
+            tool_script(
+                "call_1",
+                json!({"path": "hello.txt", "expectation": expectation()}),
+            ),
+            // Step 2: LLM reads hello.txt again (identical call 2)
+            tool_script(
+                "call_2",
+                json!({"path": "hello.txt", "expectation": expectation()}),
+            ),
+            // Step 3: LLM reads hello.txt again (identical call 3 -> StallGuard triggers warning)
+            tool_script(
+                "call_3",
+                json!({"path": "hello.txt", "expectation": expectation()}),
+            ),
+            // Step 4: Next request receives Stall Guard Warning, agent answers with text
+            text_script("I will break the loop and proceed with a different plan."),
+        ],
+        Arc::new(AllowAll),
+        json!({}),
+        None,
+    )
+    .await;
+
+    harness.prompt("investigate hello.txt").await;
+
+    assert!(harness.sink.has("session.execution.succeeded"));
+    assert_eq!(harness.model.calls(), 4);
+
+    let requests = harness.model.requests();
+    let fourth_req = &requests[3];
+    let warning_msg = fourth_req.messages.iter().find(|m| {
+        m.role == Role::User
+            && m.content.iter().any(|c| match c {
+                oc_llm::ContentPart::Text { text } => text.contains("Stall Guard Warning"),
+                _ => false,
+            })
+    });
+    assert!(
+        warning_msg.is_some(),
+        "fourth request must contain stall guard warning notice"
+    );
+}
+
+#[tokio::test]
+async fn repetition_guard_suppresses_length_continuation_on_loop() {
+    let bad_text = "echo 'repetitive content inside the stream';\n".repeat(25);
+    let harness = Harness::new(
+        vec![
+            // Step 1: Degenerate stream finishes with length reason
+            Script::Events(vec![
+                LlmEvent::StepStart,
+                LlmEvent::TextStart,
+                LlmEvent::TextDelta {
+                    delta: bad_text.clone(),
+                },
+                LlmEvent::TextEnd { text: bad_text },
+                LlmEvent::Finish {
+                    reason: "length".to_owned(),
+                    usage: usage(),
+                },
+            ]),
+            // If continuation was NOT suppressed, step 2 would run.
+            text_script("should not be reached"),
+        ],
+        Arc::new(AllowAll),
+        json!({}),
+        None,
+    )
+    .await;
+
+    harness.prompt("generate repetition").await;
+
+    // Must settle in 1 step because repetition guard suppressed continuation!
+    assert_eq!(
+        harness.model.calls(),
+        1,
+        "repetition guard must suppress length continuation on degenerate loop"
+    );
+    assert!(harness.sink.has("session.execution.succeeded"));
+}
+
 // ---------------------------------------------------------------------------
 // Observer wiring
 // ---------------------------------------------------------------------------

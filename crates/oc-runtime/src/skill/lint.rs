@@ -12,6 +12,30 @@ use super::activate::find_skill;
 use super::util::{finding, optional_str};
 use super::write::validate_id;
 
+const MAX_BODY_LINES: usize = 200;
+const MAX_BODY_CHARS: usize = 12_000;
+
+const BANNED_SHELL_PATTERNS: &[(&str, &str)] = &[
+    ("grep ", "the native `grep` tool"),
+    ("rg ", "the native `grep` tool"),
+    ("cat ", "the native `read` tool"),
+    ("head ", "the native `read` tool with `limit`"),
+    ("tail ", "the native `read` tool with `offset`"),
+    ("sed ", "the native `edit` or `patch` tool"),
+    ("awk ", "the native `edit` or `patch` tool"),
+    ("find .", "the native `glob` tool"),
+];
+
+const HYPE_WORDS: &[&str] = &[
+    "cutting-edge",
+    "state-of-the-art",
+    "revolutionary",
+    "seamless",
+    "groundbreaking",
+];
+
+const FORBIDDEN_FILES: &[&str] = &[".env", ".env.example", ".gitignore"];
+
 pub(super) struct SkillLintTool {
     pub(super) runtime: Runtime,
 }
@@ -84,7 +108,13 @@ impl Tool for SkillLintTool {
         ))
     }
 }
-fn lint(config: &ConfigService, path: &Path, id: Option<&str>, text: &str) -> Vec<Value> {
+
+pub(super) fn lint(
+    config: &ConfigService,
+    path: &Path,
+    id: Option<&str>,
+    text: &str,
+) -> Vec<Value> {
     let mut findings = Vec::new();
     let trimmed = text.strip_prefix('\u{feff}').unwrap_or(text);
     let has_frontmatter = trimmed
@@ -142,9 +172,8 @@ fn lint(config: &ConfigService, path: &Path, id: Option<&str>, text: &str) -> Ve
         }
         Some(_) => {}
     }
-    if parsed.body.trim().is_empty() {
-        findings.push(finding("warning", "empty_body", "the skill body is empty"));
-    }
+
+    lint_body(&parsed.body, &mut findings);
     match id {
         None => findings.push(finding(
             "error",
@@ -169,6 +198,78 @@ fn lint(config: &ConfigService, path: &Path, id: Option<&str>, text: &str) -> Ve
         }
     }
     findings
+}
+
+fn lint_body(body: &str, findings: &mut Vec<Value>) {
+    if body.trim().is_empty() {
+        findings.push(finding("warning", "empty_body", "the skill body is empty"));
+        return;
+    }
+
+    let line_count = body.lines().count();
+    let char_count = body.chars().count();
+    if line_count > MAX_BODY_LINES || char_count > MAX_BODY_CHARS {
+        findings.push(finding(
+            "warning",
+            "body_too_long",
+            format!(
+                "body has {line_count} lines and {char_count} characters (soft budget: {MAX_BODY_LINES} lines / {MAX_BODY_CHARS} chars); keep skills focused to avoid context window bloat"
+            ),
+        ));
+    }
+
+    let has_when_to_use = body.lines().any(|line| {
+        let line_trimmed = line.trim().trim_start_matches('#').trim();
+        line_trimmed.eq_ignore_ascii_case("when to use")
+            || line_trimmed.to_lowercase().starts_with("when to use")
+    });
+    if !has_when_to_use {
+        findings.push(finding(
+            "warning",
+            "missing_when_to_use",
+            "body is missing a '## When to use' section; explicit trigger conditions are recommended for reliable agent routing",
+        ));
+    }
+
+    for (pattern, recommendation) in BANNED_SHELL_PATTERNS {
+        if body.contains(pattern) {
+            findings.push(finding(
+                "warning",
+                "banned_shell_utility",
+                format!(
+                    "skill references raw shell command '{pattern}'; recommend using {recommendation} for structured output and safety"
+                ),
+            ));
+            break;
+        }
+    }
+
+    let body_lower = body.to_lowercase();
+    for word in HYPE_WORDS {
+        if body_lower.contains(word) {
+            findings.push(finding(
+                "warning",
+                "marketing_buzzwords",
+                format!(
+                    "body contains hype adjective '{word}'; prefer concrete technical requirements over promotional language"
+                ),
+            ));
+            break;
+        }
+    }
+
+    for file in FORBIDDEN_FILES {
+        if body.contains(file) {
+            findings.push(finding(
+                "warning",
+                "forbidden_files",
+                format!(
+                    "body references scaffolding/secret file '{file}'; skills should contain operational workflows, not secret templates or VCS ignore files"
+                ),
+            ));
+            break;
+        }
+    }
 }
 
 pub(super) fn skill_id_from_path(path: &Path) -> Option<String> {

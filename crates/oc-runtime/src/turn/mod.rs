@@ -23,11 +23,14 @@ mod assistant;
 mod compaction;
 mod finalize;
 mod permissions;
+mod repetition;
 mod session;
+mod stall;
 mod stats;
 mod stream;
 mod tools;
 mod types;
+mod verify;
 
 pub(crate) use tools::report_tool_progress;
 pub(crate) use types::{PendingToolCall, ToolOutcome};
@@ -232,6 +235,9 @@ impl Runtime {
         let mut overflow_compacted = false;
         let mut length_continuations = 0_usize;
         let mut pending_output_continuation = false;
+        let mut pending_verify_nudge: Option<String> = None;
+        let mut pending_stall_notice: Option<String> = None;
+        let mut stall_guard = stall::StallGuard::default();
         let mut step_number = 0_usize;
         let ceiling = if turn.context_window == 0 {
             u64::MAX
@@ -288,6 +294,12 @@ impl Runtime {
             if pending_output_continuation {
                 messages.push(LlmMessage::user(prompt::CONTINUE_AFTER_OUTPUT_LIMIT_PROMPT));
             }
+            if let Some(nudge) = pending_verify_nudge.take() {
+                messages.push(LlmMessage::user(nudge));
+            }
+            if let Some(notice) = pending_stall_notice.take() {
+                messages.push(LlmMessage::user(notice));
+            }
             if final_call {
                 messages.push(LlmMessage::user(MAX_STEPS_PROMPT));
             } else if turn.max_steps >= 10 {
@@ -341,6 +353,12 @@ impl Runtime {
             if !final_call && !step.calls.is_empty() {
                 length_continuations = 0;
                 stats.tool_calls = stats.tool_calls.saturating_add(step.calls.len());
+                for call in &step.calls {
+                    if let Some(warning) = stall_guard.record_and_check(&call.name, &call.input) {
+                        pending_stall_notice = Some(warning);
+                        break;
+                    }
+                }
                 match self
                     .execute_tools(session, turn, &mut step.state, &step.calls, cancel)
                     .await
@@ -353,17 +371,44 @@ impl Runtime {
                 }
             }
             self.finish_step(session, turn, &mut step).await?;
-            collect_tool_lines(stats, &step.state);
+            collect_tool_lines(stats, &step.state, step_number);
             if !final_call
                 && step.calls.is_empty()
                 && step.state.finish == Some(oc_types::message::FinishReason::Length)
                 && length_continuations < 2
             {
-                length_continuations += 1;
-                pending_output_continuation = true;
-                step_number += 1;
-                context = self.load_context(session).await?;
-                continue;
+                let text = assistant_text(&step.state);
+                if repetition::is_repetition_dominated(&text) {
+                    tracing::warn!(
+                        session = %session,
+                        "suppressed length continuation because response is repetition-dominated"
+                    );
+                } else {
+                    length_continuations += 1;
+                    pending_output_continuation = true;
+                    step_number += 1;
+                    context = self.load_context(session).await?;
+                    continue;
+                }
+            }
+            if !final_call
+                && step.calls.is_empty()
+                && verify::verify_on_stop_enabled(&self.inner.config.config)
+            {
+                let needs_verification = !stats.changed_code_files.is_empty()
+                    && match (stats.last_verification_step, stats.last_code_mutation_step) {
+                        (Some(v), Some(m)) => v < m,
+                        (None, Some(_)) => true,
+                        _ => false,
+                    };
+                if needs_verification && stats.verify_nudges < 2 {
+                    stats.verify_nudges += 1;
+                    pending_verify_nudge =
+                        Some(verify::build_verification_nudge(&stats.changed_code_files));
+                    step_number += 1;
+                    context = self.load_context(session).await?;
+                    continue;
+                }
             }
             if final_call || step.calls.is_empty() {
                 stats.assistant_text = assistant_text(&step.state);
