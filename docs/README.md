@@ -36,6 +36,7 @@ scope; the TUI must keep working against our server.
 | 20 | [engineering guide](20-handoff.md) | Architecture state, configuration, and verification |
 | 21 | [grouping](21-grouping.md) | `metadata.group` label convention, rejected alternatives |
 | 22 | [audit report](22-audit-report.md) | Verification audit, defect resolutions and regression tests |
+| 23 | [release](23-release.md) | Tag-triggered builds, archive layout, version-must-match rule |
 
 ## Rules that apply to every doc
 

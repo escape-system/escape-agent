@@ -57,6 +57,17 @@ cargo test -p <crate>
 Never run workspace-wide commands while another agent is mid-write; wait for
 the wave to finish or ask the coordinator.
 
+## Release
+
+Pushing a `vX.Y.Z` tag publishes a GitHub Release automatically; there is no
+manual asset upload. The tag must equal `[workspace.package] version` in
+`Cargo.toml` (minus the leading `v`), so bump the workspace version, refresh
+`Cargo.lock` (`cargo metadata --format-version 1 > /dev/null`), and commit both
+before tagging. `.github/workflows/release.yml` runs fmt/clippy/test, builds the
+UI plus the `oc-cli` binary, and ships them as one archive with `web/dist` next
+to the binary (exe-relative discovery). `workflow_dispatch` re-publishes an
+existing tag. See `docs/23-release.md`.
+
 ## Test policy
 
 - Tests are offline and deterministic: temp dirs, temp SQLite, fake HTTP/LSP/MCP
