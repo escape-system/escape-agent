@@ -5,15 +5,18 @@
 //! Python, Go, C/C++, and Markdown without external dependencies, and opportunistically
 //! delegates to `ripwire` when present on the system.
 
+use std::ffi::OsStr;
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::Stdio;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use ignore::WalkBuilder;
 use serde::Serialize;
 use serde_json::{Value, json};
+use tokio::process::Command;
 
 use crate::util;
 use crate::{Tool, ToolContext, ToolError, ToolResult};
@@ -25,6 +28,13 @@ const MAX_FILE_SIZE_BYTES: u64 = 4 * 1024 * 1024; // 4 MB cap
 /// One-line installation command for `redhat-et/ripwire` (zero-dep C++23 graph context engine).
 pub const RIPWIRE_INSTALL_CMD: &str =
     "curl -fsSL https://raw.githubusercontent.com/redhat-et/ripwire/main/install.sh | sh";
+
+/// Environment override for the hard ripwire timeout, in milliseconds.
+pub const RIPWIRE_TIMEOUT_ENV: &str = "OPENCODE_RIPWIRE_TIMEOUT_MS";
+/// Default hard timeout for a single ripwire invocation.
+pub const DEFAULT_RIPWIRE_TIMEOUT_MS: u64 = 30_000;
+/// Upper bound on the stderr copy surfaced in result metadata.
+const RIPWIRE_STDERR_LIMIT_BYTES: usize = 2 * 1024;
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct CodeMapTool;
@@ -175,7 +185,7 @@ impl Tool for CodeMapTool {
             }
             "map" => {
                 let q = query.as_deref().unwrap_or_default();
-                Self::execute_map(ctx, &target_path, q, max_tokens, limit)
+                Self::execute_map(ctx, &target_path, q, max_tokens, limit).await
             }
             other => Err(ToolError::new(format!(
                 "Unsupported operation '{other}'. Expected 'outline', 'map', 'symbol', or 'references'."
@@ -389,31 +399,67 @@ impl CodeMapTool {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn execute_map(
+    async fn execute_map(
         ctx: &ToolContext,
         target_path: &Path,
         query: &str,
         max_tokens: usize,
         limit: usize,
     ) -> Result<ToolResult, ToolError> {
-        // Opportunistic ripwire acceleration if available
-        if let Some(ripwire_path) = find_ripwire_binary()
-            && !query.is_empty()
-        {
-            let mut cmd = Command::new(ripwire_path);
-            cmd.arg(target_path);
-            cmd.arg(format!("--for={query}"));
-            cmd.arg(format!("--max-tokens={max_tokens}"));
-            if let Ok(output) = cmd.output()
-                && output.status.success()
-            {
-                let text = String::from_utf8_lossy(&output.stdout).to_string();
-                if !text.trim().is_empty() {
-                    return Ok(ToolResult::text(text).with_metadata(json!({
+        // Delegation is unconditional when the binary is available: a `map`
+        // without a query is ripwire's default ranked map, not a reason to keep
+        // the weaker native engine.
+        let ripwire_binary = find_ripwire_binary();
+        let mut ripwire_failure: Option<String> = None;
+        let mut ripwire_stderr: Option<String> = None;
+
+        if let Some(ripwire_path) = ripwire_binary.as_ref() {
+            match run_ripwire(ripwire_path, target_path, query, max_tokens, limit).await {
+                Ok(run) => {
+                    if let Some(stderr) = trimmed_stderr(&run.stderr) {
+                        ripwire_stderr = Some(stderr);
+                    }
+                    if !run.stdout.trim().is_empty() {
+                        let mut metadata = json!({
+                            "operation": "map",
+                            "engine": "ripwire",
+                            "query": query,
+                            "token_budget": max_tokens
+                        });
+                        // The task lens has no row window, so `limit` is only a
+                        // real bound on the default map.
+                        if query.is_empty() {
+                            metadata["limit"] = json!(limit);
+                        }
+                        if let Some(stderr) = ripwire_stderr {
+                            metadata["ripwire_stderr"] = json!(stderr);
+                        }
+                        return Ok(ToolResult::text(run.stdout).with_metadata(metadata));
+                    }
+                    // An empty map from a successful run is not a usable answer.
+                    ripwire_failure = Some("ripwire returned no output".to_string());
+                }
+                Err(RipwireFailure::Timeout { timeout }) => {
+                    return Err(ToolError::new(format!(
+                        "ripwire did not finish within {} ms; raise OPENCODE_RIPWIRE_TIMEOUT_MS \
+                         or pass `query` to narrow the scan",
+                        timeout.as_millis()
+                    ))
+                    .with_metadata(json!({
                         "operation": "map",
                         "engine": "ripwire",
-                        "query": query
+                        "timeout_ms": timeout.as_millis()
                     })));
+                }
+                Err(RipwireFailure::Spawn { message }) => {
+                    ripwire_failure = Some(message);
+                }
+                Err(RipwireFailure::Exit { code, stderr }) => {
+                    ripwire_stderr = trimmed_stderr(&stderr);
+                    ripwire_failure = Some(format!(
+                        "ripwire exited with status {}",
+                        code.map_or_else(|| "signal".to_string(), |code| code.to_string())
+                    ));
                 }
             }
         }
@@ -501,7 +547,7 @@ impl CodeMapTool {
             relative_to(&ctx.directory, target_path)
         );
 
-        let max_chars = max_tokens * 4;
+        let max_chars = max_tokens.saturating_mul(4);
         let mut total_symbols_emitted = 0;
         let mut total_files_emitted = 0;
 
@@ -523,19 +569,214 @@ impl CodeMapTool {
         }
 
         out.push_str("</code_map>\n");
-        let _ = writeln!(
-            out,
-            "\n[Tip: For deep call graphs and Personalized PageRank, install ripwire: `{RIPWIRE_INSTALL_CMD}`]"
-        );
 
-        Ok(ToolResult::text(out).with_metadata(json!({
+        let mut metadata = json!({
             "operation": "map",
             "engine": "native",
             "query": query,
             "files": total_files_emitted,
-            "symbols": total_symbols_emitted,
-            "ripwire_install_command": RIPWIRE_INSTALL_CMD
-        })))
+            "symbols": total_symbols_emitted
+        });
+
+        // The install tip is only truthful when discovery found no binary.
+        if ripwire_binary.is_none() {
+            let _ = writeln!(
+                out,
+                "\n[Tip: For deep call graphs and Personalized PageRank, install ripwire: `{RIPWIRE_INSTALL_CMD}`]"
+            );
+            metadata["ripwire_install_command"] = json!(RIPWIRE_INSTALL_CMD);
+        } else if let Some(reason) = ripwire_failure {
+            metadata["ripwire_error"] = json!(reason);
+        }
+        if let Some(stderr) = ripwire_stderr {
+            metadata["ripwire_stderr"] = json!(stderr);
+        }
+
+        Ok(ToolResult::text(out).with_metadata(metadata))
+    }
+}
+
+/// Arguments passed to ripwire, plus the parsed form of the caller's request.
+///
+/// The flag set is **mode dependent** because ripwire reads different budgets
+/// per verb. Measured on ripwire 0.6.8 over `crates/oc-tools/src`:
+///
+/// - `--for=TASK --max-tokens=300` exits 0 but emits the *full* bundle
+///   (`--max-tokens is not read by --for`, 6825 B for 300/1200/absent alike).
+/// - `--for=TASK --top-k=5` also exits 0 with the same 6825 B and a warning
+///   (`--top-k is not read by --for`).
+/// - `--for=TASK --token-budget=300` is honoured: 2047 B against 6825 B
+///   unbudgeted, with no warning, so `--token-budget` is the only budget flag
+///   the task lens reads.
+/// - Without `--for`, `--max-tokens=300` gives 1357 B and `--max-tokens=3000`
+///   gives 5274 B, while a bare `--token-budget=300` exits 3 (hard gate
+///   exceeded), so the default map reads `--max-tokens`, not `--token-budget`.
+/// - Without `--for`, `--top-k=5` gives 2022 B of ranked rows and
+///   `--top-k=100` gives 8879 B, so the default map does read `--top-k`.
+/// - With `--for`, `--limit=N` is accepted but switches the document schema
+///   from the `<ctx>` bundle to `ripwire.candidate-page/v1`, and it is refused
+///   together with `--detail`. The task lens therefore gets no row window: the
+///   budget is the only bound, and `limit` caps the default/native maps only.
+///
+/// Passing the unread flag is not harmless: it changes nothing but writes a
+/// warning to stderr that a status-only check never sees.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RipwireInvocation {
+    args: Vec<String>,
+}
+
+impl RipwireInvocation {
+    fn new(target: &Path, query: &str, max_tokens: usize, limit: usize) -> Self {
+        let mut args = vec![target.to_string_lossy().into_owned()];
+        if query.is_empty() {
+            // Default ranked map: this verb has no task lens, so the token
+            // budget and the row window are both honoured.
+            args.push(format!("--max-tokens={max_tokens}"));
+            args.push(format!("--top-k={limit}"));
+        } else {
+            // Task lens: --token-budget is the only budget flag it reads.
+            // --max-tokens and --top-k are accepted but ignored with a warning.
+            args.push(format!("--for={query}"));
+            args.push(format!("--token-budget={max_tokens}"));
+        }
+        Self { args }
+    }
+}
+
+#[derive(Debug)]
+struct RipwireOutput {
+    stdout: String,
+    stderr: Vec<u8>,
+}
+
+#[derive(Debug)]
+enum RipwireFailure {
+    /// The child was still running when the deadline elapsed; it was killed.
+    Timeout { timeout: Duration },
+    /// The child could not be started at all.
+    Spawn { message: String },
+    /// The child ran and exited non-zero.
+    Exit { code: Option<i32>, stderr: Vec<u8> },
+}
+
+/// Hard timeout for one ripwire run, overridable with
+/// [`RIPWIRE_TIMEOUT_ENV`]. A non-numeric or zero value falls back to the
+/// default rather than disabling the guard.
+fn ripwire_timeout_ms(raw: Option<&OsStr>) -> u64 {
+    raw.and_then(OsStr::to_str)
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|ms| *ms > 0)
+        .unwrap_or(DEFAULT_RIPWIRE_TIMEOUT_MS)
+}
+
+fn configured_ripwire_timeout() -> Duration {
+    let raw = std::env::var_os(RIPWIRE_TIMEOUT_ENV);
+    Duration::from_millis(ripwire_timeout_ms(raw.as_deref()))
+}
+
+/// Trim captured stderr to at most [`RIPWIRE_STDERR_LIMIT_BYTES`] and return
+/// `None` when it carries no text.
+fn trimmed_stderr(stderr: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(stderr);
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    if text.len() <= RIPWIRE_STDERR_LIMIT_BYTES {
+        return Some(text.to_string());
+    }
+    // Trim on a char boundary so lossy multi-byte input cannot panic a slice.
+    let mut end = RIPWIRE_STDERR_LIMIT_BYTES;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    Some(format!("{}…", &text[..end]))
+}
+
+/// Run ripwire with a hard deadline.
+///
+/// Both pipes are drained on dedicated blocking tasks so a child that fills a
+/// pipe buffer cannot deadlock the wait loop, and `kill_on_drop` guarantees the
+/// process dies when the future is dropped (caller cancelled, timeout fired).
+async fn run_ripwire(
+    binary: &Path,
+    target: &Path,
+    query: &str,
+    max_tokens: usize,
+    limit: usize,
+) -> Result<RipwireOutput, RipwireFailure> {
+    let invocation = RipwireInvocation::new(target, query, max_tokens, limit);
+    let timeout = configured_ripwire_timeout();
+
+    let mut child = Command::new(binary)
+        .args(&invocation.args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|error| RipwireFailure::Spawn {
+            message: format!("failed to start {}: {error}", binary.display()),
+        })?;
+
+    let stdout = child.stdout.take().ok_or_else(|| RipwireFailure::Spawn {
+        message: "ripwire stdout pipe unavailable".to_string(),
+    })?;
+    let stderr = child.stderr.take().ok_or_else(|| RipwireFailure::Spawn {
+        message: "ripwire stderr pipe unavailable".to_string(),
+    })?;
+    let stdout_task = tokio::spawn(read_to_end(stdout));
+    let stderr_task = tokio::spawn(read_to_end(stderr));
+
+    let status = match tokio::time::timeout(timeout, child.wait()).await {
+        Ok(Ok(status)) => status,
+        Ok(Err(error)) => {
+            let _ = child.kill().await;
+            stdout_task.abort();
+            stderr_task.abort();
+            return Err(RipwireFailure::Spawn {
+                message: format!("failed to wait for ripwire: {error}"),
+            });
+        }
+        Err(_) => {
+            let _ = child.kill().await;
+            // kill() reaps, so wait() returns immediately; this also lets the
+            // pipe readers observe EOF instead of blocking forever.
+            let _ = child.wait().await;
+            stdout_task.abort();
+            stderr_task.abort();
+            return Err(RipwireFailure::Timeout { timeout });
+        }
+    };
+
+    let stdout = join_reader(stdout_task).await;
+    let stderr = join_reader(stderr_task).await;
+    if status.success() {
+        Ok(RipwireOutput {
+            stdout: String::from_utf8_lossy(&stdout).into_owned(),
+            stderr,
+        })
+    } else {
+        Err(RipwireFailure::Exit {
+            code: status.code(),
+            stderr,
+        })
+    }
+}
+
+async fn read_to_end(mut reader: impl tokio::io::AsyncRead + Unpin) -> Vec<u8> {
+    let mut buffer = Vec::new();
+    let _ = tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut buffer).await;
+    buffer
+}
+
+async fn join_reader(task: tokio::task::JoinHandle<Vec<u8>>) -> Vec<u8> {
+    match task.await {
+        Ok(bytes) => bytes,
+        // A killed child closes its pipes; an aborted reader contributes
+        // nothing rather than failing the whole call.
+        Err(error) if error.is_cancelled() => Vec::new(),
+        Err(_) => Vec::new(),
     }
 }
 
@@ -608,33 +849,78 @@ fn relative_to(root: &Path, target: &Path) -> String {
     }
 }
 
-fn find_ripwire_binary() -> Option<PathBuf> {
-    if let Ok(custom) = std::env::var("RIPWIRE_PATH") {
-        let p = PathBuf::from(custom);
-        if p.exists() {
-            return Some(p);
+/// Resolve candidates for [`find_ripwire_binary`] from explicit env values so
+/// discovery is unit-testable without mutating the process environment.
+///
+/// Order: explicit `RIPWIRE_PATH`, `$HOME/.local/bin/ripwire`, then every
+/// `PATH` entry. There is no hardcoded home directory: a fixed `/root/...`
+/// candidate wrong on every non-root install and on root installs with a
+/// different `$HOME`.
+fn ripwire_candidates(ripwire_path: Option<&OsStr>, home: Option<&OsStr>) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(custom) = ripwire_path {
+        candidates.push(PathBuf::from(custom));
+    }
+    if let Some(home) = home {
+        candidates.push(PathBuf::from(home).join(".local/bin/ripwire"));
+    }
+    candidates
+}
+
+/// Whether `path` names a regular file the current user may execute.
+///
+/// Discovery must not accept a readable-but-not-executable `ripwire`: spawning
+/// it would fail with `EACCES` and turn every `map` into a spawn error.
+#[must_use]
+pub fn is_executable_file(path: &Path) -> bool {
+    let Ok(metadata) = fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+/// Pure discovery core: every environment input is a parameter so the search
+/// order and the executability rule are testable without touching the process
+/// environment (which edition 2024 only allows through `unsafe`).
+fn resolve_ripwire_binary(
+    ripwire_path: Option<&OsStr>,
+    home: Option<&OsStr>,
+    path_var: Option<&OsStr>,
+) -> Option<PathBuf> {
+    for candidate in ripwire_candidates(ripwire_path, home) {
+        if is_executable_file(&candidate) {
+            return Some(candidate);
         }
     }
-    if let Ok(home) = std::env::var("HOME") {
-        let p = PathBuf::from(home).join(".local/bin/ripwire");
-        if p.exists() {
-            return Some(p);
-        }
-    }
-    let local = PathBuf::from("/root/.local/bin/ripwire");
-    if local.exists() {
-        return Some(local);
-    }
-    // Check PATH
-    if let Ok(path_var) = std::env::var("PATH") {
-        for dir in std::env::split_paths(&path_var) {
-            let candidate = dir.join("ripwire");
-            if candidate.exists() {
-                return Some(candidate);
-            }
+    for dir in std::env::split_paths(path_var?) {
+        let candidate = dir.join("ripwire");
+        if is_executable_file(&candidate) {
+            return Some(candidate);
         }
     }
     None
+}
+
+fn find_ripwire_binary() -> Option<PathBuf> {
+    let ripwire_path = std::env::var_os("RIPWIRE_PATH");
+    let home = std::env::var_os("HOME");
+    let path_var = std::env::var_os("PATH");
+    resolve_ripwire_binary(
+        ripwire_path.as_deref(),
+        home.as_deref(),
+        path_var.as_deref(),
+    )
 }
 
 /// Pure-Rust multi-language parser for signatures and symbols.
@@ -1060,6 +1346,8 @@ fn clean_signature(line: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt as _;
 
     #[test]
     fn parses_rust_symbols_with_visibility_and_docs() {
@@ -1144,5 +1432,189 @@ async def serve_forever():
         assert_eq!(py_symbols[1].kind, SymbolKind::Method);
         assert_eq!(py_symbols[2].name, "serve_forever");
         assert_eq!(py_symbols[2].kind, SymbolKind::Function);
+    }
+
+    #[cfg(unix)]
+    fn executable_script(dir: &Path, name: &str) -> PathBuf {
+        let path = dir.join(name);
+        fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+        let mut perms = fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&path, perms).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discovery_requires_the_executable_bit() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let plain = dir.path().join("ripwire");
+        fs::write(&plain, "#!/bin/sh\nexit 0\n").unwrap();
+        let mut perms = fs::metadata(&plain).unwrap().permissions();
+        perms.set_mode(0o644);
+        fs::set_permissions(&plain, perms.clone()).unwrap();
+
+        assert!(!is_executable_file(&plain), "mode 0644 is not executable");
+        assert!(
+            resolve_ripwire_binary(Some(plain.as_os_str()), None, None).is_none(),
+            "a readable but non-executable RIPWIRE_PATH must be rejected"
+        );
+
+        perms.set_mode(0o755);
+        fs::set_permissions(&plain, perms).unwrap();
+        assert!(is_executable_file(&plain));
+        assert_eq!(
+            resolve_ripwire_binary(Some(plain.as_os_str()), None, None),
+            Some(plain.clone())
+        );
+        assert!(
+            resolve_ripwire_binary(Some(dir.path().as_os_str()), None, None).is_none(),
+            "a directory is not an executable file"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discovery_order_and_no_hardcoded_home() {
+        let root = tempfile::TempDir::new().unwrap();
+        let custom = executable_script(root.path(), "custom-ripwire");
+        let home = root.path().join("home");
+        let home_bin = home.join(".local/bin");
+        fs::create_dir_all(&home_bin).unwrap();
+        let home_ripwire = executable_script(&home_bin, "ripwire");
+        let on_path = root.path().join("pathdir");
+        fs::create_dir_all(&on_path).unwrap();
+        let path_ripwire = executable_script(&on_path, "ripwire");
+
+        // RIPWIRE_PATH wins over $HOME and PATH.
+        assert_eq!(
+            resolve_ripwire_binary(
+                Some(custom.as_os_str()),
+                Some(home.as_os_str()),
+                Some(on_path.as_os_str())
+            ),
+            Some(custom.clone())
+        );
+        // $HOME/.local/bin is second.
+        assert_eq!(
+            resolve_ripwire_binary(None, Some(home.as_os_str()), Some(on_path.as_os_str())),
+            Some(home_ripwire.clone())
+        );
+        // PATH is the last resort.
+        assert_eq!(
+            resolve_ripwire_binary(None, None, Some(on_path.as_os_str())),
+            Some(path_ripwire.clone())
+        );
+        // A missing HOME is skipped, not replaced by a hardcoded one.
+        assert_eq!(
+            resolve_ripwire_binary(None, None, None),
+            None,
+            "no inputs must not resolve a hardcoded /root path"
+        );
+
+        // The old hardcoded candidate must not be reachable through HOME when
+        // HOME points elsewhere: only the given home is searched.
+        let other_home = root.path().join("other-home");
+        fs::create_dir_all(&other_home).unwrap();
+        assert_eq!(
+            resolve_ripwire_binary(
+                None,
+                Some(other_home.as_os_str()),
+                Some(on_path.as_os_str())
+            ),
+            Some(path_ripwire),
+            "an unrelated HOME falls through to PATH"
+        );
+        // Unset HOME and PATH find nothing even though /root/.local/bin/ripwire
+        // exists on some machines: that path is no longer a candidate.
+        assert_eq!(
+            resolve_ripwire_binary(None, None, Some(OsStr::new(""))),
+            None
+        );
+    }
+
+    #[test]
+    fn invocation_flags_follow_the_measured_mode_contract() {
+        let target = Path::new("/tmp/project");
+
+        let default_map = RipwireInvocation::new(target, "", 1200, 50);
+        assert_eq!(
+            default_map.args,
+            vec![
+                "/tmp/project".to_string(),
+                "--max-tokens=1200".to_string(),
+                "--top-k=50".to_string()
+            ]
+        );
+
+        let task_lens = RipwireInvocation::new(target, "server start", 1200, 50);
+        assert_eq!(
+            task_lens.args,
+            vec![
+                "/tmp/project".to_string(),
+                "--for=server start".to_string(),
+                "--token-budget=1200".to_string()
+            ]
+        );
+        // ripwire 0.6.8 ignores both flags under --for and warns on stderr.
+        assert!(
+            !task_lens.args.iter().any(|arg| arg.starts_with("--top-k")),
+            "--top-k is not read by --for"
+        );
+        assert!(
+            !task_lens
+                .args
+                .iter()
+                .any(|arg| arg.starts_with("--max-tokens")),
+            "--max-tokens is not read by --for"
+        );
+    }
+
+    #[test]
+    fn timeout_override_rejects_zero_and_garbage() {
+        assert_eq!(
+            ripwire_timeout_ms(None),
+            DEFAULT_RIPWIRE_TIMEOUT_MS,
+            "unset env uses the default"
+        );
+        assert_eq!(
+            ripwire_timeout_ms(Some(OsStr::new("250"))),
+            250,
+            "a numeric override is honoured"
+        );
+        assert_eq!(
+            ripwire_timeout_ms(Some(OsStr::new("0"))),
+            DEFAULT_RIPWIRE_TIMEOUT_MS,
+            "zero must not disable the guard"
+        );
+        assert_eq!(
+            ripwire_timeout_ms(Some(OsStr::new("soon"))),
+            DEFAULT_RIPWIRE_TIMEOUT_MS,
+            "garbage falls back instead of failing"
+        );
+    }
+
+    #[test]
+    fn stderr_is_trimmed_and_bounded() {
+        assert_eq!(trimmed_stderr(b""), None);
+        assert_eq!(trimmed_stderr(b"   \n\t"), None, "whitespace is not text");
+        assert_eq!(
+            trimmed_stderr(b" warning: nope \n"),
+            Some("warning: nope".to_string())
+        );
+
+        let long = format!("{}END", "x".repeat(RIPWIRE_STDERR_LIMIT_BYTES));
+        let trimmed = trimmed_stderr(long.as_bytes()).unwrap();
+        assert!(
+            trimmed.len() <= RIPWIRE_STDERR_LIMIT_BYTES + '…'.len_utf8(),
+            "trimmed stderr stays bounded, got {} bytes",
+            trimmed.len()
+        );
+        assert!(trimmed.ends_with('…'), "a cut is marked: {trimmed}");
+        assert!(!trimmed.contains("END"), "the tail is dropped");
+
+        // Multi-byte input must not panic on a non-char-boundary cut.
+        let unicode = "é".repeat(RIPWIRE_STDERR_LIMIT_BYTES);
+        assert!(trimmed_stderr(unicode.as_bytes()).is_some());
     }
 }
