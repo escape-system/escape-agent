@@ -1,0 +1,29 @@
+{
+  "note": "Measured after removing sourcemaps, trimming the PWA precache, dropping agent-panel polling, and removing the third-party favicon fetch. Budgets are enforced by ui/perf/check-dist-budget.mjs.",
+  "measured_at": "2026-11-07T22:51Z",
+  "dist": "ui/vendor/opencode/packages/app/dist (deployed to web/dist)",
+  "dist_bytes": 88493398,
+  "dist_files": 2887,
+  "map_files": 0,
+  "entry": "_assets/index-D0SVV0lg.js",
+  "entry_bytes": 763262,
+  "entry_gzip_bytes": 201297,
+  "source_mapping_url_in_entry": 0,
+  "modulepreloads": 71,
+  "index_html_asset_refs": 88,
+  "index_html_asset_raw_bytes": 3095864,
+  "index_html_asset_gzip9_bytes": 864267,
+  "sw_js_bytes": 17604,
+  "sw_precache_entries": 19,
+  "sw_precache_bytes": 1447817,
+  "google_favicon_hits": 0,
+  "build_wall_seconds": 72.12,
+  "budgets": {
+    "map_files_max": 0,
+    "dist_bytes_max": 115343360,
+    "entry_gzip_bytes_max": 225280,
+    "modulepreloads_max": 75,
+    "sw_precache_bytes_max": 3145728,
+    "google_favicon_hits_max": 0
+  }
+}

@@ -30,9 +30,29 @@ export function serviceWorker(directory: string) {
       navigateFallback: "/index.html",
       // Pairing links must reach the server so it can set the session cookie.
       navigateFallbackDenylist: [/^\/(?:api|auth)(?:\/|$)/, /^\/(?:_assets|assets)(?:\/|$)/],
-      // Include lazy chunks and non-JS dependencies, not just the startup bundle.
-      globPatterns: ["**/*"],
-      globIgnores: ["**/*.map", "_headers", "_redirects"],
+      // Budget: precache only the app shell (startup JS/CSS, HTML, icons, manifest).
+      // Precaching every emitted file made each install fetch ~37 MB / 2.8k entries;
+      // grammar chunks, wasm, fonts, maps and Office engines are lazy and are fetched
+      // on demand instead, so they stay out of the install budget on purpose.
+      globPatterns: [
+        "index.html",
+        "oc-theme-preload.js",
+        "_assets/index-*.js",
+        "_assets/index-*.css",
+        "favicon*",
+        "apple-touch-icon*.png",
+        "web-app-manifest-*.png",
+        "site.webmanifest",
+        "icons/**/*",
+      ],
+      globIgnores: [
+        "**/*.map",
+        "**/*.wasm",
+        "**/*.ttf",
+        "**/*.woff*",
+        "_headers",
+        "_redirects",
+      ],
       maximumFileSizeToCacheInBytes: Number.MAX_SAFE_INTEGER,
       manifestTransforms: [
         async (entries) => ({

@@ -49,6 +49,9 @@ export default defineConfig({
       : {}),
     assetsDir: "_assets",
     target: "esnext",
-    sourcemap: true,
+    // Maps exist only for Sentry: `hidden` keeps them off the served HTML and the
+    // Sentry plugin uploads then deletes them. Without a Sentry token no map is
+    // emitted at all, so a plain `ui/build.sh` never serves sources or `*.map`.
+    sourcemap: sentry ? "hidden" : false,
   },
 })

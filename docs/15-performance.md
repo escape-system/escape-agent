@@ -127,3 +127,17 @@ comparable when it uses the documented condition: a freshly spawned server on a
 temporary data directory with no session. Sampling a long-lived server that carries
 a live transcript measures a different thing and must not be reported against this
 budget.
+
+## Web bundle
+
+`ui/perf/check-dist-budget.mjs` runs in `ui/build.sh` after `ui/verify-dist.mjs` and fails the build when:
+
+- any `*.map` file exists in dist;
+- dist total exceeds 110 MiB;
+- the entry chunk (`_assets/index-*.js`) exceeds 220 KiB gzip -9;
+- `index.html` has more than 75 `rel="modulepreload"` links;
+- the service-worker precache exceeds 3 MiB;
+- `google.com/s2/favicons` appears in any `_assets/*.js`.
+
+Measured 2026-11-07 (see `ui/perf/baseline.json`): dist 88,493,398 B (84.4 MiB), 0 maps,
+entry gzip 201,297 B (197.1 KiB), 71 preloads, SW precache 1,447,817 B (1.38 MiB), 0 favicon hits.

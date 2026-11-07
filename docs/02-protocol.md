@@ -412,6 +412,11 @@ ad-hoc per-feature writes. See [14](14-config-permissions.md).
 - `_assets/**`, `icons/**`: 200 with `public, max-age=31536000, immutable`;
   missing → 404 `no-store`.
 - `sw.js`, `registerSW.js` → `no-cache`.
+- Static responses are compressed when the client negotiates it: gzip/brotli
+  (fastest level), only for bodies ≥ 1 KiB, with `vary: accept-encoding` on
+  every static response. SSE (`/api/event`, log streams) is never compressed:
+  the compression layer wraps only the static fallback, not `/api`.
+- `*.map` is never served (404 `no-store`).
 - Non-GET/HEAD on a non-API path → 405 with `allow: GET, HEAD`.
 - The Rust server sets `content-type`, `cache-control` and
   `x-content-type-options: nosniff`. It does **not** inject a

@@ -344,13 +344,11 @@ function wrapTables(root: HTMLDivElement) {
   })
 }
 
-const publicFaviconHost = /^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/
-
-const privateFaviconSuffix = /\.(?:alt|example|internal|invalid|local|localhost|onion|test|ts\.net)$/
-
+// The icon is drawn by `.markdown-link-favicon::before` from bundled masks, so
+// no third-party favicon request leaves the page.
 function markExternalLinkFavicons(root: HTMLDivElement) {
   root.querySelectorAll<HTMLAnchorElement>("a.external-link[href]").forEach((link) => {
-    if (!link.textContent?.trim() || link.querySelector("img")) return
+    if (!link.textContent?.trim() || link.querySelector(".markdown-link-favicon")) return
 
     if (!URL.canParse(link.href)) return
     const url = new URL(link.href)
@@ -360,41 +358,11 @@ function markExternalLinkFavicons(root: HTMLDivElement) {
     const favicon = document.createElement("span")
     favicon.className = "markdown-link-favicon"
     favicon.setAttribute("aria-hidden", "true")
-    const host = url.hostname.toLowerCase()
 
-    if (host === "github.com") favicon.dataset.github = ""
-    else if (
-      publicFaviconHost.test(host) &&
-      !privateFaviconSuffix.test(host) &&
-      host !== "home.arpa" &&
-      !host.endsWith(".home.arpa")
-    ) {
-      const image = document.createElement("img")
-      image.src = `https://www.google.com/s2/favicons?domain=${encodeURIComponent(url.host)}&sz=32`
-      image.alt = ""
-      image.setAttribute("data-markdown-favicon", "")
-      image.width = 14
-      image.height = 14
-      image.decoding = "async"
-      favicon.appendChild(image)
-    }
+    if (url.hostname.toLowerCase() === "github.com") favicon.dataset.github = ""
 
     link.insertBefore(favicon, link.firstChild)
   })
-}
-
-function setupExternalLinkFavicons(root: HTMLDivElement) {
-  const loaded = (event: Event) => {
-    const image = event.target
-
-    if (!(image instanceof HTMLImageElement) || !image.hasAttribute("data-markdown-favicon")) return
-
-    if (image.naturalWidth > 0) image.dataset.loaded = ""
-  }
-
-  root.addEventListener("load", loaded, true)
-
-  return () => root.removeEventListener("load", loaded, true)
 }
 
 // A path becomes a link once `localFileExists` says the file exists. A streaming block skips the check: its last code
@@ -804,7 +772,6 @@ export function Markdown(
 
   let copyCleanup: (() => void) | undefined
   let linkCleanup: (() => void) | undefined
-  let faviconCleanup: (() => void) | undefined
   let sessionLinkCleanup: (() => void) | undefined
   let fragmentLinkCleanup: (() => void) | undefined
   let readImage: ReadMarkdownImage | undefined
@@ -899,7 +866,6 @@ export function Markdown(
 
     if (!fragmentLinkCleanup) fragmentLinkCleanup = setupFragmentLinks(container)
 
-    if (!faviconCleanup) faviconCleanup = setupExternalLinkFavicons(container)
     container.toggleAttribute("data-local-links", !!markdown?.openLocalFile)
 
     if (!result?.ready || result.text !== local.text) return
@@ -930,7 +896,6 @@ export function Markdown(
 
     if (fragmentLinkCleanup) fragmentLinkCleanup()
 
-    if (faviconCleanup) faviconCleanup()
     const container = root()
 
     if (container) disposeRenderedMarkdown(container)

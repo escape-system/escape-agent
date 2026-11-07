@@ -92,12 +92,45 @@ describe("settings search index", () => {
     expect(rankSettings("opencode", items)[0].projectInfo).toEqual(withIcon)
     expect(rankSettings("opencode color", items)).toEqual([])
   })
+
+  test("finds the agentic server pages and their rows", () => {
+    const items = index()
+    const tabs = (query: string) => rankSettings(query, items).map((item) => item.view.tab)
+
+    expect(rankSettings("auto scribe", items)[0].view).toMatchObject({
+      tab: "memory",
+      target: "settings-memory-auto-scribe",
+    })
+    expect(rankSettings("supervisor", items)[0].view).toMatchObject({ tab: "observer" })
+    expect(rankSettings("spawn depth", items)[0].view).toMatchObject({ tab: "subagents" })
+    expect(rankSettings("cargo queue", items)[0].view).toMatchObject({ tab: "lanes" })
+    expect(tabs("goal rounds")).toContain("goals")
+    // Rows of the memory page stay inside it.
+    expect(rankSettings("embedding", items).map((item) => item.view.target)).toContain(
+      "settings-memory-embedding-model",
+    )
+    expect(rankSettings("observer enabled", items).map((item) => item.view.target)).toContain(
+      "settings-observer-enabled",
+    )
+  })
+
+  test("scopes agentic pages to the selected server", () => {
+    const items = index({ selected: "remote" })
+    expect(rankSettings("lanes", items).filter((item) => item.topLevel).map((item) => item.view.server)).toEqual([
+      "remote",
+    ])
+    // An unselected server does not advertise rows only its settings page can show.
+    expect(rankSettings("lanes", index({ servers: [servers[0]], selected: "remote" }))).toEqual([])
+  })
 })
 
 describe("settings search ranking", () => {
   test("prioritizes top-level pages and omits generic project-setting copies", () => {
+    // "Lanes" matches "work" because its "network" keyword contains that token as a substring; the
+    // catalog's loose matching is deliberate, so this top-level page is a true result, not a stale extra row.
     expect(rankSettings("work", index({ servers: [servers[0]] })).map((item) => item.title)).toEqual([
       "Worktrees",
+      "Lanes",
       "Default environment",
     ])
     expect(rankSettings("mcps", index()).map((item) => item.view)).toEqual([

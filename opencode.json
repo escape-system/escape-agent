@@ -2,6 +2,52 @@
   "$schema": "https://opencode.ai/config.json",
   "model": "opencode-go/deepseek-v4.1-flash#max",
   "small_model": "opencode-go/deepseek-v4.1-flash#max",
+  "providers": {
+    "experiential": {
+      "name": "Experiential Labs",
+      "package": "@ai-sdk/openai-compatible",
+      "env": ["EXPLABS_API_KEY"],
+      "settings": {
+        "baseURL": "https://api.experientiallabs.ai/v1"
+      },
+      "models": {
+        "deepseek-v4.1-flash-1017": {
+          "name": "DeepSeek V4.1 Flash 1017",
+          "modelID": "deepseek-v4.1-flash-1017",
+          "package": "@ai-sdk/openai-compatible",
+          "settings": {
+            "baseURL": "https://api.experientiallabs.ai/v1"
+          },
+          "capabilities": {
+            "tools": true,
+            "input": ["text"],
+            "output": ["text"],
+            "reasoning": {
+              "supported": true,
+              "effort": ["low", "medium", "high", "max"]
+            }
+          }
+        },
+        "claude-sonnet-5.5": {
+          "name": "Claude Sonnet 5.5",
+          "modelID": "claude-sonnet-5.5",
+          "package": "@ai-sdk/openai-compatible",
+          "settings": {
+            "baseURL": "https://api.experientiallabs.ai/v1"
+          },
+          "capabilities": {
+            "tools": true,
+            "input": ["text"],
+            "output": ["text"],
+            "reasoning": {
+              "supported": true,
+              "effort": ["low", "medium", "high", "xhigh", "max"]
+            }
+          }
+        }
+      }
+    }
+  },
   "subagents": {
     "default_model": "opencode-go/deepseek-v4.1-flash#max",
     "timeout_seconds": 3600,

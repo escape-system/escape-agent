@@ -59,9 +59,8 @@ export function useSubagentTreeQuery(sessionID: () => string | undefined) {
       return tree ? { available: true, value: tree } : { available: false, reason: "malformed tree" }
     },
     enabled: !!sessionID() && sdk.connection.status() === "connected",
-    refetchOnMount: true,
-    refetchInterval: 3_000,
-    staleTime: 2_000,
+    refetchOnMount: false,
+    staleTime: 30_000,
     retry: false,
   }))
 }
@@ -86,9 +85,10 @@ export function useObserverRepairsQuery(sessionID: () => string | undefined) {
       return { available: true, value: parseObserverRepairs(result.value) }
     },
     enabled: !!sessionID() && sdk.connection.status() === "connected",
-    refetchOnMount: true,
-    refetchInterval: 3_000,
-    staleTime: 2_000,
+    // Live `observer.repaired` events are merged over these durable rows, so the
+    // audit does not need a 3 s poll; one fetch per mount is enough.
+    refetchOnMount: false,
+    staleTime: 30_000,
     retry: false,
   }))
 }
@@ -109,9 +109,11 @@ export function useObserverStateQuery(sessionID: () => string | undefined) {
       return { available: true, value: parseObserverState(result.value) }
     },
     enabled: !!sessionID() && sdk.connection.status() === "connected",
-    refetchOnMount: true,
-    refetchInterval: 3_000,
-    staleTime: 2_000,
+    refetchOnMount: false,
+    // Only `observer.escalated` is published; the used/limit counter changes on
+    // every repair with no matching event, so this one keeps a slow poll.
+    refetchInterval: 15_000,
+    staleTime: 30_000,
     retry: false,
   }))
 }
@@ -132,9 +134,9 @@ export function useSessionGoalQuery(sessionID: () => string | undefined) {
       return { available: true, value: parseGoal(result.value) }
     },
     enabled: !!sessionID() && sdk.connection.status() === "connected",
-    refetchOnMount: true,
-    refetchInterval: 3_000,
-    staleTime: 2_000,
+    // `goal.updated` replaces this value live; the fetch is only the initial read.
+    refetchOnMount: false,
+    staleTime: 30_000,
     retry: false,
   }))
 }

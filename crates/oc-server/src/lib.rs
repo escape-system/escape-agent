@@ -41,6 +41,9 @@ use oc_store::Store;
 use oc_types::{EventEnvelope, ServerInfo};
 use tokio::net::{TcpListener, ToSocketAddrs};
 use tokio::sync::broadcast;
+use tower_http::compression::CompressionLayer;
+use tower_http::compression::CompressionLevel;
+use tower_http::compression::predicate::{NotForContentType, Predicate, SizeAbove};
 use tower_http::cors::{AllowHeaders, AllowMethods, AllowOrigin, CorsLayer};
 use tower_http::trace::TraceLayer;
 
@@ -563,10 +566,32 @@ pub fn router(state: AppState) -> Router {
         .merge(data::schedule::routes())
         .layer(middleware::from_fn_with_state(state.clone(), auth::require));
 
-    Router::new()
+    // Compression covers the static shell only. `/api` is deliberately outside
+    // this router: SSE must never be compressed or buffered (`docs/13-ui.md`),
+    // and JSON API payloads are not the first-load cost this targets.
+    //
+    // The fallback is a custom fallback, so it must live on exactly one router:
+    // `axum` panics when two routers with custom fallbacks are merged. The API
+    // routers below only add routes (`Router::new()` default fallback), which
+    // `Router::merge` adopts without conflict.
+    let statics = Router::new().fallback(routes::fallback).layer(
+        CompressionLayer::new()
+            // `Fastest` keeps the 34 MiB of wasm modules from turning a
+            // static request into a CPU amplifier.
+            .quality(CompressionLevel::Fastest)
+            .compress_when(
+                SizeAbove::new(1024)
+                    .and(NotForContentType::SSE)
+                    .and(NotForContentType::IMAGES)
+                    .and(NotForContentType::new("font/"))
+                    .and(NotForContentType::new("audio/"))
+                    .and(NotForContentType::new("video/")),
+            ),
+    );
+
+    statics
         .merge(public)
         .merge(protected)
-        .fallback(routes::fallback)
         .layer(middleware::from_fn_with_state(state.clone(), inject_state))
         .layer(middleware::from_fn_with_state(
             state.clone(),

@@ -6,7 +6,15 @@ import { dirname, join, resolve, sep } from "node:path"
 import { fileURLToPath } from "node:url"
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)))
-const dist = resolve(root, "web", "dist")
+// `--dist <path>` or OC_WEB_DIST lets the gates check a staged build (e.g. a
+// spare-port candidate) before it replaces web/dist. Default stays web/dist.
+const distArgIndex = process.argv.indexOf("--dist")
+const dist =
+  distArgIndex !== -1 && process.argv[distArgIndex + 1]
+    ? resolve(process.argv[distArgIndex + 1])
+    : process.env.OC_WEB_DIST
+      ? resolve(process.env.OC_WEB_DIST)
+      : resolve(root, "web", "dist")
 const problems = []
 
 function checkFile(path, label) {

@@ -52,6 +52,7 @@ base64 = "0.22"
 bytes = "1"
 clap = { version = "4", features = ["derive", "env"] }
 futures-util = "0.3"
+flate2 = "1"
 globset = "0.4"
 grep-matcher = "0.1"
 grep-regex = "0.1"
@@ -82,7 +83,7 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 tokio-tungstenite = "0.28"
 tokio-util = "0.7"
 tower = { version = "0.5", features = ["util"] }
-tower-http = { version = "0.6", features = ["cors", "trace"] }
+tower-http = { version = "0.6", features = ["compression-br", "compression-gzip", "cors", "trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 url = "2"

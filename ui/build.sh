@@ -41,8 +41,10 @@ if [ ! -d "$upstream/packages/app/dist" ]; then
 fi
 
 rm -rf "$root/web/dist"
-mkdir -p "$root/web"
-cp -R "$upstream/packages/app/dist" "$root/web/dist"
+mkdir -p "$root/web/dist"
+cp -a "$upstream/packages/app/dist/." "$root/web/dist/"
 
 bun "$root/ui/verify-dist.mjs"
+echo "checking bundle budgets"
+node "$root/ui/perf/check-dist-budget.mjs" --dist "$root/web/dist"
 echo "web app written to $root/web/dist"

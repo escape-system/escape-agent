@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use axum::body::Body;
-use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE, X_CONTENT_TYPE_OPTIONS};
+use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE, VARY, X_CONTENT_TYPE_OPTIONS};
 use axum::http::{HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use percent_encoding::percent_decode_str;
@@ -24,6 +24,15 @@ pub async fn serve(state: &AppState, method: &Method, path: &str) -> Option<Resp
     }
 
     let relative = decoded.trim_start_matches('/');
+    // Sourcemaps are Sentry-only artifacts, not part of the shipped dist
+    // (`docs/13-ui.md`, `docs/24-ui-performance.md`); serving one would leak the
+    // source tree, so 404 them even if a build leaves one on disk.
+    if Path::new(relative)
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("map"))
+    {
+        return Some(not_found());
+    }
     let is_asset = relative.starts_with("_assets/") || relative.starts_with("icons/");
     let requested = if relative.is_empty() {
         dist.join("index.html")
@@ -84,6 +93,10 @@ pub async fn serve(state: &AppState, method: &Method, path: &str) -> Option<Resp
     );
     headers.insert(CACHE_CONTROL, HeaderValue::from_static(cache));
     headers.insert(X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+    // Every static response is negotiated by `accept-encoding` (the compression
+    // layer wraps this handler), so caches must key on it. Without this, the
+    // one-year `immutable` class would pin whichever variant was stored first.
+    headers.insert(VARY, HeaderValue::from_static("accept-encoding"));
     Some(response)
 }
 

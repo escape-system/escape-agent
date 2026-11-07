@@ -4,16 +4,18 @@ use std::time::Duration;
 
 use axum::body::{Body, to_bytes};
 use axum::http::header::{
-    ACCEPT, AUTHORIZATION, CONTENT_TYPE, COOKIE, HOST, LOCATION, ORIGIN, SET_COOKIE,
-    WWW_AUTHENTICATE,
+    ACCEPT, ACCEPT_ENCODING, AUTHORIZATION, CONTENT_ENCODING, CONTENT_TYPE, COOKIE, HOST, LOCATION,
+    ORIGIN, SET_COOKIE, VARY, WWW_AUTHENTICATE,
 };
 use axum::http::{Request, StatusCode};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
+use flate2::read::GzDecoder;
 use http_body_util::BodyExt;
 use oc_server::{AppState, router};
 use oc_types::{EventEnvelope, ServerInfo, ServerPaths};
 use serde_json::{Value, json};
+use std::io::Read;
 use tower::ServiceExt;
 
 fn state(password: Option<&str>) -> AppState {
@@ -621,6 +623,189 @@ async fn static_serving_does_not_escape_dist() {
     assert_eq!(&bytes[..], b"<html>ok</html>");
 }
 
+/// A temp `web/dist` shaped like the shipped shell: `index.html` plus one
+/// hashed asset. Overrides of `OC_WEB_DIST` are ignored because `state()`
+/// always receives the tempdir through `with_web_dist`.
+fn static_dist() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("_assets")).unwrap();
+    std::fs::write(dir.path().join("index.html"), "<html>ok</html>").unwrap();
+    std::fs::write(dir.path().join("_assets/app-abc.js"), "console.log(1)").unwrap();
+    dir
+}
+
+/// `*.map` files are Sentry-only artifacts and are not part of the shipped
+/// dist (`docs/13-ui.md`, `docs/24-ui-performance.md`). Serving one would leak
+/// the full source tree, so the HTTP layer must 404 them even if a build
+/// accidentally leaves one on disk.
+#[tokio::test]
+async fn static_map_files_are_not_served() {
+    let dir = static_dist();
+    std::fs::write(
+        dir.path().join("_assets/app-abc.js.map"),
+        "{\"version\":3,\"sources\":[]}",
+    )
+    .unwrap();
+
+    let app = router(state(None).with_web_dist(dir.path()));
+
+    let map = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/_assets/app-abc.js.map")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        map.status(),
+        StatusCode::NOT_FOUND,
+        "sourcemaps in web/dist must never be served"
+    );
+    assert_eq!(map.headers().get("cache-control").unwrap(), "no-store");
+
+    // The guard must be narrow: the real asset keeps its immutable cache class.
+    let asset = app
+        .oneshot(
+            Request::builder()
+                .uri("/_assets/app-abc.js")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(asset.status(), StatusCode::OK);
+    assert_eq!(
+        asset.headers().get("cache-control").unwrap(),
+        "public, max-age=31536000, immutable"
+    );
+}
+
+/// `docs/02-protocol.md:33-35`: the static shell stays public so the login
+/// screen can load, while every `/api` route is protected.
+#[tokio::test]
+async fn static_shell_stays_public_under_password() {
+    let dir = static_dist();
+    let app = router(state(Some("secret")).with_web_dist(dir.path()));
+
+    for uri in ["/", "/settings?tab=memory"] {
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{uri}");
+        assert_eq!(
+            response.headers().get(CONTENT_TYPE).unwrap(),
+            "text/html",
+            "{uri}"
+        );
+        assert_eq!(
+            response.headers().get("cache-control").unwrap(),
+            "no-cache",
+            "{uri}"
+        );
+        let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        assert_eq!(&bytes[..], b"<html>ok</html>", "{uri}");
+    }
+
+    let asset = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/_assets/app-abc.js")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(asset.status(), StatusCode::OK);
+    assert_eq!(
+        asset.headers().get(CONTENT_TYPE).unwrap(),
+        "text/javascript"
+    );
+
+    let api = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/info")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(api.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        api.headers().get(WWW_AUTHENTICATE).unwrap(),
+        "Basic realm=\"Secure Area\""
+    );
+    let body = json_body(api).await;
+    assert_eq!(body["_tag"], "UnauthorizedError");
+}
+
+/// `docs/13-ui.md` promises GET *and* HEAD for the shell and assets: same
+/// status/content-type/cache headers, empty HEAD body. `content-length` is
+/// checked loosely because the current handler reports `0` for HEAD (the gap
+/// recorded in `docs/24-ui-performance.md:99-100`), while RFC 9110 §9.3.2
+/// would allow the GET length.
+#[tokio::test]
+async fn static_head_matches_get_headers() {
+    let dir = static_dist();
+    let app = router(state(None).with_web_dist(dir.path()));
+
+    for uri in ["/", "/_assets/app-abc.js"] {
+        let get = app
+            .clone()
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let head = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("HEAD")
+                    .uri(uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(head.status(), get.status(), "{uri}");
+        for header in ["content-type", "cache-control", "x-content-type-options"] {
+            assert_eq!(
+                head.headers().get(header),
+                get.headers().get(header),
+                "{uri} {header}"
+            );
+        }
+
+        // Known gap, recorded honestly: HEAD currently reports
+        // `content-length: 0` instead of the GET length
+        // (`docs/24-ui-performance.md:99-100`). RFC 9110 §9.3.2 says HEAD
+        // SHOULD send the same Content-Length a GET would, so this accepts
+        // either the truthful length or the empty-body 0 — and rejects any
+        // other value — without blocking a future fix.
+        let head_len = head
+            .headers()
+            .get("content-length")
+            .map(|value| value.to_str().unwrap().to_owned());
+
+        let get_bytes = to_bytes(get.into_body(), 1 << 20).await.unwrap();
+        assert!(!get_bytes.is_empty(), "{uri} GET body must not be empty");
+        let head_bytes = to_bytes(head.into_body(), 1 << 20).await.unwrap();
+        assert!(head_bytes.is_empty(), "{uri} HEAD body must be empty");
+
+        let get_len = get_bytes.len().to_string();
+        assert!(
+            head_len.as_deref() == Some("0") || head_len.as_deref() == Some(get_len.as_str()),
+            "{uri} HEAD content-length must be 0 (current) or {get_len} (RFC 9110 §9.3.2), got {head_len:?}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn unknown_api_and_spa_fallbacks_are_distinct() {
     let app = router(state(None));
@@ -666,4 +851,124 @@ async fn unknown_api_and_spa_fallbacks_are_distinct() {
         .await
         .unwrap();
     assert_eq!(method.status(), StatusCode::METHOD_NOT_ALLOWED);
+}
+
+/// A dist whose assets are large enough to pass the compression predicate
+/// (`SizeAbove::new(1024)`), so negotiation is observable end to end.
+fn compression_dist() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("_assets")).unwrap();
+    let index = format!("<html><body>{}</body></html>", "shell ".repeat(400));
+    let asset = format!("console.log({});\n", "\"negotiated \"".repeat(300));
+    assert!(index.len() > 1024 && asset.len() > 1024);
+    std::fs::write(dir.path().join("index.html"), &index).unwrap();
+    std::fs::write(dir.path().join("_assets/app-abc.js"), &asset).unwrap();
+    dir
+}
+
+/// `docs/13-ui.md`: static assets are gzip/brotli negotiated above 1 KiB, and
+/// every static response carries `vary: accept-encoding` so the one-year
+/// immutable cache cannot pin a single variant.
+#[tokio::test]
+async fn static_assets_are_negotiated() {
+    let dir = compression_dist();
+    let asset = std::fs::read(dir.path().join("_assets/app-abc.js")).unwrap();
+    let app = router(state(None).with_web_dist(dir.path()));
+
+    let compressed = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/_assets/app-abc.js")
+                .header(ACCEPT_ENCODING, "gzip")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(compressed.status(), StatusCode::OK);
+    assert_eq!(
+        compressed.headers().get(CONTENT_ENCODING).unwrap(),
+        "gzip",
+        "the asset is larger than the 1 KiB predicate"
+    );
+    assert_eq!(
+        compressed.headers().get(VARY).unwrap(),
+        "accept-encoding",
+        "a cached immutable asset must vary on accept-encoding"
+    );
+    assert!(
+        !compressed.headers().contains_key("content-length"),
+        "the layer must drop the identity content-length when compressing"
+    );
+    let body = to_bytes(compressed.into_body(), 1 << 20).await.unwrap();
+    let mut decoded = Vec::new();
+    GzDecoder::new(&body[..]).read_to_end(&mut decoded).unwrap();
+    assert_eq!(decoded, asset, "the wire body must round-trip the file");
+
+    let identity = app
+        .oneshot(
+            Request::builder()
+                .uri("/_assets/app-abc.js")
+                .header(ACCEPT_ENCODING, "identity")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(identity.status(), StatusCode::OK);
+    assert!(
+        !identity.headers().contains_key(CONTENT_ENCODING),
+        "identity means no content-encoding"
+    );
+    assert_eq!(
+        identity.headers().get(VARY).unwrap(),
+        "accept-encoding",
+        "the identity variant must advertise the negotiation too"
+    );
+    let body = to_bytes(identity.into_body(), 1 << 20).await.unwrap();
+    assert_eq!(&body[..], &asset[..]);
+}
+
+/// SSE must never be compressed or buffered, even when the client offers gzip:
+/// the compression layer wraps only the static fallback router.
+#[tokio::test]
+async fn sse_is_never_compressed() {
+    let response = router(state(None))
+        .oneshot(
+            Request::builder()
+                .uri("/api/event")
+                .header(ACCEPT_ENCODING, "gzip, br")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(CONTENT_TYPE).unwrap(),
+        "text/event-stream"
+    );
+    assert!(
+        !response.headers().contains_key(CONTENT_ENCODING),
+        "SSE must stay uncompressed at the HTTP layer"
+    );
+    assert_eq!(
+        response.headers().get("cache-control").unwrap(),
+        "no-cache, no-transform"
+    );
+
+    let mut body = response.into_body();
+    let first = tokio::time::timeout(Duration::from_secs(2), body.frame())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let first = first.into_data().unwrap();
+    let first = String::from_utf8_lossy(&first);
+    assert!(
+        first.contains("\"type\":\"server.connected\""),
+        "unexpected first frame: {first:?}"
+    );
 }
