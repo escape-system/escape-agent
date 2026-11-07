@@ -533,6 +533,44 @@ fn builtin_agents_have_upstream_modes_permissions_and_prompts() {
     }));
 }
 
+/// `code_map` is a read-only search tool; the explore subagent must be able to
+/// see it (the runtime drops every tool whose action the agent denies), while
+/// the write-capable actions stay denied.
+///
+/// Regression for the explore toolset omitting `code_map` from its allow list
+/// while `deny("*","*")` hides everything not allowed explicitly.
+#[test]
+fn explore_toolset_allows_read_only_code_map_and_still_denies_edits() {
+    let fixture = Fixture::new();
+    let project = fixture.project();
+    let service = fixture.load(&project);
+
+    assert_eq!(
+        service.evaluate(Some("explore"), "code_map", "*"),
+        Effect::Allow,
+        "explore must see code_map: its action is the tool name"
+    );
+    // `build` composes the default `* * allow`, so code_map stays visible.
+    assert_eq!(
+        service.evaluate(Some("build"), "code_map", "*"),
+        Effect::Allow
+    );
+    for action in ["read", "grep", "glob", "webfetch", "websearch", "shell"] {
+        assert_eq!(
+            service.evaluate(Some("explore"), action, "*"),
+            Effect::Allow,
+            "explore keeps its read-only search toolset: {action}"
+        );
+    }
+    for action in ["edit", "write", "patch"] {
+        assert_eq!(
+            service.evaluate(Some("explore"), action, "src/main.rs"),
+            Effect::Deny,
+            "explore must not gain write-capable tools: {action}"
+        );
+    }
+}
+
 #[test]
 fn broken_documents_are_diagnostics_not_failures() {
     let fixture = Fixture::new();

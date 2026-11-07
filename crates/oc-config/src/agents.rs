@@ -288,6 +288,10 @@ pub(crate) fn builtins(home: &Path) -> Vec<AgentState> {
     explore.permissions.push(allow("webfetch", "*"));
     explore.permissions.push(allow("websearch", "*"));
     explore.permissions.push(allow("read", "*"));
+    // `code_map` is read-only structural search; it belongs in the explore
+    // toolset. Its permission action is the tool name itself (the runtime
+    // maps only write/edit/patch to `edit`).
+    explore.permissions.push(allow("code_map", "*"));
     explore.permissions.push(ask("read", "*.env"));
     explore.permissions.push(ask("read", "*.env.*"));
     explore.permissions.push(allow("read", "*.env.example"));
