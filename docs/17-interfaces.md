@@ -249,6 +249,17 @@ LSP (status/diagnostics/reload), plugin (inventory/check/update/RPC),
 experimental memory/goal/observer/subagent/lane/schedule, credentials +
 integrations, worktrees, PTY, WebSocket upgrades.
 
+`GET /api/fs/list` and `GET /api/fs/find` serve an additive superset of the
+authoritative `FileSystem.Entry` (generated `FileSystemEntry`), which is only
+`{path, type}`: this server returns `{name, path, absolute, type, size,
+modified}`, compatible because JSON clients ignore unknown fields. `path` is
+relative to the requested location root, `/`-separated, even when `path=`
+targets a nested directory; a picker directory outside the location has no
+relative form, so `path` falls back to the absolute text. `absolute` is always
+serialized with the resolved path; `modified` is epoch ms. `type` is always
+`file` or `directory`: a symlink is normalized from its resolved target, and an
+entry whose link target is missing (or is not a file/directory) is skipped.
+
 ### `AppState` (server)
 - One cloneable struct; every heavy field is `Option<Arc<…>>` and has a
   `with_*` builder plus accessor: `store`, `config`, `catalog`, `runtime`,

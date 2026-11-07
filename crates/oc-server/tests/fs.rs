@@ -374,11 +374,23 @@ async fn list_returns_sorted_entries_with_metadata() {
     assert_eq!(alpha["type"], "file");
     assert_eq!(alpha["size"], 1);
     assert!(alpha["modified"].is_i64());
+    assert_eq!(alpha["path"], "Alpha.txt", "paths are relative to the root");
     assert_eq!(
-        alpha["path"].as_str().unwrap(),
+        alpha["absolute"].as_str().unwrap(),
         harness.root.join("Alpha.txt").to_string_lossy().as_ref(),
-        "paths are absolute"
+        "absolute is the previous absolute path"
     );
+    // Every listing entry carries both forms; none leaks an absolute `path`.
+    let canonical_root = std::fs::canonicalize(&harness.root).unwrap();
+    for entry in entries {
+        let path = entry["path"].as_str().unwrap();
+        assert!(!path.starts_with('/'), "absolute path in listing: {path}");
+        assert_eq!(
+            entry["absolute"].as_str().unwrap(),
+            canonical_root.join(path).to_string_lossy().as_ref(),
+            "absolute must be root-joined path"
+        );
+    }
 
     let adir = entries
         .iter()
@@ -387,7 +399,8 @@ async fn list_returns_sorted_entries_with_metadata() {
     assert_eq!(adir["type"], "directory");
     assert_eq!(adir["size"], 0);
 
-    // `path=` still resolves inside the location.
+    // `path=` still resolves inside the location; entry paths stay relative to
+    // the location root, not to the listed subdirectory.
     let sub = path_uri(&harness.root.join("sub"));
     let (status, _, bytes) = get(&app, &format!("/api/fs/list?path={sub}")).await;
     assert_eq!(status, StatusCode::OK);
@@ -395,6 +408,16 @@ async fn list_returns_sorted_entries_with_metadata() {
     let entries = body["data"].as_array().unwrap();
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0]["name"], "nested.txt");
+    assert_eq!(entries[0]["path"], "sub/nested.txt");
+    assert_eq!(
+        entries[0]["absolute"].as_str().unwrap(),
+        harness
+            .root
+            .join("sub")
+            .join("nested.txt")
+            .to_string_lossy()
+            .as_ref()
+    );
 
     // Missing directory is a 404, never an empty list.
     let (status, _, bytes) = get(&app, "/api/fs/list?path=missing").await;
@@ -424,6 +447,9 @@ async fn list_navigates_outside_the_location() {
     let expected = expected_path.to_string_lossy().into_owned();
     let stripped = expected.strip_prefix(r"\\?\").map(str::to_owned);
     let expected = stripped.unwrap_or(expected);
+    assert_eq!(entries[0]["absolute"].as_str().unwrap(), expected.as_str());
+    // Outside the location there is no relative form, so `path` falls back to
+    // the absolute text instead of inventing a fake relative path.
     assert_eq!(entries[0]["path"].as_str().unwrap(), expected.as_str());
 
     // Listing may leave the location; reads stay confined.
@@ -558,6 +584,122 @@ async fn find_respects_gitignore_hidden_type_and_limit() {
     let (status, _, bytes) = get(&app, "/api/fs/find?query=nested&limit=nope").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(json(&bytes)["_tag"], "SchemaError");
+}
+
+#[tokio::test]
+async fn list_paths_are_relative_to_the_location_root() {
+    let harness = harness();
+    std::fs::create_dir_all(harness.root.join("nested").join("dir")).unwrap();
+    std::fs::write(
+        harness.root.join("nested").join("dir").join("file.txt"),
+        "nested",
+    )
+    .unwrap();
+    let app = router(harness.state);
+
+    let canonical = std::fs::canonicalize(&harness.root).unwrap();
+    let root_text = canonical.to_string_lossy().into_owned();
+    let expected_absolute = canonical
+        .join("nested")
+        .join("dir")
+        .join("file.txt")
+        .to_string_lossy()
+        .into_owned();
+
+    // Both an absolute `path=` and a location-relative one must answer paths
+    // relative to the requested location root, never to the nested directory.
+    for requested in [
+        path_uri(&canonical.join("nested").join("dir")),
+        "nested/dir".to_owned(),
+    ] {
+        let (status, _, bytes) = get(&app, &format!("/api/fs/list?path={requested}")).await;
+        assert_eq!(status, StatusCode::OK, "{requested}");
+        let body = json(&bytes);
+        let entries = body["data"].as_array().unwrap();
+        assert_eq!(entries.len(), 1, "{requested}: {entries:?}");
+        for entry in entries {
+            let path = entry["path"].as_str().unwrap();
+            assert!(!path.starts_with('/'), "{requested}: {path}");
+            assert!(!path.starts_with(&root_text), "{requested}: {path}");
+            assert!(path.ends_with("nested/dir/file.txt"), "{requested}: {path}");
+            assert_eq!(
+                entry["absolute"].as_str().unwrap(),
+                expected_absolute,
+                "{requested}"
+            );
+            // The old behavior serialized the absolute path in `path`; these
+            // assertions fail against it.
+            assert_ne!(path, entry["absolute"].as_str().unwrap(), "{requested}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn find_paths_are_relative_to_the_location_root() {
+    let harness = harness();
+    std::fs::create_dir_all(harness.root.join("nested").join("dir")).unwrap();
+    std::fs::write(
+        harness.root.join("nested").join("dir").join("file.txt"),
+        "nested",
+    )
+    .unwrap();
+    let app = router(harness.state);
+
+    let canonical = std::fs::canonicalize(&harness.root).unwrap();
+    let root_text = canonical.to_string_lossy().into_owned();
+
+    let (status, _, bytes) = get(&app, "/api/fs/find?query=file.txt&type=file").await;
+    assert_eq!(status, StatusCode::OK);
+    let body = json(&bytes);
+    let entries = body["data"].as_array().unwrap();
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    for entry in entries {
+        let path = entry["path"].as_str().unwrap();
+        assert!(!path.starts_with('/'), "absolute path in find: {path}");
+        assert!(
+            !path.starts_with(&root_text),
+            "root-prefixed find path: {path}"
+        );
+        assert_eq!(path, "nested/dir/file.txt");
+        assert_eq!(
+            entry["absolute"].as_str().unwrap(),
+            canonical
+                .join("nested")
+                .join("dir")
+                .join("file.txt")
+                .to_string_lossy()
+                .as_ref()
+        );
+    }
+}
+
+/// The client union is only `file | directory`; a symlink to a file must be
+/// reported as a file (the old code serialized `"symlink"`).
+#[cfg(unix)]
+#[tokio::test]
+async fn symlinked_file_reports_file_kind() {
+    let harness = harness();
+    std::fs::write(harness.root.join("real.txt"), "real").unwrap();
+    let target = harness.root.join("real.txt");
+    let link = harness.root.join("link.txt");
+    if !create_file_symlink(&target, &link) {
+        eprintln!("skipping symlink assertion: no symlink privilege");
+        return;
+    }
+
+    let app = router(harness.state);
+    let (status, _, bytes) = get(&app, "/api/fs/list").await;
+    assert_eq!(status, StatusCode::OK);
+    let body = json(&bytes);
+    let entry = body["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["name"] == "link.txt")
+        .expect("symlink must be listed");
+    assert_eq!(entry["type"], "file");
+    assert_eq!(entry["path"], "link.txt");
+    assert_eq!(entry["size"], "real".len());
 }
 
 #[tokio::test]

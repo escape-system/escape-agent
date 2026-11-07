@@ -200,8 +200,8 @@ publishing `observer.unavailable`.
 | Method + path | Query / body | Env |
 |---|---|---|
 | GET `/api/fs/read/*` | loc | B | bytes, ETag/Range |
-| GET `/api/fs/list` | loc, `path?` | L | directory picker: resolves absolute/relative paths without location confinement (parents, other drives); `fs/read`/`fs/find` stay confined |
-| GET `/api/fs/find` | loc, `query,type,limit?` | L |
+| GET `/api/fs/list` | loc, `path?` | L | directory picker: resolves absolute/relative paths without location confinement (parents, other drives); `fs/read`/`fs/find` stay confined. Entries extend upstream `{path,type}` with `name, absolute, size, modified` (JSON clients ignore unknown fields): `path` is relative to the requested location (also for a nested `path=`), falling back to the absolute text outside the location; `absolute` is always the resolved path; symlinks report their resolved `file`/`directory` kind |
+| GET `/api/fs/find` | loc, `query,type,limit?` | L | same entry shape; `path` relative to the location |
 | POST `/api/experimental/fs/write` | loc, `path`, raw bytes | L | 64 MiB cap, atomic rename |
 | POST/DELETE `/api/experimental/fs/watch` | loc, `{path}` | N | polling watcher; publishes ephemeral `filesystem.changed` |
 | GET `/api/vcs`, `/base`, `/status`, `/branch`, `/diff` | loc + mode/base/context | L |

@@ -52,13 +52,17 @@ const MAX_FIND_LIMIT: usize = 1000;
 
 /// One `FileSystem.Entry` as served by this server.
 ///
-/// Upstream's entry is only `{path,type}`; the client needs name, size and
-/// mtime to render a file tree without a second round trip, so this is
-/// additive. `path` is absolute.
+/// Upstream's entry is only `{path,type}` and requires `path` to be relative
+/// to the requested location; the client also needs name, size and mtime to
+/// render a file tree without a second round trip, so those are additive.
+/// `path` stays relative to the requested location root (also when listing a
+/// nested directory or a picker directory outside the location), while
+/// `absolute` carries the resolved filesystem path.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct FsEntry {
     pub name: String,
     pub path: String,
+    pub absolute: String,
     #[serde(rename = "type")]
     pub kind: FsEntryKind,
     pub size: u64,
@@ -72,7 +76,6 @@ pub struct FsEntry {
 pub enum FsEntryKind {
     File,
     Directory,
-    Symlink,
 }
 
 /// `GET /api/fs/read/*`
@@ -208,7 +211,9 @@ pub async fn list(
         if !is_listable(&meta) {
             continue;
         }
-        entries.push(entry_for(name, &path, &meta));
+        if let Some(entry) = entry_for(&root, name, &path, &meta) {
+            entries.push(entry);
+        }
     }
     entries.sort_by_cached_key(|entry| {
         (
@@ -330,7 +335,9 @@ fn walk(root: &Path, query: &str, kind: FindType, limit: usize) -> Vec<FsEntry> 
             continue;
         }
         let name = entry.file_name().to_string_lossy().into_owned();
-        entries.push(entry_for(name, path, &meta));
+        if let Some(entry) = entry_for(root, name, path, &meta) {
+            entries.push(entry);
+        }
     }
     entries.sort_by(|left, right| left.path.cmp(&right.path));
     entries
@@ -343,24 +350,51 @@ fn is_listable(meta: &std::fs::Metadata) -> bool {
     kind.is_file() || kind.is_dir() || kind.is_symlink()
 }
 
-fn entry_for(name: String, path: &Path, meta: &std::fs::Metadata) -> FsEntry {
-    let kind = if meta.file_type().is_symlink() {
-        FsEntryKind::Symlink
-    } else if meta.is_dir() {
-        FsEntryKind::Directory
-    } else {
-        FsEntryKind::File
-    };
-    FsEntry {
-        name,
-        path: display_path(path),
-        kind,
-        size: if kind == FsEntryKind::Directory {
-            0
+/// Build one entry relative to the requested location root.
+///
+/// Symlinks are normalized to the kind of their resolved target because the
+/// client union is only `file | directory`; an entry whose link target is
+/// missing (or otherwise unreadable) is skipped instead of being misreported.
+fn entry_for(root: &Path, name: String, path: &Path, meta: &std::fs::Metadata) -> Option<FsEntry> {
+    let (kind, size) = if meta.file_type().is_symlink() {
+        // `fs::metadata` follows the link; a broken link or a target outside
+        // the file/directory union is skipped rather than guessed.
+        let target = std::fs::metadata(path).ok()?;
+        if target.is_dir() {
+            (FsEntryKind::Directory, 0)
+        } else if target.is_file() {
+            (FsEntryKind::File, target.len())
         } else {
-            meta.len()
-        },
+            return None;
+        }
+    } else if meta.is_dir() {
+        (FsEntryKind::Directory, 0)
+    } else {
+        (FsEntryKind::File, meta.len())
+    };
+    Some(FsEntry {
+        name,
+        path: relative(root, path),
+        absolute: display_path(path),
+        kind,
+        size,
         modified: modified_millis(meta),
+    })
+}
+
+/// Entry path relative to the requested location root, `/`-separated.
+///
+/// A listing may target a picker directory outside the location; there is no
+/// relative form then, so the absolute path is the fallback (the same text
+/// `absolute` carries).
+fn relative(root: &Path, path: &Path) -> String {
+    match path.strip_prefix(root) {
+        Ok(relative) => relative
+            .components()
+            .map(|component| component.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/"),
+        Err(_) => display_path(path),
     }
 }
 
@@ -379,7 +413,7 @@ pub(crate) fn display_path(path: &Path) -> String {
 fn kind_rank(kind: FsEntryKind) -> u8 {
     match kind {
         FsEntryKind::Directory => 0,
-        FsEntryKind::File | FsEntryKind::Symlink => 1,
+        FsEntryKind::File => 1,
     }
 }
 
