@@ -27,3 +27,5 @@ test-run.log
 # Cloned reference repos
 /external/
 hermes-agent/
+opencode.prev
+opencode-deploy-restart.sh
