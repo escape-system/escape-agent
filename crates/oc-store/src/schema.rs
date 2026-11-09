@@ -403,6 +403,34 @@ CREATE TABLE snapshot (
 CREATE INDEX snapshot_session_seq_path ON snapshot(session_id, seq, path);
 ";
 
+/// Durable context boxes (`docs/25-context-boxes.md`).
+///
+/// A box belongs to a session tree (`root_id`), is addressed by `key` inside
+/// it, and carries a `stable`/`temporary` lifetime. Compaction stamps
+/// `time_expired` on `temporary` rows instead of deleting them, so the audit
+/// trail survives while reads and the prompt index hide them by default.
+const CONTEXT_BOX: &str = r"
+CREATE TABLE context_box (
+  id TEXT PRIMARY KEY,
+  root_id TEXT NOT NULL REFERENCES session_v2(id) ON DELETE CASCADE,
+  owner_session TEXT NOT NULL,
+  key TEXT NOT NULL,
+  title TEXT,
+  description TEXT,
+  kind TEXT NOT NULL CHECK (kind IN ('stable', 'temporary')),
+  tags TEXT NOT NULL DEFAULT '[]',
+  content TEXT NOT NULL,
+  revision INTEGER NOT NULL DEFAULT 1,
+  time_created INTEGER NOT NULL,
+  time_updated INTEGER NOT NULL,
+  time_expired INTEGER,
+  deleted INTEGER NOT NULL DEFAULT 0,
+  UNIQUE(root_id, key)
+);
+CREATE INDEX context_box_root_key_idx ON context_box(root_id, key);
+CREATE INDEX context_box_root_live_idx ON context_box(root_id, deleted, time_expired);
+";
+
 pub(crate) const MIGRATIONS: &[Migration] = &[
     Migration {
         id: "0001_wire",
@@ -452,6 +480,11 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
     Migration {
         id: "0010_snapshot",
         sql: SNAPSHOT,
+        column_guard: None,
+    },
+    Migration {
+        id: "0011_context_box",
+        sql: CONTEXT_BOX,
         column_guard: None,
     },
 ];

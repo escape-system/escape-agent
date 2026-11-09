@@ -101,6 +101,7 @@ id_type!(ProjectId, "prj_", new, true);
 id_type!(ObservationId, "obs_", new, false);
 id_type!(GoalId, "gol_", new, true);
 id_type!(MemoryId, "mem_", new, true);
+id_type!(ContextBoxId, "box_", new, false);
 id_type!(LaneId, "lan_", new, false);
 
 /// Message ids for event-backed messages are derived by replacing the prefix.
@@ -135,6 +136,7 @@ mod tests {
         assert_eq!(MessageId::new().as_str().len(), 30);
         assert!(SessionId::new().as_str().starts_with("ses_"));
         assert!(EventId::new().as_str().starts_with("evt_"));
+        assert!(ContextBoxId::new().as_str().starts_with("box_"));
     }
 
     #[test]

@@ -79,7 +79,7 @@ Dropped with a warning (not an error): top-level `logLevel`, `server`,
 | `media` | `{image?:{auto_resize?,max_width?,max_height?,max_base64_bytes?}}` | defaults |
 | `tool_output` | `{max_lines?,max_bytes?}` | 2000 / 51200 |
 | `mcp` | `{timeout?,servers?}` | — |
-| `compaction` | `{auto?,keep?{tokens?},buffer?}` | true / 15000 / 15% |
+| `compaction` | `{auto?,keep?{tokens?},buffer?,ceiling_tokens?}` | false / 15000 / 15% |
 | `skills` | string[] | dirs `skill/`, `skills/` |
 | `commands` | map `{template,description?,agent?,model?,subtask?}` | markdown |
 | `instructions` | string[] | AGENTS.md discovery |
@@ -139,9 +139,15 @@ read *.env.example allow
 
 Built-in agents: `build` primary + `question allow`; `general` subagent, denies
 `question` and `subagent`; `explore` deny-all then allows
-shell/grep/glob/webfetch/websearch/read/code_map (env ask) +
+shell/grep/glob/webfetch/websearch/read/code_map/box:read (env ask) +
 `external_directory`, denies `subagent`; `plan` denies edits except
 `~/.opencode/plan/*`; hidden `compaction`, `title`, `summary` deny all.
+
+Context boxes add the actions `box:read` and `box:write`, with the box key as
+the resource (`docs/25-context-boxes.md`). Primaries and `general` get both;
+`explore` gets `box:read` only; a custom agent can be write-only by allowing
+`box:write` and denying `box:read`. `compaction.auto` defaults to `false`, so
+threshold compaction only runs when the document opts in.
 
 Ask flow:
 

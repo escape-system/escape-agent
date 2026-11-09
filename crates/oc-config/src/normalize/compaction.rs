@@ -61,6 +61,16 @@ pub(super) fn normalize_compaction(
             None => ctx.invalid("$.compaction.buffer"),
         }
     }
+    if let Some(value) = object.get("ceiling_tokens") {
+        match value.as_u64() {
+            // A ceiling may only lower the computed limit; `0` would make every
+            // turn compact, so it is treated as absent.
+            Some(tokens) if tokens > 0 => {
+                result.insert("ceiling_tokens".to_owned(), Value::from(tokens));
+            }
+            Some(_) | None => ctx.invalid("$.compaction.ceiling_tokens"),
+        }
+    }
     if !result.is_empty() || object.is_empty() {
         out.insert("compaction".to_owned(), Value::Object(result));
     }

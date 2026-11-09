@@ -79,6 +79,7 @@
 //! providers are merged between [`RuntimeConfig::tools`] and the memory tools.
 
 pub mod compaction;
+mod context_box;
 pub mod expectation;
 pub mod goal;
 mod goal_store;
@@ -95,6 +96,7 @@ pub mod tokens;
 mod turn;
 
 pub use compaction::{CompactionConfig, CompactionResult, SUMMARY_SECTIONS, summary_prompt};
+pub use context_box::{BOX_READ_CHUNK, BoxTools, MAX_BOX_WRITE_CHARS, render_box_index};
 pub use expectation::{Expectation, ExpectationError, extract, inject};
 pub use goal::GoalTools;
 pub use goal_store::StoreGoalStore;

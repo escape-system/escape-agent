@@ -52,6 +52,15 @@ pub fn compaction_ceiling(context_window: u64) -> u64 {
     context_window.saturating_sub(reserve(context_window))
 }
 
+/// Effective compaction ceiling: the computed one, optionally lowered by
+/// `compaction.ceiling_tokens`. An explicit ceiling can never raise the value
+/// derived from the model's context window.
+#[must_use]
+pub fn ceiling(context_window: u64, configured: Option<u64>) -> u64 {
+    let computed = compaction_ceiling(context_window);
+    configured.map_or(computed, |tokens| tokens.min(computed))
+}
+
 /// Precompute compaction at 85% of the ceiling.
 #[must_use]
 pub fn precompute_threshold(ceiling: u64) -> u64 {

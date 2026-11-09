@@ -35,7 +35,8 @@ Everything durable lives in **one SQLite database** (WAL):
   `session_part`; pending input in `session_inbox`; the durable log in
   `event`/`event_sequence`.
 - The same file also holds projects, memory, goals/observations/repairs,
-  forms, schedules, snapshots, credentials, worktrees and lane tickets.
+  forms, schedules, snapshots, credentials, worktrees, lane tickets and
+  context boxes (`docs/25-context-boxes.md`).
 
 File resolution, first match wins:
 

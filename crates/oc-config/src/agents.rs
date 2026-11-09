@@ -292,6 +292,9 @@ pub(crate) fn builtins(home: &Path) -> Vec<AgentState> {
     // toolset. Its permission action is the tool name itself (the runtime
     // maps only write/edit/patch to `edit`).
     explore.permissions.push(allow("code_map", "*"));
+    // Boxes are the shared working context of the session tree; explore may
+    // read them but never write them (`docs/25-context-boxes.md`).
+    explore.permissions.push(allow("box:read", "*"));
     explore.permissions.push(ask("read", "*.env"));
     explore.permissions.push(ask("read", "*.env.*"));
     explore.permissions.push(allow("read", "*.env.example"));

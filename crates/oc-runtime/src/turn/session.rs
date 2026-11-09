@@ -116,6 +116,7 @@ impl Runtime {
             }
             merged.extend(&crate::subagent::SubagentTools::new(self.clone()).registry());
             merged.extend(&crate::goal::GoalTools::new(self.clone()).registry());
+            merged.extend(&crate::context_box::BoxTools::new(self.clone()).registry());
             merged.extend(&crate::skill::SkillTools::new(self.clone()).registry());
             // LaneTools replaces the built-in `shell` with the lane-aware one.
             merged.extend(&crate::lane::LaneTools::new(self.clone()).registry());
@@ -171,6 +172,7 @@ impl Runtime {
 
     /// Resolve the cache-stable instruction prefix and publish a delta when it
     /// changed. Runs once per execution, before the first provider call.
+    #[allow(clippy::too_many_lines)] // One assembly pass: boxes, memory, goal and the pinned prefix.
     pub(super) async fn refresh_instructions(
         &self,
         session: &str,
@@ -189,6 +191,27 @@ impl Runtime {
         let skill_ids = loaded_skill_ids(&stored);
         let context = self.load_context(session).await?;
         let query = prompt::last_user_text(&context);
+        let box_rows = self
+            .inner
+            .config
+            .store
+            .list_boxes(oc_store::BoxQuery {
+                root_id: root.clone(),
+                limit: 100,
+                ..oc_store::BoxQuery::default()
+            })
+            .await
+            .map_or_else(
+                |error| {
+                    tracing::warn!(
+                        session = %session,
+                        error = %error,
+                        "could not read context boxes for the prompt index"
+                    );
+                    Vec::new()
+                },
+                |page| page.items,
+            );
         let memory = self.memory();
         let assembly = prompt::assemble_instructions(&prompt::InstructionContext {
             config: &self.inner.config.config,
@@ -202,6 +225,7 @@ impl Runtime {
             skill_ids: &skill_ids,
             directory: &turn.directory,
             goal: goal.as_ref(),
+            boxes: Some(&box_rows),
         })
         .await;
 

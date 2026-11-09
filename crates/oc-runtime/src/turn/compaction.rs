@@ -154,8 +154,42 @@ impl Runtime {
         } else {
             turn.system.clone()
         };
+        // The summary request carries the live box index so the model points at
+        // keys instead of restating stable content (`docs/25-context-boxes.md`).
+        let root_id = self
+            .inner
+            .config
+            .store
+            .session_node(session)
+            .await?
+            .map_or_else(|| session.to_owned(), |node| node.root_id);
+        let box_index = match self.box_index_rows(&root_id).await {
+            Ok(rows) => crate::context_box::render_box_index(
+                &root_id,
+                &rows,
+                crate::context_box::BOX_INDEX_MAX,
+            ),
+            Err(error) => {
+                tracing::warn!(
+                    session = %session,
+                    error = %error,
+                    "could not render the box index for the compaction prompt"
+                );
+                String::new()
+            }
+        };
+        let summary_instruction = if box_index.is_empty() {
+            crate::compaction::summary_prompt(None)
+        } else {
+            format!(
+                "{}\n\nDurable context boxes of this session tree. Reference their keys instead \
+                 of restating stable content; temporary boxes expire now. Load details with \
+                 `box_read` when needed:\n{box_index}",
+                crate::compaction::summary_prompt(None)
+            )
+        };
         let mut messages = context.to_vec();
-        messages.push(LlmMessage::user(crate::compaction::summary_prompt(None)));
+        messages.push(LlmMessage::user(summary_instruction.clone()));
         let api_key = self.credential_key(&turn.model.provider.id).await;
         let request = LlmRequest {
             model: turn.model.clone(),
@@ -319,6 +353,22 @@ impl Runtime {
             .store
             .update_message(session, id.as_str(), completed)
             .await?;
+        // Expire temporary boxes only after the completed row is durable and
+        // before `session.compaction.ended` is published. A failure is logged
+        // and must not fail the compaction itself.
+        if let Err(error) = self
+            .inner
+            .config
+            .store
+            .expire_temporary_boxes(&root_id)
+            .await
+        {
+            tracing::warn!(
+                session = %session,
+                error = %error,
+                "could not expire temporary context boxes after compaction"
+            );
+        }
         let tokens = usage.as_ref().map(super::types::tokens_from_usage);
         self.emit(
             session,
@@ -339,15 +389,15 @@ impl Runtime {
 
     /// Recent-context budget preserved across a compaction (`compaction.keep.tokens`).
     fn compaction_keep_tokens(&self) -> u64 {
-        self.inner
-            .config
-            .config
-            .merged()
-            .get("compaction")
-            .and_then(|value| value.get("keep"))
-            .and_then(|value| value.get("tokens"))
-            .and_then(Value::as_u64)
-            .unwrap_or(crate::compaction::CompactionConfig::default().keep_tokens)
+        self.compaction_config().keep_tokens
+    }
+
+    /// `compaction` settings from the merged config document.
+    ///
+    /// `auto` is honored by the turn loop; the default is `false`, so
+    /// threshold compaction runs only when the document opts in.
+    pub(super) fn compaction_config(&self) -> crate::compaction::CompactionConfig {
+        crate::compaction::CompactionConfig::from_merged(self.inner.config.config.merged())
     }
 
     /// Oldest stored message to keep verbatim after a compaction.

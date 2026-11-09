@@ -6,6 +6,7 @@
 
 #![allow(clippy::too_many_lines)] // scenario tests read top-to-bottom on purpose
 
+mod boxes;
 mod credentials;
 mod forms;
 mod instructions;

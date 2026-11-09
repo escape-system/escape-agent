@@ -3,6 +3,7 @@ use std::path::Path;
 
 use oc_config::{ConfigService, Effect};
 use oc_memory::{DEFAULT_TOKEN_BUDGET, MemoryService, RetrieveRequest};
+use serde_json::Value;
 
 use crate::instructions::{InstructionSource, SourceKind};
 
@@ -50,6 +51,8 @@ pub struct InstructionContext<'a> {
     pub directory: &'a str,
     /// Active goal for the session root, when the store has one.
     pub goal: Option<&'a oc_observer::GoalSnapshot>,
+    /// Live context boxes of the session tree, rendered as `oc/boxes`.
+    pub boxes: Option<&'a [Value]>,
 }
 
 /// Instruction sources plus the ids of the memories that were rendered.
@@ -83,6 +86,16 @@ pub async fn assemble_instructions(context: &InstructionContext<'_>) -> Instruct
         let text = crate::goal::render_goal(goal);
         if !text.trim().is_empty() {
             sources.push(InstructionSource::new(SourceKind::Goal, "oc/goal", text));
+        }
+    }
+    if let Some(boxes) = context.boxes {
+        let text = crate::context_box::render_box_index(
+            context.root_id,
+            boxes,
+            crate::context_box::BOX_INDEX_MAX,
+        );
+        if !text.trim().is_empty() {
+            sources.push(InstructionSource::new(SourceKind::Boxes, "oc/boxes", text));
         }
     }
 

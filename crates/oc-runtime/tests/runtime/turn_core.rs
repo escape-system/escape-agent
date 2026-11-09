@@ -512,7 +512,7 @@ async fn oversized_context_compacts_before_the_request() {
             text_script("answer from the summary"),
         ],
         Arc::new(AllowAll),
-        json!({}),
+        json!({"compaction": {"auto": true}}),
         None,
     )
     .await;
@@ -569,6 +569,51 @@ async fn oversized_context_compacts_before_the_request() {
 }
 
 #[tokio::test]
+async fn auto_false_writes_no_compaction_row() {
+    let harness = Harness::new(
+        vec![
+            text_script("## Objective\nhandoff summary"),
+            text_script("answer"),
+        ],
+        Arc::new(AllowAll),
+        json!({}),
+        None,
+    )
+    .await;
+    harness
+        .store
+        .enqueue(NewInbox {
+            id: MessageId::new().into_inner(),
+            session_id: harness.session.clone(),
+            kind: "user".to_owned(),
+            payload: json!({"text": "a".repeat(360_000)}),
+            delivery: Delivery::Steer,
+        })
+        .await
+        .expect("enqueued");
+    harness
+        .runtime
+        .notify(&harness.session)
+        .await
+        .expect("notify");
+    harness
+        .runtime
+        .wait_idle(&harness.session, Duration::from_secs(10))
+        .await
+        .expect("idle");
+
+    let messages = harness.messages().await;
+    assert!(
+        !messages
+            .iter()
+            .any(|message| message.get("type").and_then(Value::as_str) == Some("compaction")),
+        "auto:false must not write a compaction row"
+    );
+    assert_eq!(harness.model.calls(), 1, "no summary request without auto");
+    assert!(harness.sink.has("session.execution.succeeded"));
+}
+
+#[tokio::test]
 async fn auto_compaction_records_reason_auto() {
     let harness = Harness::new(
         vec![
@@ -576,7 +621,7 @@ async fn auto_compaction_records_reason_auto() {
             text_script("answer from the summary"),
         ],
         Arc::new(AllowAll),
-        json!({}),
+        json!({"compaction": {"auto": true}}),
         None,
     )
     .await;
@@ -628,7 +673,7 @@ async fn auto_compaction_publishes_durable_lifecycle_events() {
             text_script("answer from the summary"),
         ],
         Arc::new(AllowAll),
-        json!({}),
+        json!({"compaction": {"auto": true}}),
         None,
     )
     .await;

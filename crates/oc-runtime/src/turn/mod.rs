@@ -247,12 +247,13 @@ impl Runtime {
         let mut pending_stall_notice: Option<String> = None;
         let mut stall_guard = stall::StallGuard::default();
         let mut step_number = 0_usize;
+        let compaction = self.compaction_config();
         let ceiling = if turn.context_window == 0 {
             u64::MAX
         } else {
-            // Cap at 150_000 so models with huge context windows (e.g. 1M) do not run
-            // hundreds of thousands of uncompacted tokens per step, burning tens of millions of tokens.
-            tokens::compaction_ceiling(turn.context_window).min(150_000)
+            // The ceiling is derived from the model's real window; the old
+            // hard-coded 150k cap is gone (`docs/04-agent-runtime.md`).
+            tokens::ceiling(turn.context_window, compaction.ceiling_tokens)
         };
 
         loop {
@@ -270,7 +271,8 @@ impl Runtime {
             if step_number > 0 && self.promote_steers(session, &turn.directory).await? {
                 context = self.load_context(session).await?;
             }
-            if auto_compactions < 3 && last_compacted_len != Some(context.len()) {
+            if auto_compactions < 3 && compaction.auto && last_compacted_len != Some(context.len())
+            {
                 let estimate = self.estimate_turn_tokens(session, turn, &context).await?;
                 if estimate > ceiling {
                     match self.compact(session, turn, &context, cancel, "auto").await {

@@ -145,7 +145,13 @@ ran.
 | Durable fact across sessions | `memory_write` |
 | Large document / spec | file + `read` |
 | Task state within a turn | goal + context |
+| Durable working context across compactions | context box (`box_write`) |
 | What a subagent did | `digest` (not memory) |
+
+Context boxes (`docs/25-context-boxes.md`) are a separate store: agent-authored,
+key-addressed, root-shared, with `stable`/`temporary` lifetimes. A box is what a
+compaction summary should point at instead of restating. Memory remains
+scribe/user knowledge that is retrieved by FTS; boxes are loaded explicitly.
 
 The agent is instructed (in the default system prompt) not to write memory for
 things derivable from the repo, and to write at most one memory per turn unless

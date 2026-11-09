@@ -184,6 +184,28 @@ public surface; `cargo doc -p <crate> --no-deps` is the reference.
   - `LaneTools::new(runtime).registry()` → `lane` plus a `shell` replacement
     (`ShellLaneTool`) that classifies cargo/test commands into lanes and
     delegates everything else to `oc_tools::ShellTool`.
+  - `BoxTools::new(runtime).registry()` → `box_list`, `box_read`, `box_write`,
+    `box_delete`, `compact_context` (`docs/25-context-boxes.md`).
+    `box_read`/`box_list` map to `box:read`, `box_write`/`box_delete` to
+    `box:write` with the box key as the resource; `compact_context` maps to
+    action `compaction`, resource `*`. `compact_context` never compacts inline:
+    it commits an inbox row (`kind = "compaction"`, `delivery = Queue`,
+    `reason = "manual"`), notifies the actor and returns `scheduled`.
+- `CompactionConfig` (`crate::compaction`) is the runtime view of the merged
+  `compaction` document: `{ auto, keep_tokens, buffer, ceiling_tokens }`.
+  `auto` defaults to `false`, so token-threshold compaction runs only when the
+  document opts in. `CompactionConfig::from_merged(&Value)` is the only
+  constructor; `Runtime::compaction_config()` calls it.
+- `tokens::ceiling(context_window, configured) -> u64` computes
+  `context_window − max(15%, 16k)`; a configured `compaction.ceiling_tokens`
+  may only lower it (`min`). The former hard-coded 150k cap is gone.
+- `InstructionContext.boxes: Option<&[Value]>` feeds `SourceKind::Boxes`
+  (`oc/boxes`), ordered after `oc/memory` and before `oc/goal`. Like `oc/goal`
+  it is pinned per actor epoch, so a mid-epoch box change is delivered by
+  `InstructionSet::epoch_supplement` and only a new epoch rewrites the prefix.
+- `Renderers`: `context_box::render_box_index(root_id, rows, limit)` renders
+  key/kind/size/description only (never content); `BOX_INDEX_MAX = 100`,
+  `MAX_BOX_WRITE_CHARS = 60_000`, `BOX_READ_CHUNK = 20_000`.
 - `Runtime::with_lanes(Arc<LaneService>)` attaches the scheduler; `lanes()`
   returns it.
 - `ProcessLaneRunner` implements `LaneRunner`: `new(tokens)`, `unbound()` +
@@ -439,8 +461,39 @@ impl Store {
     pub async fn append_event(&self, event: NewEvent) -> Result<i64, StoreError>;
     pub async fn events_after(&self, session_id: &str, after: i64, limit: usize)
         -> Result<Vec<StoredEvent>, StoreError>;
+
+    // Context boxes (`docs/25-context-boxes.md`), migration 0011.
+    pub async fn write_box(&self, new: NewBox, append: bool) -> Result<Value, StoreError>;
+    pub async fn get_box(&self, root_id: &str, key: &str, include_expired: bool)
+        -> Result<Option<Value>, StoreError>;
+    pub async fn list_boxes(&self, query: BoxQuery) -> Result<BoxPage, StoreError>;
+    pub async fn delete_box(&self, root_id: &str, key: &str) -> Result<bool, StoreError>;
+    pub async fn expire_temporary_boxes(&self, root_id: &str) -> Result<usize, StoreError>;
+    pub async fn box_keys(&self, root_id: &str) -> Result<BTreeSet<String>, StoreError>;
 }
+
+pub struct NewBox {
+    pub root_id: String, pub owner_session: String, pub key: String,
+    pub title: Option<String>, pub description: Option<String>,
+    pub kind: String,            // "stable" | "temporary"
+    pub tags: Vec<String>, pub content: String,
+}
+pub struct BoxQuery {
+    pub root_id: String, pub kind: Option<String>,
+    pub include_expired: bool, pub limit: usize,
+}
+pub struct BoxPage { pub items: Vec<Value>, pub has_more: bool }
+pub const BOX_KINDS: [&str; 2] = ["stable", "temporary"];
+pub const MAX_BOX_CHARS: usize = 262_144;
+pub const MAX_BOX_KEY_CHARS: usize = 64;
 ```
+
+`context_box` is keyed `(root_id, key)` with a soft delete, so every session in
+one tree shares the same boxes. Writes are create-or-update inside the writer
+transaction (an append cannot lose a line), a soft-deleted row is recreated with
+`revision = 1` and fresh timestamps, and an expired row is revived with
+`time_expired` cleared and the revision bumped. `expire_temporary_boxes` stamps
+only live `temporary` rows of the root and returns how many changed.
 
 Implementation requirements:
 

@@ -78,8 +78,10 @@ memory block (ours) → goal block (ours) → per-session entries
   appended. A subagent with no system gets the same default as its parent.
 - Skills are advertised as `<available_skills>` filtered by permission,
   `description` present, `autoinvoke !== false`, sorted by id.
-- Memory and goal blocks are instruction sources (`oc/memory`, `oc/goal`), so
-  they participate in delta updates and prompt caching.
+- Memory, box index and goal blocks are instruction sources (`oc/memory`,
+  `oc/boxes`, `oc/goal`), so they participate in delta updates and prompt
+  caching. `oc/boxes` renders keys/kinds/sizes only; content is loaded through
+  `box_read`.
 - Per-request splices (volatile) go through the `session.context` hook, not the
   prefix; anything that changes per step must not invalidate the cache.
 

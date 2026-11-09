@@ -21,6 +21,7 @@ pub enum SourceKind {
     Discovery,
     Builtins,
     Memory,
+    Boxes,
     Goal,
     Session,
 }
@@ -162,13 +163,13 @@ impl InstructionSet {
                 }
                 continue;
             }
-            if source.key == "oc/goal" {
-                if let Some(pinned) = self.sources.get("oc/goal") {
+            if source.key == "oc/goal" || source.key == "oc/boxes" {
+                if let Some(pinned) = self.sources.get(&source.key) {
                     out.push(pinned.clone());
                 }
-                // When the epoch started without `oc/goal`, keep it out of the
-                // system prefix and deliver it via `epoch_supplement` so mid-session
-                // goal creation does not bust the prompt cache.
+                // When the epoch started without the source, keep it out of the
+                // system prefix and deliver it via `epoch_supplement` so a
+                // mid-session change does not bust the prompt cache.
                 continue;
             }
             out.push(source.clone());
@@ -179,10 +180,12 @@ impl InstructionSet {
         {
             out.push(pinned_memory.clone());
         }
-        if let Some(pinned_goal) = self.sources.get("oc/goal")
-            && !out.iter().any(|source| source.key == "oc/goal")
-        {
-            out.push(pinned_goal.clone());
+        for key in ["oc/boxes", "oc/goal"] {
+            if let Some(pinned) = self.sources.get(key)
+                && !out.iter().any(|source| source.key == key)
+            {
+                out.push(pinned.clone());
+            }
         }
         out.sort_by(|left, right| {
             (left.kind, left.key.as_str()).cmp(&(right.kind, right.key.as_str()))
@@ -261,13 +264,15 @@ impl InstructionSet {
                 ));
             }
         }
-        if let Some(candidate_goal) = next.iter().find(|source| source.key == "oc/goal") {
-            let changed = self
-                .sources
-                .get("oc/goal")
-                .is_none_or(|pinned| pinned.text != candidate_goal.text);
-            if changed {
-                blocks.push(candidate_goal.text.trim().to_owned());
+        for key in ["oc/boxes", "oc/goal"] {
+            if let Some(candidate) = next.iter().find(|source| source.key == key) {
+                let changed = self
+                    .sources
+                    .get(key)
+                    .is_none_or(|pinned| pinned.text != candidate.text);
+                if changed {
+                    blocks.push(candidate.text.trim().to_owned());
+                }
             }
         }
         if blocks.is_empty() {

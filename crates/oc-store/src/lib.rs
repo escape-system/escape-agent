@@ -42,6 +42,7 @@
 //! [`Store::open`] shows the file-backed variant.
 
 mod agentic;
+mod boxes;
 mod credentials;
 mod cursor;
 mod db;
@@ -63,6 +64,7 @@ mod snapshot;
 mod worktrees;
 
 pub use agentic::{GoalPatch, NewGoal, NewObservation, NewRepair, SessionNodeRow};
+pub use boxes::{BOX_KINDS, BoxPage, BoxQuery, MAX_BOX_CHARS, MAX_BOX_KEY_CHARS, NewBox};
 pub use credentials::{CredentialPatch, NewCredential};
 pub use cursor::{Cursor, Order};
 pub use db::Store;

@@ -7,6 +7,8 @@
 mod actor_death;
 #[path = "runtime/actor_error_terminal.rs"]
 mod actor_error_terminal;
+#[path = "runtime/context_boxes.rs"]
+mod context_boxes;
 #[path = "runtime/instruction_scope.rs"]
 mod instruction_scope;
 #[path = "runtime/memory.rs"]

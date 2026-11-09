@@ -26,20 +26,66 @@ with these headings:\n\
 ## Relevant Files\n\
 ## Important Context\n";
 
-/// Default compaction settings (upstream).
+/// Default compaction settings.
+///
+/// `auto` is **false**: threshold compaction runs only when the document opts
+/// in. Manual `compaction` inbox rows, the `compact_context` tool and provider
+/// overflow recovery remain available regardless.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CompactionConfig {
     pub auto: bool,
     pub keep_tokens: u64,
     pub buffer: u64,
+    /// Optional ceiling override. It may only lower the computed ceiling
+    /// (`context_window − max(15%, 16k)`), never raise it.
+    pub ceiling_tokens: Option<u64>,
 }
 
 impl Default for CompactionConfig {
     fn default() -> Self {
         Self {
-            auto: true,
+            auto: false,
             keep_tokens: 15_000,
             buffer: 0,
+            ceiling_tokens: None,
+        }
+    }
+}
+
+impl CompactionConfig {
+    /// Read `compaction` from the merged config document.
+    ///
+    /// Unknown or invalid values fall back to the default: the normalizer
+    /// already rejected them at load time, so this only guards against a
+    /// hand-edited `merged()` value.
+    #[must_use]
+    pub fn from_merged(merged: &serde_json::Value) -> Self {
+        let default = Self::default();
+        let Some(object) = merged
+            .get("compaction")
+            .and_then(serde_json::Value::as_object)
+        else {
+            return default;
+        };
+        Self {
+            auto: object
+                .get("auto")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(default.auto),
+            keep_tokens: object
+                .get("keep")
+                .and_then(serde_json::Value::as_object)
+                .and_then(|keep| keep.get("tokens"))
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(default.keep_tokens),
+            buffer: object
+                .get("buffer")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(default.buffer),
+            ceiling_tokens: object
+                .get("ceiling_tokens")
+                .and_then(serde_json::Value::as_u64)
+                .filter(|tokens| *tokens > 0),
         }
     }
 }
