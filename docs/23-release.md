@@ -47,7 +47,7 @@ replaces the release (`gh release delete --yes` then create).
 ## The version-must-match rule
 
 The tag must equal `[workspace.package] version` in `Cargo.toml` (currently
-`0.2.0`) exactly, minus the leading `v`. The workflow fails before building if
+`0.3.0`) exactly, minus the leading `v`. The workflow fails before building if
 they differ:
 
 ```

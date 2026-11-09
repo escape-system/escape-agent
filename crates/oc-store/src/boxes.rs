@@ -7,7 +7,8 @@
 
 use std::collections::BTreeSet;
 
-use rusqlite::{Connection, OptionalExtension, Row, params};
+use rusqlite::types::Value as SqlValue;
+use rusqlite::{Connection, OptionalExtension, Row, params, params_from_iter};
 use serde_json::{Map, Value, json};
 
 use crate::db::{Store, in_tx, now_ms};
@@ -26,6 +27,11 @@ pub const MAX_BOX_KEY_CHARS: usize = 64;
 
 const LIST_DEFAULT: usize = 100;
 const LIST_CAP: usize = 200;
+
+/// Owner ids bound into one `IN (...)` list. SQLite's default host-parameter
+/// limit is 999; 500 leaves headroom for the fixed parameters and keeps the
+/// statement small.
+const OWNER_CHUNK: usize = 500;
 
 pub(crate) const BOX_COLUMNS: &str = "id, root_id, owner_session, key, title, description, kind, \
 tags, content, revision, time_created, time_updated, time_expired";
@@ -289,17 +295,77 @@ impl Store {
     ///
     /// Returns the number of boxes expired. Stable boxes are never touched;
     /// an already expired row keeps its first expiry time.
+    ///
+    /// This is the whole-tree form of [`Self::expire_temporary_boxes_for`]; it
+    /// expires rows regardless of which session of the tree wrote them.
     pub async fn expire_temporary_boxes(&self, root_id: &str) -> Result<usize, StoreError> {
-        let root_id = root_id.to_owned();
+        self.expire_temporary_boxes_scoped(root_id.to_owned(), None)
+            .await
+    }
+
+    /// Expires the live `temporary` boxes of `root_id` written by `owners`.
+    ///
+    /// A compaction is scoped to the compacting session and its descendants,
+    /// so a sibling subtree's temporary boxes must survive it (R3). An empty
+    /// `owners` expires nothing: the caller asked for a subtree, and an empty
+    /// subtree is not the whole tree.
+    ///
+    /// Owner ids are bound in chunks of [`OWNER_CHUNK`] to stay under SQLite's
+    /// host-parameter limit. All chunks run in one transaction, so the expiry
+    /// is atomic and idempotent: rows already expired keep their first
+    /// `time_expired`.
+    pub async fn expire_temporary_boxes_for(
+        &self,
+        root_id: &str,
+        owners: &[String],
+    ) -> Result<usize, StoreError> {
+        let owners: Vec<String> = owners
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        if owners.is_empty() {
+            return Ok(0);
+        }
+        self.expire_temporary_boxes_scoped(root_id.to_owned(), Some(owners))
+            .await
+    }
+
+    /// Shared expiry write. `None` owners means the whole tree; `Some` means
+    /// only rows whose `owner_session` is in that non-empty list.
+    async fn expire_temporary_boxes_scoped(
+        &self,
+        root_id: String,
+        owners: Option<Vec<String>>,
+    ) -> Result<usize, StoreError> {
         let time = now_ms();
         self.write(move |connection| {
             in_tx(connection, |transaction| {
-                let changed = transaction.execute(
-                    "UPDATE context_box SET time_expired = ?2, time_updated = ?2
-                     WHERE root_id = ?1 AND kind = 'temporary' AND deleted = 0
-                       AND time_expired IS NULL",
-                    params![&root_id, time],
-                )?;
+                let Some(owners) = owners else {
+                    let changed = transaction.execute(
+                        "UPDATE context_box SET time_expired = ?2, time_updated = ?2
+                         WHERE root_id = ?1 AND kind = 'temporary' AND deleted = 0
+                           AND time_expired IS NULL",
+                        params![&root_id, time],
+                    )?;
+                    return Ok(changed);
+                };
+                let mut changed = 0usize;
+                for chunk in owners.chunks(OWNER_CHUNK) {
+                    let placeholders = vec!["?"; chunk.len()].join(", ");
+                    let sql = format!(
+                        "UPDATE context_box SET time_expired = ?2, time_updated = ?2
+                         WHERE root_id = ?1 AND kind = 'temporary' AND deleted = 0
+                           AND time_expired IS NULL
+                           AND owner_session IN ({placeholders})"
+                    );
+                    let mut values: Vec<SqlValue> = Vec::with_capacity(chunk.len() + 2);
+                    values.push(SqlValue::Text(root_id.clone()));
+                    values.push(SqlValue::Integer(time));
+                    values.extend(chunk.iter().map(|owner| SqlValue::Text(owner.clone())));
+                    changed += transaction.execute(&sql, params_from_iter(values.iter()))?;
+                }
                 Ok(changed)
             })
         })

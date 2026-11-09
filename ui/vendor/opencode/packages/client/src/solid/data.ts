@@ -319,6 +319,38 @@ export function createData(config: CreateDataInput) {
     setStore("session", "active", sessionID, status)
   }
 
+  // Session IDs the user asked to stop before any execution boundary confirmed it. `status` reports them as idle so
+  // the stop reads as immediate; a lost interrupt request must not leave the session looking busy. The next
+  // execution boundary (started or terminal) clears the mark, since the server then owns the state again.
+  const [stopRequests, setStopRequests] = createSignal<ReadonlySet<string>>(new Set())
+
+  function markStopRequested(ids: string[]) {
+    if (ids.length === 0) return
+    setStopRequests((current) => {
+      const next = new Set(current)
+      let changed = false
+      for (const id of ids) {
+        if (next.has(id)) continue
+        next.add(id)
+        changed = true
+      }
+      return changed ? next : current
+    })
+  }
+
+  function clearStopRequested(id: string) {
+    setStopRequests((current) => {
+      if (!current.has(id)) return current
+      const next = new Set(current)
+      next.delete(id)
+      return next
+    })
+  }
+
+  function hasStopRequest(id: string) {
+    return stopRequests().has(id)
+  }
+
   function removePending(sessionID: string, inboxID?: string) {
     if (!inboxID) return
     pendingUpdates.get(sessionID)?.set(inboxID, undefined)
@@ -1111,6 +1143,8 @@ export function createData(config: CreateDataInput) {
         })
         return
       case "session.execution.started":
+        // The server owns the state again: a requested stop that this execution outlived no longer applies.
+        clearStopRequested(event.data.sessionID)
         setSessionActive(event.data.sessionID, "running")
         // Revalidate so `time.busy` follows the projected execution start.
         if (!store.session.info[event.data.sessionID] && !sync.has(`session:${event.data.sessionID}`)) {
@@ -1135,6 +1169,8 @@ export function createData(config: CreateDataInput) {
       case "session.execution.succeeded":
       case "session.execution.failed":
       case "session.execution.interrupted":
+        // A terminal boundary settles any pending stop request, whichever side confirmed it.
+        clearStopRequested(event.data.sessionID)
         setSessionActive(event.data.sessionID, "idle")
         message.update(event.data.sessionID, (draft) => {
           const currentAssistant = message.activeAssistant(draft)
@@ -1505,12 +1541,23 @@ export function createData(config: CreateDataInput) {
         )
       },
       status(sessionID: string) {
+        // A pending stop reads as idle even if the projected state still says running: the click is what the user saw.
+        if (hasStopRequest(sessionID)) return "idle"
         return store.session.active[sessionID] ?? "idle"
       },
       active() {
         return Object.entries(store.session.active).flatMap(([sessionID, status]) =>
-          status === "running" ? [sessionID] : [],
+          status === "running" && !hasStopRequest(sessionID) ? [sessionID] : [],
         )
+      },
+      requestStop(ids: string[]) {
+        markStopRequested(ids)
+      },
+      releaseStop(sessionID: string) {
+        clearStopRequested(sessionID)
+      },
+      isStopRequested(sessionID: string) {
+        return hasStopRequest(sessionID)
       },
       // Inputs are the pending user and synthetic items; compactions are control items.
       input: {

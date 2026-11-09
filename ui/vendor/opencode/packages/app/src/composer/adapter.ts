@@ -85,6 +85,10 @@ export type ComposerSession = {
     session: {
       prompt: (input: Parameters<Data["session"]["prompt"]>[0]) => ReturnType<Data["session"]["prompt"]>
       setStatus: Data["session"]["setStatus"]
+      // Durable stop intent: the store reports a requested stop as idle until an execution boundary settles it, so a
+      // lagging event or a racing status write cannot make a stopped session look busy again.
+      requestStop: Data["session"]["requestStop"]
+      releaseStop: Data["session"]["releaseStop"]
     }
   }
   current: Accessor<

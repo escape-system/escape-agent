@@ -569,3 +569,135 @@ async fn max_depth_refuses_the_next_spawn_without_creating_a_session() {
         "the failed spawn is reported back to the root as a tool result"
     );
 }
+
+/// A background spawn is "enqueue the child prompt, then notify the child".
+/// When a stop lands in between, the queued prompt must be withdrawn with the
+/// tree; before the withdrawal existed `interrupt` returned `false` here and
+/// the child later ran the prompt anyway.
+#[tokio::test]
+async fn interrupt_before_a_background_child_starts_withdraws_its_prompt() {
+    // Deterministic: queue a child prompt WITHOUT waking the child actor, then
+    // interrupt the root. Withdrawing undelivered rows must prevent the child
+    // from ever starting a turn.
+    let harness = Harness::new(vec![], nested_config(3)).await;
+    let child = background_child(&harness).await;
+
+    let inbox_id = MessageId::new().into_inner();
+    harness
+        .store
+        .enqueue(NewInbox {
+            id: inbox_id.clone(),
+            session_id: child.clone(),
+            kind: "user".to_owned(),
+            payload: json!({
+                "text": "CHILD_WORK",
+                "time": {"created": oc_types::now_millis()},
+            }),
+            delivery: Delivery::Steer,
+        })
+        .await
+        .expect("child prompt queued");
+
+    // Prove the stop has something to withdraw before asserting it withdrew it.
+    let queued = harness.store.list_inbox(&child).await.expect("child inbox");
+    assert_eq!(queued.len(), 1, "the child prompt is queued: {queued:?}");
+    assert_eq!(queued[0]["type"], "user");
+    assert_eq!(queued[0]["id"], inbox_id.as_str());
+
+    let interrupted = harness
+        .runtime
+        .interrupt(&harness.session)
+        .await
+        .expect("interrupt the root");
+    assert!(
+        interrupted,
+        "withdrawing the child's queued prompt is a stop, even though neither actor is live"
+    );
+
+    let remaining = harness.store.list_inbox(&child).await.expect("child inbox");
+    assert!(
+        !remaining.iter().any(|item| item["type"] == "user"),
+        "the child's undelivered prompt is withdrawn: {remaining:?}"
+    );
+
+    // `Harness` keeps its sink private, but `SessionExecutionStarted` is durable,
+    // so the store's event log is the same evidence the sink would show.
+    let events = harness
+        .store
+        .events_after(&child, 0, 200)
+        .await
+        .expect("child events");
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.kind == "session.execution.started"),
+        "a withdrawn prompt never starts an execution: {:?}",
+        events
+            .iter()
+            .map(|event| event.kind.as_str())
+            .collect::<Vec<_>>()
+    );
+
+    let node = harness
+        .store
+        .session_node(&child)
+        .await
+        .expect("child node")
+        .expect("child exists");
+    assert_eq!(node.status, "idle", "the child never became busy");
+
+    assert!(
+        harness.model.requests().is_empty(),
+        "no provider call was made for the withdrawn prompt"
+    );
+    harness
+        .runtime
+        .wait_idle(&child, Duration::from_secs(2))
+        .await
+        .expect("the child has no queued work and no running execution");
+}
+
+/// Creates the depth-1 `general` child without notifying it.
+///
+/// `create_child` lives in `tests/runtime/support.rs`, which is compiled only
+/// into the `runtime` binary and brings its own `Harness`/`Script` types; this
+/// file owns its own, so the same two store calls are repeated here.
+async fn background_child(harness: &Harness) -> String {
+    let root = harness
+        .store
+        .get_session(&harness.session)
+        .await
+        .expect("root session")
+        .expect("root exists");
+    let directory = root["location"]["directory"]
+        .as_str()
+        .expect("root directory")
+        .to_owned();
+    let project_id = root["projectID"].as_str().expect("root project").to_owned();
+    let child = "ses_child".to_owned();
+    harness
+        .store
+        .create_session_with_tree(
+            NewSession {
+                id: child.clone(),
+                parent_id: Some(harness.session.clone()),
+                project_id,
+                directory,
+                title: Some("background child".to_owned()),
+                agent: Some("general".to_owned()),
+                model: Some(json!({"providerID": "test", "id": "alpha"})),
+                metadata: None,
+                permissions: None,
+                time_created: oc_types::now_millis(),
+            },
+            NewSessionTree {
+                root_id: harness.session.clone(),
+                depth: 1,
+                role: "subagent".to_owned(),
+                spawn_allowed: true,
+            },
+        )
+        .await
+        .expect("child session");
+    child
+}

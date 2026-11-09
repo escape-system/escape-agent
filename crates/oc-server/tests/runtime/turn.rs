@@ -5,7 +5,7 @@ use oc_llm::LlmEvent;
 use serde_json::{Value, json};
 
 use crate::support::{
-    Harness, Script, assistants, call, expectation, text_script, tool_script, tool_states,
+    Harness, SESSION, Script, assistants, call, expectation, text_script, tool_script, tool_states,
     wait_for_permission, wait_until_active,
 };
 
@@ -322,6 +322,156 @@ async fn a_user_stop_does_not_restart_the_session() {
         .expect("session node")
         .expect("session row");
     assert_eq!(node.idle_reason.as_deref(), Some("user"));
+
+    harness.runtime.expect("runtime").shutdown().await;
+}
+
+/// A user stop is terminal for the *wired* observer too: the engine is
+/// attached exactly as in production (real goal store, repair channel and bus
+/// notifier) and the judge is scripted to `repost` the stopped session. The
+/// forced check (`POST /observer/check`) bypasses wake conditions, so only the
+/// engine's user-stop guard can keep the judge from being called.
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // One scenario: stop, then assert the observer never judged.
+async fn a_user_stop_is_terminal_for_the_wired_observer() {
+    let repost = format!(
+        r#"{{"action":"repair","target":"{SESSION}","reason":"the session looks stalled",
+            "repair":{{"kind":"repost","args":{{"text":"continue"}}}}}}"#
+    );
+    let harness = Harness::new_with_observer(
+        vec![Script::HangAfter(vec![LlmEvent::StepStart])],
+        None,
+        vec![repost],
+    )
+    .await;
+    let judge = harness
+        .observer_model
+        .as_ref()
+        .expect("observer model is wired");
+
+    // The audit route sees the attached engine, so this test cannot pass by
+    // silently running without an observer.
+    let (status, body) = call(
+        &harness.app,
+        Method::GET,
+        &format!("/api/experimental/observer?sessionID={}", harness.session),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body.expect("audit")["data"]["enabled"], json!(true));
+
+    let (status, _) = harness.prompt("hang").await;
+    assert_eq!(status, StatusCode::OK);
+    wait_until_active(&harness).await;
+    // The interrupt route only marks an existing assistant row as aborted; wait
+    // for the hanging step to have created it.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while assistants(&harness.messages().await).is_empty() {
+        assert!(
+            Instant::now() < deadline,
+            "hanging step never created an assistant message"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let (status, body) = call(
+        &harness.app,
+        Method::POST,
+        &format!("/api/session/{}/interrupt", harness.session),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body.unwrap(), json!({ "interrupted": true }));
+    let (status, body) = harness.wait().await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body:?}");
+
+    // A user stop is durable before the observer can see it.
+    let node = harness
+        .store
+        .session_node(&harness.session)
+        .await
+        .expect("session node")
+        .expect("session row");
+    assert_eq!(node.status, "interrupted");
+    assert_eq!(node.idle_reason.as_deref(), Some("user"));
+
+    let calls_at_stop = judge.calls();
+    let starts_at_stop = execution_started_events(&harness).await;
+    let messages_at_stop = harness.messages().await;
+
+    // Force one engine run. The route answers 204 only after `check_now` ran;
+    // 503 would mean the runtime had no observer binding.
+    let (status, body) = call(
+        &harness.app,
+        Method::POST,
+        "/api/experimental/observer/check",
+        Some(json!({ "sessionID": harness.session })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body:?}");
+
+    // A repost verdict would be applied asynchronously (repair worker →
+    // synthetic inbox row → new execution), so give it a deterministic window.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    assert_eq!(
+        judge.calls(),
+        calls_at_stop,
+        "the judge must not be called for a user-stopped root"
+    );
+    assert_eq!(judge.calls(), 0, "no observer evaluation may run at all");
+
+    let starts_after = execution_started_events(&harness).await;
+    assert_eq!(
+        starts_after, starts_at_stop,
+        "the observer must not start another execution after a user stop"
+    );
+
+    let (_, active) = call(&harness.app, Method::GET, "/api/session/active", None).await;
+    assert_eq!(
+        active.expect("active body")["data"],
+        json!({}),
+        "a stopped session must not stay or become active"
+    );
+
+    let after = harness.messages().await;
+    let after_types: Vec<String> = after
+        .iter()
+        .map(|message| message["type"].as_str().unwrap_or("?").to_owned())
+        .collect();
+    let before_ids: Vec<&str> = messages_at_stop
+        .iter()
+        .filter_map(|message| message["id"].as_str())
+        .collect();
+    let appended: Vec<&Value> = after
+        .iter()
+        .filter(|message| match message["id"].as_str() {
+            Some(id) => !before_ids.contains(&id),
+            None => true,
+        })
+        .collect();
+    assert!(
+        appended.is_empty(),
+        "a forced observer check after a user stop must append nothing; \
+         appended = {appended:?} after = {after_types:?}"
+    );
+    assert!(
+        !after
+            .iter()
+            .any(|message| matches!(message["type"].as_str(), Some("synthetic" | "observer"))),
+        "a user stop must not append a synthetic or observer row; after = {after_types:?}"
+    );
+    assert!(
+        harness
+            .store
+            .list_repairs(&harness.session, 20)
+            .await
+            .expect("repairs")
+            .is_empty(),
+        "no observer repair may be recorded for a user-stopped root"
+    );
 
     harness.runtime.expect("runtime").shutdown().await;
 }

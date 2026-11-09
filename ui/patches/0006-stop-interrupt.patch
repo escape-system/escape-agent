@@ -1,7 +1,22 @@
-diff --git a/packages/app/src/composer/model.ts b/packages/app/src/composer/model.ts
+diff --git a/ui/vendor/opencode/packages/app/src/composer/adapter.ts b/ui/vendor/opencode/packages/app/src/composer/adapter.ts
+index 0b9fc5a..220d2df 100644
+--- a/ui/vendor/opencode/packages/app/src/composer/adapter.ts
++++ b/ui/vendor/opencode/packages/app/src/composer/adapter.ts
+@@ -85,6 +85,10 @@ export type ComposerSession = {
+     session: {
+       prompt: (input: Parameters<Data["session"]["prompt"]>[0]) => ReturnType<Data["session"]["prompt"]>
+       setStatus: Data["session"]["setStatus"]
++      // Durable stop intent: the store reports a requested stop as idle until an execution boundary settles it, so a
++      // lagging event or a racing status write cannot make a stopped session look busy again.
++      requestStop: Data["session"]["requestStop"]
++      releaseStop: Data["session"]["releaseStop"]
+     }
+   }
+   current: Accessor<
+diff --git a/ui/vendor/opencode/packages/app/src/composer/model.ts b/ui/vendor/opencode/packages/app/src/composer/model.ts
 index 2350812..e29583d 100644
---- a/packages/app/src/composer/model.ts
-+++ b/packages/app/src/composer/model.ts
+--- a/ui/vendor/opencode/packages/app/src/composer/model.ts
++++ b/ui/vendor/opencode/packages/app/src/composer/model.ts
 @@ -116,7 +116,7 @@ export function createComposerModel(adapter: ComposerAdapter, options?: { queue?
      return text.trim().length === 0 && attachments().length === 0 && commentCount() === 0
    })
@@ -11,10 +26,10 @@ index 2350812..e29583d 100644
  
    const placeholder = () => {
      if (mode() === "shell") return language.t("prompt.placeholder.shell", { example: "git status" })
-diff --git a/packages/app/src/composer/submit.test.ts b/packages/app/src/composer/submit.test.ts
-index 0d0caa0..e0acfd2 100644
---- a/packages/app/src/composer/submit.test.ts
-+++ b/packages/app/src/composer/submit.test.ts
+diff --git a/ui/vendor/opencode/packages/app/src/composer/submit.test.ts b/ui/vendor/opencode/packages/app/src/composer/submit.test.ts
+index 0d0caa0..e6857ed 100644
+--- a/ui/vendor/opencode/packages/app/src/composer/submit.test.ts
++++ b/ui/vendor/opencode/packages/app/src/composer/submit.test.ts
 @@ -55,7 +55,12 @@ function controls(): ComposerControls {
    }
  }
@@ -37,7 +52,60 @@ index 0d0caa0..e0acfd2 100644
    }
  }
  
-@@ -870,4 +876,135 @@ describe("Composer submission", () => {
+@@ -119,8 +125,26 @@ function session(input: {
+   switchModel?: ComposerSession["api"]["switchModel"]
+   background?: ComposerSession["background"]
+ }): ComposerSession {
++  const id = "session-1"
++  // Mirrors the data layer: `status` reports idle while a stop is requested, whatever the projected state says, and
++  // records only real transitions so a stray running write behind a stop is invisible.
++  const stopRequested = new Set<string>()
++  const projected = new Map<string, "idle" | "running">()
++  const reported = new Map<string, "idle" | "running">()
++
++  const status = (sessionID: string): "idle" | "running" =>
++    stopRequested.has(sessionID) ? "idle" : (projected.get(sessionID) ?? "idle")
++
++  const publish = (sessionID: string) => {
++    const next = status(sessionID)
++
++    if (reported.get(sessionID) === next) return
++    reported.set(sessionID, next)
++    input.statuses?.push(next)
++  }
++
+   return {
+-    id: "session-1",
++    id,
+     background: input.background,
+     directory: "C:/repo",
+     handoff: input.handoff ?? { set() {}, clear() {} },
+@@ -152,7 +176,23 @@ function session(input: {
+     data: {
+       location: { command: { list: () => [] } },
+       session: {
+-        setStatus: (_sessionID, status) => input.statuses?.push(status),
++        setStatus: (sessionID, next) => {
++          projected.set(sessionID, next)
++          publish(sessionID)
++        },
++        requestStop: (ids) => {
++          for (const sessionID of ids) {
++            if (stopRequested.has(sessionID)) continue
++            stopRequested.add(sessionID)
++            input.calls.push(`stop:${sessionID}`)
++            publish(sessionID)
++          }
++        },
++        releaseStop: (sessionID) => {
++          if (!stopRequested.delete(sessionID)) return
++          input.calls.push(`release:${sessionID}`)
++          publish(sessionID)
++        },
+         // Like the data layer: admit locally, prepare, then send.
+         prompt: async (value) => {
+           input.calls.push("admit")
+@@ -870,4 +910,181 @@ describe("Composer submission", () => {
      expect(calls).toEqual([])
      expect(state.current().some((part) => part.type === "image")).toBe(true)
    })
@@ -171,12 +239,58 @@ index 0d0caa0..e0acfd2 100644
 +      // The stop is terminal: the admission is not retried, so only one turn could ever have started.
 +      expect(calls.filter((call) => call === "admit")).toHaveLength(1)
 +    })
++
++    test("a stop request survives a stray running event", async () => {
++      const calls: string[] = []
++      const statuses: ("idle" | "running")[] = []
++      const first = Promise.withResolvers<void>()
++      const target = session({ calls, statuses })
++      const submission = submitInput(
++        active(createMemoryComposerState().capture(), target, controls, {
++          working: () => true,
++          interrupt: () => first.promise,
++        }),
++      )
++
++      const stopped = submission.stop()
++      // The interrupt is still in flight, so a lifecycle event that still reports the old execution must not make the
++      // session look busy again: the stop is durable, not a one-shot optimistic write.
++      target.data.session.setStatus(target.id, "running")
++
++      expect(statuses).toEqual(["idle"])
++
++      first.resolve()
++      await stopped
++      expect(statuses).toEqual(["idle"])
++      // `submit` must not re-assert running behind the stop either.
++      expect(calls.filter((call) => call === "send")).toEqual([])
++    })
++
++    test("a terminal event clears the stop request", async () => {
++      const calls: string[] = []
++      const statuses: ("idle" | "running")[] = []
++      const target = session({ calls, statuses })
++      const submission = submitInput(
++        active(createMemoryComposerState().capture(), target, controls, { working: () => true }),
++      )
++
++      await submission.stop()
++      expect(calls).toEqual(["stop:session-1"])
++      expect(statuses).toEqual(["idle"])
++
++      // The store clears the mark on every execution boundary, so the next turn's running state is reported again.
++      target.data.session.releaseStop(target.id)
++      target.data.session.setStatus(target.id, "running")
++
++      expect(calls).toEqual(["stop:session-1", "release:session-1"])
++      expect(statuses).toEqual(["idle", "running"])
++    })
 +  })
  })
-diff --git a/packages/app/src/composer/submit.ts b/packages/app/src/composer/submit.ts
-index 05398ad..4297c18 100644
---- a/packages/app/src/composer/submit.ts
-+++ b/packages/app/src/composer/submit.ts
+diff --git a/ui/vendor/opencode/packages/app/src/composer/submit.ts b/ui/vendor/opencode/packages/app/src/composer/submit.ts
+index 05398ad..5643c28 100644
+--- a/ui/vendor/opencode/packages/app/src/composer/submit.ts
++++ b/ui/vendor/opencode/packages/app/src/composer/submit.ts
 @@ -13,12 +13,36 @@ import { blobDataUrl, resolveBlobUrl } from "@/runtime/persistence/drafts"
  import { isAttachment } from "./prompt-parts"
  import type { ModelSelection } from "@/providers/models/selection"
@@ -214,7 +328,7 @@ index 05398ad..4297c18 100644
  type ComposerSubmission = {
    id: SessionMessage.ID
    mode: "normal" | "shell"
-@@ -244,11 +268,51 @@ export function createComposerSubmit(input: ComposerSubmitInput) {
+@@ -244,11 +268,56 @@ export function createComposerSubmit(input: ComposerSubmitInput) {
        // Stopping a held send cancels it and leaves the prompt in the composer.
        if (held()) return Promise.resolve(void setHeld(false))
  
@@ -229,11 +343,12 @@ index 05398ad..4297c18 100644
 +      // Any admission retry that straddles this stop belongs to a turn the user cancelled.
 +      state.generation += 1
 +
-+      // Clear the run now so the stop reads as immediate, following the send path's optimistic status write; a
-+      // rejected request puts it back.
++      // Clear the run now so the stop reads as immediate, following the send path's optimistic status write. The store
++      // keeps the request durable: every status read reports idle until an execution boundary settles it, so a lagging
++      // running event cannot make the session look busy again. A rejected request releases it and puts the state back.
 +      const wasRunning = input.adapter.working()
 +
-+      if (wasRunning) session.data.session.setStatus(session.id, "idle")
++      if (wasRunning) session.data.session.requestStop([session.id])
 +
 +      return Promise.resolve()
 +        .then(() => input.adapter.interrupt())
@@ -241,7 +356,11 @@ index 05398ad..4297c18 100644
 +          // A fulfilled request means the run is stopped, including when the server had nothing live to interrupt.
 +          () => undefined,
 +          (error) => {
-+            if (wasRunning) session.data.session.setStatus(session.id, "running")
++            if (wasRunning) {
++              // The run is still live: drop the durable stop mark and put the projected state back.
++              session.data.session.releaseStop(session.id)
++              session.data.session.setStatus(session.id, "running")
++            }
 +            input.notify.failed("prompt", stopFailure(error))
 +          },
 +        )
@@ -267,7 +386,7 @@ index 05398ad..4297c18 100644
  function clearClientCommand(input: ComposerSubmitInput, prompt: Prompt) {
    input.adapter.state.set([{ type: "text", content: "", start: 0, end: 0 }, ...prompt.filter(isAttachment)], 0)
    input.adapter.state.mode.set("normal")
-@@ -624,7 +688,14 @@ async function sendPrompt(
+@@ -624,7 +693,14 @@ async function sendPrompt(
      prepare: staged ? undefined : () => (committed ??= commit()),
    }
  
@@ -283,11 +402,38 @@ index 05398ad..4297c18 100644
  }
  
  async function buildSubmissionRequest(session: ComposerSession, value: ComposerSubmission) {
-diff --git a/packages/app/src/session/composer/adapter.ts b/packages/app/src/session/composer/adapter.ts
-index 15fc9a5..6740e5b 100644
---- a/packages/app/src/session/composer/adapter.ts
-+++ b/packages/app/src/session/composer/adapter.ts
-@@ -41,11 +41,9 @@ export function createActiveComposerAdapter(input: {
+diff --git a/ui/vendor/opencode/packages/app/src/new-session/composer-adapter.ts b/ui/vendor/opencode/packages/app/src/new-session/composer-adapter.ts
+index e0aa500..b1ecb63 100644
+--- a/ui/vendor/opencode/packages/app/src/new-session/composer-adapter.ts
++++ b/ui/vendor/opencode/packages/app/src/new-session/composer-adapter.ts
+@@ -172,6 +172,8 @@ export function createNewSessionComposerAdapter(props: {
+             location: data.location,
+             session: {
+               setStatus: data.session.setStatus,
++              requestStop: data.session.requestStop,
++              releaseStop: data.session.releaseStop,
+               prompt: (input) =>
+                 data.session.prompt({
+                   ...input,
+diff --git a/ui/vendor/opencode/packages/app/src/session/composer/adapter.ts b/ui/vendor/opencode/packages/app/src/session/composer/adapter.ts
+index 15fc9a5..4e7a92a 100644
+--- a/ui/vendor/opencode/packages/app/src/session/composer/adapter.ts
++++ b/ui/vendor/opencode/packages/app/src/session/composer/adapter.ts
+@@ -36,16 +36,22 @@ export function createActiveComposerAdapter(input: {
+       directory: location().directory,
+       handoff: createSessionMessageHandoff(input.sessionKey(), id, server.event),
+       api: server.api.session,
+-      data,
++      data: {
++        location: data.location,
++        session: {
++          prompt: data.session.prompt,
++          setStatus: data.session.setStatus,
++          requestStop: data.session.requestStop,
++          releaseStop: data.session.releaseStop,
++        },
++      },
+       current: () => data.session.get(id),
        admitted: (messageID) => data.session.input.has(id, messageID) || !!data.session.message.get(id, messageID),
        background: input.background,
      }),
@@ -302,3 +448,208 @@ index 15fc9a5..6740e5b 100644
    }
  
    return adapter
+diff --git a/ui/vendor/opencode/packages/client/src/solid/data.ts b/ui/vendor/opencode/packages/client/src/solid/data.ts
+index 95845ab..4b35625 100644
+--- a/ui/vendor/opencode/packages/client/src/solid/data.ts
++++ b/ui/vendor/opencode/packages/client/src/solid/data.ts
+@@ -319,6 +319,38 @@ export function createData(config: CreateDataInput) {
+     setStore("session", "active", sessionID, status)
+   }
+ 
++  // Session IDs the user asked to stop before any execution boundary confirmed it. `status` reports them as idle so
++  // the stop reads as immediate; a lost interrupt request must not leave the session looking busy. The next
++  // execution boundary (started or terminal) clears the mark, since the server then owns the state again.
++  const [stopRequests, setStopRequests] = createSignal<ReadonlySet<string>>(new Set())
++
++  function markStopRequested(ids: string[]) {
++    if (ids.length === 0) return
++    setStopRequests((current) => {
++      const next = new Set(current)
++      let changed = false
++      for (const id of ids) {
++        if (next.has(id)) continue
++        next.add(id)
++        changed = true
++      }
++      return changed ? next : current
++    })
++  }
++
++  function clearStopRequested(id: string) {
++    setStopRequests((current) => {
++      if (!current.has(id)) return current
++      const next = new Set(current)
++      next.delete(id)
++      return next
++    })
++  }
++
++  function hasStopRequest(id: string) {
++    return stopRequests().has(id)
++  }
++
+   function removePending(sessionID: string, inboxID?: string) {
+     if (!inboxID) return
+     pendingUpdates.get(sessionID)?.set(inboxID, undefined)
+@@ -1111,6 +1143,8 @@ export function createData(config: CreateDataInput) {
+         })
+         return
+       case "session.execution.started":
++        // The server owns the state again: a requested stop that this execution outlived no longer applies.
++        clearStopRequested(event.data.sessionID)
+         setSessionActive(event.data.sessionID, "running")
+         // Revalidate so `time.busy` follows the projected execution start.
+         if (!store.session.info[event.data.sessionID] && !sync.has(`session:${event.data.sessionID}`)) {
+@@ -1135,6 +1169,8 @@ export function createData(config: CreateDataInput) {
+       case "session.execution.succeeded":
+       case "session.execution.failed":
+       case "session.execution.interrupted":
++        // A terminal boundary settles any pending stop request, whichever side confirmed it.
++        clearStopRequested(event.data.sessionID)
+         setSessionActive(event.data.sessionID, "idle")
+         message.update(event.data.sessionID, (draft) => {
+           const currentAssistant = message.activeAssistant(draft)
+@@ -1505,13 +1541,24 @@ export function createData(config: CreateDataInput) {
+         )
+       },
+       status(sessionID: string) {
++        // A pending stop reads as idle even if the projected state still says running: the click is what the user saw.
++        if (hasStopRequest(sessionID)) return "idle"
+         return store.session.active[sessionID] ?? "idle"
+       },
+       active() {
+         return Object.entries(store.session.active).flatMap(([sessionID, status]) =>
+-          status === "running" ? [sessionID] : [],
++          status === "running" && !hasStopRequest(sessionID) ? [sessionID] : [],
+         )
+       },
++      requestStop(ids: string[]) {
++        markStopRequested(ids)
++      },
++      releaseStop(sessionID: string) {
++        clearStopRequested(sessionID)
++      },
++      isStopRequested(sessionID: string) {
++        return hasStopRequest(sessionID)
++      },
+       // Inputs are the pending user and synthetic items; compactions are control items.
+       input: {
+         list(sessionID: string) {
+diff --git a/ui/vendor/opencode/packages/client/test/solid-stop-request.test.ts b/ui/vendor/opencode/packages/client/test/solid-stop-request.test.ts
+new file mode 100644
+index 0000000..617f7ff
+--- /dev/null
++++ b/ui/vendor/opencode/packages/client/test/solid-stop-request.test.ts
+@@ -0,0 +1,112 @@
++import { expect, test } from "bun:test"
++import { createRoot } from "solid-js"
++import { createData, type CreateDataInput } from "../src/solid"
++import { OpenCode, type OpenCodeEvent, type SessionInfo } from "../src/promise"
++
++const sessionID = "ses_stop"
++
++const info: SessionInfo = {
++  id: sessionID,
++  projectID: "project",
++  cost: 0,
++  tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
++  outcome: "succeeded",
++  time: { created: 0, updated: 0 },
++  location: { directory: "/project" },
++}
++
++function fixture() {
++  const listeners = new Set<Parameters<CreateDataInput["event"]["listen"]>[0]>()
++  const api = OpenCode.make({
++    baseUrl: "http://opencode.local",
++    fetch: async (input, init) => {
++      const request = input instanceof Request ? input : new Request(input, init)
++      if (new URL(request.url).pathname === `/api/session/${sessionID}`) return Response.json({ data: info })
++      return Response.json({ data: [] })
++    },
++  })
++  let seq = 0
++  return createRoot((dispose) => {
++    const data = createData({
++      api: () => api,
++      directory: "/project",
++      event: {
++        on: () => () => {},
++        listen(handler) {
++          listeners.add(handler)
++          return () => listeners.delete(handler)
++        },
++      },
++    })
++    const emit = (type: string, payload: Record<string, unknown> = {}) => {
++      seq++
++      const event = {
++        id: `evt_${seq}`,
++        type,
++        created: seq,
++        durable: { aggregateID: sessionID, seq, version: 1 },
++        data: { sessionID, ...payload },
++      } as OpenCodeEvent
++      listeners.forEach((listener) => listener({ name: event.type, details: event }))
++    }
++    return {
++      data,
++      dispose,
++      started: () => emit("session.execution.started"),
++      interrupted: () => emit("session.execution.interrupted", { reason: "user" }),
++    }
++  })
++}
++
++test("status is idle while a stop is requested", () => {
++  const setup = fixture()
++  try {
++    setup.data.session.remember(info)
++    setup.started()
++    expect(setup.data.session.status(sessionID)).toBe("running")
++    expect(setup.data.session.active()).toContain(sessionID)
++
++    setup.data.session.requestStop([sessionID])
++
++    expect(setup.data.session.status(sessionID)).toBe("idle")
++    expect(setup.data.session.active()).not.toContain(sessionID)
++  } finally {
++    setup.dispose()
++  }
++})
++
++test("a new execution start clears the stop request", () => {
++  const setup = fixture()
++  try {
++    setup.data.session.remember(info)
++    setup.started()
++    setup.data.session.requestStop([sessionID])
++    expect(setup.data.session.status(sessionID)).toBe("idle")
++    expect(setup.data.session.isStopRequested(sessionID)).toBe(true)
++
++    setup.started()
++
++    expect(setup.data.session.status(sessionID)).toBe("running")
++    expect(setup.data.session.isStopRequested(sessionID)).toBe(false)
++  } finally {
++    setup.dispose()
++  }
++})
++
++test("a terminal event clears the stop request", () => {
++  const setup = fixture()
++  try {
++    setup.data.session.remember(info)
++    setup.started()
++    setup.data.session.requestStop([sessionID])
++    expect(setup.data.session.status(sessionID)).toBe("idle")
++    expect(setup.data.session.isStopRequested(sessionID)).toBe(true)
++
++    setup.interrupted()
++
++    expect(setup.data.session.status(sessionID)).toBe("idle")
++    expect(setup.data.session.isStopRequested(sessionID)).toBe(false)
++  } finally {
++    setup.dispose()
++  }
++})

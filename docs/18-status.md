@@ -2,6 +2,17 @@
 
 This document provides the technical status, architectural verification logs, and active roadmap for the Escape Agent (`opencode-rust`) workspace.
 
+## v0.3.0
+
+- **Stop / background children** — prompts queued for a background spawn before the actor starts are withdrawn by `interrupt` (`interrupt_before_a_background_child_starts_withdraws_its_prompt`, `crates/oc-runtime/tests/nested_spawn.rs`).
+- **Durable UI stop state** — the client keeps a per-session stop request (`requestStop`/`isStopRequested`) that survives stray `session.execution` / running events and clears on execution start or a terminal event; new client tests in `packages/client/test/solid-stop-request.test.ts`; UI patch `0006-stop-interrupt.patch` regenerated.
+- **Content-free box tool metadata** — `box_list`/`box_write` return summaries only; `box_read` keeps the body in its tool output, so box bodies no longer ride into metadata or prompt context.
+- **Permission-filtered `box_list`** — rows are filtered per key through `box:read`, so a `secret*` deny hides both the rows and their count.
+- **Subtree-scoped temporary-box expiry** — compaction expires temporary boxes of the compacting subtree only, leaving sibling/child trees intact.
+- **Index truncation notice** — the prompt index reports truncation instead of silently dropping rows; empty box bodies are rejected.
+- **Observer in the server harness** — `crates/oc-server/tests/runtime` wires the real observer engine and proves a user-stopped session is never re-raised (16/16).
+- **Windows** — the workspace builds for `x86_64-pc-windows-gnu` (ConPTY/shell/config already cfg-gated); the release ships a Windows artefact.
+
 ## Snapshot
 
 **CI Gates are green.** `cargo fmt --all --check` and `cargo clippy --workspace --all-targets -- -D warnings` pass cleanly. `cargo test --workspace` reports **803 automated tests across 80 suites (0 ignored, 0 failed)** covering unit, integration, and end-to-end scenarios.

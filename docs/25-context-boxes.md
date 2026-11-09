@@ -104,7 +104,7 @@ compaction does not reset it) renders the fresh index into the prefix.
 
 | Tool | Action | Resource | Behaviour |
 |---|---|---|---|
-| `box_list` | `box:read` | `*` | Index of live boxes; optional `kind`, `include_expired` |
+| `box_list` | `box:read` | `*`, then per key | Index of live boxes; optional `kind`, `include_expired` |
 | `box_read` | `box:read` | box key | Chunked content with size notice |
 | `box_write` | `box:write` | box key | Create/update/append; `kind` defaults to `stable` |
 | `box_delete` | `box:write` | box key | Soft delete |
@@ -113,6 +113,13 @@ compaction does not reset it) renders the fresh index into the prefix.
 Every call is authorized by the runtime before dispatch, like any other tool.
 `box_read` on an expired box fails unless `include_expired` is set; `box_write`
 on an expired key revives it (`time_expired` cleared, revision bumped).
+
+`box_list` is additionally filtered per row: after the dispatch check on
+`box:read: *`, every row is re-evaluated as `box:read` on its own key with the
+same agent + session rule order, and `deny` rows are dropped from the text, the
+`boxes` metadata and the count. A key the caller may not read is therefore
+invisible in listings, not merely unreadable. `ask` is not treated as a deny —
+listing never prompts; the prompt is raised by the `box_read` itself.
 
 Append is `box_write` with `append: true`: the new text joins the existing
 content with a newline and the same cap applies.

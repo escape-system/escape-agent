@@ -356,11 +356,16 @@ impl Runtime {
         // Expire temporary boxes only after the completed row is durable and
         // before `session.compaction.ended` is published. A failure is logged
         // and must not fail the compaction itself.
+        //
+        // The expiry is scoped to the compacting session and its descendants
+        // (R3): a sibling subtree's temporary boxes are not part of this
+        // compaction and must survive it.
+        let owners = self.compaction_owner_sessions(session).await;
         if let Err(error) = self
             .inner
             .config
             .store
-            .expire_temporary_boxes(&root_id)
+            .expire_temporary_boxes_for(&root_id, &owners)
             .await
         {
             tracing::warn!(
@@ -398,6 +403,42 @@ impl Runtime {
     /// threshold compaction runs only when the document opts in.
     pub(super) fn compaction_config(&self) -> crate::compaction::CompactionConfig {
         crate::compaction::CompactionConfig::from_merged(self.inner.config.config.merged())
+    }
+
+    /// The compacting session plus every descendant, breadth-first.
+    ///
+    /// A compaction expires only the temporary boxes owned by this subtree
+    /// (R3). The session itself is always included, even when the tree lookup
+    /// fails, so the box expiry still covers the caller; a lookup error is
+    /// logged and never fails the compaction.
+    async fn compaction_owner_sessions(&self, session: &str) -> Vec<String> {
+        let mut owners = vec![session.to_owned()];
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut queue = std::collections::VecDeque::new();
+        seen.insert(session.to_owned());
+        queue.push_back(session.to_owned());
+        while let Some(parent) = queue.pop_front() {
+            let children = match self.inner.config.store.children(&parent).await {
+                Ok(children) => children,
+                Err(error) => {
+                    tracing::warn!(
+                        session = %session,
+                        parent = %parent,
+                        error = %error,
+                        "could not list child sessions while scoping box expiry"
+                    );
+                    continue;
+                }
+            };
+            for child in children {
+                if !seen.insert(child.id.clone()) {
+                    continue;
+                }
+                queue.push_back(child.id.clone());
+                owners.push(child.id);
+            }
+        }
+        owners
     }
 
     /// Oldest stored message to keep verbatim after a compaction.

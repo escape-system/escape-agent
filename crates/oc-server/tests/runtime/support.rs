@@ -15,7 +15,11 @@ use oc_llm::{
     Catalog, ContentPart, LlmClient, LlmError, LlmEvent, LlmMessage, LlmRequest, LlmStream,
     SharedLlmClient, Usage,
 };
-use oc_runtime::{ModelClient, Runtime, RuntimeConfig};
+use oc_observer::{ObserverConfig, ObserverEngine, ObserverError, ObserverModel, SystemClock};
+use oc_runtime::{
+    ModelClient, ObserverBinding, RepairChannel, Runtime, RuntimeConfig, StoreGoalStore,
+};
+use oc_server::observer_host::BusObserverNotifier;
 use oc_server::{AppState, BusSink, PermissionBroker, router};
 use oc_store::{NewSession, Store};
 use oc_tools::ToolRegistry;
@@ -132,6 +136,10 @@ impl ModelClient for ScriptedModel {
     }
 }
 
+/// Session id every harness creates. Exposed so a test can script an observer
+/// verdict that targets it before the harness exists.
+pub(crate) const SESSION: &str = "ses_server_runtime";
+
 pub(crate) struct Harness {
     _root: TempDir,
     work: PathBuf,
@@ -139,13 +147,84 @@ pub(crate) struct Harness {
     pub(crate) app: axum::Router,
     pub(crate) runtime: Option<Arc<Runtime>>,
     pub(crate) model: Arc<ScriptedModel>,
+    /// Present only for [`Harness::new_with_observer`].
+    pub(crate) observer_model: Option<Arc<ScriptedObserverModel>>,
     pub(crate) store: Arc<Store>,
     config: Arc<ConfigService>,
     catalog: Arc<Catalog>,
 }
 
+/// Scripted observer judge: records calls and returns the queued verdict text.
+///
+/// The observer is wired end-to-end, so a verdict that reaches the engine is
+/// applied by the runtime exactly as in production (a `repost` becomes a
+/// synthetic message and a new execution). A test asserts `calls() == 0` to
+/// prove the engine's user-stop guard short-circuited before the judge.
+pub(crate) struct ScriptedObserverModel {
+    verdicts: Mutex<VecDeque<String>>,
+    calls: AtomicUsize,
+}
+
+impl ScriptedObserverModel {
+    pub(crate) fn new(verdicts: Vec<String>) -> Arc<Self> {
+        Arc::new(Self {
+            verdicts: Mutex::new(verdicts.into()),
+            calls: AtomicUsize::new(0),
+        })
+    }
+
+    pub(crate) fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+impl ObserverModel for ScriptedObserverModel {
+    fn judge<'a>(
+        &'a self,
+        _input: &'a str,
+        _cfg: &'a ObserverConfig,
+    ) -> BoxFuture<'a, Result<String, ObserverError>> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let next = self
+            .verdicts
+            .lock()
+            .expect("verdicts")
+            .pop_front()
+            .unwrap_or_else(|| r#"{"action":"none","reason":"script exhausted"}"#.to_owned());
+        Box::pin(async move { Ok(next) })
+    }
+}
+
 impl Harness {
     pub(crate) async fn new(scripts: Vec<Script>, session_permissions: Option<Value>) -> Self {
+        Self::build(scripts, session_permissions, None).await
+    }
+
+    /// Like [`Harness::new`], but additionally attaches a real
+    /// [`ObserverEngine`] to the runtime and the state, the way
+    /// `oc_cli::bootstrap::attach_runtime` does in production.
+    ///
+    /// The judge is a local double returning `verdicts` in order and counting
+    /// calls; the executor is the runtime's real [`RepairChannel`], so any
+    /// verdict that reaches the engine is applied for real. `tick_ms` is set
+    /// far above the test duration and `min_interval_ms`/`max_calls_per_min`
+    /// are disabled, so the only thing that can stop a model call is the
+    /// engine's user-stop guard.
+    pub(crate) async fn new_with_observer(
+        scripts: Vec<Script>,
+        session_permissions: Option<Value>,
+        verdicts: Vec<String>,
+    ) -> Self {
+        Self::build(scripts, session_permissions, Some(verdicts)).await
+    }
+
+    // One linear harness setup: temp tree, config, catalog, store, observer.
+    #[allow(clippy::too_many_lines)]
+    async fn build(
+        scripts: Vec<Script>,
+        session_permissions: Option<Value>,
+        observer_verdicts: Option<Vec<String>>,
+    ) -> Self {
         let root = tempfile::tempdir().expect("temp dir");
         let work = root.path().join("work");
         std::fs::create_dir_all(&work).expect("work dir");
@@ -174,7 +253,7 @@ impl Harness {
                 .await
                 .expect("store opens"),
         );
-        let session = "ses_server_runtime".to_owned();
+        let session = SESSION.to_owned();
         store
             .create_session(NewSession {
                 id: session.clone(),
@@ -214,7 +293,7 @@ impl Harness {
         let broker = Arc::new(PermissionBroker::from_state(&state));
         let sink = Arc::new(BusSink::from_state(&state));
         let model = ScriptedModel::new(scripts);
-        let runtime = Arc::new(Runtime::new_with_model_client(
+        let mut runtime = Runtime::new_with_model_client(
             RuntimeConfig {
                 store: Arc::clone(&store),
                 config: Arc::clone(&config),
@@ -225,14 +304,54 @@ impl Harness {
                 permissions: broker.clone(),
             },
             Arc::clone(&model) as Arc<dyn ModelClient>,
-        ));
-        runtime.start().await.expect("runtime starts");
-
-        let app = router(
-            state
-                .with_runtime(Arc::clone(&runtime))
-                .with_permissions(broker),
         );
+
+        let mut observer_model = None;
+        let mut observer_engine = None;
+        if let Some(verdicts) = observer_verdicts {
+            let judge = ScriptedObserverModel::new(verdicts);
+            let (executor, repairs) = RepairChannel::new();
+            let directory: Arc<str> = Arc::from(state.directory().to_string_lossy().as_ref());
+            let engine = Arc::new(ObserverEngine::new(
+                ObserverConfig {
+                    model: Some("test/alpha".to_owned()),
+                    // The ticker must not fire during the test: the forced
+                    // `POST /observer/check` below is the single engine run,
+                    // which keeps the assertion deterministic.
+                    tick_ms: 60_000,
+                    // No coalescing/rate limiting, so a broken guard would
+                    // certainly call the judge instead of a `Skipped` run.
+                    min_interval_ms: 0,
+                    max_calls_per_min: 100,
+                    ..ObserverConfig::default()
+                },
+                Arc::new(SystemClock),
+                Arc::clone(&judge) as Arc<dyn ObserverModel>,
+                executor,
+                Arc::new(BusObserverNotifier::new(
+                    state.bus().clone(),
+                    Arc::clone(&store),
+                    directory,
+                )),
+            ));
+            runtime = runtime.with_observer(ObserverBinding {
+                engine: Arc::clone(&engine),
+                goals: Arc::new(StoreGoalStore::new(Arc::clone(&store))),
+                repairs,
+            });
+            observer_model = Some(judge);
+            observer_engine = Some(engine);
+        }
+        runtime.start().await.expect("runtime starts");
+        let runtime = Arc::new(runtime);
+
+        let mut state = state
+            .with_runtime(Arc::clone(&runtime))
+            .with_permissions(broker);
+        if let Some(engine) = observer_engine {
+            state = state.with_observer_engine(engine);
+        }
+        let app = router(state);
         Self {
             _root: root,
             work,
@@ -240,6 +359,7 @@ impl Harness {
             app,
             runtime: Some(runtime),
             model,
+            observer_model,
             store,
             config,
             catalog,

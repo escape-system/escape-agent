@@ -238,6 +238,105 @@ async fn expiration_hides_temporary_boxes_and_keeps_stable_ones() {
 }
 
 #[tokio::test]
+async fn expiry_with_owners_touches_only_that_subtree() {
+    let store = Store::open_memory().await.expect("memory store");
+    let root = seed_tree(&store).await;
+    // A second subtree under the same root: a sibling of the compacting child.
+    store
+        .create_session_with_tree(
+            NewSession {
+                parent_id: Some(root.clone()),
+                ..new_session("ses_sibling")
+            },
+            NewSessionTree {
+                root_id: root.clone(),
+                depth: 1,
+                role: "subagent".to_owned(),
+                spawn_allowed: false,
+            },
+        )
+        .await
+        .expect("sibling session");
+
+    for (owner, key) in [
+        (root.as_str(), "root-scratch"),
+        ("ses_sibling", "sibling-scratch"),
+        ("ses_child", "child-scratch"),
+    ] {
+        store
+            .write_box(
+                NewBox {
+                    owner_session: owner.to_owned(),
+                    ..new_box(&root, key, "temporary", "notes")
+                },
+                false,
+            )
+            .await
+            .expect("temporary write");
+    }
+
+    let scoped = store
+        .expire_temporary_boxes_for(&root, &["ses_child".to_owned()])
+        .await
+        .expect("scoped expire");
+    assert_eq!(scoped, 1, "only the compacting subtree's box expires");
+
+    let live: Vec<String> = store
+        .box_keys(&root)
+        .await
+        .expect("live keys")
+        .into_iter()
+        .collect();
+    assert_eq!(
+        live,
+        vec!["root-scratch".to_owned(), "sibling-scratch".to_owned()],
+        "the root and sibling boxes survive the child's compaction"
+    );
+    assert!(
+        store
+            .get_box(&root, "child-scratch", false)
+            .await
+            .expect("child read")
+            .is_none(),
+        "the compacting subtree's temporary box is expired"
+    );
+
+    // Idempotent: the same owners expire nothing new.
+    assert_eq!(
+        store
+            .expire_temporary_boxes_for(&root, &["ses_child".to_owned()])
+            .await
+            .expect("scoped expire again"),
+        0
+    );
+    // An empty owner list is a no-op, never "the whole tree".
+    assert_eq!(
+        store
+            .expire_temporary_boxes_for(&root, &[])
+            .await
+            .expect("empty owners"),
+        0
+    );
+    assert_eq!(store.box_keys(&root).await.expect("still live").len(), 2);
+
+    // The unfiltered form still expires the whole tree.
+    assert_eq!(
+        store
+            .expire_temporary_boxes(&root)
+            .await
+            .expect("whole tree"),
+        2
+    );
+    assert!(
+        store
+            .box_keys(&root)
+            .await
+            .expect("empty live set")
+            .is_empty()
+    );
+}
+
+#[tokio::test]
 async fn delete_soft_deletes_and_frees_the_key() {
     let store = Store::open_memory().await.expect("memory store");
     let root = seed_tree(&store).await;

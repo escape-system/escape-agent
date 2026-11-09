@@ -125,8 +125,26 @@ function session(input: {
   switchModel?: ComposerSession["api"]["switchModel"]
   background?: ComposerSession["background"]
 }): ComposerSession {
+  const id = "session-1"
+  // Mirrors the data layer: `status` reports idle while a stop is requested, whatever the projected state says, and
+  // records only real transitions so a stray running write behind a stop is invisible.
+  const stopRequested = new Set<string>()
+  const projected = new Map<string, "idle" | "running">()
+  const reported = new Map<string, "idle" | "running">()
+
+  const status = (sessionID: string): "idle" | "running" =>
+    stopRequested.has(sessionID) ? "idle" : (projected.get(sessionID) ?? "idle")
+
+  const publish = (sessionID: string) => {
+    const next = status(sessionID)
+
+    if (reported.get(sessionID) === next) return
+    reported.set(sessionID, next)
+    input.statuses?.push(next)
+  }
+
   return {
-    id: "session-1",
+    id,
     background: input.background,
     directory: "C:/repo",
     handoff: input.handoff ?? { set() {}, clear() {} },
@@ -158,7 +176,23 @@ function session(input: {
     data: {
       location: { command: { list: () => [] } },
       session: {
-        setStatus: (_sessionID, status) => input.statuses?.push(status),
+        setStatus: (sessionID, next) => {
+          projected.set(sessionID, next)
+          publish(sessionID)
+        },
+        requestStop: (ids) => {
+          for (const sessionID of ids) {
+            if (stopRequested.has(sessionID)) continue
+            stopRequested.add(sessionID)
+            input.calls.push(`stop:${sessionID}`)
+            publish(sessionID)
+          }
+        },
+        releaseStop: (sessionID) => {
+          if (!stopRequested.delete(sessionID)) return
+          input.calls.push(`release:${sessionID}`)
+          publish(sessionID)
+        },
         // Like the data layer: admit locally, prepare, then send.
         prompt: async (value) => {
           input.calls.push("admit")
@@ -1005,6 +1039,52 @@ describe("Composer submission", () => {
 
       // The stop is terminal: the admission is not retried, so only one turn could ever have started.
       expect(calls.filter((call) => call === "admit")).toHaveLength(1)
+    })
+
+    test("a stop request survives a stray running event", async () => {
+      const calls: string[] = []
+      const statuses: ("idle" | "running")[] = []
+      const first = Promise.withResolvers<void>()
+      const target = session({ calls, statuses })
+      const submission = submitInput(
+        active(createMemoryComposerState().capture(), target, controls, {
+          working: () => true,
+          interrupt: () => first.promise,
+        }),
+      )
+
+      const stopped = submission.stop()
+      // The interrupt is still in flight, so a lifecycle event that still reports the old execution must not make the
+      // session look busy again: the stop is durable, not a one-shot optimistic write.
+      target.data.session.setStatus(target.id, "running")
+
+      expect(statuses).toEqual(["idle"])
+
+      first.resolve()
+      await stopped
+      expect(statuses).toEqual(["idle"])
+      // `submit` must not re-assert running behind the stop either.
+      expect(calls.filter((call) => call === "send")).toEqual([])
+    })
+
+    test("a terminal event clears the stop request", async () => {
+      const calls: string[] = []
+      const statuses: ("idle" | "running")[] = []
+      const target = session({ calls, statuses })
+      const submission = submitInput(
+        active(createMemoryComposerState().capture(), target, controls, { working: () => true }),
+      )
+
+      await submission.stop()
+      expect(calls).toEqual(["stop:session-1"])
+      expect(statuses).toEqual(["idle"])
+
+      // The store clears the mark on every execution boundary, so the next turn's running state is reported again.
+      target.data.session.releaseStop(target.id)
+      target.data.session.setStatus(target.id, "running")
+
+      expect(calls).toEqual(["stop:session-1", "release:session-1"])
+      expect(statuses).toEqual(["idle", "running"])
     })
   })
 })

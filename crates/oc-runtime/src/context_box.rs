@@ -13,6 +13,7 @@
 use std::fmt::Write as _;
 use std::sync::Arc;
 
+use oc_config::Effect as ConfigEffect;
 use oc_store::{BoxQuery, Delivery, NewBox, NewInbox, StoreError};
 use oc_tools::{Tool, ToolContext, ToolError, ToolRegistry, ToolResult};
 use oc_types::{MessageId, now_millis};
@@ -27,8 +28,15 @@ pub const MAX_BOX_WRITE_CHARS: usize = 60_000;
 /// Characters returned by one `box_read` call.
 pub const BOX_READ_CHUNK: usize = 20_000;
 
-/// Boxes rendered in the prompt index.
+/// Boxes rendered in the prompt index. Index queries fetch one row past this
+/// limit so the renderer can prove that more boxes exist (the store caps one
+/// page at 200 rows, so the extra row is always available).
 pub const BOX_INDEX_MAX: usize = 100;
+
+/// Rows the index query fetches: one past [`BOX_INDEX_MAX`] so the renderer can
+/// prove that more boxes exist instead of truncating silently. The store clamps
+/// one page at 200 rows, so the probe row is always available.
+pub(crate) const BOX_INDEX_QUERY_MAX: usize = BOX_INDEX_MAX + 1;
 
 /// Build the box tool set for one runtime.
 #[derive(Clone, Debug)]
@@ -90,6 +98,8 @@ pub fn render_box_index(root_id: &str, boxes: &[Value], limit: usize) -> String 
     let _ = writeln!(out, "<boxes root=\"{}\">", escape_attr(root_id));
     for (index, value) in live.iter().enumerate() {
         if index >= limit {
+            // The caller fetches one row past `limit`, so the extra row proves
+            // more exist; the true total may be higher, hence "at least".
             let _ = writeln!(
                 out,
                 "- … {} more boxes; call box_list",
@@ -136,6 +146,39 @@ fn escape_attr(value: &str) -> String {
         .replace('"', "&quot;")
 }
 
+/// Content-free projection of one store box row, used for every tool metadata
+/// payload. A box body is returned only by `box_read`'s `output`; metadata is
+/// attached to events and transcripts, so it must never carry the body.
+///
+/// Fields: `id`, `key`, `kind`, `title`, `description` (omitted when absent),
+/// `size`, `revision`, `timeCreated`, `timeUpdated`, `rootID`, `ownerSession`
+/// and `tags` verbatim. `content` and `timeExpired` are intentionally absent.
+fn box_summary(value: &Value) -> Value {
+    const FIELDS: [&str; 11] = [
+        "id",
+        "key",
+        "kind",
+        "title",
+        "description",
+        "size",
+        "revision",
+        "timeCreated",
+        "timeUpdated",
+        "rootID",
+        "ownerSession",
+    ];
+    let mut map = Map::new();
+    for field in FIELDS {
+        if let Some(field_value) = value.get(field) {
+            map.insert(field.to_owned(), field_value.clone());
+        }
+    }
+    if let Some(tags) = value.get("tags") {
+        map.insert("tags".to_owned(), tags.clone());
+    }
+    Value::Object(map)
+}
+
 impl Runtime {
     /// Root session id for a tool call. Every box operation is scoped to the
     /// tree, so a subagent reads and writes the same boxes as its root.
@@ -148,13 +191,17 @@ impl Runtime {
     }
 
     /// Live boxes of the session's tree, ordered by key.
+    ///
+    /// Fetches one row past [`BOX_INDEX_MAX`] so [`render_box_index`] can prove
+    /// that more boxes exist and emit its truncation notice instead of
+    /// truncating silently.
     pub(crate) async fn box_index_rows(&self, root_id: &str) -> Result<Vec<Value>, ToolError> {
         self.inner
             .config
             .store
             .list_boxes(BoxQuery {
                 root_id: root_id.to_owned(),
-                limit: BOX_INDEX_MAX,
+                limit: BOX_INDEX_QUERY_MAX,
                 ..BoxQuery::default()
             })
             .await
@@ -207,6 +254,22 @@ impl Tool for BoxListTool {
             }
         };
         let include_expired = optional_bool(&input, "include_expired")?.unwrap_or(false);
+        // Every box operation is scoped to the tree, but read visibility is
+        // per key: a caller denied `box:read` on a key must not learn it from
+        // the listing. Load the session once and evaluate each row's key.
+        let info = self
+            .runtime
+            .inner
+            .config
+            .store
+            .get_session(&ctx.session_id)
+            .await
+            .map_err(|error| store_error(&error))?
+            .ok_or_else(|| {
+                ToolError::new(format!("session `{}` no longer exists", ctx.session_id))
+            })?;
+        let session =
+            Runtime::parse_session(&info).map_err(|error| ToolError::new(error.to_string()))?;
         let root = self.runtime.box_root(&ctx.session_id).await?;
         let page = self
             .runtime
@@ -221,12 +284,26 @@ impl Tool for BoxListTool {
             })
             .await
             .map_err(|error| store_error(&error))?;
+        // A denied key is invisible, exactly as `box_read` refuses it. `ask`
+        // is not a deny: listing stays non-interactive (the prompt would be
+        // raised by the read itself), so only `Deny` rows drop out.
+        let visible: Vec<&Value> = page
+            .items
+            .iter()
+            .filter(|item| {
+                let key = item.get("key").and_then(Value::as_str).unwrap_or_default();
+                self.runtime
+                    .stored_session_effect(&session, "box:read", key)
+                    != ConfigEffect::Deny
+            })
+            .collect();
         let mut out = String::new();
-        let _ = writeln!(out, "root {root}: {} box(es)", page.items.len());
+        let summaries: Vec<Value> = visible.iter().map(|item| box_summary(item)).collect();
+        let _ = writeln!(out, "root {root}: {} box(es)", visible.len());
         if page.has_more {
             out.push_str("(more boxes exist than are listed)\n");
         }
-        for item in &page.items {
+        for item in &visible {
             let key = item.get("key").and_then(Value::as_str).unwrap_or_default();
             let kind = item.get("kind").and_then(Value::as_str).unwrap_or("stable");
             let size = item.get("size").and_then(Value::as_u64).unwrap_or(0);
@@ -248,7 +325,7 @@ impl Tool for BoxListTool {
             );
         }
         Ok(ToolResult::text(out).with_metadata(json!({
-            "boxes": page.items,
+            "boxes": summaries,
             "hasMore": page.has_more,
         })))
     }
@@ -427,6 +504,11 @@ impl Tool for BoxWriteTool {
             .get("content")
             .and_then(Value::as_str)
             .ok_or_else(|| ToolError::new("`content` is required"))?;
+        if content.trim().is_empty() {
+            return Err(ToolError::new(
+                "`content` must not be empty or whitespace-only; write real text or delete the box",
+            ));
+        }
         if content.chars().count() > MAX_BOX_WRITE_CHARS {
             return Err(ToolError::new(format!(
                 "one box_write call accepts at most {MAX_BOX_WRITE_CHARS} characters"
@@ -489,7 +571,7 @@ impl Tool for BoxWriteTool {
         Ok(ToolResult::text(format!(
             "Box `{key}` written [{kind}], {size} chars, revision {revision}. The prompt index updates on the next turn."
         ))
-        .with_metadata(json!({ "box": written })))
+        .with_metadata(json!({ "box": box_summary(&written) })))
     }
 }
 

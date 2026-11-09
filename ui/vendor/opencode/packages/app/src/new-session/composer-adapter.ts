@@ -172,6 +172,8 @@ export function createNewSessionComposerAdapter(props: {
             location: data.location,
             session: {
               setStatus: data.session.setStatus,
+              requestStop: data.session.requestStop,
+              releaseStop: data.session.releaseStop,
               prompt: (input) =>
                 data.session.prompt({
                   ...input,

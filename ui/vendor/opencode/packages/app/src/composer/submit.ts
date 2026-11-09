@@ -278,11 +278,12 @@ export function createComposerSubmit(input: ComposerSubmitInput) {
       // Any admission retry that straddles this stop belongs to a turn the user cancelled.
       state.generation += 1
 
-      // Clear the run now so the stop reads as immediate, following the send path's optimistic status write; a
-      // rejected request puts it back.
+      // Clear the run now so the stop reads as immediate, following the send path's optimistic status write. The store
+      // keeps the request durable: every status read reports idle until an execution boundary settles it, so a lagging
+      // running event cannot make the session look busy again. A rejected request releases it and puts the state back.
       const wasRunning = input.adapter.working()
 
-      if (wasRunning) session.data.session.setStatus(session.id, "idle")
+      if (wasRunning) session.data.session.requestStop([session.id])
 
       return Promise.resolve()
         .then(() => input.adapter.interrupt())
@@ -290,7 +291,11 @@ export function createComposerSubmit(input: ComposerSubmitInput) {
           // A fulfilled request means the run is stopped, including when the server had nothing live to interrupt.
           () => undefined,
           (error) => {
-            if (wasRunning) session.data.session.setStatus(session.id, "running")
+            if (wasRunning) {
+              // The run is still live: drop the durable stop mark and put the projected state back.
+              session.data.session.releaseStop(session.id)
+              session.data.session.setStatus(session.id, "running")
+            }
             input.notify.failed("prompt", stopFailure(error))
           },
         )

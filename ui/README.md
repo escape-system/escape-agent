@@ -37,6 +37,9 @@ them. An external `OC_UPSTREAM` must be patched with `git apply --check` first:
    reports `time.released === 0`.
 4. `0004-background-metadata-guard.patch` — tolerate a running shell tool part
    without `metadata`.
+5. `0006-stop-interrupt.patch` — durable Stop: the client store remembers a
+   requested stop and reports the session idle until an execution boundary
+   settles it, and the composer interrupts once with `resume:false`.
 
 Patch scope (see `docs/13-ui.md`):
 

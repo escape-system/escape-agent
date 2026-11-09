@@ -266,6 +266,135 @@ async fn explore_is_read_only_and_a_write_only_agent_cannot_list_boxes() {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)] // One scenario: per-key visibility on a small tree, then on a truncated page.
+async fn box_list_hides_keys_the_caller_cannot_read() {
+    let harness = Harness::new(
+        vec![],
+        Arc::new(AllowAll),
+        json!({
+            "agents": {
+                "secretive": {
+                    "permissions": [
+                        {"action": "box:read", "resource": "secret*", "effect": "deny"}
+                    ]
+                }
+            }
+        }),
+        None,
+    )
+    .await;
+    let secretive =
+        create_child(&harness, &harness.session, "ses_box_secretive", "secretive").await;
+    for (key, content) in [
+        ("decisions", "keep the wire shape"),
+        ("secret-key", "do not leak"),
+        ("scratch", "working note"),
+    ] {
+        harness
+            .store
+            .write_box(
+                NewBox {
+                    root_id: harness.session.clone(),
+                    owner_session: harness.session.clone(),
+                    key: key.to_owned(),
+                    title: None,
+                    description: Some(format!("{key} description")),
+                    kind: "stable".to_owned(),
+                    tags: Vec::new(),
+                    content: content.to_owned(),
+                },
+                false,
+            )
+            .await
+            .expect("box written");
+    }
+
+    // A caller allowed `box:read: *` sees every key.
+    let root_list = run_tool(&harness, &harness.session, "box_list", json!({}))
+        .await
+        .expect("root lists");
+    assert!(root_list.contains("secret-key"), "{root_list}");
+    assert!(root_list.contains("3 box(es)"), "{root_list}");
+
+    // The restricted agent sees the two allowed keys and neither the denied
+    // key nor a count that includes it.
+    let restricted = run_tool(&harness, &secretive, "box_list", json!({}))
+        .await
+        .expect("child lists");
+    assert!(restricted.contains("decisions"), "{restricted}");
+    assert!(restricted.contains("scratch"), "{restricted}");
+    assert!(
+        !restricted.contains("secret"),
+        "a denied key is invisible in the listing: {restricted}"
+    );
+    assert!(restricted.contains("2 box(es)"), "{restricted}");
+
+    // Metadata mirrors the text: no summary row for the denied key either.
+    let result = box_tool(&harness, "box_list")
+        .execute(&tool_context(&harness, &secretive), json!({}))
+        .await
+        .expect("list with metadata");
+    let boxes = result
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("boxes"))
+        .and_then(Value::as_array)
+        .expect("boxes metadata");
+    assert_eq!(boxes.len(), 2, "{boxes:?}");
+    assert!(
+        boxes.iter().all(|row| row["key"] != "secret-key"),
+        "{boxes:?}"
+    );
+
+    // A filtered page must still report the truthful visible count and the
+    // truncation notice. 100 `z…` keys plus one denied `secret-key` fill the
+    // 100-row page; the denied row sorts first and is dropped, so the child
+    // sees 99 while the store still has more rows than are listed.
+    for index in 0..100 {
+        harness
+            .store
+            .write_box(
+                NewBox {
+                    root_id: harness.session.clone(),
+                    owner_session: harness.session.clone(),
+                    key: format!("z{index:03}"),
+                    title: None,
+                    description: None,
+                    kind: "stable".to_owned(),
+                    tags: Vec::new(),
+                    content: format!("filler {index}"),
+                },
+                false,
+            )
+            .await
+            .expect("filler box");
+    }
+    let truncated = run_tool(&harness, &secretive, "box_list", json!({}))
+        .await
+        .expect("truncated list");
+    assert!(
+        truncated.contains("99 box(es)"),
+        "the count only includes visible rows: {truncated}"
+    );
+    assert!(
+        truncated.contains("more boxes exist than are listed"),
+        "{truncated}"
+    );
+
+    let result = box_tool(&harness, "box_list")
+        .execute(&tool_context(&harness, &secretive), json!({}))
+        .await
+        .expect("truncated list with metadata");
+    assert_eq!(
+        result
+            .metadata
+            .as_ref()
+            .and_then(|meta| meta["hasMore"].as_bool()),
+        Some(true)
+    );
+}
+
+#[tokio::test]
 async fn compact_context_enqueues_a_queued_row_instead_of_compacting_inline() {
     let harness = Harness::new(
         vec![text_script("## Objective\nscheduled handoff")],
@@ -526,4 +655,111 @@ async fn box_writes_do_not_bust_the_pinned_instruction_prefix() {
         .join("\n");
     assert!(third.contains("[stable] late"), "{third}");
     assert!(third.contains("[stable] early"), "{third}");
+}
+
+#[tokio::test]
+async fn tool_metadata_never_carries_box_bodies() {
+    let harness = Harness::new(vec![], Arc::new(AllowAll), json!({}), None).await;
+    let sentinel = "BOX_BODY_SENTINEL_9f3c";
+    run_tool(
+        &harness,
+        &harness.session,
+        "box_write",
+        json!({"key": "secret", "content": sentinel, "description": "body leak probe"}),
+    )
+    .await
+    .expect("write");
+
+    let tools = BoxTools::new(harness.runtime.clone()).registry();
+    for (name, input) in [
+        ("box_list", json!({})),
+        (
+            "box_write",
+            json!({"key": "secret", "content": sentinel, "append": true}),
+        ),
+        ("box_read", json!({"key": "secret"})),
+    ] {
+        let result = tools
+            .get(name)
+            .unwrap_or_else(|| panic!("{name} is registered"))
+            .execute(&tool_context(&harness, &harness.session), input)
+            .await
+            .unwrap_or_else(|error| panic!("{name}: {error}"));
+        let metadata = result.metadata.expect("metadata");
+        assert!(
+            !metadata.to_string().contains(sentinel),
+            "{name} metadata leaks the box body: {metadata}"
+        );
+        if name == "box_read" {
+            assert!(
+                result.output.unwrap_or_default().contains(sentinel),
+                "box_read output still carries the body"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_empty_box_body_is_rejected() {
+    let harness = Harness::new(vec![], Arc::new(AllowAll), json!({}), None).await;
+    for input in [
+        json!({"key": "blank", "content": "   \n\t "}),
+        json!({"key": "blank", "content": "", "append": true}),
+    ] {
+        let error = run_tool(&harness, &harness.session, "box_write", input)
+            .await
+            .expect_err("an empty body is rejected");
+        assert!(error.to_string().contains("empty"), "{error}");
+    }
+    assert!(
+        harness
+            .store
+            .get_box(&harness.session, "blank", true)
+            .await
+            .expect("read")
+            .is_none(),
+        "a rejected write must not create a row"
+    );
+}
+
+#[tokio::test]
+async fn the_index_reports_more_boxes_than_it_shows() {
+    let harness = Harness::new(
+        vec![text_script("done")],
+        Arc::new(AllowAll),
+        json!({}),
+        None,
+    )
+    .await;
+    for index in 0..105 {
+        harness
+            .store
+            .write_box(
+                NewBox {
+                    root_id: harness.session.clone(),
+                    owner_session: harness.session.clone(),
+                    key: format!("k{index:03}"),
+                    title: None,
+                    description: Some(format!("box {index}")),
+                    kind: "stable".to_owned(),
+                    tags: Vec::new(),
+                    content: format!("body {index}"),
+                },
+                false,
+            )
+            .await
+            .expect("box written");
+    }
+    harness.prompt("render the index").await;
+    let system = harness.model.requests()[0].system.join("\n");
+    let rendered = system
+        .lines()
+        .filter(|line| line.starts_with("- [stable]") || line.starts_with("- [temporary]"))
+        .count();
+    assert_eq!(rendered, 100, "the index shows exactly its cap: {system}");
+    let notice = system
+        .lines()
+        .find(|line| line.contains("more boxes"))
+        .unwrap_or_else(|| panic!("truncation notice missing: {system}"));
+    assert!(notice.contains("1 more boxes"), "{notice}");
 }

@@ -197,7 +197,7 @@ impl Runtime {
             .store
             .list_boxes(oc_store::BoxQuery {
                 root_id: root.clone(),
-                limit: 100,
+                limit: crate::context_box::BOX_INDEX_QUERY_MAX,
                 ..oc_store::BoxQuery::default()
             })
             .await
@@ -435,6 +435,26 @@ impl Runtime {
                 false
             }
         }
+    }
+
+    /// Evaluate one resource for a stored session exactly like dispatch-time
+    /// authorization does: the agent's composed rules first, then the
+    /// session's own rows (last match wins).
+    ///
+    /// Tools that must enforce a per-resource rule *inside* one call (the
+    /// `box_list` per-key `box:read` filter) use this instead of duplicating
+    /// the evaluation order.
+    pub(crate) fn stored_session_effect(
+        &self,
+        info: &SessionInfo,
+        action: &str,
+        resource: &str,
+    ) -> ConfigEffect {
+        let agent_id = info
+            .agent
+            .clone()
+            .unwrap_or_else(|| self.inner.config.config.default_agent().to_owned());
+        self.effect(&agent_id, &session_rules(info), action, resource)
     }
 
     pub(super) fn effect(
