@@ -18,8 +18,12 @@ prompt → inbox row (durable) → wake actor → execution.started
   prompts are written to the transcript at admission; a `queue` row stays
   inbox-only (invisible to the running turn's requests) until the runtime
   promotes it as the next execution.
-- `POST /interrupt?resume=` stops the current execution; `resume=true` keeps
-  the claim so the next process/actor continues.
+- `POST /interrupt?resume=` stops the current execution. The `resume` query
+  parameter is accepted for wire compatibility and **ignored**: there is no
+  paused-execution state in the runtime, so nothing is kept claimed for a
+  later continuation. The claim is always released once the turn settles; the
+  next execution starts only from a new inbox row (typically the user's next
+  prompt).
 - `POST /background` detaches the current execution from the request; the
   actor keeps running. In phase 1 the only detachable blocking work is a
   foreground `subagent` wait: the flag makes the wait return `status: running`,
@@ -171,7 +175,22 @@ Cancellation is cooperative but the finalizer is uninterruptible:
 2. Emit `aborted` for running tools, settle the assistant message with
    `STEP_INTERRUPTED`.
 3. Publish `session.execution.interrupted{reason: user|shutdown|superseded|inactivity}`.
-4. Commit, then release the session claim (unless `resume`).
+4. Commit, then release the session claim.
+
+A **user interrupt** (`POST /interrupt` without `resume`, and the UI stop
+button that calls it) is broader than one turn:
+
+- It cancels the active execution of the session *and* of every live
+  descendant (`Runtime::interrupt` walks the child tree, `interrupt_single` per
+  session), so a stopped coordinator does not leave subagents running.
+- It withdraws the session's and its descendants' undelivered `session_inbox`
+  rows — queued prompts, synthetic/observer rows and queued `compaction` rows —
+  before releasing the claim, so no post-stop turn can start from them.
+- The settle step persists the reason durably (`session_v2.idle_reason`, see
+  `docs/03`), in the same write as `idle_outcome = interrupted`.
+- A user stop is **terminal for automation** until the user prompts again:
+  goals, observer nudges/repairs and other automation must not restart the
+  session on their own (`docs/08`).
 
 A naive `tokio::spawn` that drops the future loses 2–4 events. The Rust actor
 owns the step future; cancellation is a token observed at await points, and the

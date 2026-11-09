@@ -24,6 +24,7 @@ pub(super) async fn build_tree(
             parent: None,
             agent: node.agent,
             state,
+            idle_reason: node.idle_reason,
             depth: node.depth,
         });
         queue.push_back(node.id);
@@ -47,6 +48,7 @@ pub(super) async fn build_tree(
                 parent: child.parent_id,
                 agent: child.agent,
                 state,
+                idle_reason: child.idle_reason,
                 depth: child.depth,
             });
             queue.push_back(id);

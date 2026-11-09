@@ -9,6 +9,7 @@
 mod boxes;
 mod credentials;
 mod forms;
+mod idle_reason;
 mod instructions;
 mod lanes;
 mod saved_permissions;

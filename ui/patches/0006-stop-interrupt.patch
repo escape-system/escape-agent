@@ -1,0 +1,304 @@
+diff --git a/packages/app/src/composer/model.ts b/packages/app/src/composer/model.ts
+index 2350812..e29583d 100644
+--- a/packages/app/src/composer/model.ts
++++ b/packages/app/src/composer/model.ts
+@@ -116,7 +116,7 @@ export function createComposerModel(adapter: ComposerAdapter, options?: { queue?
+     return text.trim().length === 0 && attachments().length === 0 && commentCount() === 0
+   })
+ 
+-  const stopping = createMemo(() => adapter.working() && blank())
++  const stopping = createMemo(() => adapter.working())
+ 
+   const placeholder = () => {
+     if (mode() === "shell") return language.t("prompt.placeholder.shell", { example: "git status" })
+diff --git a/packages/app/src/composer/submit.test.ts b/packages/app/src/composer/submit.test.ts
+index 0d0caa0..e0acfd2 100644
+--- a/packages/app/src/composer/submit.test.ts
++++ b/packages/app/src/composer/submit.test.ts
+@@ -55,7 +55,12 @@ function controls(): ComposerControls {
+   }
+ }
+ 
+-function active(state: ComposerStateTarget, target: ComposerSession, ctl = controls): ActiveComposerAdapter {
++function active(
++  state: ComposerStateTarget,
++  target: ComposerSession,
++  ctl = controls,
++  overrides: Partial<Pick<ActiveComposerAdapter, "working" | "interrupt">> = {},
++): ActiveComposerAdapter {
+   return {
+     kind: "active-session",
+     state,
+@@ -66,6 +71,7 @@ function active(state: ComposerStateTarget, target: ComposerSession, ctl = contr
+     interrupt: async () => undefined,
+     submitted() {},
+     setEditor() {},
++    ...overrides,
+   }
+ }
+ 
+@@ -870,4 +876,135 @@ describe("Composer submission", () => {
+     expect(calls).toEqual([])
+     expect(state.current().some((part) => part.type === "image")).toBe(true)
+   })
++
++  describe("stopping the run", () => {
++    test("stop sends exactly one interrupt with resume:false", async () => {
++      const statuses: ("idle" | "running")[] = []
++      let interrupts = 0
++      const submission = submitInput(
++        active(createMemoryComposerState().capture(), session({ calls: [], statuses }), controls, {
++          working: () => true,
++          interrupt: async () => {
++            interrupts += 1
++          },
++        }),
++      )
++
++      await submission.stop()
++
++      // The adapter owns `resume: false`; submit must call it once, not twice.
++      expect(interrupts).toBe(1)
++    })
++
++    test("stop marks the session idle before the interrupt resolves", async () => {
++      const statuses: ("idle" | "running")[] = []
++      const interrupting = Promise.withResolvers<void>()
++      const submission = submitInput(
++        active(createMemoryComposerState().capture(), session({ calls: [], statuses }), controls, {
++          working: () => true,
++          interrupt: () => interrupting.promise,
++        }),
++      )
++
++      const stopped = submission.stop()
++
++      // Optimistic idle happens synchronously, before the request settles.
++      expect(statuses).toEqual(["idle"])
++      interrupting.resolve()
++      await stopped
++      expect(statuses).toEqual(["idle"])
++    })
++
++    test("a second stop while in flight is a no-op", async () => {
++      let interrupts = 0
++      const interrupting = Promise.withResolvers<void>()
++      const submission = submitInput(
++        active(createMemoryComposerState().capture(), session({ calls: [] }), controls, {
++          working: () => true,
++          interrupt: () => {
++            interrupts += 1
++
++            return interrupting.promise
++          },
++        }),
++      )
++
++      const first = submission.stop()
++      await submission.stop()
++      expect(interrupts).toBe(1)
++
++      interrupting.resolve()
++      await first
++      // Once the first request settled a later stop is a new stop, not a permanent latch.
++      await submission.stop()
++      expect(interrupts).toBe(2)
++    })
++
++    test("a rejected interrupt restores running and surfaces the error", async () => {
++      const statuses: ("idle" | "running")[] = []
++      const failures: { kind: string; error: unknown }[] = []
++      const submission = submitInput(
++        active(createMemoryComposerState().capture(), session({ calls: [], statuses }), controls, {
++          working: () => true,
++          interrupt: async () => {
++            throw new Error("server unavailable")
++          },
++        }),
++        {
++          missingSelection() {},
++          unqueueable() {},
++          failed: (kind, error) => failures.push({ kind, error }),
++        },
++      )
++
++      await submission.stop()
++
++      expect(statuses).toEqual(["idle", "running"])
++      expect(failures).toHaveLength(1)
++      const failure = failures[0]
++      expect(failure?.kind).toBe("prompt")
++      expect(failure?.error instanceof Error ? failure.error.message : undefined).toBe(
++        "Failed to stop the run: server unavailable",
++      )
++    })
++
++    test("a fulfilled interrupt with nothing live still counts as stopped", async () => {
++      const failures: string[] = []
++      const submission = submitInput(
++        active(createMemoryComposerState().capture(), session({ calls: [] }), controls, {
++          working: () => true,
++          // The adapter resolves `{interrupted: false}` to void; only the rejection path is a failure.
++          interrupt: async () => undefined,
++        }),
++        { missingSelection() {}, unqueueable() {}, failed: () => failures.push("failed") },
++      )
++
++      await submission.stop()
++      expect(failures).toEqual([])
++    })
++
++    test("the duplicate-prompt retry does not fire after a stop", async () => {
++      const state = createMemoryComposerState({ prompt: "ship it" }).capture()
++      const calls: string[] = []
++      const firstAttempt = Promise.withResolvers<void>()
++      const submission = submitInput(
++        active(state, session({ calls, prompt: () => firstAttempt.promise }), controls, {
++          working: () => true,
++          interrupt: async () => undefined,
++        }),
++      )
++
++      const submitted = submission.submit(new Event("submit"))
++      await new Promise((resolve) => setTimeout(resolve, 0))
++      expect(calls.filter((call) => call === "admit")).toHaveLength(1)
++
++      await submission.stop()
++      firstAttempt.reject(new Error("network unavailable"))
++      await submitted
++      await new Promise((resolve) => setTimeout(resolve, 0))
++
++      // The stop is terminal: the admission is not retried, so only one turn could ever have started.
++      expect(calls.filter((call) => call === "admit")).toHaveLength(1)
++    })
++  })
+ })
+diff --git a/packages/app/src/composer/submit.ts b/packages/app/src/composer/submit.ts
+index 05398ad..4297c18 100644
+--- a/packages/app/src/composer/submit.ts
++++ b/packages/app/src/composer/submit.ts
+@@ -13,12 +13,36 @@ import { blobDataUrl, resolveBlobUrl } from "@/runtime/persistence/drafts"
+ import { isAttachment } from "./prompt-parts"
+ import type { ModelSelection } from "@/providers/models/selection"
+ import { parseSlashCommand } from "./client-slash-command"
++// Reuse the send-failure formatter so a rejected stop reports the same server/network detail a failed send does.
++import { formatServerError } from "@/runtime/server/errors"
+ 
+ const submitting = new WeakSet<object>()
+ 
+ // The model each session was last switched to from this client, by session ID.
+ const switched = new Map<string, string>()
+ 
++// Per-session stop bookkeeping. `generation` changes on every accepted stop, so an admission retry that straddles a
++// stop cannot start a turn the user cancelled; `inFlight` makes a repeated Stop click while the first request is
++// pending a no-op.
++type StopState = { generation: number; inFlight: boolean }
++
++const stops = new Map<string, StopState>()
++
++function stopState(id: string) {
++  const existing = stops.get(id)
++
++  if (existing) return existing
++  const created: StopState = { generation: 0, inFlight: false }
++
++  stops.set(id, created)
++
++  return created
++}
++
++function stopGeneration(id: string) {
++  return stops.get(id)?.generation ?? 0
++}
++
+ type ComposerSubmission = {
+   id: SessionMessage.ID
+   mode: "normal" | "shell"
+@@ -244,11 +268,51 @@ export function createComposerSubmit(input: ComposerSubmitInput) {
+       // Stopping a held send cancels it and leaves the prompt in the composer.
+       if (held()) return Promise.resolve(void setHeld(false))
+ 
+-      return input.adapter.kind === "active-session" ? input.adapter.interrupt() : Promise.resolve()
++      if (input.adapter.kind !== "active-session") return Promise.resolve()
++      const session = input.adapter.session()
++      const state = stopState(session.id)
++
++      // A second click while the first request is pending must not send another interrupt.
++      if (state.inFlight) return Promise.resolve()
++      state.inFlight = true
++      // Any admission retry that straddles this stop belongs to a turn the user cancelled.
++      state.generation += 1
++
++      // Clear the run now so the stop reads as immediate, following the send path's optimistic status write; a
++      // rejected request puts it back.
++      const wasRunning = input.adapter.working()
++
++      if (wasRunning) session.data.session.setStatus(session.id, "idle")
++
++      return Promise.resolve()
++        .then(() => input.adapter.interrupt())
++        .then(
++          // A fulfilled request means the run is stopped, including when the server had nothing live to interrupt.
++          () => undefined,
++          (error) => {
++            if (wasRunning) session.data.session.setStatus(session.id, "running")
++            input.notify.failed("prompt", stopFailure(error))
++          },
++        )
++        .finally(() => {
++          state.inFlight = false
++        })
+     },
+   }
+ }
+ 
++// A stop failure is not a send failure; keep the server/network detail but say what failed. A fulfilled request is
++// success even when the server reports `{"interrupted": false}` (nothing live was left to interrupt).
++function stopFailure(
++  // oxlint-disable-next-line anti-slop/no-unknown-parameters -- a rejected interrupt is opaque; formatServerError reads it
++  error: unknown,
++) {
++  const message = "Failed to stop the run"
++  const detail = formatServerError(error, undefined, message)
++
++  return new Error(detail === message ? message : `${message}: ${detail}`)
++}
++
+ function clearClientCommand(input: ComposerSubmitInput, prompt: Prompt) {
+   input.adapter.state.set([{ type: "text", content: "", start: 0, end: 0 }, ...prompt.filter(isAttachment)], 0)
+   input.adapter.state.mode.set("normal")
+@@ -624,7 +688,14 @@ async function sendPrompt(
+     prepare: staged ? undefined : () => (committed ??= commit()),
+   }
+ 
+-  await session.data.session.prompt(admission).catch(() => session.data.session.prompt(admission))
++  // One duplicate attempt covers a lost response. A stop between the two attempts is terminal for this submission,
++  // so the retry must not start a turn the user already cancelled.
++  const generation = stopGeneration(session.id)
++
++  await session.data.session.prompt(admission).catch(() => {
++    if (stopGeneration(session.id) !== generation) return
++    return session.data.session.prompt(admission)
++  })
+ }
+ 
+ async function buildSubmissionRequest(session: ComposerSession, value: ComposerSubmission) {
+diff --git a/packages/app/src/session/composer/adapter.ts b/packages/app/src/session/composer/adapter.ts
+index 15fc9a5..6740e5b 100644
+--- a/packages/app/src/session/composer/adapter.ts
++++ b/packages/app/src/session/composer/adapter.ts
+@@ -41,11 +41,9 @@ export function createActiveComposerAdapter(input: {
+       admitted: (messageID) => data.session.input.has(id, messageID) || !!data.session.message.get(id, messageID),
+       background: input.background,
+     }),
+-    interrupt: () =>
+-      server.api.session
+-        .interrupt({ sessionID: id, resume: true })
+-        .then(() => undefined)
+-        .catch(() => undefined),
++    // Stop means stop: never resume the run. The rejection reaches the caller, which reports it and restores the
++    // status it cleared optimistically.
++    interrupt: () => server.api.session.interrupt({ sessionID: id, resume: false }).then(() => undefined),
+   }
+ 
+   return adapter

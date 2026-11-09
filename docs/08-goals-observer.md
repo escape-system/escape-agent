@@ -71,7 +71,8 @@ Wake conditions:
 
 - the earliest `started_ms + intervene_s` deadline (timer);
 - a strip settles with `Error`/`Cancelled`, or three settle in a row;
-- a session execution fails or is interrupted;
+- a session execution fails or is interrupted (a user stop is the exception —
+  see *User stop is terminal* below);
 - a goal is set/changed/completed;
 - a manual request from the UI (`POST /api/experimental/observer/check`);
 - a stall: no strip settled and no step event for `observer.stall_seconds`
@@ -136,7 +137,43 @@ Repair budget: `max_repairs_per_10min` per root (default 5), plus per-target 2.
 On exhaustion the observer emits `observer.escalated` and stops acting
 automatically; the UI shows a banner.
 
-## 5. Repair notification
+## 5. User stop is terminal
+
+When a session's latest settled execution was interrupted with reason `user`
+(`session_v2.idle_reason = 'user'`, written atomically with
+`idle_outcome = 'interrupted'`; see `docs/03`), the observer must treat that
+session, and every descendant under it, as **off-limits to automation**:
+
+- it must not wake on the interrupt event itself;
+- it must not `nudge` the session or any descendant;
+- it must not `repost` the last user prompt;
+- it must not `restart_subagent` for the session or any of its descendants.
+
+The guard is durable: it is read from storage (`SessionNodeRow.idle_reason`,
+carried on the agent-tree rows the observer already consumes), not from process
+memory, so a server restart does not clear it. It lifts only when the session
+starts a new execution — typically the user's next prompt; the new turn's
+settle writes a fresh `idle_outcome`/`idle_reason` pair (or clears the reason
+on success), and the observer may supervise normally again.
+
+Two consequences worth stating explicitly:
+
+- **Observer repairs never self-classify as user stops.** An observer-initiated
+  interrupt of a child execution (for example the cancel half of
+  `restart_subagent`) uses reason `superseded`, so the guard above does not
+  latch on the observer's own action.
+- **The goal is not mutated by a stop.** A user stop leaves
+  `goal.status` unchanged (`active` stays `active`); the suppression is purely
+  behavioral — the observer simply does not act on that subtree. If the user
+  never prompts again, the goal waits rather than being marked blocked or
+  failed.
+
+Manual `POST /api/experimental/observer/check` is subject to the same rule: a
+forced check may inspect and report on a user-stopped session (its strips,
+outcome, goal state), but it must not re-raise it — no nudge, no `repost`, no
+`restart_subagent` for that session or its descendants.
+
+## 6. Repair notification
 
 Every repair writes, in one transaction:
 
@@ -149,7 +186,7 @@ Every repair writes, in one transaction:
 The UI renders repair rows on the timeline and in the observer panel. Nothing
 is silent.
 
-## 6. Goal system
+## 7. Goal system
 
 A goal belongs to a root session. One active goal per root.
 
@@ -189,7 +226,7 @@ real message/tool ids. A `wait` verdict schedules a re-check with backoff; a
 The goal is supervised **by the same observer loop** that supervises tool
 strips: one actor, one budget, one audit trail.
 
-## 7. Configuration
+## 8. Configuration
 
 ```jsonc
 {
@@ -219,7 +256,7 @@ The observer model defaults to `subagents.digest_model`, then the root model.
 If the root provider is unreachable, observer calls fail open (`none`) and
 publish `observer.unavailable` once per 5 min; they never block the turn.
 
-## 8. Why this stays cheap
+## 9. Why this stays cheap
 
 - No transcript in the prompt; strips are ~40 tokens each, cap 24 active.
 - Coalesced tick; no call when everything is on schedule.

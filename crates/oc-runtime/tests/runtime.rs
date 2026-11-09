@@ -17,6 +17,8 @@ mod memory;
 mod observer;
 #[path = "runtime/recovery.rs"]
 mod recovery;
+#[path = "runtime/stop.rs"]
+mod stop;
 #[path = "runtime/subagents.rs"]
 mod subagents;
 #[path = "runtime/support.rs"]

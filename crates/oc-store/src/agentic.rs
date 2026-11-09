@@ -12,7 +12,7 @@ use crate::db::{Store, in_tx, now_ms};
 use crate::error::StoreError;
 
 const NODE_COLUMNS: &str = "id, parent_id, root_id, depth, role, spawn_allowed, child_count, \
-agent, model, time_busy, time_idle, idle_outcome, time_archived, time_suspended";
+agent, model, time_busy, time_idle, idle_outcome, time_archived, time_suspended, idle_reason";
 const GOAL_COLUMNS: &str = "id, root_id, objective, criteria, status, rounds, stalls, \
 last_progress, evidence, model, time_created, time_updated";
 const OBSERVATION_COLUMNS: &str = "id, root_id, session_id, tool_call_id, tool, why, expect_s, \
@@ -43,6 +43,9 @@ pub struct SessionNodeRow {
     pub model: Option<String>,
     /// Derived lifecycle state; see [`Store::session_node`].
     pub status: String,
+    /// Why the last execution was interrupted (`user`, …), when it was a
+    /// user-initiated stop. Only set while `status` is `interrupted`.
+    pub idle_reason: Option<String>,
 }
 
 /// A goal to start for a root session.
@@ -548,6 +551,7 @@ fn node_row(row: &Row<'_>) -> Result<SessionNodeRow, StoreError> {
     let outcome: Option<String> = row.get(11)?;
     let archived: Option<i64> = row.get(12)?;
     let suspended: Option<i64> = row.get(13)?;
+    let idle_reason: Option<String> = row.get(14)?;
     Ok(SessionNodeRow {
         status: node_status(archived, busy, idle, outcome.as_deref(), suspended),
         root_id: root_id.unwrap_or_else(|| id.clone()),
@@ -559,6 +563,7 @@ fn node_row(row: &Row<'_>) -> Result<SessionNodeRow, StoreError> {
         child_count: u32::try_from(child_count).unwrap_or_default(),
         agent: agent.unwrap_or_else(|| "build".to_owned()),
         model: model.and_then(|raw| compact_model(&raw)),
+        idle_reason: idle_reason.filter(|_| outcome.as_deref() == Some("interrupted")),
     })
 }
 

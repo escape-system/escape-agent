@@ -606,6 +606,7 @@ impl Store {
                 "UPDATE session_v2
                  SET time_busy = max(?1, coalesce(time_idle + 1, ?1)),
                      idle_outcome = NULL,
+                     idle_reason = NULL,
                      time_updated = max(time_updated, ?1)
                  WHERE id = ?2",
                 params![time_busy, id],
@@ -622,16 +623,35 @@ impl Store {
         time_idle: i64,
         outcome: &str,
     ) -> Result<(), StoreError> {
+        self.mark_session_idle_with_reason(id, time_idle, outcome, None)
+            .await
+    }
+
+    /// Records the completion of an execution and, when `outcome` is
+    /// `interrupted`, why it was interrupted (`user`, …). A reason on any other
+    /// outcome is not durable and is stored as `NULL`, so a later successful
+    /// turn always clears a previous stop reason.
+    pub async fn mark_session_idle_with_reason(
+        &self,
+        id: &str,
+        time_idle: i64,
+        outcome: &str,
+        reason: Option<&str>,
+    ) -> Result<(), StoreError> {
         let id = id.to_owned();
         let outcome = outcome.to_owned();
+        let reason = reason
+            .filter(|_| outcome == "interrupted")
+            .map(str::to_owned);
         self.write(move |connection| {
             connection.execute(
                 "UPDATE session_v2
                  SET time_idle = max(?1, coalesce(time_busy, ?1)),
                      idle_outcome = ?2,
+                     idle_reason = ?3,
                      time_updated = max(time_updated, ?1)
-                 WHERE id = ?3",
-                params![time_idle, outcome, id],
+                 WHERE id = ?4",
+                params![time_idle, outcome, reason, id],
             )?;
             Ok(())
         })

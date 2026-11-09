@@ -41,11 +41,9 @@ export function createActiveComposerAdapter(input: {
       admitted: (messageID) => data.session.input.has(id, messageID) || !!data.session.message.get(id, messageID),
       background: input.background,
     }),
-    interrupt: () =>
-      server.api.session
-        .interrupt({ sessionID: id, resume: true })
-        .then(() => undefined)
-        .catch(() => undefined),
+    // Stop means stop: never resume the run. The rejection reaches the caller, which reports it and restores the
+    // status it cleared optimistically.
+    interrupt: () => server.api.session.interrupt({ sessionID: id, resume: false }).then(() => undefined),
   }
 
   return adapter

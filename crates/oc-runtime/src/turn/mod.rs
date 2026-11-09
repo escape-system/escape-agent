@@ -12,7 +12,7 @@ use oc_types::payload::{
     SessionExecutionFailed, SessionExecutionInterrupted, SessionExecutionSucceeded, SessionIdle,
     SessionInboxDelivered, SessionStatusUpdated,
 };
-use oc_types::{MessageId, SessionStatus};
+use oc_types::{InterruptReason, MessageId, SessionStatus};
 use serde_json::{Map, Value, json};
 
 use crate::prompt::{self, MAX_STEPS_PROMPT};
@@ -39,6 +39,17 @@ use assistant::assistant_text;
 use stats::TurnStats;
 use stats::collect_tool_lines;
 use types::{ExecutionOutcome, ResolvedTurn};
+
+/// Lowercase wire value of an [`InterruptReason`] (`user`, `shutdown`,
+/// `superseded`, `inactivity`), used for the durable `session_v2.idle_reason`.
+fn interrupt_reason_str(reason: InterruptReason) -> &'static str {
+    match reason {
+        InterruptReason::User => "user",
+        InterruptReason::Shutdown => "shutdown",
+        InterruptReason::Superseded => "superseded",
+        InterruptReason::Inactivity => "inactivity",
+    }
+}
 
 /// Promotes one inbox row unless the host already wrote the message; a row
 /// that already exists is consumed as a doorbell and reported as the sentinel
@@ -512,12 +523,24 @@ impl Runtime {
             ExecutionOutcome::Failed(error) => ("failed", Some(error.clone())),
             ExecutionOutcome::Interrupted(_) => ("interrupted", None),
         };
+        let reason = match &outcome {
+            ExecutionOutcome::Interrupted(reason) => Some(interrupt_reason_str(*reason)),
+            _ => None,
+        };
         self.clear_background_request(session);
         // The idle row and its event are committed/published before the outcome
         // event, so a crash between them leaves a session without an
         // `execution.*` terminal rather than a terminal followed by a busy row.
-        self.publish_idle_terminal(session, directory, now, name, error.as_ref(), terminal)
-            .await?;
+        self.publish_idle_terminal(
+            session,
+            directory,
+            now,
+            name,
+            error.as_ref(),
+            reason,
+            terminal,
+        )
+        .await?;
         self.publish_outcome_terminal(session, directory, outcome, terminal)
             .await
     }
@@ -528,6 +551,10 @@ impl Runtime {
     /// Idempotent: the terminal guard records that the pair was published so a
     /// later recovery pass (the actor failure path) does not duplicate the
     /// ephemeral events.
+    // Settle helper: the flat parameter list mirrors the persisted idle row and
+    // its event fields one-for-one; grouping it into a struct would only add
+    // ceremony at the two call sites.
+    #[allow(clippy::too_many_arguments)]
     async fn publish_idle_terminal(
         &self,
         session: &str,
@@ -535,6 +562,7 @@ impl Runtime {
         now: i64,
         name: &str,
         error: Option<&oc_types::StructuredError>,
+        reason: Option<&str>,
         terminal: &TerminalState,
     ) -> Result<(), RuntimeError> {
         if terminal.idle_published() {
@@ -543,7 +571,7 @@ impl Runtime {
         self.inner
             .config
             .store
-            .mark_session_idle(session, now, name)
+            .mark_session_idle_with_reason(session, now, name, reason)
             .await?;
         let mut idle = Map::new();
         idle.insert("time".to_owned(), json!({ "created": now }));
@@ -686,6 +714,7 @@ impl Runtime {
                 now,
                 "failed",
                 Some(&structured),
+                None,
                 terminal,
             )
             .await

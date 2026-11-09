@@ -279,6 +279,10 @@ fn tool_script(call_id: &str, agent: &str, prompt: &str) -> Script {
         "prompt": prompt,
         "background": false,
     });
+    tool_input_script(call_id, input)
+}
+
+fn tool_input_script(call_id: &str, input: Value) -> Script {
     let text = input.to_string();
     Script::Events(vec![
         LlmEvent::StepStart,
@@ -457,7 +461,12 @@ async fn interrupt_during_foreground_subagent_wait_cancels_the_child() {
         assert!(Instant::now() < deadline, "the root never spawned a child");
         tokio::time::sleep(Duration::from_millis(10)).await;
     };
-    while !harness.runtime.active().iter().any(|id| id == &child) {
+    // Sync on the child's provider call, not just on the actor existing. A stop
+    // that lands after the actor is registered but before it promotes the
+    // queued prompt now withdraws that row (see `withdraw_queued_input`), so
+    // the child would never run a turn and would legitimately have no idle row.
+    // `requests` counts the root call first and the child call second.
+    while harness.model.requests().len() < 2 {
         assert!(Instant::now() < deadline, "the child never started");
         tokio::time::sleep(Duration::from_millis(10)).await;
     }

@@ -1,6 +1,6 @@
 use oc_store::{Delivery, MessageQuery, NewInbox, Order, SessionPatch};
 use oc_types::payload::SessionModelSelected;
-use oc_types::{MessageId, SessionId, now_millis};
+use oc_types::{InterruptReason, MessageId, SessionId, now_millis};
 use serde_json::{Value, json};
 use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -139,7 +139,10 @@ impl Runtime {
     async fn apply_repair_command(&self, command: RepairCommand) -> Result<(), RuntimeError> {
         match command {
             RepairCommand::Interrupt { session_id } => {
-                if !self.interrupt(&session_id).await? {
+                if !self
+                    .interrupt_with_reason(&session_id, InterruptReason::Superseded)
+                    .await?
+                {
                     tracing::debug!(session = %session_id, "observer interrupt found no running execution");
                 }
             }
@@ -153,7 +156,10 @@ impl Runtime {
                 }
             }
             RepairCommand::RestartSubagent { session_id, note } => {
-                if !self.interrupt(&session_id).await? {
+                if !self
+                    .interrupt_with_reason(&session_id, InterruptReason::Superseded)
+                    .await?
+                {
                     tracing::debug!(session = %session_id, "observer restart found no running execution");
                 }
                 let Some(prompt) = self.session_text(&session_id, "user", Order::Asc).await? else {

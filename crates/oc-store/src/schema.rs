@@ -431,6 +431,15 @@ CREATE INDEX context_box_root_key_idx ON context_box(root_id, key);
 CREATE INDEX context_box_root_live_idx ON context_box(root_id, deleted, time_expired);
 ";
 
+/// Durable reason for the last idle outcome. Distinguishes a user-initiated
+/// stop from other interrupts so the observer does not resume a stopped
+/// session. Internal only; never serialised onto the wire session shape.
+///
+/// Deliberately not part of `WIRE`: `0001_wire` is frozen because its checksum
+/// is recorded in every existing database. Fresh databases get the column by
+/// running `0001` and then this migration, so they reach the same shape.
+const SESSION_IDLE_REASON: &str = "ALTER TABLE session_v2 ADD COLUMN idle_reason TEXT;";
+
 pub(crate) const MIGRATIONS: &[Migration] = &[
     Migration {
         id: "0001_wire",
@@ -486,5 +495,10 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         id: "0011_context_box",
         sql: CONTEXT_BOX,
         column_guard: None,
+    },
+    Migration {
+        id: "0012_session_idle_reason",
+        sql: SESSION_IDLE_REASON,
+        column_guard: Some(("session_v2", "idle_reason")),
     },
 ];

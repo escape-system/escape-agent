@@ -8,7 +8,7 @@ and `LICENSE`.
 Layout inside the archive:
 
 ```
-opencode-0.1.0-linux-x86_64/
+opencode-0.2.0-linux-x86_64/
   opencode
   README.md
   LICENSE
@@ -47,7 +47,7 @@ replaces the release (`gh release delete --yes` then create).
 ## The version-must-match rule
 
 The tag must equal `[workspace.package] version` in `Cargo.toml` (currently
-`0.1.0`) exactly, minus the leading `v`. The workflow fails before building if
+`0.2.0`) exactly, minus the leading `v`. The workflow fails before building if
 they differ:
 
 ```

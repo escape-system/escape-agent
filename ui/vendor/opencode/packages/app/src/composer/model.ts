@@ -116,7 +116,7 @@ export function createComposerModel(adapter: ComposerAdapter, options?: { queue?
     return text.trim().length === 0 && attachments().length === 0 && commentCount() === 0
   })
 
-  const stopping = createMemo(() => adapter.working() && blank())
+  const stopping = createMemo(() => adapter.working())
 
   const placeholder = () => {
     if (mode() === "shell") return language.t("prompt.placeholder.shell", { example: "git status" })

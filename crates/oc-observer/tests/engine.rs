@@ -132,6 +132,7 @@ fn tree() -> Vec<TreeRow> {
         agent: "build".to_owned(),
         state: "busy".to_owned(),
         depth: 0,
+        idle_reason: None,
     }]
 }
 
@@ -661,6 +662,7 @@ async fn subagent_strip_is_not_overdue_while_child_session_is_busy() {
             agent: "build".to_owned(),
             state: "busy".to_owned(),
             depth: 0,
+            idle_reason: None,
         },
         TreeRow {
             sid: "ses_child".to_owned(),
@@ -668,6 +670,7 @@ async fn subagent_strip_is_not_overdue_while_child_session_is_busy() {
             agent: "general".to_owned(),
             state: "busy".to_owned(),
             depth: 1,
+            idle_reason: None,
         },
     ];
     assert!(
@@ -694,4 +697,134 @@ async fn cancel_tool_accepts_session_id_of_running_strip() {
         matches!(run, Some(ObserverRun::Repair { .. })),
         "got {run:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// User stop is terminal (docs/08 §5)
+// ---------------------------------------------------------------------------
+
+fn tree_with(state: &str, idle_reason: Option<&str>) -> Vec<TreeRow> {
+    vec![TreeRow {
+        sid: "ses_root".to_owned(),
+        parent: None,
+        agent: "build".to_owned(),
+        state: state.to_owned(),
+        depth: 0,
+        idle_reason: idle_reason.map(str::to_owned),
+    }]
+}
+
+fn repost_repair(target: &str) -> String {
+    format!(
+        r#"{{"action":"repair","target":"{target}","reason":"the session looks stalled",
+            "repair":{{"kind":"repost"}}}}"#
+    )
+}
+
+#[tokio::test]
+async fn user_stopped_root_does_not_wake_the_observer() {
+    let h = harness(ObserverConfig::default(), vec![Ok(nudge())]);
+    // An overdue strip plus a pending wake: without the guard both the timer
+    // tick and the forced check would call the model.
+    h.engine.observe_start(strip("tc_1", 0, 10));
+    h.engine
+        .note_host_event("ses_root", HostFlag::ExecutionInterrupted);
+    h.clock.set(1_000_000);
+    assert_eq!(h.engine.earliest_deadline("ses_root"), Some(10_000));
+
+    let stopped = tree_with("interrupted", Some("user"));
+    assert!(
+        h.engine
+            .tick("ses_root", stopped.clone(), None)
+            .await
+            .is_none(),
+        "a timer tick must not wake a user-stopped root"
+    );
+    assert_eq!(h.model.calls(), 0);
+
+    assert!(
+        h.engine
+            .check_now("ses_root", stopped, None)
+            .await
+            .is_none(),
+        "a forced check must not re-raise a user-stopped root"
+    );
+    assert_eq!(h.model.calls(), 0);
+    assert!(h.executor.calls.lock().expect("executor").is_empty());
+    assert!(h.notifier.notices().is_empty());
+}
+
+#[tokio::test]
+async fn a_non_user_interrupt_still_wakes() {
+    let h = harness(ObserverConfig::default(), vec![Ok(nudge())]);
+    h.engine
+        .note_host_event("ses_root", HostFlag::ExecutionInterrupted);
+    h.clock.set(500);
+
+    let run = h
+        .engine
+        .tick("ses_root", tree_with("interrupted", Some("shutdown")), None)
+        .await;
+    assert!(
+        matches!(run, Some(ObserverRun::Verdict { .. })),
+        "a shutdown interrupt must still wake, got {run:?}"
+    );
+    assert_eq!(h.model.calls(), 1);
+}
+
+#[tokio::test]
+async fn repost_is_rejected_for_a_user_stopped_target() {
+    let h = harness(
+        ObserverConfig::default(),
+        vec![Ok(repost_repair("ses_root"))],
+    );
+    h.engine.observe_start(strip("tc_1", 0, 10));
+    h.clock.set(30_000);
+
+    let run = h
+        .engine
+        .tick("ses_root", tree_with("interrupted", Some("user")), None)
+        .await;
+    // The run-level guard fires before the verdict is requested, so the
+    // rejection is observable as "no model call, no repair, no notice" rather
+    // than as `ObserverRun::Rejected`.
+    assert!(
+        run.is_none(),
+        "a repost verdict must never be requested for a stopped root, got {run:?}"
+    );
+    assert_eq!(h.model.calls(), 0);
+    assert!(
+        h.model.last_input().is_none(),
+        "the repost verdict must never even be requested"
+    );
+    assert!(
+        h.executor.calls.lock().expect("executor").is_empty(),
+        "no repost may reach the executor"
+    );
+    assert!(h.notifier.notices().is_empty());
+}
+
+#[tokio::test]
+async fn the_guard_lifts_after_a_new_execution() {
+    let h = harness(ObserverConfig::default(), vec![Ok(nudge())]);
+    h.engine.observe_start(strip("tc_1", 0, 10));
+    h.engine
+        .note_host_event("ses_root", HostFlag::ExecutionInterruptedByUser);
+    h.clock.set(30_000);
+    assert!(
+        h.engine
+            .tick("ses_root", tree_with("interrupted", Some("user")), None)
+            .await
+            .is_none()
+    );
+    assert_eq!(h.model.calls(), 0);
+
+    h.engine
+        .note_host_event("ses_root", HostFlag::ExecutionStarted);
+    let run = h.engine.tick("ses_root", tree(), None).await;
+    assert!(
+        matches!(run, Some(ObserverRun::Verdict { .. })),
+        "a new execution lifts the guard, got {run:?}"
+    );
+    assert_eq!(h.model.calls(), 1);
 }

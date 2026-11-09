@@ -48,6 +48,16 @@ pub struct RootInput {
     pub step: u32,
     /// `busy`, `idle`, `interrupted`.
     pub state: String,
+    /// True when the root was stopped by the user and is still idle as a
+    /// result. Omitted when false so the input document stays terse.
+    #[serde(rename = "stoppedByUser", skip_serializing_if = "is_false")]
+    pub stopped_by_user: bool,
+}
+
+/// Serde predicate for `#[serde(skip_serializing_if = ...)]` on bool fields.
+#[allow(clippy::trivially_copy_pass_by_ref)] // serde `skip_serializing_if` requires `fn(&T) -> bool`
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// Optional root metadata the host feeds once per change.
@@ -118,6 +128,14 @@ pub struct TreeRow {
     pub agent: String,
     /// `busy`, `idle`, `failed`, …
     pub state: String,
+    /// Durable interruption cause (`user`, `shutdown`, `superseded`,
+    /// `inactivity`) when the row stopped as `interrupted`; omitted otherwise.
+    ///
+    /// The runtime populates this from `session_v2.idle_reason`. The observer
+    /// treats `interrupted` + `user` as a user stop and never re-raises that
+    /// session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_reason: Option<String>,
     /// Depth from the root (root = 0).
     pub depth: u32,
 }
@@ -227,6 +245,7 @@ mod tests {
                 model: Some("anthropic/claude-sonnet-4-5".to_owned()),
                 step: 7,
                 state: "busy".to_owned(),
+                stopped_by_user: false,
             },
             active: vec![active(0)],
             recent: Vec::new(),
@@ -236,6 +255,7 @@ mod tests {
                 agent: "build".to_owned(),
                 state: "busy".to_owned(),
                 depth: 0,
+                idle_reason: None,
             }],
         }
     }
@@ -278,6 +298,7 @@ mod tests {
                 parent: Some("ses_root".to_owned()),
                 agent: "general".to_owned(),
                 state: "busy".to_owned(),
+                idle_reason: None,
                 depth,
             })
             .collect();

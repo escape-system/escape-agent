@@ -129,7 +129,10 @@ fn system_prompt(nudge_max_chars: usize) -> String {
          - reason is required (at most 20 words)\n\
          - message is only for \"nudge\" (must be <= {nudge_max_chars} chars; omit for other actions)\n\
          - repair is only for \"repair\" (omit for other actions)\n\
-         - goal_evidence is only for \"goal_done\" (omit for other actions)\n\n\
+         - goal_evidence is only for \"goal_done\" (omit for other actions)\n\
+         - A session whose latest settled execution was interrupted with reason \"user\" is stopped by the user. \
+         Treat it as terminal: do not choose nudge, repost, or restart_subagent for that session or any of its descendants. \
+         Manual checks may inspect and report, but must not re-raise a stopped session.\n\n\
          Reply with exactly one JSON object with only the applicable fields:\n\
          {{\"action\":\"none|nudge|inspect|repair|goal_done|goal_blocked|goal_failed\",\
          \"target\":\"session or tool-call id\",\

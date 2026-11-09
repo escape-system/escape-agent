@@ -55,7 +55,12 @@ function controls(): ComposerControls {
   }
 }
 
-function active(state: ComposerStateTarget, target: ComposerSession, ctl = controls): ActiveComposerAdapter {
+function active(
+  state: ComposerStateTarget,
+  target: ComposerSession,
+  ctl = controls,
+  overrides: Partial<Pick<ActiveComposerAdapter, "working" | "interrupt">> = {},
+): ActiveComposerAdapter {
   return {
     kind: "active-session",
     state,
@@ -66,6 +71,7 @@ function active(state: ComposerStateTarget, target: ComposerSession, ctl = contr
     interrupt: async () => undefined,
     submitted() {},
     setEditor() {},
+    ...overrides,
   }
 }
 
@@ -869,5 +875,136 @@ describe("Composer submission", () => {
 
     expect(calls).toEqual([])
     expect(state.current().some((part) => part.type === "image")).toBe(true)
+  })
+
+  describe("stopping the run", () => {
+    test("stop sends exactly one interrupt with resume:false", async () => {
+      const statuses: ("idle" | "running")[] = []
+      let interrupts = 0
+      const submission = submitInput(
+        active(createMemoryComposerState().capture(), session({ calls: [], statuses }), controls, {
+          working: () => true,
+          interrupt: async () => {
+            interrupts += 1
+          },
+        }),
+      )
+
+      await submission.stop()
+
+      // The adapter owns `resume: false`; submit must call it once, not twice.
+      expect(interrupts).toBe(1)
+    })
+
+    test("stop marks the session idle before the interrupt resolves", async () => {
+      const statuses: ("idle" | "running")[] = []
+      const interrupting = Promise.withResolvers<void>()
+      const submission = submitInput(
+        active(createMemoryComposerState().capture(), session({ calls: [], statuses }), controls, {
+          working: () => true,
+          interrupt: () => interrupting.promise,
+        }),
+      )
+
+      const stopped = submission.stop()
+
+      // Optimistic idle happens synchronously, before the request settles.
+      expect(statuses).toEqual(["idle"])
+      interrupting.resolve()
+      await stopped
+      expect(statuses).toEqual(["idle"])
+    })
+
+    test("a second stop while in flight is a no-op", async () => {
+      let interrupts = 0
+      const interrupting = Promise.withResolvers<void>()
+      const submission = submitInput(
+        active(createMemoryComposerState().capture(), session({ calls: [] }), controls, {
+          working: () => true,
+          interrupt: () => {
+            interrupts += 1
+
+            return interrupting.promise
+          },
+        }),
+      )
+
+      const first = submission.stop()
+      await submission.stop()
+      expect(interrupts).toBe(1)
+
+      interrupting.resolve()
+      await first
+      // Once the first request settled a later stop is a new stop, not a permanent latch.
+      await submission.stop()
+      expect(interrupts).toBe(2)
+    })
+
+    test("a rejected interrupt restores running and surfaces the error", async () => {
+      const statuses: ("idle" | "running")[] = []
+      const failures: { kind: string; error: unknown }[] = []
+      const submission = submitInput(
+        active(createMemoryComposerState().capture(), session({ calls: [], statuses }), controls, {
+          working: () => true,
+          interrupt: async () => {
+            throw new Error("server unavailable")
+          },
+        }),
+        {
+          missingSelection() {},
+          unqueueable() {},
+          failed: (kind, error) => failures.push({ kind, error }),
+        },
+      )
+
+      await submission.stop()
+
+      expect(statuses).toEqual(["idle", "running"])
+      expect(failures).toHaveLength(1)
+      const failure = failures[0]
+      expect(failure?.kind).toBe("prompt")
+      expect(failure?.error instanceof Error ? failure.error.message : undefined).toBe(
+        "Failed to stop the run: server unavailable",
+      )
+    })
+
+    test("a fulfilled interrupt with nothing live still counts as stopped", async () => {
+      const failures: string[] = []
+      const submission = submitInput(
+        active(createMemoryComposerState().capture(), session({ calls: [] }), controls, {
+          working: () => true,
+          // The adapter resolves `{interrupted: false}` to void; only the rejection path is a failure.
+          interrupt: async () => undefined,
+        }),
+        { missingSelection() {}, unqueueable() {}, failed: () => failures.push("failed") },
+      )
+
+      await submission.stop()
+      expect(failures).toEqual([])
+    })
+
+    test("the duplicate-prompt retry does not fire after a stop", async () => {
+      const state = createMemoryComposerState({ prompt: "ship it" }).capture()
+      const calls: string[] = []
+      const firstAttempt = Promise.withResolvers<void>()
+      const submission = submitInput(
+        active(state, session({ calls, prompt: () => firstAttempt.promise }), controls, {
+          working: () => true,
+          interrupt: async () => undefined,
+        }),
+      )
+
+      const submitted = submission.submit(new Event("submit"))
+      await new Promise((resolve) => setTimeout(resolve, 0))
+      expect(calls.filter((call) => call === "admit")).toHaveLength(1)
+
+      await submission.stop()
+      firstAttempt.reject(new Error("network unavailable"))
+      await submitted
+      await new Promise((resolve) => setTimeout(resolve, 0))
+
+      // The stop is terminal: the admission is not retried, so only one turn could ever have started.
+      expect(calls.filter((call) => call === "admit")).toHaveLength(1)
+    })
   })
 })

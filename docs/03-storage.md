@@ -25,7 +25,8 @@ internal model for our features.
   (never silently skip). Current ids: `0001_wire`, `0002_additive`,
   `0003_memory_fts`, `0004_project_archived`, `0005_form`,
   `0006_lane_ticket_message`, `0007_lane_ticket_output_path`,
-  `0008_lane_ticket_queued_idx`, `0009_schedule`, `0010_snapshot`.
+  `0008_lane_ticket_queued_idx`, `0009_schedule`, `0010_snapshot`,
+  `0011_context_box`, `0012_session_idle_reason`.
 
 ## Where sessions are stored
 
@@ -75,7 +76,8 @@ session_v2(
   tokens_cache_read INTEGER NOT NULL DEFAULT 0, tokens_cache_write INTEGER NOT NULL DEFAULT 0,
   time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL,
   time_busy INTEGER, time_idle INTEGER, time_viewed INTEGER,
-  time_idle_outcome INTEGER, time_compacting INTEGER, time_archived INTEGER,
+  idle_outcome TEXT, idle_reason TEXT,          -- idle_reason: migration 0012
+  time_compacting INTEGER, time_archived INTEGER,
   time_suspended INTEGER, resume_attempts INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX session_project_idx  ON session_v2(project_id);
@@ -171,6 +173,18 @@ Notes on the wire tables that carry more columns than their wire object:
   `get_credential` and skipped by `list_credentials`.
 - `project.archived` and the `project_archived_idx`/`project_time_idx` indices
   are added by migration `0004` behind a column guard.
+- `session_v2.idle_reason` is added by migration `0012` behind a column guard.
+  It is `NULL` or one of `user`, `shutdown`, `superseded`, `inactivity`, and is
+  written in the same `UPDATE` as `idle_outcome` when an execution settles as
+  `interrupted`, so the two columns can never disagree. `NULL` for
+  `succeeded`/`failed` outcomes and for every row that predates the migration:
+  `0012` has no backfill, so old interrupted rows keep `idle_reason = NULL`
+  (unknown reason) and must not be read as a user stop. The column is internal —
+  it is not on the wire, is not part of `Session.Info`, and is not emitted in
+  any event payload. It is the durable basis for distinguishing a user stop
+  from an observer repair or shutdown after a restart; `Store::mark_session_idle_with_reason`
+  writes it and `SessionNodeRow.idle_reason` reads it back for the observer and
+  the agent-tree code. No REST route or event exposes it.
 
 `session_message.data` and `session_part.data` keep the upstream JSON key
 layout exactly (`$.status`, `$.model.providerID`, `$.tokens.*`, `$.snapshot.*`,

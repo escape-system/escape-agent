@@ -13,11 +13,35 @@ import { blobDataUrl, resolveBlobUrl } from "@/runtime/persistence/drafts"
 import { isAttachment } from "./prompt-parts"
 import type { ModelSelection } from "@/providers/models/selection"
 import { parseSlashCommand } from "./client-slash-command"
+// Reuse the send-failure formatter so a rejected stop reports the same server/network detail a failed send does.
+import { formatServerError } from "@/runtime/server/errors"
 
 const submitting = new WeakSet<object>()
 
 // The model each session was last switched to from this client, by session ID.
 const switched = new Map<string, string>()
+
+// Per-session stop bookkeeping. `generation` changes on every accepted stop, so an admission retry that straddles a
+// stop cannot start a turn the user cancelled; `inFlight` makes a repeated Stop click while the first request is
+// pending a no-op.
+type StopState = { generation: number; inFlight: boolean }
+
+const stops = new Map<string, StopState>()
+
+function stopState(id: string) {
+  const existing = stops.get(id)
+
+  if (existing) return existing
+  const created: StopState = { generation: 0, inFlight: false }
+
+  stops.set(id, created)
+
+  return created
+}
+
+function stopGeneration(id: string) {
+  return stops.get(id)?.generation ?? 0
+}
 
 type ComposerSubmission = {
   id: SessionMessage.ID
@@ -244,9 +268,49 @@ export function createComposerSubmit(input: ComposerSubmitInput) {
       // Stopping a held send cancels it and leaves the prompt in the composer.
       if (held()) return Promise.resolve(void setHeld(false))
 
-      return input.adapter.kind === "active-session" ? input.adapter.interrupt() : Promise.resolve()
+      if (input.adapter.kind !== "active-session") return Promise.resolve()
+      const session = input.adapter.session()
+      const state = stopState(session.id)
+
+      // A second click while the first request is pending must not send another interrupt.
+      if (state.inFlight) return Promise.resolve()
+      state.inFlight = true
+      // Any admission retry that straddles this stop belongs to a turn the user cancelled.
+      state.generation += 1
+
+      // Clear the run now so the stop reads as immediate, following the send path's optimistic status write; a
+      // rejected request puts it back.
+      const wasRunning = input.adapter.working()
+
+      if (wasRunning) session.data.session.setStatus(session.id, "idle")
+
+      return Promise.resolve()
+        .then(() => input.adapter.interrupt())
+        .then(
+          // A fulfilled request means the run is stopped, including when the server had nothing live to interrupt.
+          () => undefined,
+          (error) => {
+            if (wasRunning) session.data.session.setStatus(session.id, "running")
+            input.notify.failed("prompt", stopFailure(error))
+          },
+        )
+        .finally(() => {
+          state.inFlight = false
+        })
     },
   }
+}
+
+// A stop failure is not a send failure; keep the server/network detail but say what failed. A fulfilled request is
+// success even when the server reports `{"interrupted": false}` (nothing live was left to interrupt).
+function stopFailure(
+  // oxlint-disable-next-line anti-slop/no-unknown-parameters -- a rejected interrupt is opaque; formatServerError reads it
+  error: unknown,
+) {
+  const message = "Failed to stop the run"
+  const detail = formatServerError(error, undefined, message)
+
+  return new Error(detail === message ? message : `${message}: ${detail}`)
 }
 
 function clearClientCommand(input: ComposerSubmitInput, prompt: Prompt) {
@@ -624,7 +688,14 @@ async function sendPrompt(
     prepare: staged ? undefined : () => (committed ??= commit()),
   }
 
-  await session.data.session.prompt(admission).catch(() => session.data.session.prompt(admission))
+  // One duplicate attempt covers a lost response. A stop between the two attempts is terminal for this submission,
+  // so the retry must not start a turn the user already cancelled.
+  const generation = stopGeneration(session.id)
+
+  await session.data.session.prompt(admission).catch(() => {
+    if (stopGeneration(session.id) !== generation) return
+    return session.data.session.prompt(admission)
+  })
 }
 
 async function buildSubmissionRequest(session: ComposerSession, value: ComposerSubmission) {

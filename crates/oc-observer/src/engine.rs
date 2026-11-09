@@ -223,6 +223,13 @@ pub enum HostFlag {
     ExecutionFailed,
     /// A session execution was interrupted.
     ExecutionInterrupted,
+    /// A session execution was interrupted because the user pressed stop.
+    ///
+    /// This is terminal for the observer: it must not wake, nudge, repost or
+    /// restart the stopped session until a new execution starts.
+    ExecutionInterruptedByUser,
+    /// A session execution started (clears a previous user stop).
+    ExecutionStarted,
     /// A step completed (activity, not a wake on its own).
     StepEvent,
 }
@@ -235,6 +242,11 @@ struct RootState {
     last_activity_ms: Option<i64>,
     error_streak: u32,
     pending_wake: bool,
+    /// True between a user stop and the next execution start.
+    ///
+    /// Terminal for the observer: no tick, nudge, repost or restart until the
+    /// root runs again.
+    pub user_stopped: bool,
     last_goal: Option<(GoalStatus, u32)>,
     escalated: bool,
     last_unavailable_notice_ms: Option<i64>,
@@ -378,6 +390,16 @@ impl ObserverEngine {
             HostFlag::StepEvent => root.last_activity_ms = Some(now),
             HostFlag::ExecutionFailed | HostFlag::ExecutionInterrupted => {
                 root.pending_wake = true;
+                root.last_activity_ms = Some(now);
+            }
+            HostFlag::ExecutionInterruptedByUser => {
+                // Terminal for the observer: no wake, no re-raise.
+                root.pending_wake = false;
+                root.user_stopped = true;
+                root.last_activity_ms = Some(now);
+            }
+            HostFlag::ExecutionStarted => {
+                root.user_stopped = false;
                 root.last_activity_ms = Some(now);
             }
         });
@@ -524,6 +546,22 @@ impl ObserverEngine {
             self.with_root(root_id, |state| state.pending_wake = true);
         }
 
+        // A user stop is terminal until the root actually runs again. The
+        // durable signal lives on the tree rows (`interrupted` + `user`); the
+        // host flag covers the window before that row is read back.
+        let root_active = tree
+            .iter()
+            .any(|row| row.sid == root_id && row.state == "busy");
+        if root_active {
+            self.with_root(root_id, |state| state.user_stopped = false);
+        }
+        let user_stopped = self.user_stopped(root_id, &tree);
+        if user_stopped {
+            // Terminal for both timer ticks and manual checks: a forced check
+            // must never re-raise a session the user stopped.
+            return None;
+        }
+
         let active_strips = self.registry.active(root_id);
         let busy = tree.iter().any(|row| row.state == "busy");
         let stall = busy
@@ -638,7 +676,31 @@ impl ObserverEngine {
                 return Some(ObserverRun::Unavailable { reason });
             }
         };
-        Some(self.apply(root_id, goal.as_ref(), &verdict, now).await)
+        Some(
+            self.apply(root_id, &tree, goal.as_ref(), &verdict, now)
+                .await,
+        )
+    }
+
+    /// True when the root is stopped by the user.
+    ///
+    /// Any `interrupted` row with `idle_reason=user` in the tree counts, and
+    /// the in-memory host flag is OR-ed in so a stop is honored even before the
+    /// durable row is visible to this tick.
+    fn user_stopped(&self, root_id: &str, tree: &[TreeRow]) -> bool {
+        let durable = tree.iter().any(is_user_stopped_row);
+        durable || self.with_root(root_id, |state| state.user_stopped)
+    }
+
+    /// True when `target` is a user-stopped session.
+    fn is_stopped_target(&self, root_id: &str, target: &str, tree: &[TreeRow]) -> bool {
+        if target.is_empty() {
+            return false;
+        }
+        if let Some(row) = tree.iter().find(|row| row.sid == target) {
+            return is_user_stopped_row(row);
+        }
+        target == root_id && self.with_root(root_id, |state| state.user_stopped)
     }
 
     fn build_input(
@@ -693,6 +755,7 @@ impl ObserverEngine {
 
         let root_row = tree.iter().find(|row| row.sid == root_id);
         let context = self.with_root(root_id, |state| state.root_context.clone());
+        let stopped_by_user = self.user_stopped(root_id, tree);
         let root = RootInput {
             id: root_id.to_owned(),
             agent: context
@@ -711,6 +774,7 @@ impl ObserverEngine {
                         "busy".to_owned()
                     }
                 }),
+            stopped_by_user,
         };
 
         ObserverInput {
@@ -725,6 +789,7 @@ impl ObserverEngine {
     async fn apply(
         &self,
         root_id: &str,
+        tree: &[TreeRow],
         goal: Option<&GoalSnapshot>,
         verdict: &ObserverVerdict,
         now: i64,
@@ -735,6 +800,12 @@ impl ObserverEngine {
             },
             ObserverAction::Nudge => {
                 let target = verdict.target.clone().unwrap_or_default();
+                if self.is_stopped_target(root_id, &target, tree) {
+                    return ObserverRun::Rejected {
+                        action: verdict.action,
+                        reason: "session stopped by the user".to_owned(),
+                    };
+                }
                 let allowed = self.with_root(root_id, |state| {
                     let window = state.nudges.entry(target.clone()).or_default();
                     prune_vec(window, now, self.cfg.budget_window_ms);
@@ -788,7 +859,7 @@ impl ObserverEngine {
                     verdict: verdict.clone(),
                 }
             }
-            ObserverAction::Repair => self.apply_repair(root_id, verdict, now).await,
+            ObserverAction::Repair => self.apply_repair(root_id, tree, verdict, now).await,
             ObserverAction::GoalDone | ObserverAction::GoalBlocked | ObserverAction::GoalFailed => {
                 self.apply_goal(root_id, goal, verdict, now)
             }
@@ -799,11 +870,12 @@ impl ObserverEngine {
     async fn apply_repair(
         &self,
         root_id: &str,
+        tree: &[TreeRow],
         verdict: &ObserverVerdict,
         now: i64,
     ) -> ObserverRun {
         let target = verdict.target.clone().unwrap_or_default();
-        let kind = match self.validate_repair(root_id, verdict, &target, now) {
+        let kind = match self.validate_repair(root_id, tree, verdict, &target, now) {
             Ok(kind) => kind,
             Err(reason) => {
                 return ObserverRun::Rejected {
@@ -921,6 +993,7 @@ impl ObserverEngine {
     fn validate_repair(
         &self,
         root_id: &str,
+        tree: &[TreeRow],
         verdict: &ObserverVerdict,
         target: &str,
         now: i64,
@@ -932,6 +1005,11 @@ impl ObserverEngine {
             .ok_or_else(|| "repair object has no kind".to_owned())?;
         if target.is_empty() {
             return Err("repair requires a target".to_owned());
+        }
+        if matches!(kind, RepairKind::RestartSubagent | RepairKind::Repost)
+            && self.is_stopped_target(root_id, target, tree)
+        {
+            return Err("session stopped by the user".to_owned());
         }
         match kind {
             RepairKind::RetryTool => {
@@ -1081,6 +1159,10 @@ impl ObserverEngine {
         let mut map = self.state.lock();
         f(map.entry(root_id.to_owned()).or_default())
     }
+}
+
+fn is_user_stopped_row(row: &TreeRow) -> bool {
+    row.state == "interrupted" && row.idle_reason.as_deref() == Some("user")
 }
 
 fn is_strip_overdue(strip: &FlightStrip, tree: &[TreeRow], now: i64) -> bool {
