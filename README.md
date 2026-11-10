@@ -68,7 +68,7 @@ Detailed architecture and interface specifications are available in the [`docs/`
 
 ### Prebuilt Binaries
 
-Ready-made builds are attached to [GitHub Releases](https://github.com/helloyigoza/escape-agent/releases)
+Ready-made builds are attached to [GitHub Releases](https://github.com/escape-system/escape-agent/releases)
 as `opencode-<version>-<os>-<arch>.tar.gz` plus a `.sha256` checksum sidecar; see
 [docs/23-release.md](docs/23-release.md) for the archive layout.
 
@@ -178,7 +178,7 @@ Mimarinin derinlemesine incelendiği teknik şartnameler [`docs/`](docs/README.m
 
 ### Hazır Derlenmiş Paketler
 
-Hazır derlenmiş sürümler [GitHub Releases](https://github.com/helloyigoza/escape-agent/releases)
+Hazır derlenmiş sürümler [GitHub Releases](https://github.com/escape-system/escape-agent/releases)
 sayfasında `opencode-<sürüm>-<işletim sistemi>-<mimari>.tar.gz` ve `.sha256` sağlama toplamı
 dosyasıyla yayınlanır; arşiv düzeni için [docs/23-release.md](docs/23-release.md).
 
