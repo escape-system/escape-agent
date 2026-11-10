@@ -7,11 +7,13 @@ the observable semantics and drops the Effect fiber machinery.
 
 ```
 prompt → inbox row (durable) → wake actor → execution.started
-       → [step] → execution.succeeded | failed | interrupted
+       → [step] → execution.succeeded → [execution.step_limit when the budget ran out]
+                | failed | interrupted
 ```
 
 - `session_inbox` types: `user`, `synthetic`, `compaction`, `move`, plus our
-  `peer` (subagent-to-sibling) and `observer` (repair note). Delivery is
+  `peer` (subagent-to-sibling) and `observer` (repair note, or host-side
+  compaction advice with `metadata.advice="compact"`). Delivery is
   `steer` (promote mid-turn) or `queue` (next turn).
 - One execution per session at a time. New prompts during an execution are
   admitted, not rejected; `steer` promotes at step boundaries. Only `steer`
@@ -38,12 +40,22 @@ prompt → inbox row (durable) → wake actor → execution.started
 2. **Context**: session, agent, merged permissions, tool snapshot, instruction
    sources. Emit `session.instructions.updated` deltas when sources changed.
 3. **Title**: generate if empty (hidden `title` agent, cheap model).
-4. **Estimate prompt**: anchor-based. Find last assistant message with measured
-   `input + cache.read + cache.write` for the same provider; estimate only
-   messages after it at ~4 chars/token, image 1500, pdf 2000.
-5. **Compaction**: ceiling = `context_window − max(15%, 16k)`. Auto when over;
-   precompute at 85% when measured ≥ 64k. Summary is itself a session request
-   with the fixed 7-section template; native compaction is optional.
+4. **Estimate prompt**: anchor-based. Find the last assistant message with a
+   measured prompt size of `input + cache.read + cache.write` (i.e.
+   `Tokens::prompt_tokens()`; the wire `Tokens.input` is NON-cached) for the
+   same provider; estimate only messages after it at ~4 chars/token, image
+   1500, pdf 2000.
+5. **Compaction**: ceiling = `context_window − max(15%, 16k)`; a configured
+   `compaction.ceiling_tokens` may only lower it. The trigger is
+   `ceiling − buffer`, where `compaction.buffer` (`0`/absent) falls back to
+   `max(8_000, context_window / 10)`; the gate is strict `estimate > trigger`,
+   evaluated before every request, with at most 3 auto-compactions per turn.
+   `compaction.auto` defaults to **false**, but an explicit `ceiling_tokens`
+   arms the guard even then: an explicit ceiling is a real limit, not just a
+   cap on the computed one. `precompute_threshold`/`should_compact` exist in
+   `tokens.rs` but are not wired into the turn loop. Summary is itself a
+   session request with the fixed 7-section template; native compaction is
+   optional.
 6. **Request**: build transcript, `session.context` transform hook, deep-copy
    tool defs, apply modality bounds (images: 25 MiB trigger / 15 MiB target,
    oldest demoted to text), inject `expectation` into every tool schema.
@@ -94,7 +106,12 @@ memory block (ours) → goal block (ours) → per-session entries
 - Tool defs are preserved even when `toolChoice: "none"` (max steps) so the
   prompt cache stays valid.
 - Max steps: `agent.steps` (legacy `maxSteps`); the final step runs with
-  `MAX_STEPS_PROMPT` and `toolChoice: "none"`.
+  `MAX_STEPS_PROMPT` and `toolChoice: "none"`. A turn that exhausts the budget
+  still settles `succeeded` (it answered), then publishes the durable qualifier
+  `session.execution.step_limit {sessionID, steps}` after the terminal and
+  records the grammar `step limit reached after N steps` in `idle_reason`. The
+  store persists it for `interrupted` outcomes and for step-limit markers,
+  whatever outcome records them; every other row keeps it `NULL` (`docs/03`).
 - Output limit: `finish === "length"` → synthetic `CONTINUE_AFTER_OUTPUT_LIMIT`;
   three consecutive → `output-limit` failure.
 - Mid-stream interruption → one `CONTINUE_AFTER_INCOMPLETE_STREAM` retry.
@@ -206,6 +223,11 @@ On boot, for every session with an execution claim:
 - Inbox rows already `delivered` but not promoted → re-promote.
 - Background subagent jobs → re-attach if the child still exists, else
   synthesize a failure to the parent.
+- Lane tickets → `LaneService::restore` replays queued rows in enqueue order,
+  marks `running` rows failed with a restart reason, and resumes the ticket
+  counter above every restored id so an id is never reused. Terminal rows are
+  only read, never re-published, so a boot cannot wipe their `finished`/
+  `output_path`.
 
 All of this is one transaction per session, then one event per change.
 
@@ -217,5 +239,6 @@ All of this is one transaction per session, then one event per change.
 | pre-step gate | observer may veto/repair before a provider call |
 | post-step | observer gets the terse step record (no text) |
 | `session.idle` | goal/observer continuation decision |
+| host compaction adviser | deterministic per-tick token-pressure check; publishes `observer.advised`, never a hook and never the LLM observer |
 | `tool.execute.before/after` | permission, lanes, expectation settlement |
 | `instructions` source | memory, goal, skill index, digest |

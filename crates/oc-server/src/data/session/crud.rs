@@ -10,7 +10,7 @@ use axum::response::{IntoResponse, Response};
 use oc_store::{NewSession, Order, SessionPatch, SessionQuery};
 use oc_types::{
     ApiError, EventPayload, SessionArchived, SessionDeleted, SessionId, SessionMetadataUpdated,
-    SessionPermissions, SessionRenamed, SessionUnarchived, now_millis,
+    SessionOutcome, SessionPermissions, SessionRenamed, SessionUnarchived, now_millis,
 };
 use serde_json::{Map, Value, json};
 
@@ -24,6 +24,30 @@ use crate::data::{
     cursor_value, no_content, query_error, require_store, schema_error, session_not_found,
 };
 use crate::error::ErrorResponse;
+
+/// Projects a stored session onto the wire `Session.Info`.
+///
+/// `oc-store` records internal outcomes the wire enum does not know; today the
+/// only one is `step_limit` (a turn whose step budget ended it). The generated
+/// type in `ui/vendor/opencode/packages/client/src/promise/generated/types.ts`
+/// is exactly `succeeded | failed | interrupted`, so an unknown literal is
+/// omitted here — never `null`, never remapped to a wrong literal — while the
+/// store keeps recording it. Every other key is copied untouched.
+pub(crate) fn project_session(mut value: Value) -> Value {
+    // `SessionOutcome`'s own serde parse is the source of truth for the three
+    // literals; no second copy of the list lives here.
+    let unknown_outcome = match value.get("outcome") {
+        Some(Value::String(outcome)) => {
+            serde_json::from_value::<SessionOutcome>(Value::String(outcome.clone())).is_err()
+        }
+        // Absent, or a shape the store never writes: leave it alone.
+        _ => false,
+    };
+    if unknown_outcome && let Some(object) = value.as_object_mut() {
+        object.remove("outcome");
+    }
+    value
+}
 
 /// `GET /api/session`
 pub async fn list(
@@ -66,7 +90,7 @@ pub async fn list(
         .await?;
 
     Ok(Json(json!({
-        "data": page.items,
+        "data": page.items.into_iter().map(project_session).collect::<Vec<_>>(),
         "cursor": cursor_value(page.cursor),
     })))
 }
@@ -147,7 +171,7 @@ pub async fn get(
         .get_session(&session_id)
         .await?
         .ok_or_else(|| session_not_found(&session_id))?;
-    Ok(Json(json!({ "data": session })))
+    Ok(Json(json!({ "data": project_session(session) })))
 }
 
 /// `PATCH /api/session/:sid`

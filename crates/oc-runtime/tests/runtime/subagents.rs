@@ -1178,6 +1178,154 @@ async fn parent_completion_message_carries_the_subagent_metadata() {
 }
 
 #[tokio::test]
+async fn subagent_step_limit_is_reported_to_the_parent() {
+    // The child agent gets a budget of one tool-enabled step, so its scripted
+    // read exhausts the budget and the next (final, tool-less) call only
+    // produces a summary. Without the qualifier the parent would see an
+    // ordinary `state="completed"` result and plan on a truncated answer.
+    let harness = Harness::new(
+        vec![
+            tool_script(
+                "read_1",
+                json!({"path": "hello.txt", "expectation": expectation()}),
+            ),
+            text_script("partial summary"),
+        ],
+        Arc::new(AllowAll),
+        json!({
+            "agents": {"general": {"steps": 1}},
+            "subagents": {"background_default": false},
+        }),
+        None,
+    )
+    .await;
+    let tool = subagent_tool(&harness, "subagent");
+    let result = tool
+        .execute(
+            &tool_context(&harness, &harness.session),
+            json!({
+                "agent": "general",
+                "description": "truncated child",
+                "prompt": "work",
+                "background": true,
+            }),
+        )
+        .await
+        .expect("background spawn");
+    let child = serde_json::from_str::<Value>(result.output.as_deref().expect("output"))
+        .expect("json")["sessionID"]
+        .as_str()
+        .expect("child")
+        .to_owned();
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let messages = session_messages(&harness.store, &harness.session).await;
+        if let Some(message) = messages.iter().find(|message| {
+            message["type"] == "synthetic"
+                && message["metadata"]["source"] == "subagent"
+                && message["metadata"]["childID"] == child.as_str()
+        }) {
+            assert_eq!(message["metadata"]["state"], "completed");
+            assert_eq!(message["metadata"]["stepLimit"], true);
+            let steps = message["metadata"]["steps"]
+                .as_u64()
+                .expect("steps recorded on the envelope metadata");
+            assert_eq!(
+                steps, 1,
+                "the reported count is the configured budget, not an arbitrary number"
+            );
+            let text = message["text"].as_str().expect("envelope");
+            assert!(
+                text.contains(&format!(
+                    "\n[step budget exhausted after {steps} steps; result may be incomplete]"
+                )),
+                "{text}"
+            );
+            assert!(text.contains("partial summary"), "{text}");
+            break;
+        }
+        assert!(Instant::now() < deadline, "no step-limit report");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test]
+async fn subagent_that_stops_on_its_own_has_no_step_limit_marker() {
+    // Negative control for the qualifier: the child answers in one tool-less
+    // step, so its turn never hits the budget. The parent envelope must stay
+    // byte-identical to the ordinary completion (no `stepLimit`, no `steps`,
+    // no appended caveat) and no `session.execution.step_limit` event may be
+    // committed for the child.
+    let harness = Harness::new(
+        vec![text_script("child final")],
+        Arc::new(AllowAll),
+        json!({"subagents": {"background_default": false}}),
+        None,
+    )
+    .await;
+    let tool = subagent_tool(&harness, "subagent");
+    let result = tool
+        .execute(
+            &tool_context(&harness, &harness.session),
+            json!({
+                "agent": "general",
+                "description": "plain child",
+                "prompt": "work",
+                "background": true,
+            }),
+        )
+        .await
+        .expect("background spawn");
+    let child = serde_json::from_str::<Value>(result.output.as_deref().expect("output"))
+        .expect("json")["sessionID"]
+        .as_str()
+        .expect("child")
+        .to_owned();
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let messages = session_messages(&harness.store, &harness.session).await;
+        if let Some(message) = messages.iter().find(|message| {
+            message["type"] == "synthetic"
+                && message["metadata"]["source"] == "subagent"
+                && message["metadata"]["childID"] == child.as_str()
+        }) {
+            assert_eq!(message["metadata"]["state"], "completed");
+            assert!(
+                message["metadata"].get("stepLimit").is_none(),
+                "an unexhausted budget leaves no marker: {}",
+                message["metadata"]
+            );
+            assert!(
+                message["metadata"].get("steps").is_none(),
+                "an unexhausted budget records no step count: {}",
+                message["metadata"]
+            );
+            let text = message["text"].as_str().expect("envelope");
+            assert!(text.contains("child final"), "{text}");
+            assert!(!text.contains("step budget exhausted"), "{text}");
+            break;
+        }
+        assert!(Instant::now() < deadline, "no completion message");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let logged = harness
+        .store
+        .events_after(&child, 0, 1_000)
+        .await
+        .expect("event log");
+    assert!(
+        !logged
+            .iter()
+            .any(|event| event.kind == "session.execution.step_limit"),
+        "the child's own log carries no qualifier: {:?}",
+        logged.iter().map(|event| &event.kind).collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
 async fn subagent_schemas_match_the_documented_keys() {
     let harness = Harness::new(vec![], Arc::new(AllowAll), json!({}), None).await;
     let registry = SubagentTools::new(harness.runtime.clone()).registry();

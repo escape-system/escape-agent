@@ -114,7 +114,9 @@ fn outcome_state(outcome: Option<&str>) -> Option<&'static str> {
     match outcome {
         Some("failed") => Some("failed"),
         Some("interrupted") => Some("cancelled"),
-        Some("succeeded") => Some("completed"),
+        // `step_limit` is the stored literal for a completed turn whose step
+        // budget ended it; it is a qualified success, never a failure.
+        Some("succeeded" | "step_limit") => Some("completed"),
         _ => None,
     }
 }

@@ -8,7 +8,7 @@ use oc_server::AppState;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::lane::{BusLaneEvents, lane_config};
+use crate::lane::{BusLaneEvents, StoreLaneTickets, lane_config};
 use crate::paths::default_db_path;
 use crate::schedule::spawn_schedule_runner;
 use crate::scribe;
@@ -155,11 +155,18 @@ pub(crate) async fn attach_runtime(
     Ok((state, runtime, broker))
 }
 
-pub(crate) fn attach_extensions(
+/// Builds the MCP/LSP/plugin/lane extensions and attaches them to the state.
+///
+/// The lane service is restored from the persisted `lane_ticket` table: queued
+/// rows are re-enqueued in their original order, `running` rows are failed as
+/// interrupted by the restart, and the id counter resumes above the highest
+/// restored id. A restore failure is logged and propagated, never swallowed:
+/// booting with a silently empty queue would lose submitted work.
+pub(crate) async fn attach_extensions(
     mut state: AppState,
     services: &Services,
     directory: &Path,
-) -> (AppState, Extensions) {
+) -> anyhow::Result<(AppState, Extensions)> {
     let mut providers: Vec<Arc<dyn oc_runtime::ToolProvider>> = Vec::new();
 
     match oc_server::data::mcp::McpManager::from_config(services.config.as_ref(), directory) {
@@ -200,23 +207,32 @@ pub(crate) fn attach_extensions(
     // The service takes the erased runner; keep the concrete handle for `bind`.
     let runner_handle: Arc<dyn oc_lanes::LaneRunner> = runner.clone();
     let clock: Arc<dyn oc_lanes::Clock> = Arc::new(oc_lanes::SystemClock);
-    let lanes = Arc::new(oc_lanes::LaneService::new(
-        lane_config(services.config.as_ref()),
-        runner_handle,
-        events,
-        clock,
-    ));
+    let lanes = Arc::new(
+        oc_lanes::LaneService::restore(
+            lane_config(services.config.as_ref()),
+            runner_handle,
+            events,
+            clock,
+            Arc::new(StoreLaneTickets::new(Arc::clone(&services.store))),
+        )
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, "lane restore failed");
+            anyhow::Error::new(error)
+        })
+        .context("restore lane service")?,
+    );
     runner.bind(lanes.as_ref());
     state = state.with_lanes(Arc::clone(&lanes));
 
-    (
+    Ok((
         state,
         Extensions {
             lsp,
             lanes,
             providers,
         },
-    )
+    ))
 }
 
 /// Spawn the ctrl-c watcher, the managed-service registration watcher and the

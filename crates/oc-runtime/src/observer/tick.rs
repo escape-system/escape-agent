@@ -145,6 +145,12 @@ impl Runtime {
                 return false;
             }
         };
+        let active_sessions: Vec<String> = tree
+            .iter()
+            .filter(|row| row.state == "busy" || row.state == "waiting_permission")
+            .map(|row| row.sid.clone())
+            .collect();
+        let advised = self.advise_context_pressure(&active_sessions).await;
         let any_active_session = tree
             .iter()
             .any(|row| row.state == "busy" || row.state == "waiting_permission");
@@ -159,7 +165,7 @@ impl Runtime {
         let run = host.engine.tick(root, tree, goal).await;
         let had_run = run.is_some();
         self.apply_observer_run(root, run).await;
-        any_active_session || any_active_strips || had_run
+        any_active_session || any_active_strips || had_run || advised
     }
 
     async fn apply_observer_run(&self, root: &str, run: Option<ObserverRun>) {

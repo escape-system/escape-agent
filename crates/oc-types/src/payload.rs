@@ -52,6 +52,33 @@ macro_rules! impl_event_payload {
     };
 }
 
+/// `idle_reason` prefix used when a turn stopped because its step budget ran out.
+pub const STEP_LIMIT_PREFIX: &str = "step limit reached after ";
+
+/// Render the canonical step-limit reason.
+#[must_use]
+pub fn step_limit_reason(steps: u64) -> String {
+    format!("{STEP_LIMIT_PREFIX}{steps} steps")
+}
+
+/// Parse a step count back out of an `idle_reason` produced by
+/// [`step_limit_reason`].
+///
+/// Strict: the whole string must be that exact shape — the prefix, a plain
+/// decimal `u64` and the ` steps` suffix. Anything else (a wrong prefix, a
+/// trailing sentence, a non-digit count or an out-of-range number) is not a
+/// step-limit reason and yields `None`.
+#[must_use]
+pub fn parse_step_limit(reason: &str) -> Option<u64> {
+    let digits = reason
+        .strip_prefix(STEP_LIMIT_PREFIX)?
+        .strip_suffix(" steps")?;
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
 /// `session.created`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -128,6 +155,24 @@ pub struct SessionExecutionSucceeded {
 impl_event_payload!(
     SessionExecutionSucceeded,
     "session.execution.succeeded",
+    true,
+    1
+);
+
+/// `session.execution.step_limit` — published after the terminal event when a
+/// turn stopped because the step budget was exhausted. The turn still publishes
+/// `session.execution.succeeded`; this event is the honest qualifier.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionExecutionStepLimit {
+    #[serde(rename = "sessionID")]
+    pub session_id: String,
+    pub steps: u64,
+}
+
+impl_event_payload!(
+    SessionExecutionStepLimit,
+    "session.execution.step_limit",
     true,
     1
 );
@@ -805,6 +850,11 @@ mod tests {
         check!(SessionDeleted, "session.deleted", true);
         check!(SessionExecutionStarted, "session.execution.started", true);
         check!(
+            SessionExecutionStepLimit,
+            "session.execution.step_limit",
+            true
+        );
+        check!(
             SessionExecutionSucceeded,
             "session.execution.succeeded",
             true
@@ -865,5 +915,61 @@ mod tests {
         });
         let parsed: SessionStatusUpdated = serde_json::from_value(fixture.clone()).unwrap();
         assert_eq!(serde_json::to_value(&parsed).unwrap(), fixture);
+    }
+
+    #[test]
+    fn step_limit_reason_round_trips_and_parses_strictly() {
+        for steps in [0, 7, u64::MAX] {
+            let reason = step_limit_reason(steps);
+            assert_eq!(reason, format!("step limit reached after {steps} steps"));
+            assert_eq!(parse_step_limit(&reason), Some(steps));
+        }
+        assert_eq!(
+            parse_step_limit("step limit reached after 0 steps"),
+            Some(0)
+        );
+        assert_eq!(parse_step_limit("timeout after 5 steps"), None);
+        assert_eq!(
+            parse_step_limit("step limit reached after 7 steps and more"),
+            None
+        );
+        assert_eq!(
+            parse_step_limit("step limit reached after seven steps"),
+            None
+        );
+        assert_eq!(parse_step_limit("step limit reached after +7 steps"), None);
+        assert_eq!(
+            parse_step_limit("step limit reached after 18446744073709551616 steps"),
+            None,
+            "an out-of-range count is not a valid reason"
+        );
+        assert_eq!(parse_step_limit(""), None);
+    }
+
+    #[test]
+    fn step_limit_payload_matches_the_wire_shape() {
+        let payload = SessionExecutionStepLimit {
+            session_id: "ses_x".to_owned(),
+            steps: 7,
+        };
+        let data = serde_json::to_value(&payload).unwrap();
+        assert_eq!(data, serde_json::json!({"sessionID": "ses_x", "steps": 7}));
+        assert!(
+            !data.to_string().contains("null"),
+            "the payload has no optional fields to leak as null"
+        );
+        let parsed: SessionExecutionStepLimit =
+            serde_json::from_value(serde_json::json!({"sessionID": "ses_x", "steps": 7})).unwrap();
+        assert_eq!(parsed, payload);
+        assert_eq!(
+            <SessionExecutionStepLimit as EventPayload>::TYPE,
+            "session.execution.step_limit"
+        );
+        assert_eq!(<SessionExecutionStepLimit as EventPayload>::VERSION, 1);
+        assert_eq!(
+            <SessionExecutionStepLimit as EventPayload>::DURABLE,
+            <SessionExecutionSucceeded as EventPayload>::DURABLE,
+            "the qualifier is persisted wherever the terminal it qualifies is"
+        );
     }
 }

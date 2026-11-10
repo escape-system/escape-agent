@@ -112,6 +112,27 @@ impl Store {
         })
         .await
     }
+
+    /// Lists every ticket row, oldest first, for boot-time lane restore.
+    ///
+    /// Unlike [`Self::lane_tickets`] there is no page limit: a restore that
+    /// skipped a row would silently drop a queued command. Ordering is
+    /// `queued` ascending, so a replay keeps enqueue order; `LaneService`
+    /// re-sorts defensively.
+    pub async fn lane_tickets_all(&self) -> Result<Vec<Value>, StoreError> {
+        self.read(move |connection| {
+            let sql =
+                format!("SELECT {TICKET_COLUMNS} FROM lane_ticket ORDER BY queued ASC, id ASC");
+            let mut statement = connection.prepare(&sql)?;
+            let mut rows = statement.query([])?;
+            let mut tickets = Vec::new();
+            while let Some(row) = rows.next()? {
+                tickets.push(ticket_value(row)?);
+            }
+            Ok(tickets)
+        })
+        .await
+    }
 }
 
 impl StoredTicket {

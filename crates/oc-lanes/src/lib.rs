@@ -110,7 +110,12 @@ pub mod types;
 
 pub use classifier::classify;
 pub use config::{DEFAULT_CONCURRENCY, DEFAULT_MAX_QUEUE, LaneConfig};
-pub use error::LaneError;
+pub use error::{LaneError, RestoreError};
 pub use oc_observer::{Clock, SystemClock};
-pub use service::{BoxFuture, CancellationTokens, LaneEvents, LaneRunner, LaneService};
-pub use types::{LaneRequest, LaneStatus, NewTicket, RunnerResult, Ticket, TicketId, TicketState};
+pub use service::{
+    BoxFuture, CancellationTokens, LaneEvents, LaneRunner, LaneService, LaneTicketSource,
+};
+pub use types::{
+    EnqueueResult, LaneRequest, LaneStatus, NewTicket, RunnerResult, Ticket, TicketId,
+    TicketRecord, TicketState,
+};

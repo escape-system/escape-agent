@@ -21,6 +21,7 @@ pub use bodies::{
     AgentBody, CommandBody, CompactBody, CreateBody, CreateLocation, InterruptParams, ListParams,
     ModelBody, MoveBody, PatchBody, PromptBody, SyntheticBody, WaitParams,
 };
+pub(crate) use crud::project_session;
 pub use crud::{active, create, delete, get, list, patch};
 pub(crate) use events::{notify, publish_enqueued};
 pub use prompt::{command, compact, prompt, synthetic};

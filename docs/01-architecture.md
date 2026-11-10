@@ -92,7 +92,9 @@ without a live model.
 4. Tool calls get the `expectation` argument stripped, are authorized, then run
    concurrently; each start/settle updates the expectation registry and the
    observer.
-5. Step ends → compaction check → continue if tools ran → settle execution.
+5. Step ends → compaction check → continue if tools ran → settle execution
+   (a step-budget exhaustion settles `succeeded`, then publishes
+   `session.execution.step_limit`).
 6. All durable writes are committed before the terminal event is published.
 
 ## Key decisions and why

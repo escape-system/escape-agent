@@ -682,9 +682,10 @@ impl Tool for CompactContextTool {
                     "compaction was enqueued as {inbox_id} but the actor could not be woken: {error}"
                 ))
             })?;
-        Ok(ToolResult::text(
-            "Compaction scheduled; it runs at the next boundary, after this turn. Stable boxes survive and temporary boxes expire.",
-        )
+        Ok(ToolResult::text(format!(
+            "Compaction queued as `{inbox_id}`; it runs at the next turn boundary, after this turn \
+             ends, so no summary exists yet. Stable boxes survive and temporary boxes expire."
+        ))
         .with_metadata(json!({ "inboxID": inbox_id })))
     }
 }

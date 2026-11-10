@@ -411,7 +411,7 @@ async fn compact_context_enqueues_a_queued_row_instead_of_compacting_inline() {
     )
     .await
     .expect("scheduled");
-    assert!(message.contains("scheduled"), "{message}");
+    assert!(message.contains("queued"), "{message}");
 
     let inbox = harness.inbox().await;
     assert_eq!(inbox.len(), 1, "one queued row: {inbox:?}");
@@ -437,6 +437,43 @@ async fn compact_context_enqueues_a_queued_row_instead_of_compacting_inline() {
     let rows = wait_compaction(&harness).await;
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0]["status"], "completed");
+}
+
+#[tokio::test]
+async fn compact_context_tool_call_compacts_the_callers_own_session_at_the_next_boundary() {
+    let harness = Harness::new(
+        vec![
+            named_tool_script(
+                "compact_context",
+                "call_compact",
+                json!({"note": "self compaction", "expectation": expectation()}),
+            ),
+            text_script("queued the compaction"),
+            text_script("## Objective\nself compaction handoff"),
+        ],
+        Arc::new(AllowAll),
+        json!({}),
+        None,
+    )
+    .await;
+
+    // The tool runs through turn dispatch, exactly as the model would call it.
+    // Its wake triggers the follow-up execution, which drains the queued row at
+    // that next turn boundary.
+    harness.prompt("compact this session").await;
+    let rows = wait_compaction(&harness).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0]["status"], "completed");
+    assert_eq!(rows[0]["reason"], "manual");
+    assert!(
+        rows[0]["summary"]
+            .as_str()
+            .is_some_and(|summary| !summary.trim().is_empty()),
+        "{rows:?}"
+    );
+    // `harness.messages()` is scoped to the caller's session id, so the row
+    // landing here proves the tool targeted the caller and nobody else.
+    assert_eq!(harness.inbox().await.len(), 0);
 }
 
 #[tokio::test]

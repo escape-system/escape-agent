@@ -1,4 +1,9 @@
 //! The publishing half of the observer: bus events, repair audits and goal transitions.
+//!
+//! Compaction *advice* does not travel through [`ObserverNotice`]: the observer
+//! engine has no token usage (`ObserverInput` carries none), so the deterministic
+//! adviser lives in `oc-runtime` (`observer/advice.rs`) and publishes its own
+//! durable `observer.advised` event.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -222,7 +227,9 @@ impl ObserverNotifier for BusObserverNotifier {
             } => self.report_goal(&root_id, &goal_id, status.as_str(), &reason, &goal),
             ObserverNotice::Nudged { .. } | ObserverNotice::Inspected { .. } => {
                 // The runtime applies nudges/inspects; publishing here would
-                // duplicate its effects.
+                // duplicate its effects. Compaction advice is host-side (see the
+                // module doc), never an observer notice.
+                tracing::debug!("observer nudge/inspect applied by the runtime");
             }
             ObserverNotice::RepairFailed {
                 root_id,

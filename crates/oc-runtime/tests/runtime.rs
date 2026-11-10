@@ -11,10 +11,14 @@ mod actor_error_terminal;
 mod context_boxes;
 #[path = "runtime/instruction_scope.rs"]
 mod instruction_scope;
+#[path = "runtime/lane_subscriber.rs"]
+mod lane_subscriber;
 #[path = "runtime/memory.rs"]
 mod memory;
 #[path = "runtime/observer.rs"]
 mod observer;
+#[path = "runtime/observer_advice.rs"]
+mod observer_advice;
 #[path = "runtime/recovery.rs"]
 mod recovery;
 #[path = "runtime/stop.rs"]
@@ -27,3 +31,5 @@ mod support;
 mod tools_goals;
 #[path = "runtime/turn_core.rs"]
 mod turn_core;
+#[path = "runtime/write_budget.rs"]
+mod write_budget;

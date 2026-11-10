@@ -1,4 +1,26 @@
 //! Compaction summary contract.
+//!
+//! # Threshold semantics
+//!
+//! The turn loop compacts before a request when the anchor-aware token
+//! estimate crosses a threshold, at most three times per turn.
+//!
+//! - The hard ceiling is `context_window − max(15%, 16k)`; an explicit
+//!   `compaction.ceiling_tokens` may only lower it (`tokens::ceiling`).
+//! - The threshold is `ceiling − effective_buffer`, where an explicit
+//!   `compaction.buffer` is honored as-is and `0`/absent means
+//!   `max(8_000, context_window / 10)` (`tokens::trigger`).
+//! - The threshold path is **armed** when `compaction.auto` is true *or* an
+//!   explicit `compaction.ceiling_tokens` is configured. An explicit ceiling
+//!   is therefore a real guard even with `auto: false`: the comparison is
+//!   `estimate > trigger`, not `estimate > ceiling`.
+//! - The internal reason is `"auto"` when auto is armed and the estimate also
+//!   crossed the hard ceiling, otherwise `"guard"` (explicit ceiling with
+//!   `auto: false`). The wire literal stays `auto` for both; only `manual`
+//!   rows and events differ (`event_reason`).
+//! - With no `compaction` block at all, nothing is armed: no threshold
+//!   compaction. Manual rows, `compact_context` and provider-overflow recovery
+//!   keep working unchanged.
 
 /// Headings the summary must contain, in order.
 pub const SUMMARY_SECTIONS: [&str; 7] = [
@@ -28,16 +50,20 @@ with these headings:\n\
 
 /// Default compaction settings.
 ///
-/// `auto` is **false**: threshold compaction runs only when the document opts
-/// in. Manual `compaction` inbox rows, the `compact_context` tool and provider
+/// `auto` is **false**. The threshold path is armed by `auto` **or** an
+/// explicit `ceiling_tokens`; with neither, no threshold compaction runs.
+/// Manual `compaction` inbox rows, the `compact_context` tool and provider
 /// overflow recovery remain available regardless.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CompactionConfig {
     pub auto: bool,
     pub keep_tokens: u64,
+    /// Reserve below the ceiling before the threshold compacts. `0` (absent)
+    /// means `max(8_000, context_window / 10)`; see [`crate::tokens::trigger`].
     pub buffer: u64,
     /// Optional ceiling override. It may only lower the computed ceiling
-    /// (`context_window − max(15%, 16k)`), never raise it.
+    /// (`context_window − max(15%, 16k)`), never raise it. Setting it arms the
+    /// threshold guard even when `auto` is false.
     pub ceiling_tokens: Option<u64>,
 }
 

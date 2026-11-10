@@ -92,6 +92,12 @@ pub(crate) fn load_settings(config: &ConfigService) -> SubagentSettings {
                 .unwrap_or(20),
         )
         .unwrap_or(u32::MAX),
+        max_writes_per_min: u32::try_from(
+            sibling_field("max_writes_per_min")
+                .and_then(Value::as_u64)
+                .unwrap_or(20),
+        )
+        .unwrap_or(u32::MAX),
     };
 
     let timeout_seconds = field("timeout_seconds")

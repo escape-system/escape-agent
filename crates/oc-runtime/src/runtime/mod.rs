@@ -94,6 +94,8 @@ pub(crate) struct Inner {
     pub(crate) subagents: Mutex<crate::subagent::SubagentState>,
     pub(crate) tool_cancels: Mutex<HashMap<String, ToolCancelEntry>>,
     pub(crate) pending_permissions: Mutex<HashMap<String, usize>>,
+    /// Last `observer.advised` enqueue time per session (`observer/advice.rs`).
+    pub(crate) observer_advised: Mutex<HashMap<String, i64>>,
     pub(crate) shutdown: CancelToken,
     pub(crate) idle: Notify,
     pub(crate) started: AtomicBool,
@@ -125,6 +127,7 @@ impl Runtime {
                 subagents: Mutex::new(crate::subagent::SubagentState::default()),
                 tool_cancels: Mutex::new(HashMap::new()),
                 pending_permissions: Mutex::new(HashMap::new()),
+                observer_advised: Mutex::new(HashMap::new()),
                 shutdown: CancelToken::new(),
                 idle: Notify::new(),
                 started: AtomicBool::new(false),

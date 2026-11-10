@@ -171,12 +171,17 @@ Lane service:
   `cargo:<workspace>` etc.
 - Named lanes with semaphores (cargo 1, node 1, network 4, gpu 1, default 8).
 - `shell` intercepts classified commands, returns a ticket, streams progress;
-  `lane.queue/order/status/cancel/notify` for the coordinator.
-- Safety is the semaphore, not the model. `build-master` agent is a template.
+  `lane.queue/order/status/cancel/notify` for the coordinator. `lane.queue`
+  takes an optional `tree_rev` and returns `{id, subscribed}`; identical
+  submissions on a live ticket coalesce.
+- Boot restores lanes: queued tickets replay in enqueue order, `running` ones
+  become failed with a restart reason, and ids are never reused.
+- Safety is the semaphore, not the model. `steward` agent is a template.
 
 ## 5. Events (additive)
 
 `observer.repaired`, `observer.escalated`, `observer.unavailable`,
+`observer.advised` (durable, v1, from the host-side compaction adviser),
 `goal.updated`, `memory.updated`, `subagent.peer.message`,
 `lane.queued|started|finished|cancelled`. Payloads are documented in
 `docs/02-protocol.md` (extensions).
@@ -188,7 +193,8 @@ Lane service:
 2. `StoreGoals` (goal/observation/repair tables API) + `RuntimeObserver`.
 3. `StoreSubagents` (node/children/child_count) + subagent tools + sibling
    delivery.
-4. `LaneService` + `shell` interception + `build-master` agent + UI lane pill.
+4. `LaneService` + `shell` interception + `steward` agent template + UI lane
+   pill.
 5. UI pages for memory/goals/observer/subagents/lanes.
 
 Each step ends with a real HTTP/turn test: no step is "done" because the crate

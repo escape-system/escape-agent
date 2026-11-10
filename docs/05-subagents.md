@@ -51,11 +51,12 @@ rejected before the child session is created. The child's model is visible in
       "enabled": true,
       "wake": true,                     // a peer message wakes an idle sibling
       "allow_parent": true,
-      "max_messages_per_min": 20
+      "max_messages_per_min": 20,
+      "max_writes_per_min": 20          // session_write per sender; 0 denies all
     },
     "agents": {
       "explore": { "allow_spawn": false, "max_children": 0 },
-      "build-master": { "model": "…", "role": "coordinator" }
+      "steward": { "model": "…", "role": "coordinator" }
     }
   }
 }
@@ -104,6 +105,16 @@ Model-visible envelope (`state` is the child's settled state):
 <subagent sessionID="ses_…" state="failed">final text</subagent>
 ```
 
+When the child settled `completed` but exhausted its step budget, the state
+stays `completed` and exactly one qualifier line is appended:
+
+```
+<subagent sessionID="ses_…" state="completed">partial text</subagent>
+[step budget exhausted after N steps; result may be incomplete]
+```
+
+The parent-facing metadata then also carries `stepLimit: true` and `steps: N`.
+
 The reported state comes from the child session's durable `idle_outcome`, read
 through `pub(super) fn child_state(messages: &[Value], durable: Option<&str>) -> Option<&'static str>`
 (`succeeded`→`completed`, `failed`→`failed`, `interrupted`→`cancelled`). The
@@ -117,7 +128,9 @@ envelope and the metadata carries `sessionID`/`status`. A deleted child reports
 `state="failed"` with metadata `status: "failed"`.
 
 The parent sees **only** this text plus the tool metadata (`sessionID`,
-`status`; background delivery uses `childID`, `agent`, `state`). Everything else
+`status`, and `stepLimit`/`steps` when the child hit its budget; background
+delivery uses `childID`, `agent`, `state` and the same optional
+`stepLimit`/`steps`). Everything else
 (tool calls, intermediate reasoning, costs) is retrieved on demand through
 `digest`:
 
@@ -196,6 +209,14 @@ Denied for siblings, parents, and unrelated sessions. This is stricter than the
 HTTP `POST /api/session/:id/prompt` route, which stays trusted (loopback +
 password) for UI/CLI use.
 
+Every write also consumes a per-sender `WriteBudget` (60 s fixed window,
+`subagents.siblings.max_writes_per_min`, default 20) after `can_write` and
+before any enqueue or interrupt, so `steer`/`queue` does not buy extra writes
+and a refused write leaves no partial row. The budget is in memory: a restart
+forgets every window, while inbox rows a write already produced stay durable.
+Exhaustion is a structured tool error `BudgetError: rate limit reached (max
+N/min); retry after M ms`; `max_writes_per_min: 0` denies every write.
+
 ## Big brother / little brother: lanes
 
 The problem: N agents each run `cargo test` in the same target directory; cargo
@@ -213,18 +234,37 @@ serializes on its lock, agents block, turns stall, tokens burn.
 3. The `shell` tool submits classified commands to a lane and returns a
    **ticket**. No thread blocks; the tool reports progress and streams output
    when the ticket runs. `lane.wait` is an await on a channel with a deadline.
-4. **Coordinator subagent** (`build-master`, role `coordinator`, built-in
-   agent) gets the `lane` tool:
-   - `lane.queue {lane, command, cwd, priority, owner}`
+4. **Coordinator subagent** (`steward`, role `coordinator`, project agent
+   template) gets the `lane` tool:
+   - `lane.queue {lane, command, cwd, priority, owner, tree_rev?}` →
+     `{id, subscribed}`
    - `lane.order {ticket, priority}`
    - `lane.status {ticket|lane}`
    - `lane.cancel {ticket}`
    - `lane.notify {session_id, text}`
    It decides ordering (format → clippy → test, or affected crate first),
    batches (`cargo nextest --no-fail-fast`), and messages siblings with results.
+
+   `lane.queue` coalesces identical work: when the caller supplies a non-empty
+   `tree_rev` and the same `(lane, normalized command, cwd, tree_rev)` ticket is
+   still queued or running, it returns that id with `subscribed: true` instead
+   of creating a second ticket, and one run serves every subscriber. Terminal
+   tickets are never reused, and a missing `tree_rev` always creates a distinct
+   ticket. The `shell` tool computes `tree_rev` for `cargo:` lanes only, from
+   the short `HEAD` plus the tracked-tree status, with a 500 ms per-probe
+   budget; any git failure simply disables coalescing for that submission.
+   Coalescing state is in memory, so a restart drops it but never drops a run:
+   `LaneService::restore` replays queued rows in enqueue order, marks `running`
+   rows failed with a restart reason, keeps terminal rows as history and
+   resumes the id counter above every restored id. Terminal rows are only
+   read, never re-published, so a boot cannot wipe `finished`/`output_path`,
+   and the next id is always max seen + 1 (persisted ids are never reissued).
+   A coalesced subscriber that times out must not cancel the shared run: it
+   calls `LaneService::unsubscribe(id, session)`, which cancels only when no
+   owner and no subscribers remain.
 5. The main agent configures the coordinator and siblings through normal agent
-   config and `subagent` calls; `build-master` is a template, not a special
-   code path.
+   config and `subagent` calls; `steward` is a template (see "Agent
+   templates"), not a builtin and not a special code path.
 6. Rust specifics encoded in the built-in `rust-build-test` skill:
    - one `cargo` per target dir; parallel work only via distinct
      `CARGO_TARGET_DIR` or worktrees;
@@ -242,6 +282,23 @@ dir. The coordinator is the optimization layer, not the safety layer.
 - Subagent bar shows agent, model, lane, ticket, status, elapsed/expected.
 - Session tree shows coordinator → workers with sibling links.
 
+### Agent templates (steward)
+
+`steward` is a **project template**, not a built-in agent: the file
+`.opencode/agent/steward.md` carries the prompt with `mode: subagent` in its
+frontmatter, and `agents.steward` in `opencode.json` carries what markdown
+cannot express — its `permissions` (deny `edit`, deny `subagent`, allow
+`shell`/`lane`/`read`/`grep`/`glob`/`box:*`/`talk`/`roster`/`digest`) and
+`steps: 120`. Markdown frontmatter honors only `description`, `color`,
+`hidden`, `steps`, `mode`, `model`, `temperature`, `top_p` and `disabled`; it
+does **not** honor `permissions` and does **not** read `name` (the id is the
+file stem). The `opencode.json` entry is therefore load-bearing: drop it and
+the template loads with default permissions. `mode: subagent` is required for
+`subagent {agent:"steward"}` to resolve, because only `subagent`/`all` agents
+are advertised as spawnable. No lane coordinator is a built-in, and none ever
+was: the builtin set stays `build`, `plan`, `general`, `explore`, `compaction`,
+`title`, `summary`.
+
 ## Failure modes
 
 | Failure | Behavior |
@@ -251,4 +308,6 @@ dir. The coordinator is the optimization layer, not the safety layer.
 | Sibling message to a deleted session | Tool error `SessionNotFoundError`; sender is notified |
 | Depth/child limit hit | Tool error before session creation; no partial state |
 | Model unavailable | Resolution fails before spawn; error lists the resolved candidate chain |
-| Sibling storm | `max_messages_per_min` per sender; excess is queued with a warning |
+| Sibling storm | `max_messages_per_min` per sender, after `can_message`; exhaustion is a tool **error** (`BudgetError: rate limit reached …`), not a queued warning |
+| Write storm | `max_writes_per_min` per sender, consumed after `can_write` and before any enqueue/interrupt; exhaustion is the same structured `BudgetError` and no inbox row is written |
+| Lane runner interrupted | On boot a `running` ticket becomes `failed` (`exit: -1`, restart reason); queued tickets replay, ids are never reused |

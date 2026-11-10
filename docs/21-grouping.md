@@ -210,11 +210,16 @@ Rejected. `lane` is a **shell-command concurrency scheduler**:
 `LaneService` (`crates/oc-lanes/src/service.rs:91`, doc comment `:85-90`)
 classifies cargo/test commands (`classify`, `crates/oc-lanes/src/classifier.rs:28`)
 and serializes them with a per-lane semaphore. It says nothing about sessions.
-Its persistence is dead in any case: `lane_ticket` (`schema.rs:275-287`) is
-written only by `save_lane_ticket` (`crates/oc-store/src/lane.rs:47`), which
-has **zero production callers** — only `oc-store` tests call it
-(`crates/oc-store/tests/store_ext/lanes.rs`), as `docs/17-interfaces.md:217-219`
-already notes. `metadata.lane` on a spawned child (`spawn.rs:203`) is a hint to
+Persistence is live: the lane host calls `save_lane_ticket`, and boot replays
+the table through `LaneService::restore(...)` with a store-backed
+`LaneTicketSource` (`crates/oc-cli/src/bootstrap.rs`). Queued rows are
+re-enqueued in `(queued_ms, id)` order, `running` rows settle as `Failed` with a
+message containing `restart`, and terminal rows are history that is read but
+never re-published, so a boot cannot null `finished`/`output_path`. Ids are
+never reissued (the counter resumes at `max(tkt_<n>) + 1`). Coalescing on
+`tree_rev` and the subscriber lists are in memory only: a restart drops
+coalescing but never a run.
+`metadata.lane` on a spawned child (`spawn.rs:203`) is a hint to
 that scheduler, not a set.
 
 ### `parentID` alone

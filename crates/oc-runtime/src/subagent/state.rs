@@ -1,6 +1,6 @@
 use std::collections::{HashSet, VecDeque};
 
-use oc_subagents::{Limits, SiblingBudget, SpawnBudget};
+use oc_subagents::{Limits, SiblingBudget, SpawnBudget, WriteBudget};
 
 use super::digest::DIGEST_CACHE_CAPACITY;
 
@@ -9,6 +9,7 @@ use super::digest::DIGEST_CACHE_CAPACITY;
 pub(crate) struct SubagentState {
     pub(super) spawn: std::collections::HashMap<String, SpawnBudget>,
     pub(super) siblings: std::collections::HashMap<String, SiblingBudget>,
+    pub(super) writes: std::collections::HashMap<String, WriteBudget>,
     pub(super) digests: DigestCache,
     pub(super) digest_rate: std::collections::HashMap<String, VecDeque<i64>>,
     pub(super) active_watchers: HashSet<(String, String)>,
@@ -33,6 +34,12 @@ impl SubagentState {
         self.siblings
             .entry(session.to_owned())
             .or_insert_with(|| SiblingBudget::from_limits(limits))
+    }
+
+    pub(super) fn write_budget(&mut self, session: &str, limits: &Limits) -> &mut WriteBudget {
+        self.writes
+            .entry(session.to_owned())
+            .or_insert_with(|| WriteBudget::from_limits(limits))
     }
 }
 

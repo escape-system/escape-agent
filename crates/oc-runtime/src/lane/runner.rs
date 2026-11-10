@@ -412,6 +412,8 @@ mod tests {
             started_ms: None,
             finished_ms: None,
             output_path: None,
+            tree_rev: None,
+            subscribers: Vec::new(),
         }
     }
 

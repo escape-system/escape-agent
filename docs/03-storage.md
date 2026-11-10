@@ -174,17 +174,36 @@ Notes on the wire tables that carry more columns than their wire object:
 - `project.archived` and the `project_archived_idx`/`project_time_idx` indices
   are added by migration `0004` behind a column guard.
 - `session_v2.idle_reason` is added by migration `0012` behind a column guard.
-  It is `NULL` or one of `user`, `shutdown`, `superseded`, `inactivity`, and is
-  written in the same `UPDATE` as `idle_outcome` when an execution settles as
-  `interrupted`, so the two columns can never disagree. `NULL` for
-  `succeeded`/`failed` outcomes and for every row that predates the migration:
-  `0012` has no backfill, so old interrupted rows keep `idle_reason = NULL`
-  (unknown reason) and must not be read as a user stop. The column is internal —
-  it is not on the wire, is not part of `Session.Info`, and is not emitted in
-  any event payload. It is the durable basis for distinguishing a user stop
-  from an observer repair or shutdown after a restart; `Store::mark_session_idle_with_reason`
-  writes it and `SessionNodeRow.idle_reason` reads it back for the observer and
-  the agent-tree code. No REST route or event exposes it.
+  It is `NULL`, one of `user`, `shutdown`, `superseded`, `inactivity`, or the
+  step-limit grammar `step limit reached after N steps`
+  (`oc_types::step_limit_reason`), and is written in the same `UPDATE` as
+  `idle_outcome`, so the two columns can never disagree. `idle_outcome`
+  stores a fourth value, `step_limit`, next to `succeeded`, `failed` and
+  `interrupted`; a turn that exhausted its step budget stores `step_limit`,
+  not `succeeded`. The enum `SessionOutcome`, the REST projection and every
+  wire shape keep the same three literals: `Session.Info` reads an unknown
+  stored literal as no outcome and omits the key on re-serialize (never
+  `null`), so the session stays parseable on its next turn, and the server
+  drops the key for values outside `SessionOutcome` (see `docs/17`). The
+  honest signal is the stored literal, `idle_reason` and the durable
+  `session.execution.step_limit {sessionID, steps}` event.
+  `mark_session_idle_with_reason` keeps the reason for `interrupted` (any
+  reason) and `step_limit` (any reason), and for `succeeded` when it is a
+  step-limit reason (`keeps_idle_reason` asks `oc_types::parse_step_limit`;
+  those rows predate the literal); every other `succeeded`/`failed` pair
+  stores `NULL`. This is a store-level predicate on
+  the `(outcome, reason)` pair, not event-time filtering, so a later voluntary
+  turn always clears a previous reason. Rows that predate the migration stay
+  `NULL`: `0012` has no backfill, so old interrupted rows keep an unknown
+  reason and must not be read as a user stop. The column is internal — it is
+  not on the wire, is not part of `Session.Info`, and is not emitted in any
+  event payload. It is the durable basis for distinguishing a user stop from an
+  observer repair or shutdown after a restart;
+  `Store::mark_session_idle_with_reason` writes it and
+  `SessionNodeRow.idle_reason` reads it back for the observer and the
+  agent-tree code. No REST route or event exposes it.
+  `session_node.status` reports `completed` for a `step_limit` row, so the
+  agent tree never reads a step-limited turn as a failure.
 
 `session_message.data` and `session_part.data` keep the upstream JSON key
 layout exactly (`$.status`, `$.model.providerID`, `$.tokens.*`, `$.snapshot.*`,
@@ -260,6 +279,11 @@ snapshot(id TEXT PRIMARY KEY,
          time_created INTEGER NOT NULL);
 CREATE INDEX snapshot_session_seq_path ON snapshot(session_id, seq, path);
 ```
+
+`lane_ticket` keeps its columns: coalescing state lives in memory only, so
+`tree_rev` and `subscribers` are deliberately not persisted. On boot
+`lane_tickets_all()` replays every row, and a `running` row from the dead
+process is rewritten as failed with a restart reason.
 
 `golden` rule: additive tables never share names with upstream tables. Import
 from an upstream DB copies only the tables in the wire-compatible section.

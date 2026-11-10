@@ -102,7 +102,7 @@ and anything that answers an honest `501`/`503` says so in its row.
 | POST `/api/session/:SID/revert/stage` | `{messageID,files?}` | D | `{messageID,files:FileDiff.Info[]}`; diffs the earliest pre-write snapshot of each path at/after the boundary against the current tree; 404 unknown message |
 | DELETE `/api/session/:SID/revert` | — | N | restores every earliest snapshot (rewrites the pre-image, or deletes a file that did not exist), then drops the snapshots |
 | POST `/api/session/:SID/revert/commit` | — | N | deletes boundary seq onward, drops snapshots, clears revert |
-| GET `/api/session/:SID/context` | — | D | `Message[]` from the newest completed compaction |
+| GET `/api/session/:SID/context` | — | D | bare `{"data":[...]}` of the wire messages AFTER the newest compaction row whose status is absent or `"completed"`; the boundary row itself is excluded; no token/window/ceiling fields |
 | GET `/api/session/:SID/diff` | `from?,to?,context?` | D | `FileDiff.Info[]`; recomputed from snapshots vs the current tree for a staged revert; `from`/`to` are only validated as message ids (they do not select a historical range) and `context` is accepted but every hunk is full-file |
 | GET `/api/session/:SID/inbox` | — | D | pending items |
 | PATCH `/api/session/:SID/inbox/:id` | `{delivery}` | N | 404 `NotFoundError`, 400 invalid delivery |
@@ -319,8 +319,10 @@ called/success/failed, step/execution events, `session.viewed`,
 `session.forked`, `session.skill.activated`, `session.instructions.updated`
 and the compaction lifecycle (`session.compaction.started`,
 `session.compaction.ended`, `session.compaction.failed`; all v1, published
-after the corresponding commit) are durable. `session.compaction.delta` is not
-implemented.
+after the corresponding commit), `session.execution.step_limit` (v1,
+`{sessionID, steps}`, always after `session.execution.succeeded`) and the
+host-side `observer.advised` (v1, `{sessionID, estimateTokens, ceilingTokens,
+triggerTokens}`) are durable. `session.compaction.delta` is not implemented.
 
 `GET /api/experimental/session/:SID/log?after=<seq>&follow=true` (also exposed
 as `GET /api/session/:SID/log`) replays durable events for that session
@@ -388,7 +390,11 @@ Durable extension events: `session.forked` (v2, data
 `{sessionID,parentID,boundary,instructions?,instructionEntries?}`),
 `session.viewed` (v1, `{sessionID,idle}`), `session.skill.activated` (v1, from
 the runtime skill tool), `session.instructions.updated` (v2, from the runtime
-instruction prefix).
+instruction prefix), `session.execution.step_limit` (v1, `{sessionID,steps}`,
+always after `session.execution.succeeded`, never a terminal itself) and
+`observer.advised` (v1, `{sessionID,estimateTokens,ceilingTokens,
+triggerTokens}`, from the host-side compaction adviser; its payload is
+runtime-local, not declared in `oc-types`).
 
 Ephemeral extension events: `form.created` (`{form:Form.Info}`),
 `form.replied` (`{id,sessionID,answer}`), `form.cancelled` (`{id,sessionID}`),

@@ -54,6 +54,41 @@ pub(crate) struct BusLaneEvents {
     pub(crate) store: Option<Arc<oc_store::Store>>,
 }
 
+/// Boot-time [`oc_lanes::LaneTicketSource`] over the `lane_ticket` table.
+///
+/// `oc-lanes` has no store dependency, so the adapter maps the store's wire
+/// rows onto [`oc_lanes::TicketRecord`] here.
+#[derive(Debug, Clone)]
+pub(crate) struct StoreLaneTickets {
+    store: Arc<oc_store::Store>,
+}
+
+impl StoreLaneTickets {
+    pub(crate) fn new(store: Arc<oc_store::Store>) -> Self {
+        Self { store }
+    }
+}
+
+impl oc_lanes::LaneTicketSource for StoreLaneTickets {
+    fn load(
+        &self,
+    ) -> oc_lanes::BoxFuture<'_, Result<Vec<oc_lanes::TicketRecord>, oc_lanes::RestoreError>> {
+        Box::pin(async move {
+            let rows = self
+                .store
+                .lane_tickets_all()
+                .await
+                .map_err(|error| oc_lanes::RestoreError::Source(error.to_string()))?;
+            rows.iter()
+                .map(|row| {
+                    serde_json::from_value(row.clone())
+                        .map_err(|error| oc_lanes::RestoreError::Source(error.to_string()))
+                })
+                .collect()
+        })
+    }
+}
+
 impl oc_lanes::LaneEvents for BusLaneEvents {
     fn changed(&self, ticket: &oc_lanes::Ticket) {
         if let Some(store) = self.store.clone()

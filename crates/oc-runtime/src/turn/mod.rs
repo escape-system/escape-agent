@@ -9,8 +9,8 @@ use std::sync::Arc;
 use oc_llm::LlmMessage;
 use oc_store::NewMessage;
 use oc_types::payload::{
-    SessionExecutionFailed, SessionExecutionInterrupted, SessionExecutionSucceeded, SessionIdle,
-    SessionInboxDelivered, SessionStatusUpdated,
+    SessionExecutionFailed, SessionExecutionInterrupted, SessionExecutionStepLimit,
+    SessionExecutionSucceeded, SessionIdle, SessionInboxDelivered, SessionStatusUpdated,
 };
 use oc_types::{InterruptReason, MessageId, SessionStatus};
 use serde_json::{Map, Value, json};
@@ -39,6 +39,18 @@ use assistant::assistant_text;
 use stats::TurnStats;
 use stats::collect_tool_lines;
 use types::{ExecutionOutcome, ResolvedTurn};
+
+/// Token pressure for one session, used by compaction and observer advice.
+///
+/// `estimated` is the same anchor-aware estimate the turn loop uses,
+/// `ceiling` is [`tokens::ceiling`] and `trigger` is [`tokens::trigger`], so
+/// observers and the threshold path cannot disagree on the numbers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ContextPressure {
+    pub(crate) estimated: u64,
+    pub(crate) ceiling: u64,
+    pub(crate) trigger: u64,
+}
 
 /// Lowercase wire value of an [`InterruptReason`] (`user`, `shutdown`,
 /// `superseded`, `inactivity`), used for the durable `session_v2.idle_reason`.
@@ -177,14 +189,19 @@ pub(crate) async fn run_execution(
     let outcome = runtime
         .run_steps(session, &turn, cancel, &mut stats)
         .await?;
-    if matches!(outcome, ExecutionOutcome::Succeeded) {
+    // A step-limited turn still answered on its final, tool-less request; it is
+    // treated like a success for memory/scribe, but settles with the qualifier.
+    let answered = matches!(
+        outcome,
+        ExecutionOutcome::Succeeded | ExecutionOutcome::StepLimited { .. }
+    );
+    if answered {
         runtime.touch_memory(&turn.memory_ids).await;
     }
-    let succeeded = matches!(outcome, ExecutionOutcome::Succeeded);
     runtime
         .settle(session, &directory, outcome, &handle.terminal)
         .await?;
-    if succeeded {
+    if answered {
         runtime.spawn_scribe(session, &stats).await;
     }
     Ok(())
@@ -266,6 +283,12 @@ impl Runtime {
             // hard-coded 150k cap is gone (`docs/04-agent-runtime.md`).
             tokens::ceiling(turn.context_window, compaction.ceiling_tokens)
         };
+        let guard_armed = compaction.auto || compaction.ceiling_tokens.is_some();
+        let trigger = if turn.context_window == 0 {
+            u64::MAX
+        } else {
+            tokens::trigger(ceiling, turn.context_window, compaction.buffer)
+        };
 
         loop {
             if cancel.is_cancelled() {
@@ -282,11 +305,23 @@ impl Runtime {
             if step_number > 0 && self.promote_steers(session, &turn.directory).await? {
                 context = self.load_context(session).await?;
             }
-            if auto_compactions < 3 && compaction.auto && last_compacted_len != Some(context.len())
-            {
+            if auto_compactions < 3 && guard_armed && last_compacted_len != Some(context.len()) {
                 let estimate = self.estimate_turn_tokens(session, turn, &context).await?;
-                if estimate > ceiling {
-                    match self.compact(session, turn, &context, cancel, "auto").await {
+                if estimate > trigger {
+                    // `guard` is only reachable with an explicit ceiling and
+                    // `auto=false`; everything else keeps the historical
+                    // `auto` reason. The wire reason stays `auto` for both
+                    // (`event_reason`).
+                    let reason = if compaction.auto { "auto" } else { "guard" };
+                    tracing::info!(
+                        session = %session,
+                        estimate,
+                        trigger,
+                        ceiling,
+                        reason,
+                        "threshold compaction"
+                    );
+                    match self.compact(session, turn, &context, cancel, reason).await {
                         Ok(()) => {
                             context = self.load_context(session).await?;
                             auto_compactions += 1;
@@ -433,11 +468,52 @@ impl Runtime {
             }
             if final_call || step.calls.is_empty() {
                 stats.assistant_text = assistant_text(&step.state);
+                if final_call && step_number > 0 {
+                    // The budget, not the model, ended the turn: tools were
+                    // disabled for this final request. The outcome carries the
+                    // consumed budget so settle can qualify the terminal and
+                    // persist the honest session outcome.
+                    return Ok(ExecutionOutcome::StepLimited {
+                        steps: u64::try_from(turn.max_steps).unwrap_or(u64::MAX),
+                    });
+                }
                 return Ok(ExecutionOutcome::Succeeded);
             }
             step_number += 1;
             context = self.load_context(session).await?;
         }
+    }
+
+    /// Token pressure for one session, used by compaction and observer advice.
+    ///
+    /// Cheap and non-failing for the caller: any session/model resolve error
+    /// becomes `Ok(None)` so an observer tick never fails on a stale session.
+    pub(crate) async fn context_pressure(
+        &self,
+        session: &str,
+    ) -> Result<Option<ContextPressure>, RuntimeError> {
+        let Ok(Some(value)) = self.inner.config.store.get_session(session).await else {
+            return Ok(None);
+        };
+        let Ok(info) = Runtime::parse_session(&value) else {
+            return Ok(None);
+        };
+        let directory = info.location.directory.clone();
+        let Ok(turn) = self.resolve_turn(&info, &directory) else {
+            return Ok(None);
+        };
+        if turn.context_window == 0 {
+            return Ok(None);
+        }
+        let context = self.load_context(session).await?;
+        let estimate = self.estimate_turn_tokens(session, &turn, &context).await?;
+        let compaction = self.compaction_config();
+        let ceiling = tokens::ceiling(turn.context_window, compaction.ceiling_tokens);
+        Ok(Some(ContextPressure {
+            estimated: estimate,
+            ceiling,
+            trigger: tokens::trigger(ceiling, turn.context_window, compaction.buffer),
+        }))
     }
 
     async fn estimate_turn_tokens(
@@ -470,10 +546,7 @@ impl Runtime {
                     return None;
                 }
                 let tokens_obj = message.get("tokens")?;
-                let input = tokens_obj.get("input").and_then(Value::as_u64)?;
-                if input == 0 {
-                    return None;
-                }
+                let prompt_tokens = types::prompt_tokens_from_store(tokens_obj)?;
                 let output = tokens_obj
                     .get("output")
                     .and_then(Value::as_u64)
@@ -484,7 +557,7 @@ impl Runtime {
                     .unwrap_or(0);
                 Some((
                     index,
-                    input.saturating_add(output.saturating_sub(reasoning)),
+                    types::anchor_measured(prompt_tokens, output, reasoning),
                 ))
             });
         let Some((anchor_index, measured)) = anchor else {
@@ -515,16 +588,38 @@ impl Runtime {
         match &outcome {
             ExecutionOutcome::Failed(_) => self.note_observer_execution(session, true).await,
             ExecutionOutcome::Interrupted(_) => self.note_observer_execution(session, false).await,
-            ExecutionOutcome::Succeeded => {}
+            ExecutionOutcome::Succeeded | ExecutionOutcome::StepLimited { .. } => {}
         }
         let now = oc_types::now_millis();
-        let (name, error) = match &outcome {
-            ExecutionOutcome::Succeeded => ("succeeded", None),
-            ExecutionOutcome::Failed(error) => ("failed", Some(error.clone())),
-            ExecutionOutcome::Interrupted(_) => ("interrupted", None),
+        // The *stored* outcome is the honest internal literal `step_limit`
+        // (a completed turn whose step budget ended it), while the *wire*
+        // terminal stays `session.execution.succeeded` and the idle message
+        // keeps the literal `succeeded`: `SessionOutcome` has exactly three
+        // literals, so a fourth one on a wire event/message would break the
+        // generated-types contract. `oc_types::SessionInfo` reads an unknown
+        // stored outcome as absent instead of failing, which is what lets the
+        // next execution of this session parse at all.
+        let (stored, name, error, reason) = match &outcome {
+            ExecutionOutcome::Succeeded => ("succeeded", "succeeded", None, None),
+            ExecutionOutcome::StepLimited { .. } => ("step_limit", "succeeded", None, None),
+            ExecutionOutcome::Failed(error) => ("failed", "failed", Some(error.clone()), None),
+            ExecutionOutcome::Interrupted(reason) => (
+                "interrupted",
+                "interrupted",
+                None,
+                Some(interrupt_reason_str(*reason)),
+            ),
         };
+        // A step-limited answer keeps the step-limit grammar as its reason;
+        // the store persists it next to the `step_limit` outcome.
         let reason = match &outcome {
-            ExecutionOutcome::Interrupted(reason) => Some(interrupt_reason_str(*reason)),
+            ExecutionOutcome::StepLimited { steps } => Some(oc_types::step_limit_reason(*steps)),
+            _ => reason.map(str::to_owned),
+        };
+        // Hoisted out of the variant before `publish_outcome_terminal` consumes
+        // the outcome. The qualifier is emitted only with the first terminal.
+        let step_limit = match &outcome {
+            ExecutionOutcome::StepLimited { steps } => Some(*steps),
             _ => None,
         };
         self.clear_background_request(session);
@@ -535,18 +630,41 @@ impl Runtime {
             session,
             directory,
             now,
+            stored,
             name,
             error.as_ref(),
-            reason,
+            reason.as_deref(),
             terminal,
         )
         .await?;
+        let first_outcome = !terminal.outcome_published();
         self.publish_outcome_terminal(session, directory, outcome, terminal)
-            .await
+            .await?;
+        // The qualifier is published strictly after the terminal event is
+        // durable, so its sequence number orders it after `succeeded`. Guarded
+        // by the same idempotency flag as the terminal itself.
+        if first_outcome && let Some(steps) = step_limit {
+            self.emit(
+                session,
+                directory,
+                SessionExecutionStepLimit {
+                    session_id: session.to_owned(),
+                    steps,
+                },
+            )
+            .await?;
+        }
+        Ok(())
     }
 
     /// Writes the idle row, then publishes `session.idle` and
     /// `session.status{idle}`.
+    ///
+    /// `stored` is the internal `session_v2.idle_outcome` literal (it may be
+    /// `step_limit`, which the wire does not know); `name` is the wire literal
+    /// for the persisted idle message. Both are written in the same step, so the
+    /// durable row and the transcript can never disagree about *that* a turn
+    /// settled — only about the internal qualifier.
     ///
     /// Idempotent: the terminal guard records that the pair was published so a
     /// later recovery pass (the actor failure path) does not duplicate the
@@ -560,6 +678,7 @@ impl Runtime {
         session: &str,
         directory: &str,
         now: i64,
+        stored: &str,
         name: &str,
         error: Option<&oc_types::StructuredError>,
         reason: Option<&str>,
@@ -571,7 +690,7 @@ impl Runtime {
         self.inner
             .config
             .store
-            .mark_session_idle_with_reason(session, now, name, reason)
+            .mark_session_idle_with_reason(session, now, stored, reason)
             .await?;
         let mut idle = Map::new();
         idle.insert("time".to_owned(), json!({ "created": now }));
@@ -627,7 +746,10 @@ impl Runtime {
             return Ok(());
         }
         match outcome {
-            ExecutionOutcome::Succeeded => {
+            // A step-limited turn keeps the same wire terminal as a voluntary
+            // stop; the qualifier is `session.execution.step_limit`, emitted by
+            // `settle` after this event is durable.
+            ExecutionOutcome::Succeeded | ExecutionOutcome::StepLimited { .. } => {
                 self.emit(
                     session,
                     directory,
@@ -712,6 +834,7 @@ impl Runtime {
                 session,
                 &directory,
                 now,
+                "failed",
                 "failed",
                 Some(&structured),
                 None,

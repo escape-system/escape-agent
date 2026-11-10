@@ -26,7 +26,21 @@ public surface; `cargo doc -p <crate> --no-deps` is the reference.
 - Compaction lifecycle payloads are durable v1 events published after the
   matching commit: `SessionCompactionStarted`/`Ended`/`Failed`
   (`session.compaction.started|ended|failed`); ephemeral
-  `session.compaction.delta` is not implemented.
+  `session.compaction.delta` is not implemented, though the vendored UI still
+  carries a dead handler for it.
+- `Tokens.input` is **non-cached**; `Tokens::prompt_tokens()`
+  (`input + cache.read + cache.write`) is the inclusive prompt size used for
+  context/compaction math (a fully cached step can report `input == 0`).
+- `Session.Info.tokens` is **cumulative** for the whole session;
+  `session.usage.updated.tokens` is **per-step** current-context usage and is
+  ephemeral (not durable, not replayed).
+- `SessionExecutionStepLimit` (`session.execution.step_limit`, durable v1,
+  `{sessionID, steps}`) plus the public helpers `STEP_LIMIT_PREFIX`,
+  `step_limit_reason(n)` (`"step limit reached after {n} steps"`) and the strict
+  `parse_step_limit(&str) -> Option<u64>` are re-exported from the crate root.
+  The payload is the **qualifier of a succeeded terminal**: it is published
+  after `session.execution.succeeded`, never as a terminal itself, and `steps`
+  is the exhausted budget.
 
 ### `oc-store`
 - `Store::{open, open_memory}`, `Store: Clone`; bodies are wire `Value`.
@@ -61,7 +75,8 @@ public surface; `cargo doc -p <crate> --no-deps` is the reference.
   (deletes messages and inbox rows at/after `seq` in one transaction).
   `time_viewed` is written only by the `session.viewed` projector
   (`append_event`), which keeps it monotonic.
-- Lane history: `save_lane_ticket(&Value)`, `lane_tickets(limit)`.
+- Lane history: `save_lane_ticket(&Value)`, `lane_tickets(limit)`,
+  `lane_tickets_all()` (no page limit, `queued` ascending) for boot restore.
 - Projects: `list_projects(archived)`, `get_project`, `update_project`.
 - Credentials: `create_credential(NewCredential)`, `list_credentials()`,
   `get_credential(id)`, `update_credential(id, CredentialPatch)`,
@@ -188,17 +203,64 @@ public surface; `cargo doc -p <crate> --no-deps` is the reference.
     `box_delete`, `compact_context` (`docs/25-context-boxes.md`).
     `box_read`/`box_list` map to `box:read`, `box_write`/`box_delete` to
     `box:write` with the box key as the resource; `compact_context` maps to
-    action `compaction`, resource `*`. `compact_context` never compacts inline:
+    action `compaction`, resource `*`. `compact_context(note)` always targets
+    the CALLER's own session, never a supplied id. It never compacts inline:
     it commits an inbox row (`kind = "compaction"`, `delivery = Queue`,
-    `reason = "manual"`), notifies the actor and returns `scheduled`.
+    `reason = "manual"`), notifies the actor and returns `scheduled`; the
+    compaction runs at the next turn boundary. Agents are expected to compact
+    their own session around 60-70% of the model context window. `explore`
+    agents do not get the tool (their `deny("*","*")` covers action
+    `compaction`).
 - `CompactionConfig` (`crate::compaction`) is the runtime view of the merged
   `compaction` document: `{ auto, keep_tokens, buffer, ceiling_tokens }`.
-  `auto` defaults to `false`, so token-threshold compaction runs only when the
-  document opts in. `CompactionConfig::from_merged(&Value)` is the only
+  `auto` defaults to `false`; the threshold path is nevertheless **armed** when
+  `auto` is true **or** `ceiling_tokens` is set, so an explicit ceiling is a
+  hard guard on its own. `CompactionConfig::from_merged(&Value)` is the only
   constructor; `Runtime::compaction_config()` calls it.
 - `tokens::ceiling(context_window, configured) -> u64` computes
   `context_window − max(15%, 16k)`; a configured `compaction.ceiling_tokens`
   may only lower it (`min`). The former hard-coded 150k cap is gone.
+- `tokens::effective_buffer(requested, context_window) -> u64` returns
+  `requested` when non-zero and `max(8_000, context_window / 10)` otherwise;
+  `tokens::trigger(ceiling, context_window, buffer) -> u64` is
+  `ceiling − effective_buffer(...)`, saturating at 0. The turn loop compares
+  the estimate against `trigger`, never against the ceiling directly.
+- `Runtime::context_pressure(session)` (crate-private) returns
+  `Result<Option<ContextPressure>, RuntimeError>` with
+  `ContextPressure { estimated, ceiling, trigger }` — the same
+  anchor-aware estimate and the same `tokens::ceiling`/`tokens::trigger`
+  values the turn loop uses, so observers and compaction use the same
+  formulas; the loop snapshots its compaction config once at turn start, so
+  only a mid-turn config reload can make the two differ.
+  `None` for an unknown session, an unresolvable model, or a window of 0.
+  `Runtime::advise_context_pressure(&[String])` (crate-private, host-side, in
+  `observer/advice.rs`) is the adviser built on it; thresholds and cooldown
+  are specified in `docs/08`. It skips entirely when the runtime already
+  protects the session (`compaction.auto` on **or** `compaction.ceiling_tokens`
+  set) or when no ceiling can be computed.
+- `observer.advised` is a durable v1 event
+  `{sessionID, estimateTokens, ceilingTokens, triggerTokens}` published by that
+  adviser next to its durable `observer` inbox row. Its payload type
+  (`ObserverAdvised`) is **runtime-local** (`oc-runtime/src/observer/advice.rs`)
+  and is **not** declared in `oc-types`; `oc-types` owns only the inbox kind
+  (`InboxKind::Observer`).
+- Turn settlement (`turn::settle`, crate-private): the internal
+  `ExecutionOutcome` has four variants — `Succeeded`,
+  `StepLimited { steps }`, `Failed(StructuredError)` and
+  `Interrupted(InterruptReason)`. `StepLimited` is the internal variant
+  (`StepLimited { steps }`), stored as `idle_outcome = "step_limit"` plus its
+  reason, and mapped to the wire terminal `session.execution.succeeded`; the
+  `session.execution.step_limit {sessionID, steps}` event follows it, never as
+  a terminal. `SessionOutcome` stays exactly
+  `succeeded|failed|interrupted`: `project_session` (list, get, export `info`)
+  omits the key for any stored value outside the enum — never `null`, never
+  remapped — so the three known literals pass through.
+- Consuming an outcome: `succeeded` alone does not mean the turn completed.
+  Check for the `session.execution.step_limit` qualifier (or the store-level
+  `idle_reason` grammar, `docs/03-storage.md`). A parent subagent envelope
+  for a step-limited child keeps `state: "completed"` but adds
+  `metadata.stepLimit = true`, `metadata.steps = N` and one trailing line
+  `[step budget exhausted after N steps; result may be incomplete]`.
 - `InstructionContext.boxes: Option<&[Value]>` feeds `SourceKind::Boxes`
   (`oc/boxes`), ordered after `oc/memory` and before `oc/goal`. Like `oc/goal`
   it is pinned per actor epoch, so a mid-epoch box change is delivered by
@@ -225,21 +287,64 @@ public surface; `cargo doc -p <crate> --no-deps` is the reference.
 
 ### `oc-subagents`
 - `SessionNode`, `Role`, `NodeState`, `Limits` (defaults depth 3, children 8,
-  siblings 20/min), `Policy::{spawn,can_message,can_write,resolve_model}`,
-  `TreeLookup`/`SessionTree`, `SpawnBudget`, `SiblingBudget`, typed errors.
+  siblings 20 messages/min, 20 writes/min), `Policy::{spawn,can_message,
+  can_write,resolve_model}`, `TreeLookup`/`SessionTree`, `SpawnBudget`,
+  `SiblingBudget`, `WriteBudget::try_write(now_ms) -> Result<(), BudgetError>`
+  (60 s fixed window per sender, in memory), typed errors.
+  `Limits::unrestricted()` sets every cap to `u32::MAX`; a configured
+  `max_writes_per_min: 0` denies every write instead of meaning unlimited.
+  The runtime reads `subagents.siblings.max_writes_per_min` (default 20) and
+  refuses with `BudgetError: rate limit reached (max {N}/min); retry after
+  {ms} ms` before any enqueue or interrupt.
 - Coordinator scope = parent + siblings + their descendants; siblings can talk
   only when enabled; writes are descendants/self/scope.
 
 ### `oc-lanes`
 - `classify(command,cwd) -> Option<LaneRequest>` for cargo/rustc/node/go/
   pytest/dotnet/gradle/mvn; workspace-aware lane keys.
-- `LaneService::{enqueue,status,ticket,cancel,reorder,wait,shutdown}` with
-  priority FIFO per lane, semaphores, `LaneRunner`/`LaneEvents`/`Clock` traits;
-  `tokens()` exposes the cancellation table for a runner.
+- `LaneService::{enqueue,enqueue_detailed,status,ticket,cancel,reorder,wait,
+  shutdown}` with priority FIFO per lane, semaphores, `LaneRunner`/`LaneEvents`/
+  `Clock` traits; `tokens()` exposes the cancellation table for a runner.
+  `enqueue` returns a `TicketId`; `enqueue_detailed` returns
+  `EnqueueResult { id, subscribed }`.
+- `LaneService::unsubscribe(id, session) -> Result<bool, LaneError>` drops one
+  session's interest in a coalesced ticket (clearing the owner slot when it owns
+  the ticket) and returns whether the run is still alive. The run survives while
+  an owner or one subscriber remains, so a coalesced subscriber's timeout never
+  cancels shared work; only when nobody is left is it cancelled like `cancel`.
+  A terminal ticket returns `false` and is never reopened. Runtime-internal, no
+  route exposes it.
+- `LaneService::restore(config, runner, events, clock, source) ->
+  Result<LaneService, RestoreError>` rebuilds the queue through
+  `LaneTicketSource::load() -> BoxFuture<'_, Result<Vec<TicketRecord>,
+  RestoreError>>`. `RestoreError` is boot-only, never on the wire, and separate
+  from `LaneError` (`Source(String)`, `Ticket { id, reason }`); `LaneError` has
+  no restore variant, so every route-level match stays exhaustive.
+  `TicketRecord` is the persisted subset `{id, lane, command, cwd, priority,
+  ownerSession?, state, queuedMs, startedMs?, finishedMs?, outputPath?}`; it
+  carries no `tree_rev` and no `subscribers`.
+- Boot semantics: `Store::lane_tickets_all()` (unbounded, oldest first) feeds
+  restore; queued rows replay in `(queuedMs, id suffix)` order, `running` rows
+  become `Failed { exit: -1 }` with the message `lane runner was interrupted by
+  a restart`, and terminal rows are only read, never re-published, so a boot
+  cannot wipe their `finished`/`outputPath`. The next id is always max seen + 1
+  and a persisted id is never reissued. An empty store is a valid fresh boot; a
+  source failure aborts boot instead of silently starting with an empty queue.
+- Coalescing key `(lane, normalized command, cwd, tree_rev)` requires
+  `tree_rev: Some(non-empty)` and only matches a queued or running ticket: a
+  match returns that id with `subscribed = true` and appends the caller to
+  `Ticket.subscribers` (deduplicated). Terminal tickets are never reused, and
+  a missing `tree_rev` always creates a distinct ticket.
+- `tree_rev` is caller-supplied and opaque; the runtime's producer
+  (`crates/oc-runtime/src/lane/mod.rs`) hashes `git rev-parse --short HEAD`
+  with `git status --porcelain=v2 --untracked-files=no` under a 500 ms budget
+  per probe and returns `None` on any failure, which disables coalescing but
+  never fails a submission. Only `cargo:` lanes compute it.
 - The production runner (`ProcessLaneRunner`) and the SSE event adapter live in
-  `oc-runtime`/`oc-cli`. The store exposes ticket history
-  (`save_lane_ticket`/`lane_tickets`) but the lane host does not persist
-  tickets yet.
+  `oc-runtime`/`oc-cli`. The store persists ticket history
+  (`save_lane_ticket`/`lane_tickets`), and `lane_tickets_all` feeds restore;
+  coalescing state is in memory only, so `tree_rev`/`subscribers` are never
+  persisted and a restart drops coalescing without dropping a run.
 
 ### `oc-server` route modules
 Every route group is a module under `crates/oc-server/src/data/` exposing

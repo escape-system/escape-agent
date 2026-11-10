@@ -296,6 +296,485 @@ async fn max_steps_makes_one_final_tool_less_call() {
     assert_eq!(requests[2].options.tool_choice.as_deref(), Some("none"));
     assert_eq!(harness.sink.count("session.tool.success"), 2);
     assert!(harness.sink.has("session.execution.succeeded"));
+    let step_limit = harness.sink.data("session.execution.step_limit");
+    assert_eq!(
+        step_limit.len(),
+        1,
+        "the exhausted step budget is reported exactly once: {step_limit:?}"
+    );
+    assert_eq!(step_limit[0]["steps"], 2);
+    assert_eq!(step_limit[0]["sessionID"], harness.session);
+    assert!(
+        !step_limit[0].to_string().contains("null"),
+        "the qualifier payload has exactly two fields and never null: {}",
+        step_limit[0]
+    );
+}
+
+#[tokio::test]
+async fn explicit_ceiling_guards_even_when_auto_is_false() {
+    // 100k window -> computed ceiling 84k; the explicit 30k ceiling lowers it,
+    // and the default buffer (max(8k, 10%)) puts the trigger at 20k. A ~25k
+    // token prompt must compact even though `auto` is absent/false.
+    let harness = Harness::new(
+        vec![
+            text_script("## Objective\nhandoff summary"),
+            text_script("answer from the summary"),
+        ],
+        Arc::new(AllowAll),
+        json!({"compaction": {"ceiling_tokens": 30_000}}),
+        None,
+    )
+    .await;
+    harness
+        .store
+        .enqueue(NewInbox {
+            id: MessageId::new().into_inner(),
+            session_id: harness.session.clone(),
+            kind: "user".to_owned(),
+            payload: json!({"text": "a".repeat(100_000)}),
+            delivery: Delivery::Steer,
+        })
+        .await
+        .expect("enqueued");
+    harness
+        .runtime
+        .notify(&harness.session)
+        .await
+        .expect("notify");
+    harness
+        .runtime
+        .wait_idle(&harness.session, Duration::from_secs(10))
+        .await
+        .expect("idle");
+
+    assert_eq!(harness.model.calls(), 2, "summary then the real request");
+    let messages = harness.messages().await;
+    let compactions: Vec<&Value> = messages
+        .iter()
+        .filter(|message| message.get("type").and_then(Value::as_str) == Some("compaction"))
+        .collect();
+    assert_eq!(compactions.len(), 1, "exactly one compaction row");
+    assert_eq!(compactions[0]["status"], "completed");
+    assert_eq!(
+        compactions[0]["reason"], "auto",
+        "the wire reason stays `auto` for the internal `guard` path"
+    );
+    assert!(harness.sink.has("session.execution.succeeded"));
+}
+
+#[tokio::test]
+async fn buffer_moves_the_trigger_earlier() {
+    // Same transcript and explicit 50k ceiling; only the buffer differs.
+    // trigger = 50k - buffer: 42k (no compaction) vs 10k (compaction).
+    let text = "a".repeat(60_000);
+
+    let small = Harness::new(
+        vec![text_script("answer")],
+        Arc::new(AllowAll),
+        json!({"compaction": {"ceiling_tokens": 50_000, "buffer": 8_000}}),
+        None,
+    )
+    .await;
+    small
+        .store
+        .enqueue(NewInbox {
+            id: MessageId::new().into_inner(),
+            session_id: small.session.clone(),
+            kind: "user".to_owned(),
+            payload: json!({"text": text}),
+            delivery: Delivery::Steer,
+        })
+        .await
+        .expect("enqueued");
+    small.runtime.notify(&small.session).await.expect("notify");
+    small
+        .runtime
+        .wait_idle(&small.session, Duration::from_secs(10))
+        .await
+        .expect("idle");
+    assert_eq!(
+        small.model.calls(),
+        1,
+        "a small buffer keeps the trigger above the estimate"
+    );
+    assert!(
+        !small
+            .messages()
+            .await
+            .iter()
+            .any(|message| message.get("type").and_then(Value::as_str) == Some("compaction")),
+        "no compaction row below the trigger"
+    );
+
+    let large = Harness::new(
+        vec![
+            text_script("## Objective\nhandoff summary"),
+            text_script("answer from the summary"),
+        ],
+        Arc::new(AllowAll),
+        json!({"compaction": {"ceiling_tokens": 50_000, "buffer": 40_000}}),
+        None,
+    )
+    .await;
+    large
+        .store
+        .enqueue(NewInbox {
+            id: MessageId::new().into_inner(),
+            session_id: large.session.clone(),
+            kind: "user".to_owned(),
+            payload: json!({"text": text}),
+            delivery: Delivery::Steer,
+        })
+        .await
+        .expect("enqueued");
+    large.runtime.notify(&large.session).await.expect("notify");
+    large
+        .runtime
+        .wait_idle(&large.session, Duration::from_secs(10))
+        .await
+        .expect("idle");
+    assert_eq!(
+        large.model.calls(),
+        2,
+        "a large buffer lowers the trigger below the estimate"
+    );
+    assert_eq!(
+        large
+            .messages()
+            .await
+            .iter()
+            .filter(|message| message.get("type").and_then(Value::as_str) == Some("compaction"))
+            .count(),
+        1,
+        "exactly one compaction row above the trigger"
+    );
+}
+
+#[tokio::test]
+async fn step_limit_emits_a_durable_qualifier() {
+    // steps=2: two tool-enabled steps run, then the final request is made with
+    // tools disabled even though the model still asks for one. The turn
+    // succeeds, and the qualifier is a separate durable event ordered after it.
+    let harness = Harness::new(
+        vec![
+            tool_script(
+                "call_1",
+                json!({"path": "hello.txt", "expectation": expectation()}),
+            ),
+            tool_script(
+                "call_2",
+                json!({"path": "hello.txt", "expectation": expectation()}),
+            ),
+            tool_script(
+                "call_3",
+                json!({"path": "hello.txt", "expectation": expectation()}),
+            ),
+        ],
+        Arc::new(AllowAll),
+        json!({"agents": {"build": {"steps": 2}}}),
+        None,
+    )
+    .await;
+    harness.prompt("keep going").await;
+
+    assert_eq!(harness.model.calls(), 3);
+    assert!(harness.sink.has("session.execution.succeeded"));
+
+    let logged = harness
+        .store
+        .events_after(&harness.session, 0, 1_000)
+        .await
+        .expect("event log");
+    let succeeded = logged
+        .iter()
+        .find(|event| event.kind == "session.execution.succeeded")
+        .expect("durable terminal succeeded");
+    let qualified = logged
+        .iter()
+        .find(|event| event.kind == "session.execution.step_limit")
+        .expect("durable step-limit qualifier");
+    assert!(
+        qualified.seq > succeeded.seq,
+        "the qualifier is committed after the terminal: {} > {}",
+        qualified.seq,
+        succeeded.seq
+    );
+    assert_eq!(qualified.data["sessionID"], harness.session);
+    assert_eq!(qualified.data["steps"], 2);
+    let mut keys: Vec<&str> = qualified
+        .data
+        .as_object()
+        .expect("payload is an object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        ["sessionID", "steps"],
+        "the payload has exactly two keys and no null: {}",
+        qualified.data
+    );
+    assert!(
+        !qualified.data.to_string().contains("null"),
+        "the payload never emits null: {}",
+        qualified.data
+    );
+    assert_eq!(qualified.version, 1);
+
+    // The durable session row is honest about *why* it ended: the model did not
+    // stop, the budget did. The stored `idle_outcome` is the internal literal
+    // `step_limit` (the wire terminal stays `succeeded`), and `idle_reason`
+    // carries the step-limit grammar alongside it.
+    let session = harness
+        .store
+        .get_session(&harness.session)
+        .await
+        .expect("session row")
+        .expect("session exists");
+    assert_eq!(
+        session["outcome"], "step_limit",
+        "a step-limited turn stores the honest internal outcome: {session}"
+    );
+    let node = harness
+        .store
+        .session_node(&harness.session)
+        .await
+        .expect("session node")
+        .expect("node row");
+    let reason = oc_types::step_limit_reason(2);
+    assert_eq!(
+        node.idle_reason.as_deref(),
+        Some(reason.as_str()),
+        "the session row records the exhausted budget"
+    );
+    assert!(
+        node.idle_reason
+            .as_deref()
+            .is_some_and(|value| value.starts_with("step limit reached after ")),
+        "the reason uses the canonical step-limit grammar: {:?}",
+        node.idle_reason
+    );
+}
+
+#[tokio::test]
+async fn a_model_that_stops_on_its_own_emits_no_step_limit_event() {
+    // steps=2 and the model calls one tool, then answers with text. The turn
+    // ends because the model stopped, not because the budget ran out, so the
+    // qualifier must not be published at all.
+    let harness = Harness::new(
+        vec![
+            tool_script(
+                "call_1",
+                json!({"path": "hello.txt", "expectation": expectation()}),
+            ),
+            text_script("all done"),
+        ],
+        Arc::new(AllowAll),
+        json!({"agents": {"build": {"steps": 2}}}),
+        None,
+    )
+    .await;
+    harness.prompt("read once").await;
+
+    assert_eq!(harness.model.calls(), 2);
+    assert!(harness.sink.has("session.execution.succeeded"));
+    assert!(
+        !harness.sink.has("session.execution.step_limit"),
+        "a voluntary stop publishes no qualifier"
+    );
+    let logged = harness
+        .store
+        .events_after(&harness.session, 0, 1_000)
+        .await
+        .expect("event log");
+    assert!(
+        !logged
+            .iter()
+            .any(|event| event.kind == "session.execution.step_limit"),
+        "a voluntary stop writes no durable qualifier"
+    );
+}
+
+#[tokio::test]
+async fn a_model_that_stops_on_its_own_records_no_step_limit_reason() {
+    // Same budget as the limited turn, but here the model answers with text
+    // before the budget runs out. The session row must not claim a step limit:
+    // no qualifier event and no durable `idle_reason`.
+    let harness = Harness::new(
+        vec![
+            tool_script(
+                "call_1",
+                json!({"path": "hello.txt", "expectation": expectation()}),
+            ),
+            text_script("finished on my own"),
+        ],
+        Arc::new(AllowAll),
+        json!({"agents": {"build": {"steps": 2}}}),
+        None,
+    )
+    .await;
+    harness.prompt("read once").await;
+
+    assert_eq!(harness.model.calls(), 2, "the budget was never exhausted");
+    assert!(harness.sink.has("session.execution.succeeded"));
+    assert!(
+        !harness.sink.has("session.execution.step_limit"),
+        "a voluntary stop publishes no qualifier"
+    );
+
+    let session = harness
+        .store
+        .get_session(&harness.session)
+        .await
+        .expect("session row")
+        .expect("session exists");
+    assert_eq!(session["outcome"], "succeeded");
+    let node = harness
+        .store
+        .session_node(&harness.session)
+        .await
+        .expect("session node")
+        .expect("node row");
+    assert_eq!(
+        node.idle_reason, None,
+        "a voluntary stop must not look step-limited"
+    );
+    assert_eq!(node.status, "completed");
+}
+
+#[tokio::test]
+async fn step_limited_turn_still_publishes_the_succeeded_terminal() {
+    // Guard against "fixing" the step limit by renaming the wire terminal:
+    // `SessionOutcome` has three literals and `Runtime::parse_session`
+    // deserializes strictly, so the terminal must stay
+    // `session.execution.succeeded` and the qualifier rides alongside it.
+    let harness = Harness::new(
+        vec![
+            tool_script(
+                "call_1",
+                json!({"path": "hello.txt", "expectation": expectation()}),
+            ),
+            tool_script(
+                "call_2",
+                json!({"path": "hello.txt", "expectation": expectation()}),
+            ),
+            tool_script(
+                "call_3",
+                json!({"path": "hello.txt", "expectation": expectation()}),
+            ),
+        ],
+        Arc::new(AllowAll),
+        json!({"agents": {"build": {"steps": 2}}}),
+        None,
+    )
+    .await;
+    harness.prompt("keep going").await;
+
+    assert_eq!(harness.sink.count("session.execution.succeeded"), 1);
+    assert_eq!(harness.sink.count("session.execution.step_limit"), 1);
+    assert_eq!(
+        harness.sink.count("session.execution.failed"),
+        0,
+        "a step-limited turn is not a failure"
+    );
+    assert_eq!(harness.sink.count("session.execution.interrupted"), 0);
+
+    let logged = harness
+        .store
+        .events_after(&harness.session, 0, 1_000)
+        .await
+        .expect("event log");
+    let kinds: Vec<&str> = logged
+        .iter()
+        .map(|event| event.kind.as_str())
+        .filter(|kind| kind.starts_with("session.execution."))
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            "session.execution.started",
+            "session.execution.succeeded",
+            "session.execution.step_limit",
+        ],
+        "the same execution carries both the wire terminal and the qualifier"
+    );
+
+    // The stored `step_limit` literal is unknowable to the three-literal wire
+    // enum, so the read path must tolerate it: `SessionInfo` maps it to `None`
+    // instead of failing. That is what lets the session run again.
+    let session = harness
+        .store
+        .get_session(&harness.session)
+        .await
+        .expect("session row")
+        .expect("session exists");
+    assert_eq!(session["outcome"], "step_limit");
+    let info: oc_types::SessionInfo =
+        serde_json::from_value(session).expect("a step-limited session stays parseable");
+    assert_eq!(
+        info.outcome, None,
+        "an unknown stored outcome reads as absent, not as a parse failure"
+    );
+}
+
+#[tokio::test]
+async fn a_step_limited_session_can_run_again() {
+    // The regression the strict parse would have caused: a stored fourth
+    // literal makes every later execution of the session fail to parse.
+    let harness = Harness::new(
+        vec![
+            tool_script(
+                "call_1",
+                json!({"path": "hello.txt", "expectation": expectation()}),
+            ),
+            tool_script(
+                "call_2",
+                json!({"path": "hello.txt", "expectation": expectation()}),
+            ),
+            tool_script(
+                "call_3",
+                json!({"path": "hello.txt", "expectation": expectation()}),
+            ),
+            text_script("second turn ran"),
+        ],
+        Arc::new(AllowAll),
+        json!({"agents": {"build": {"steps": 2}}}),
+        None,
+    )
+    .await;
+    harness.prompt("exhaust the budget").await;
+    let limited = harness
+        .store
+        .get_session(&harness.session)
+        .await
+        .expect("session row")
+        .expect("session exists");
+    assert_eq!(limited["outcome"], "step_limit");
+
+    harness.prompt("run again").await;
+
+    assert_eq!(
+        harness.model.calls(),
+        4,
+        "the second turn reached the model"
+    );
+    let messages = harness.messages().await;
+    let assistants = assistants(&messages);
+    assert_eq!(
+        assistants
+            .last()
+            .map(|message| &message["content"][0]["text"]),
+        Some(&json!("second turn ran")),
+        "the second turn produced its own answer"
+    );
+    assert!(
+        assistants
+            .last()
+            .is_some_and(|message| message["error"].is_null()),
+        "the second turn must not fail on the stored outcome"
+    );
 }
 
 #[tokio::test]

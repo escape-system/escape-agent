@@ -22,12 +22,29 @@ pub struct CacheTokens {
 }
 
 /// `TokenUsage.Info`.
+///
+/// `input` is the **non-cached** prompt part. The provider prompt size is
+/// [`Tokens::prompt_tokens`]; this disjoint shape matches the vendored
+/// `token-usage` contract, whose `total()` adds every field.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Tokens {
     pub input: i64,
     pub output: i64,
     pub reasoning: i64,
     pub cache: CacheTokens,
+}
+
+impl Tokens {
+    /// Inclusive prompt size: non-cached input plus cache reads/writes.
+    ///
+    /// Use this for context-window and compaction math; `input` alone is
+    /// non-cached and a fully cached step can report `input == 0`.
+    #[must_use]
+    pub fn prompt_tokens(&self) -> i64 {
+        self.input
+            .saturating_add(self.cache.read)
+            .saturating_add(self.cache.write)
+    }
 }
 
 /// `Model.Ref`: a model reference as carried on the wire (`providerID`).
@@ -162,6 +179,27 @@ pub struct SessionRevert {
     pub files: Option<Vec<FileDiff>>,
 }
 
+/// Reads `Session.Info.outcome` tolerantly.
+///
+/// The wire model has exactly three literals ([`SessionOutcome`]), but the
+/// runtime stores one internal literal the wire does not know:
+/// `"step_limit"` (a completed turn whose step budget ended it). A strict
+/// parse would make that session unreadable on its next execution, so an
+/// unknown string reads as `None` — "no wire outcome" — and is omitted when
+/// the value is re-serialized. Wrong JSON types still fail.
+fn deserialize_outcome<'de, D>(deserializer: D) -> Result<Option<SessionOutcome>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<String>::deserialize(deserializer)?;
+    Ok(raw.and_then(|raw| match raw.as_str() {
+        "succeeded" => Some(SessionOutcome::Succeeded),
+        "failed" => Some(SessionOutcome::Failed),
+        "interrupted" => Some(SessionOutcome::Interrupted),
+        _ => None,
+    }))
+}
+
 /// Exact wire `Session.Info`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -179,7 +217,11 @@ pub struct SessionInfo {
     pub model: Option<ModelRef>,
     pub cost: f64,
     pub tokens: Tokens,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_outcome"
+    )]
     pub outcome: Option<SessionOutcome>,
     pub time: SessionTimes,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -337,5 +379,86 @@ mod tests {
             !text.contains("null"),
             "optional fields must be omitted: {text}"
         );
+    }
+
+    fn session_with_outcome(outcome: &Value) -> Value {
+        serde_json::json!({
+            "id": "ses_0123456789abABCDEFGHIJKLMN",
+            "projectID": "prj_0123456789abABCDEFGHIJKLMN",
+            "cost": 0.0,
+            "tokens": {
+                "input": 1,
+                "output": 1,
+                "reasoning": 0,
+                "cache": {"read": 0, "write": 0}
+            },
+            "outcome": outcome.clone(),
+            "time": {"created": 1_730_000_000_000i64, "updated": 1_730_000_000_000i64},
+            "location": {"directory": "/work"}
+        })
+    }
+
+    #[test]
+    fn known_outcome_literals_round_trip() {
+        for (literal, expected) in [
+            ("succeeded", SessionOutcome::Succeeded),
+            ("failed", SessionOutcome::Failed),
+            ("interrupted", SessionOutcome::Interrupted),
+        ] {
+            let fixture = session_with_outcome(&Value::String(literal.to_owned()));
+            let parsed: SessionInfo = serde_json::from_value(fixture.clone()).unwrap();
+            assert_eq!(parsed.outcome, Some(expected), "{literal}");
+            assert_eq!(
+                serde_json::to_value(&parsed).unwrap(),
+                fixture,
+                "{literal} must round-trip unchanged"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_outcome_reads_as_absent_and_is_omitted() {
+        // `step_limit` is the runtime's durable literal for a completed turn
+        // whose step budget ended it. The wire enum has no such variant, so a
+        // tolerant read maps it to `None` instead of failing the whole session.
+        let fixture = session_with_outcome(&Value::String("step_limit".to_owned()));
+        let parsed: SessionInfo = serde_json::from_value(fixture).expect("unknown outcome parses");
+        assert_eq!(parsed.outcome, None);
+
+        let reserialized = serde_json::to_value(&parsed).unwrap();
+        assert!(
+            reserialized.get("outcome").is_none(),
+            "an unreadable outcome is omitted, never null: {reserialized}"
+        );
+        assert!(
+            !reserialized.to_string().contains("null"),
+            "optional fields must be omitted: {reserialized}"
+        );
+
+        // An unrelated unknown literal behaves the same way.
+        let parsed: SessionInfo =
+            serde_json::from_value(session_with_outcome(&Value::String("cancelled".to_owned())))
+                .expect("unrelated unknown outcome parses");
+        assert_eq!(parsed.outcome, None);
+    }
+
+    #[test]
+    fn an_explicitly_absent_outcome_stays_absent() {
+        let fixture = serde_json::json!({
+            "id": "ses_0123456789abABCDEFGHIJKLMN",
+            "projectID": "prj_0123456789abABCDEFGHIJKLMN",
+            "cost": 0.0,
+            "tokens": {
+                "input": 0,
+                "output": 0,
+                "reasoning": 0,
+                "cache": {"read": 0, "write": 0}
+            },
+            "time": {"created": 1, "updated": 1},
+            "location": {"directory": "/work"}
+        });
+        let parsed: SessionInfo = serde_json::from_value(fixture.clone()).unwrap();
+        assert_eq!(parsed.outcome, None);
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), fixture);
     }
 }

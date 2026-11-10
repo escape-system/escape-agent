@@ -81,7 +81,7 @@ pub(crate) async fn serve(options: ServeOptions) -> anyhow::Result<()> {
     // Extensions own the MCP manager, the LSP supervisor, the plugin registry
     // and the lane service. They must exist before the runtime so the MCP/LSP
     // tool providers and the lane handle can be attached to it.
-    let (state, extensions) = attach_extensions(state, &services, &directory);
+    let (state, extensions) = attach_extensions(state, &services, &directory).await?;
     let (state, runtime, broker) = attach_runtime(state, &services, &extensions).await?;
     let pty = Arc::new(oc_pty::PtyManager::new(oc_pty::PtyConfig::default()));
     let state = state.with_pty(pty.clone());

@@ -70,7 +70,7 @@ self-report.
 ## Operational nuances and environment factors
 
 1. **Harness Environment Lifecycle (~10 min restarts)**: The execution container restarts child processes roughly every 10 minutes. While durable session state and events survive in SQLite WAL, long-running processes (such as massive `oc-server` integration test binary linkers or hour-long interactive tasks) may experience interruption.
-2. **Context Window Indicator (UI Lifecycle)**: The context fullness percentage in the web UI tracks the current model turn's occupancy relative to its token limit, not cumulative session tokens. When automatic compaction triggers (at ~85% of limit), it summarizes history down to 15k tokens, causing the indicator to step down to ~10-15%, and temporarily displaying 0% during the compaction transition until the next assistant response concludes.
+2. **Context Window Indicator (UI Lifecycle)**: The context fullness percentage in the web UI tracks the current model turn's occupancy relative to its token limit, not cumulative session tokens. When threshold compaction triggers (at `ceiling − buffer`, where `ceiling = context_window − max(15%, 16k)`), it summarizes history down to 15k tokens, causing the indicator to step down to ~10-15%, and temporarily displaying 0% during the compaction transition until the next assistant response concludes.
 3. **Single Review Panel UX Strip**: The session drawer (`#review-panel`) starts closed (`width: 0px`) by default. Opening the Review tab switches the strip to `review:changes` (git diff); access to Terminal or File Picker requires opening a new tab (`+`) or using dedicated hotkeys (`Ctrl+Alt+T`, `Ctrl+Alt+P`).
 
 ## Agent grouping

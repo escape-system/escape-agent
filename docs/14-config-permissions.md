@@ -138,16 +138,24 @@ read *.env.example allow
 ```
 
 Built-in agents: `build` primary + `question allow`; `general` subagent, denies
-`question` and `subagent`; `explore` deny-all then allows
+`question` (spawning is governed by `subagents.*`, not by a permission rule);
+`explore` deny-all then allows
 shell/grep/glob/webfetch/websearch/read/code_map/box:read (env ask) +
 `external_directory`, denies `subagent`; `plan` denies edits except
 `~/.opencode/plan/*`; hidden `compaction`, `title`, `summary` deny all.
+`steward` is **not** a built-in: it is a project template
+(`.opencode/agent/steward.md`, `mode: subagent`) whose `permissions` and
+`steps` come from the `agents.steward` entry in `opencode.json`, because agent
+markdown frontmatter cannot express permissions.
 
 Context boxes add the actions `box:read` and `box:write`, with the box key as
 the resource (`docs/25-context-boxes.md`). Primaries and `general` get both;
 `explore` gets `box:read` only; a custom agent can be write-only by allowing
 `box:write` and denying `box:read`. `compaction.auto` defaults to `false`, so
-threshold compaction only runs when the document opts in.
+threshold compaction only runs when the document opts in; an explicit
+`compaction.ceiling_tokens` arms the same guard without `auto`, and the
+threshold is `ceiling − buffer` (buffer absent ⇒ `max(8k, 10% of the window)`),
+so the guard fires before the hard ceiling.
 
 Ask flow:
 

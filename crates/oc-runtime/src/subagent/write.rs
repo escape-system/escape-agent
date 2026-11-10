@@ -8,8 +8,8 @@ use crate::runtime::Runtime;
 
 use super::settings::settings_for_session;
 use super::tree::{
-    load_info, load_node, load_tree, optional_bool, optional_str, required_str, runtime_error,
-    write_error,
+    budget_error, load_info, load_node, load_tree, optional_bool, optional_str, required_str,
+    runtime_error, write_error,
 };
 
 #[derive(Debug, Clone)]
@@ -62,6 +62,14 @@ impl Tool for WriteSessionTool {
         Policy::new(settings.limits.clone())
             .can_write(&from_node, &to_node, &tree)
             .map_err(|error| write_error(&error))?;
+
+        {
+            let mut state = runtime.inner.subagents.lock().expect("subagent state");
+            state
+                .write_budget(&caller, &settings.limits)
+                .try_write(oc_types::now_millis())
+                .map_err(|error| budget_error(&error))?;
+        }
 
         if optional_bool(&input, "interrupt").unwrap_or(false) {
             runtime

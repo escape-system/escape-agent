@@ -122,6 +122,14 @@ pub fn default_system_prompt_with_memory(
              skill using `skill_write`. Keep bodies under 200 lines and include a '## When to use' section.\n",
         );
     }
+    if tool_names.iter().any(|name| name == "compact_context") {
+        prompt.push_str(
+            "- You may compact your own session by calling `compact_context` with a short `note` \
+             saying why. It does not run inline: the request is queued and the compaction happens \
+             at the next turn boundary, after this turn. Call it when the conversation is roughly \
+             60-70% of the model's context window, or before starting a long multi-step task.\n",
+        );
+    }
     let _ = write!(
         prompt,
         "\n\

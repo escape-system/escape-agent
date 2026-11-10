@@ -13,6 +13,7 @@ pub struct Limits {
     pub siblings_enabled: bool,
     pub allow_parent: bool,
     pub max_messages_per_min: u32,
+    pub max_writes_per_min: u32,
 }
 
 impl Default for Limits {
@@ -27,6 +28,7 @@ impl Default for Limits {
             siblings_enabled: true,
             allow_parent: true,
             max_messages_per_min: 20,
+            max_writes_per_min: 20,
         }
     }
 }
@@ -45,6 +47,7 @@ impl Limits {
             siblings_enabled: true,
             allow_parent: true,
             max_messages_per_min: u32::MAX,
+            max_writes_per_min: u32::MAX,
         }
     }
 }

@@ -260,7 +260,7 @@ async fn boot_terminal_host(directory: &Path, db: Option<PathBuf>) -> anyhow::Re
         .with_store(services.store.clone())
         .with_config(services.config.clone())
         .with_catalog(services.catalog.clone());
-    let (state, extensions) = attach_extensions(state, &services, directory);
+    let (state, extensions) = attach_extensions(state, &services, directory).await?;
     let (state, runtime, broker) = attach_runtime(state, &services, &extensions).await?;
     Ok(TerminalHost {
         services,

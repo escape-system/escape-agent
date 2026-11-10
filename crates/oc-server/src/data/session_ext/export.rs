@@ -79,10 +79,14 @@ pub async fn export(
         }
     };
     let store = require_store(&state)?;
-    let info = require_session(store, &session_id).await?;
+    // The wire `Session.Info` has exactly three outcome literals; the store also
+    // records the internal `step_limit`. Project `info` at the boundary so an
+    // export never carries a literal the generated types reject. Transcript
+    // rows below are a different resource and stay untouched.
+    let mut info =
+        crate::data::session::project_session(require_session(store, &session_id).await?);
     let mut messages = messages_all(store, &session_id).await?;
     let data = if sanitize_requested {
-        let mut info = info;
         sanitize(&mut info);
         for message in &mut messages {
             sanitize(message);

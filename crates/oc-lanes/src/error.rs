@@ -35,3 +35,22 @@ pub enum LaneError {
         timeout_ms: u64,
     },
 }
+
+/// Why [`crate::LaneService::restore`] could not replay persisted tickets.
+///
+/// Boot-only: no route handler returns this, so it is deliberately separate
+/// from [`LaneError`] and every existing `LaneError` match stays exhaustive.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum RestoreError {
+    /// The persisted ticket source failed (store read or row decode).
+    #[error("cannot load persisted lane tickets: {0}")]
+    Source(String),
+    /// A persisted row cannot be replayed without corrupting the queue.
+    #[error("lane ticket `{id}` cannot be restored: {reason}")]
+    Ticket {
+        /// Ticket id.
+        id: String,
+        /// Human-readable reason.
+        reason: String,
+    },
+}

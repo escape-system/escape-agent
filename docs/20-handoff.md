@@ -128,8 +128,11 @@ else `%TEMP%/opencode/opencode.db` (Windows without `HOME`). WAL sidecars are
   (`/_assets`, `/icons`) are 404, not the "UI not built" 503.
 - **Compaction reason is part of the wire shape.** Inbox-driven (manual)
   compaction writes `reason:"manual"`; inline auto compaction writes
-  `"auto"`. Never hardcode `"auto"` in the shared compact path (a test pins
-  both the completed/failed rows).
+  `"auto"`. The loop's internal reason for an armed explicit ceiling with
+  `auto:false` is `guard`, but `event_reason` maps every non-manual reason to
+  the wire literal `auto`, so the wire shape has exactly two values. Never
+  hardcode `"auto"` in the shared compact path (a test pins both the
+  completed/failed rows).
 - **Compaction `keepID` is top-level message data.** The runtime writes it on
   the compaction row; fork/import must read and remap `keepID` at the top level
   (legacy `/metadata/keepID` is migrated and removed). Both routes have a

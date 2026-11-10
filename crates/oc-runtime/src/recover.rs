@@ -364,7 +364,9 @@ impl Runtime {
             return Ok(None);
         };
         let state = match session.get("outcome").and_then(Value::as_str) {
-            Some("succeeded") => "completed",
+            // A step-limited child did answer; the budget ended it, not a
+            // failure. Recovery reports it as completed, as `child_state` does.
+            Some("succeeded" | "step_limit") => "completed",
             Some("failed") => "failed",
             Some("interrupted") => "cancelled",
             _ => return Ok(None),

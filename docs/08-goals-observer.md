@@ -78,6 +78,10 @@ Wake conditions:
 - a stall: no strip settled and no step event for `observer.stall_seconds`
   (default 120) while execution is busy.
 
+The host adviser (see *Compaction advice* below) also runs once per tick over
+the active sessions; that pass is deterministic and does not call the LLM, so
+it never counts against the coalescing/rate limits above.
+
 Coalescing: at most one LLM call per `min_interval_ms` (2000), at most
 `max_calls_per_min` (12). If more events arrive, one call carries all of them.
 
@@ -132,6 +136,40 @@ action → `none`):
 | `repair.repost` | re-deliver last user prompt to a stalled session | only if no user input pending |
 | `goal_done` | mark goal done | requires evidence refs that exist |
 | `goal_blocked` / `goal_failed` | mark goal, stop the loop | one terminal verdict |
+
+### 4a. Compaction advice (host-side, deterministic)
+
+The LLM observer sees flight strips only: `ObserverInput` carries no usage and
+no `context_window` (its `root` header is agent/model/step/state), so it cannot
+judge context pressure. The adviser is therefore **not** the LLM observer: it
+is a host-side pass, `Runtime::advise_context_pressure` in
+`crates/oc-runtime/src/observer/advice.rs`, driven by the observer ticker over
+the currently active sessions, and it never calls a model.
+
+Rules (fixed constants `ADVICE_THRESHOLD_PERCENT = 70`,
+`ADVICE_COOLDOWN_MS = 600_000`):
+
+- Pressure is the runtime's own `context_pressure()` estimate, the same number
+  the turn loop's threshold path uses.
+- It advises when the estimate is at or above **70% of the ceiling**. It stays
+  silent when the runtime already protects the session (`compaction.auto` is on
+  **or** `compaction.ceiling_tokens` is set, so the threshold path already
+  runs), when no ceiling can be computed for the session, when a compaction is
+  pending (an inbox `compaction` row, or a `compaction` message with
+  `status: "running"`), when less than **10 minutes** have passed since the
+  last advice for that session, or when the estimate is below the threshold.
+  The cooldown is stamped only after the advice row is durable, the session is
+  woken, and the event is published.
+- One advice enqueues a durable `observer` inbox row (`delivery: steer`) with
+  `metadata {observer: true, advice: "compact", estimateTokens,
+  ceilingTokens, triggerTokens}` and publishes the durable v1
+  `observer.advised {sessionID, estimateTokens, ceilingTokens, triggerTokens}`.
+- It never forces compaction: no `compaction` inbox row, no `RepairCommand`, no
+  goal/expectation mutation, no repair-budget consumption. Acting on the advice
+  (calling `compact_context`, or finishing and handing off) stays the agent's
+  decision.
+- The cooldown map is process-local, so a restart forgets the clock but never
+  the message; the advisory row is durable.
 
 Repair budget: `max_repairs_per_10min` per root (default 5), plus per-target 2.
 On exhaustion the observer emits `observer.escalated` and stops acting
@@ -255,6 +293,12 @@ strips: one actor, one budget, one audit trail.
 The observer model defaults to `subagents.digest_model`, then the root model.
 If the root provider is unreachable, observer calls fail open (`none`) and
 publish `observer.unavailable` once per 5 min; they never block the turn.
+
+The host-side compaction adviser has **no config keys**: the 70% threshold and
+the 10-minute cooldown are fixed constants. Only `compaction.auto` (its advice
+is suppressed while auto-compaction already runs) and
+`compaction.ceiling_tokens`/`buffer` (they move the numbers it reports)
+influence it.
 
 ## 9. Why this stays cheap
 

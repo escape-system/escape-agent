@@ -26,6 +26,9 @@
               "supported": true,
               "effort": ["low", "medium", "high", "max"]
             }
+          },
+          "limit": {
+            "context": 1048576
           }
         },
         "claude-sonnet-5.5": {
@@ -69,6 +72,25 @@
     },
     "explore": {
       "model": "opencode-go/deepseek-v4.1-flash#max"
+    },
+    "steward": {
+      "mode": "subagent",
+      "description": "Build steward: single owner of the cargo lane. Runs the classified cargo queue for other agents, returns results, and never edits code.",
+      "steps": 120,
+      "permissions": [
+        { "action": "edit", "resource": "*", "effect": "deny" },
+        { "action": "subagent", "resource": "*", "effect": "deny" },
+        { "action": "shell", "resource": "*", "effect": "allow" },
+        { "action": "lane", "resource": "*", "effect": "allow" },
+        { "action": "read", "resource": "*", "effect": "allow" },
+        { "action": "grep", "resource": "*", "effect": "allow" },
+        { "action": "glob", "resource": "*", "effect": "allow" },
+        { "action": "box:read", "resource": "*", "effect": "allow" },
+        { "action": "box:write", "resource": "*", "effect": "allow" },
+        { "action": "talk", "resource": "*", "effect": "allow" },
+        { "action": "roster", "resource": "*", "effect": "allow" },
+        { "action": "digest", "resource": "*", "effect": "allow" }
+      ]
     }
   }
 }

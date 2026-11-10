@@ -211,6 +211,7 @@ fn ticket(command: &str, priority: i32) -> NewTicket {
         priority,
         owner_session: Some("ses_test".to_owned()),
         label: None,
+        tree_rev: None,
     }
 }
 

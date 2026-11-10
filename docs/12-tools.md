@@ -31,7 +31,7 @@ namespace exists. `execute` is reserved for Code Mode.
 | `grep` | `pattern`, `path?`, `include?`, `literal?`, `caseSensitive?`, `limit?` | ripgrep JSON matches, excludes `.git` | 100 default, 30 s, 2000-char lines |
 | `shell` | `command`, `workdir?`, `timeout?`, `background?` | Shell exec, file-backed output | 120 s foreground default; `0` = no timeout; 2000 lines/50 KiB tail |
 | `todowrite` | `todos[{content,status}]` | Replace the todo list | registered only if `experimental.todo` |
-| `subagent` | `agent`, `description`, `prompt`, `model?`, `sessionID?`, `background?` (+ our fields) | Child session | depth 1 upstream; ours see [05](05-subagents.md) |
+| `subagent` | `agent`, `description`, `prompt`, `model?`, `sessionID?`, `background?` (+ our fields) | Child session; a completed child that exhausted its step budget keeps `status: "completed"` and adds the qualifier line | depth 1 upstream; ours see [05](05-subagents.md) |
 | `skill` | `id` | Load `<skill_content>` + base dir + file sample | permission `skill` |
 | `question` | `questions[{question,header,options[{label,description}],multiple?}]` | Asks the user via a Form | non-empty |
 | `webfetch` | `url`, `format?: text\|markdown\|html`, `timeout?` | GET → text; redirects checked | 30 s default, 120 max, byte cap |
@@ -86,7 +86,8 @@ Never a 500, never a silent default.
 - Metadata keys the UI reads: read `{truncated}`, shell
   `{status,truncated,exit?,signal?,timeout?,shellID?}`, glob `{count,truncated}`,
   grep `{matches,truncated}`, edit/patch `{files:[{file,patch,status,additions,
-  deletions}]}`, subagent `{sessionID,status}`, execute `{toolCalls,error?}`.
+  deletions}]}`, subagent `{sessionID,status,stepLimit?,steps?}`, execute
+  `{toolCalls,error?}`.
 
 ## Truncation
 
@@ -199,7 +200,21 @@ path escapes the location.
 
 `shell` classifies build/test commands (`cargo`, `npm/pnpm/bun/yarn`, `go`,
 `pytest`, `dotnet`, `gradle`, `mvn`) and routes them through `LaneService`.
-The tool call returns a ticket immediately; progress and output stream as
-events. The coordinator agent uses the `lane` tool to order, cancel and notify.
+The unclassified path executes inline; a classified call enqueues a ticket,
+then blocks in `lane.wait` with the caller's timeout (5 min default) and returns
+the ticket's output tail once it settles. A coalesced call joins the existing
+run first, so identical work is awaited once. The `lane` tool is the coordinator
+surface: `queue`, `order`, `status`, `wait`, `cancel`, `notify`.
+`lane.queue` accepts an optional `tree_rev` (opaque caller-supplied tree state)
+and returns `{id, subscribed}`: identical `(lane, command, cwd, tree_rev)`
+submissions reuse the active ticket and add the caller as a subscriber.
+`lane.wait {ticket, timeout_ms?}` blocks until the ticket is terminal and
+returns `{ticket}`, the same view `status` gives. On timeout it returns
+`{ticket, timedOut: true}` with the current state and no error, and never
+cancels the run; `timeout_ms` defaults to 300000 (5 min) and `0` waits until
+terminal. A subscriber that stops waiting calls `unsubscribe(id,
+caller_session)`: the run continues for its owner and every other subscriber,
+and only the last interested party stops it. `cancel` is explicit and no
+timeout path calls it.
 Safety does not depend on the model: the lane semaphore is enforced in Rust.
 See [05](05-subagents.md).

@@ -22,7 +22,11 @@ Compaction runs only when asked:
 
 `compaction.auto` gates the token-threshold path and defaults to **`false`** in
 this deployment. Setting it to `true` restores threshold compaction for hosts
-that want it. `compaction.ceiling_tokens` optionally lowers the computed ceiling
+that want it. The path is also armed when `compaction.ceiling_tokens` is set,
+even with `auto: false`: an explicit ceiling is a real guard, and the loop
+compares the estimate against `ceiling − buffer` (buffer absent ⇒
+`max(8k, 10% of the window)`), not against the ceiling itself.
+`compaction.ceiling_tokens` optionally lowers the computed ceiling
 (`context_window − max(15%, 16k)`); it can never raise it. The old hard-coded
 150k cap is gone, so a 1M-window model compacts at its real ceiling.
 
@@ -72,7 +76,8 @@ Limits: store rejects content above 262,144 characters; `box_write` caps at
 | `temporary` | no (gets `timeExpired`) | no, unless `include_expired` |
 
 A successful compaction stamps `time_expired` on every live `temporary` box of
-the root, after the `completed` compaction row is committed and before
+the compacting subtree (the session plus its descendants), after the
+`completed` compaction row is committed and before
 `session.compaction.ended` is published. Stable boxes are untouched. Expiry is
 soft: the row and its content remain queryable with `include_expired` for
 audit, but `box_read`/`box_list` and the prompt index ignore it by default. The
@@ -109,6 +114,12 @@ compaction does not reset it) renders the fresh index into the prefix.
 | `box_write` | `box:write` | box key | Create/update/append; `kind` defaults to `stable` |
 | `box_delete` | `box:write` | box key | Soft delete |
 | `compact_context` | `compaction` | `*` | Enqueue a `manual` compaction for the next boundary |
+
+`compact_context(note)` always targets the **caller's own session**; there is
+no target argument. It is queued (`delivery = Queue`) and runs at the next turn
+boundary, never inline inside the tool call. Agents are expected to call it when
+their session is roughly 60-70% of the model context window, or before a long
+multi-step task. `explore` agents do not get the tool.
 
 Every call is authorized by the runtime before dispatch, like any other tool.
 `box_read` on an expired box fails unless `include_expired` is set; `box_write`

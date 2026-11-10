@@ -627,10 +627,16 @@ impl Store {
             .await
     }
 
-    /// Records the completion of an execution and, when `outcome` is
-    /// `interrupted`, why it was interrupted (`user`, …). A reason on any other
-    /// outcome is not durable and is stored as `NULL`, so a later successful
-    /// turn always clears a previous stop reason.
+    /// Records the completion of an execution and, when the reason is
+    /// meaningful, why it ended (`user`, `step limit reached after N steps`).
+    ///
+    /// `idle_reason` is durable for three shapes only: an `interrupted` outcome
+    /// (why the turn was stopped), a `step_limit` outcome (the internal literal a
+    /// step-limited turn stores; the reason is the step-limit grammar), and a
+    /// `succeeded` outcome whose reason is that same grammar
+    /// ([`oc_types::parse_step_limit`]) — the turn answered, but its step budget,
+    /// not the model, ended it. Any other pair stores `NULL`, so a later voluntary
+    /// turn always clears a previous reason.
     pub async fn mark_session_idle_with_reason(
         &self,
         id: &str,
@@ -641,7 +647,7 @@ impl Store {
         let id = id.to_owned();
         let outcome = outcome.to_owned();
         let reason = reason
-            .filter(|_| outcome == "interrupted")
+            .filter(|reason| keeps_idle_reason(Some(outcome.as_str()), reason))
             .map(str::to_owned);
         self.write(move |connection| {
             connection.execute(
@@ -722,6 +728,23 @@ impl Store {
 }
 
 const ROLES: [&str; 3] = ["primary", "subagent", "coordinator"];
+
+/// Whether a durable `idle_reason` survives next to `outcome`.
+///
+/// Only these pairs are durable: `interrupted` + any reason (why it stopped),
+/// `step_limit` + any reason (the internal step-limited outcome), and
+/// `succeeded` + the strict step-limit grammar (rows written before the
+/// `step_limit` literal existed). Everything else — including a `succeeded`
+/// row with an unrelated reason — is stored as `NULL`, so a voluntary turn
+/// clears any previous reason and the interrupted-only rule stays intact for
+/// every other outcome.
+pub(crate) fn keeps_idle_reason(outcome: Option<&str>, reason: &str) -> bool {
+    match outcome {
+        Some("interrupted" | "step_limit") => true,
+        Some("succeeded") => oc_types::parse_step_limit(reason).is_some(),
+        _ => false,
+    }
+}
 
 fn validate_role(role: &str) -> Result<(), StoreError> {
     if ROLES.contains(&role) {

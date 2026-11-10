@@ -3,6 +3,7 @@ use std::time::Duration;
 use oc_store::{Delivery, NewInbox};
 use oc_tools::{ToolError, ToolResult};
 use oc_types::MessageId;
+use oc_types::payload::parse_step_limit;
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
@@ -304,8 +305,9 @@ async fn persist_child_outcome(runtime: &Runtime, child: &str, state: &str) {
             if let Some("failed" | "interrupted") = session.get("outcome").and_then(Value::as_str) {
                 return;
             }
-            // `succeeded` (or no outcome at all) contradicts the failure the
-            // parent is about to deliver; that is the divergence to repair.
+            // `succeeded`, `step_limit` (a completed turn with a qualifier) or
+            // no outcome at all contradicts the failure the parent is about to
+            // deliver; that is the divergence to repair.
         }
         Ok(None) => return,
         Err(error) => {
@@ -329,6 +331,70 @@ async fn persist_child_outcome(runtime: &Runtime, child: &str, state: &str) {
     }
 }
 
+/// Appends the step-budget qualifier to a completed child's envelope and
+/// records it in the parent-facing metadata.
+///
+/// `steps == None` leaves both untouched, so every other delivery path stays
+/// byte-identical. The state stays `completed`: the child did answer, and the
+/// qualifier is the honest caveat on that answer.
+pub(crate) fn apply_step_limit(body: &str, metadata: &mut Value, steps: Option<u64>) -> String {
+    let Some(steps) = steps else {
+        return body.to_owned();
+    };
+    metadata["stepLimit"] = json!(true);
+    metadata["steps"] = json!(steps);
+    format!("{body}\n[step budget exhausted after {steps} steps; result may be incomplete]")
+}
+
+/// Steps consumed by the child's last settled turn when it stopped at its step
+/// budget.
+///
+/// The marker is durable in two places: `session_v2.idle_reason` (the reason
+/// [`super::protocol`] parses) and the child's own
+/// `session.execution.step_limit` event, which the runtime publishes after the
+/// terminal execution event. The event is authoritative for a `succeeded`
+/// turn, because `idle_reason` is internal and the store surfaces it only for
+/// interrupted and step-limited rows.
+async fn child_step_limit(runtime: &Runtime, child: &str) -> Option<u64> {
+    let store = &runtime.inner.config.store;
+    if let Ok(Some(node)) = store.session_node(child).await
+        && let Some(steps) = node.idle_reason.as_deref().and_then(parse_step_limit)
+    {
+        return Some(steps);
+    }
+    let mut after = 0;
+    let mut marker: Option<(i64, u64)> = None;
+    let mut terminal = 0;
+    loop {
+        let events = store.events_after(child, after, 1_000).await.ok()?;
+        let Some(last) = events.last() else {
+            break;
+        };
+        after = last.seq;
+        for event in &events {
+            match event.kind.as_str() {
+                "session.execution.succeeded"
+                | "session.execution.failed"
+                | "session.execution.interrupted" => terminal = event.seq,
+                "session.execution.step_limit" => {
+                    if let Some(steps) = event.data.get("steps").and_then(Value::as_u64) {
+                        marker = Some((event.seq, steps));
+                    }
+                }
+                _ => {}
+            }
+        }
+        if events.len() < 1_000 {
+            break;
+        }
+    }
+    // A marker from an older turn is stale: only one after the newest
+    // terminal execution event describes the child's last settled turn.
+    marker
+        .filter(|(seq, _)| *seq > terminal)
+        .map(|(_, steps)| steps)
+}
+
 pub(crate) async fn deliver_subagent_result(
     runtime: &Runtime,
     parent: &str,
@@ -343,7 +409,7 @@ pub(crate) async fn deliver_subagent_result(
     } else {
         text
     };
-    let body = match &reason {
+    let mut body = match &reason {
         Some(reason) => envelope_reason(&state, child, Some(description), reason, &text),
         None => envelope(&state, child, Some(description), &text),
     };
@@ -356,6 +422,15 @@ pub(crate) async fn deliver_subagent_result(
     if let Some(reason) = &reason {
         metadata["reason"] = json!(reason);
     }
+    let steps = match &reason {
+        Some(reason) => parse_step_limit(reason),
+        None => None,
+    }
+    .or(match state.as_str() {
+        "completed" => child_step_limit(runtime, child).await,
+        _ => None,
+    });
+    body = apply_step_limit(&body, &mut metadata, steps);
     let payload = json!({ "text": body, "metadata": metadata });
     let item = NewInbox {
         id: MessageId::new().into_inner(),
@@ -491,4 +566,34 @@ pub(super) async fn finish_foreground(
         return Err(error);
     }
     Ok(ToolResult::text(body).with_metadata(json!({ "sessionID": child, "status": state })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::apply_step_limit;
+    use serde_json::json;
+
+    #[test]
+    fn step_limit_qualifies_a_completed_envelope() {
+        let mut metadata = json!({"state": "completed"});
+        let body = apply_step_limit(
+            "<subagent state=\"completed\">x</subagent>",
+            &mut metadata,
+            Some(7),
+        );
+        assert_eq!(
+            metadata,
+            json!({"state": "completed", "stepLimit": true, "steps": 7})
+        );
+        assert!(
+            body.ends_with("\n[step budget exhausted after 7 steps; result may be incomplete]")
+        );
+    }
+
+    #[test]
+    fn no_step_limit_leaves_the_envelope_untouched() {
+        let mut metadata = json!({"state": "completed"});
+        assert_eq!(apply_step_limit("x", &mut metadata, None), "x");
+        assert_eq!(metadata, json!({"state": "completed"}));
+    }
 }

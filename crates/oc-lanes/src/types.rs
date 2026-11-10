@@ -18,10 +18,68 @@ pub struct NewTicket {
     pub owner_session: Option<String>,
     /// Optional display label. It is not part of the public [`Ticket`].
     pub label: Option<String>,
+    /// Opaque caller-supplied tree state (for example a git revision plus a
+    /// dirty-tree hash). It is never interpreted by the service.
+    ///
+    /// Two submissions coalesce only when this is `Some(non-empty)`, the lane,
+    /// the normalized command and the working directory match, and the ticket
+    /// is still queued or running. [`None`] always creates a distinct ticket:
+    /// reusing a run that started from a different tree state would silently
+    /// serve a stale result.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tree_rev: Option<String>,
 }
 
 /// Opaque ticket identifier.
 pub type TicketId = String;
+
+/// Outcome of [`crate::LaneService::enqueue`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EnqueueResult {
+    /// Id of the ticket that runs the command.
+    pub id: TicketId,
+    /// `true` when an identical active ticket was reused instead of creating a
+    /// new one. The caller waits on [`Self::id`] exactly like its own ticket.
+    pub subscribed: bool,
+}
+
+/// One persisted lane ticket, as replayed by [`crate::LaneService::restore`].
+///
+/// It is the wire [`Ticket`] shape without the coalescing-only fields
+/// (`tree_rev`, `subscribers`), including the persisted terminal fields, so a
+/// JSON row from `oc_store::Store::lane_tickets_all` deserializes directly and
+/// a restored history row is faithful to what the store holds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TicketRecord {
+    /// Persisted ticket id (`tkt_<n>`).
+    pub id: String,
+    /// Lane that owns the ticket.
+    pub lane: String,
+    /// Command string.
+    pub command: String,
+    /// Working directory of the command.
+    pub cwd: PathBuf,
+    /// Dispatch priority.
+    pub priority: i32,
+    /// Session that submitted the command, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_session: Option<String>,
+    /// Last persisted state.
+    pub state: TicketState,
+    /// Time the ticket entered the queue (epoch milliseconds).
+    pub queued_ms: i64,
+    /// Time a runner started the ticket, when it did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_ms: Option<i64>,
+    /// Time the ticket reached a terminal state, when it did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_ms: Option<i64>,
+    /// File that holds the captured command output, when the runner wrote one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_path: Option<PathBuf>,
+}
 
 /// Lifecycle of a ticket.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -86,6 +144,13 @@ pub struct Ticket {
     /// failure; a cancelled ticket never gains one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_path: Option<PathBuf>,
+    /// Tree state the ticket was coalesced on, when the caller supplied one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tree_rev: Option<String>,
+    /// Sessions that subscribed to this ticket through a coalesced
+    /// [`crate::LaneService::enqueue`], deduplicated, in subscription order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subscribers: Vec<String>,
 }
 
 /// Snapshot of one lane used by `lane.status` and the UI.

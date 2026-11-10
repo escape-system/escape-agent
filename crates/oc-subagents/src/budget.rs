@@ -1,5 +1,12 @@
 //! Pure rate budgets. Callers pass explicit millisecond timestamps; there is
 //! no clock in this crate.
+//!
+//! [`WriteBudget`] limits `session_write` calls per sender. The budget is
+//! per-sender and in-memory: a runtime restart forgets every window, while the
+//! inbox rows a write already produced stay durable in the store. The
+//! `steer`/`queue` delivery choice does not bypass the budget — it is consumed
+//! before the row is written, so a refused write never leaves a partial row and
+//! changing delivery does not buy extra writes.
 
 use crate::{BudgetError, Limits};
 
@@ -129,5 +136,123 @@ impl SiblingBudget {
 
     pub fn try_message(&mut self, now_ms: i64) -> Result<(), BudgetError> {
         self.window.try_take(now_ms, self.max_per_minute)
+    }
+}
+
+/// `session_write` budget for one sender.
+#[derive(Debug, Clone)]
+pub struct WriteBudget {
+    max_per_minute: u32,
+    window: Window,
+}
+
+impl WriteBudget {
+    #[must_use]
+    pub fn new(max_per_minute: u32) -> Self {
+        Self {
+            max_per_minute,
+            window: Window::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn from_limits(limits: &Limits) -> Self {
+        Self::new(limits.max_writes_per_min)
+    }
+
+    pub fn try_write(&mut self, now_ms: i64) -> Result<(), BudgetError> {
+        self.window.try_take(now_ms, self.max_per_minute)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BudgetError, Limits, WINDOW_MS, WriteBudget};
+
+    #[test]
+    fn write_budget_allows_twenty_per_minute() {
+        let mut budget = WriteBudget::from_limits(&Limits::default());
+        for tick in 0..20 {
+            assert!(budget.try_write(tick * 100).is_ok());
+        }
+        assert_eq!(
+            budget.try_write(2_000),
+            Err(BudgetError::RateLimited {
+                max_per_minute: 20,
+                retry_after_ms: 58_000,
+            })
+        );
+    }
+
+    #[test]
+    fn write_budget_admits_again_after_the_window_expires() {
+        let mut budget = WriteBudget::new(2);
+        assert!(budget.try_write(0).is_ok());
+        assert!(budget.try_write(1_000).is_ok());
+        assert!(matches!(
+            budget.try_write(2_000),
+            Err(BudgetError::RateLimited { .. })
+        ));
+        assert!(budget.try_write(WINDOW_MS - 1).is_err());
+        assert!(budget.try_write(WINDOW_MS).is_ok());
+    }
+
+    #[test]
+    fn write_budget_is_per_sender() {
+        let limits = Limits::default();
+        let mut alice = WriteBudget::from_limits(&limits);
+        let mut bob = WriteBudget::from_limits(&limits);
+        for tick in 0..20 {
+            assert!(alice.try_write(tick).is_ok());
+        }
+        assert!(alice.try_write(100).is_err());
+        assert!(
+            bob.try_write(100).is_ok(),
+            "a second sender has its own window"
+        );
+    }
+
+    #[test]
+    fn write_budget_honors_a_configured_limit() {
+        let limits = Limits {
+            max_writes_per_min: 2,
+            ..Limits::default()
+        };
+        let mut budget = WriteBudget::from_limits(&limits);
+        assert!(budget.try_write(0).is_ok());
+        assert!(budget.try_write(0).is_ok());
+        assert_eq!(
+            budget.try_write(0),
+            Err(BudgetError::RateLimited {
+                max_per_minute: 2,
+                retry_after_ms: 60_000,
+            })
+        );
+    }
+
+    #[test]
+    fn write_budget_zero_denies_every_write() {
+        // A hard zero is total denial, not "unlimited": `max_writes_per_min: 0`
+        // is the honest reading of a zero write allowance, and it stays denied
+        // even after a window would have expired.
+        let limits = Limits {
+            max_writes_per_min: 0,
+            ..Limits::default()
+        };
+        let mut budget = WriteBudget::from_limits(&limits);
+        assert_eq!(
+            budget.try_write(0),
+            Err(BudgetError::RateLimited {
+                max_per_minute: 0,
+                retry_after_ms: 60_000,
+            })
+        );
+        assert_eq!(
+            budget.try_write(WINDOW_MS),
+            Err(BudgetError::RateLimited {
+                max_per_minute: 0,
+                retry_after_ms: 60_000,
+            })
+        );
     }
 }

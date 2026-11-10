@@ -49,7 +49,7 @@ pub mod node;
 pub mod policy;
 pub mod spawn;
 
-pub use budget::{DEFAULT_SPAWNS_PER_MIN, SiblingBudget, SpawnBudget, WINDOW_MS};
+pub use budget::{DEFAULT_SPAWNS_PER_MIN, SiblingBudget, SpawnBudget, WINDOW_MS, WriteBudget};
 pub use error::{BudgetError, MessageError, ModelError, SpawnError, WriteError};
 pub use limits::Limits;
 pub use message::{SessionTree, TreeLookup};

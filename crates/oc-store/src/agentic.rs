@@ -43,8 +43,10 @@ pub struct SessionNodeRow {
     pub model: Option<String>,
     /// Derived lifecycle state; see [`Store::session_node`].
     pub status: String,
-    /// Why the last execution was interrupted (`user`, …), when it was a
-    /// user-initiated stop. Only set while `status` is `interrupted`.
+    /// Why the last execution ended, when the reason is durable: the stop
+    /// reason for `status == "interrupted"` (`user`, …) or the step-limit
+    /// grammar (`step limit reached after N steps`) for an answered turn whose
+    /// budget ran out. `None` for every other outcome.
     pub idle_reason: Option<String>,
 }
 
@@ -563,7 +565,8 @@ fn node_row(row: &Row<'_>) -> Result<SessionNodeRow, StoreError> {
         child_count: u32::try_from(child_count).unwrap_or_default(),
         agent: agent.unwrap_or_else(|| "build".to_owned()),
         model: model.and_then(|raw| compact_model(&raw)),
-        idle_reason: idle_reason.filter(|_| outcome.as_deref() == Some("interrupted")),
+        idle_reason: idle_reason
+            .filter(|reason| crate::session::keeps_idle_reason(outcome.as_deref(), reason)),
     })
 }
 
@@ -588,7 +591,7 @@ fn node_status(
     match outcome {
         Some("failed") => "failed",
         Some("interrupted") => "interrupted",
-        Some("succeeded" | "completed") => "completed",
+        Some("succeeded" | "completed" | "step_limit") => "completed",
         _ => "idle",
     }
     .to_owned()

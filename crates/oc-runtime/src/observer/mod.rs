@@ -11,6 +11,7 @@
 //! The observer never sees tool arguments or output. Only [`FlightStrip`]
 //! fields cross the boundary.
 
+mod advice;
 mod host;
 mod repair;
 mod repair_worker;

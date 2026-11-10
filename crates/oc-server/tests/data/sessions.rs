@@ -251,3 +251,111 @@ async fn message_default_page_and_limit_clamp_are_unchanged() {
         "the oldest row is older than the default page"
     );
 }
+
+/// The generated wire type is exactly `succeeded | failed | interrupted`
+/// (`ui/vendor/opencode/packages/client/src/promise/generated/types.ts`), while
+/// the store durably records the internal `step_limit` outcome. The server
+/// boundary omits that unknown literal — the key is absent, never `null`, never
+/// remapped — and every other field is unchanged.
+#[tokio::test]
+async fn session_outcome_omits_an_unknown_literal() {
+    let harness = harness().await;
+    let app = router(harness.state.clone());
+    let session = create_session(&app, json!({"title": "budget"})).await;
+    let sid = session_id(&session);
+    let store = harness.state.store().expect("store");
+    store
+        .mark_session_idle_with_reason(
+            &sid,
+            oc_types::now_millis(),
+            "step_limit",
+            Some("step limit reached after 7 steps"),
+        )
+        .await
+        .unwrap();
+
+    // The store keeps the honest recorded outcome; only the wire omits it.
+    let stored = store.get_session(&sid).await.unwrap().unwrap();
+    assert_eq!(stored["outcome"], "step_limit");
+
+    let (status, body) = call(&app, Method::GET, &format!("/api/session/{sid}"), None).await;
+    assert_eq!(status, StatusCode::OK);
+    let body = body.unwrap();
+    assert!(
+        body["data"].get("outcome").is_none(),
+        "an unknown outcome is omitted, not null: {body}"
+    );
+    assert!(!body.to_string().contains("\"outcome\":null"));
+    assert_eq!(body["data"]["title"], "budget");
+    assert!(body["data"]["time"]["idle"].is_i64());
+    assert_eq!(body["data"]["cost"], 0.0);
+
+    let (status, body) = call(&app, Method::GET, "/api/session", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let body = body.unwrap();
+    let listed = body["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == sid.as_str())
+        .expect("the session is listed");
+    assert!(
+        listed.get("outcome").is_none(),
+        "list rows omit the unknown outcome too: {body}"
+    );
+    assert_eq!(listed["title"], "budget");
+    assert!(listed["time"]["updated"].is_i64());
+
+    // Export projects `data.info` the same way; the transcript is untouched.
+    let (status, body) = call(
+        &app,
+        Method::GET,
+        &format!("/api/experimental/session/{sid}/export"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let body = body.unwrap();
+    assert!(
+        body["data"]["info"].get("outcome").is_none(),
+        "exported info omits the unknown outcome: {body}"
+    );
+    assert_eq!(body["data"]["info"]["title"], "budget");
+    assert_eq!(body["data"]["messages"].as_array().unwrap().len(), 0);
+}
+
+/// The no-regression guard: a fix that dropped `outcome` entirely would make
+/// the previous test pass, so the three known literals must still be present
+/// with their exact value on both the detail and the list route.
+#[tokio::test]
+async fn session_outcome_keeps_the_three_known_literals() {
+    for literal in ["succeeded", "failed", "interrupted"] {
+        let harness = harness().await;
+        let app = router(harness.state.clone());
+        let session = create_session(&app, json!({})).await;
+        let sid = session_id(&session);
+        harness
+            .state
+            .store()
+            .expect("store")
+            .mark_session_idle(&sid, oc_types::now_millis(), literal)
+            .await
+            .unwrap();
+
+        let (status, body) = call(&app, Method::GET, &format!("/api/session/{sid}"), None).await;
+        assert_eq!(status, StatusCode::OK);
+        let body = body.unwrap();
+        assert_eq!(
+            body["data"]["outcome"], literal,
+            "known literal {literal} must survive the projection"
+        );
+
+        let (status, body) = call(&app, Method::GET, "/api/session", None).await;
+        assert_eq!(status, StatusCode::OK);
+        let body = body.unwrap();
+        assert_eq!(
+            body["data"][0]["outcome"], literal,
+            "known literal {literal} must survive the list projection"
+        );
+    }
+}

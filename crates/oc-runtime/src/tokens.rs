@@ -61,6 +61,27 @@ pub fn ceiling(context_window: u64, configured: Option<u64>) -> u64 {
     configured.map_or(computed, |tokens| tokens.min(computed))
 }
 
+/// Buffer kept below the ceiling before threshold compaction triggers.
+///
+/// A requested value of `0` (absent in the document) falls back to
+/// `max(8_000, window / 10)`, so a large window reserves proportionally more
+/// room for the next request while a small one still keeps 8k.
+#[must_use]
+pub fn effective_buffer(requested: u64, context_window: u64) -> u64 {
+    if requested > 0 {
+        requested
+    } else {
+        (context_window / 10).max(8_000)
+    }
+}
+
+/// Prompt estimate at which threshold compaction triggers: the ceiling minus
+/// the effective buffer.
+#[must_use]
+pub fn trigger(ceiling: u64, context_window: u64, buffer: u64) -> u64 {
+    ceiling.saturating_sub(effective_buffer(buffer, context_window))
+}
+
 /// Precompute compaction at 85% of the ceiling.
 #[must_use]
 pub fn precompute_threshold(ceiling: u64) -> u64 {
@@ -104,6 +125,26 @@ mod tests {
         assert_eq!(precompute_threshold(170_000), 144_500);
         assert!(should_compact(170_001, 200_000));
         assert!(!should_compact(170_000, 200_000));
+    }
+
+    #[test]
+    fn effective_buffer_falls_back_to_window_scaled_floor() {
+        assert_eq!(effective_buffer(0, 100_000), 10_000);
+        assert_eq!(effective_buffer(0, 40_000), 8_000);
+        assert_eq!(effective_buffer(0, 10_000), 8_000);
+        assert_eq!(effective_buffer(8_000, 100_000), 8_000);
+        assert_eq!(effective_buffer(40_000, 100_000), 40_000);
+    }
+
+    #[test]
+    fn trigger_is_ceiling_minus_buffer_and_saturates() {
+        assert_eq!(trigger(85_000, 100_000, 8_000), 77_000);
+        assert_eq!(trigger(85_000, 100_000, 0), 75_000);
+        assert_eq!(trigger(85_000, 100_000, 40_000), 45_000);
+        // A buffer larger than the ceiling can never underflow.
+        assert_eq!(trigger(5_000, 100_000, 40_000), 0);
+        // Tiny windows keep the 8k floor, still without underflow.
+        assert_eq!(trigger(0, 10_000, 0), 0);
     }
 
     #[test]

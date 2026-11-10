@@ -10,6 +10,31 @@ use super::output::{Tail, read_tail, status_exit, status_name, tail_body};
 use super::{DEFAULT_TIMEOUT_MS, NO_TIMEOUT, clamp_priority, optional_i64};
 
 // ---------------------------------------------------------------------------
+// Shared-run timeout decision
+// ---------------------------------------------------------------------------
+
+/// What a timed-out wait means for the ticket it was waiting on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TimeoutAction {
+    /// The owner or another subscriber is still waiting: the run continues.
+    KeepRunning,
+    /// Nobody is interested any more, so the ticket is no longer running.
+    Stopped,
+}
+
+/// Maps [`oc_lanes::LaneService::unsubscribe`] to the user-visible outcome.
+///
+/// `still_running` is the service's answer: `true` means an owner or another
+/// subscriber remains and the shared run was deliberately left alone.
+fn timeout_action(still_running: bool) -> TimeoutAction {
+    if still_running {
+        TimeoutAction::KeepRunning
+    } else {
+        TimeoutAction::Stopped
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Shell tool with lane routing
 // ---------------------------------------------------------------------------
 
@@ -114,8 +139,15 @@ impl Tool for ShellLaneTool {
             return self.shell.execute(ctx, input).await;
         };
 
-        let ticket_id = lanes
-            .enqueue(
+        // Only cargo work coalesces: the tree revision describes a git tree,
+        // and a node/gpu ticket must not join a cargo run by accident.
+        let tree_rev = if request.lane.starts_with("cargo:") {
+            crate::lane::tree_rev(&cwd.to_string_lossy()).await
+        } else {
+            None
+        };
+        let queued = lanes
+            .enqueue_detailed(
                 request.lane.clone(),
                 NewTicket {
                     command: request.command,
@@ -123,10 +155,12 @@ impl Tool for ShellLaneTool {
                     priority: clamp_priority(priority),
                     owner_session: Some(ctx.session_id.clone()),
                     label: None,
+                    tree_rev,
                 },
             )
             .await
             .map_err(|error| ToolError::new(error.to_string()))?;
+        let ticket_id = queued.id;
 
         let timeout = if timeout_ms == 0 {
             NO_TIMEOUT
@@ -136,16 +170,29 @@ impl Tool for ShellLaneTool {
         let ticket = match lanes.wait(&ticket_id, timeout).await {
             Ok(ticket) => ticket,
             Err(LaneError::Timeout { .. }) => {
-                let _ = lanes.cancel(&ticket_id).await;
+                // Dropping out of a shared run must not cancel it: the owner
+                // and every other subscriber still need the result.
+                // `unsubscribe` cancels only when nobody is left interested,
+                // so a slow subscriber can never kill another agent's build.
+                let still_running = lanes
+                    .unsubscribe(&ticket_id, &ctx.session_id)
+                    .await
+                    .unwrap_or(false);
                 let metadata = json!({
                     "lane": request.lane,
                     "ticket": ticket_id,
                     "status": "timeout",
+                    "subscribed": queued.subscribed,
                 });
-                return Err(ToolError::new(format!(
-                    "Lane ticket {ticket_id} did not finish within {timeout_ms} ms; it was cancelled. Retry with a larger timeout if the command is expected to take longer."
-                ))
-                .with_metadata(metadata));
+                let message = match timeout_action(still_running) {
+                    TimeoutAction::KeepRunning => format!(
+                        "Stopped waiting for lane ticket {ticket_id} after {timeout_ms} ms, but the run continues for its owner and other subscribers. Poll `lane status {ticket_id}` or call `lane wait` to collect the result."
+                    ),
+                    TimeoutAction::Stopped => format!(
+                        "Lane ticket {ticket_id} did not finish within {timeout_ms} ms and is no longer running. Retry with a larger timeout if the command is expected to take longer."
+                    ),
+                };
+                return Err(ToolError::new(message).with_metadata(metadata));
             }
             Err(error) => return Err(ToolError::new(error.to_string())),
         };
@@ -204,5 +251,24 @@ impl Tool for ShellLaneTool {
         }
 
         Ok(ToolResult::new(Some(body), None, Some(metadata)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TimeoutAction, timeout_action};
+
+    /// A still-live shared run is never cancelled by a subscriber leaving:
+    /// the owner and the other subscribers still need the result.
+    #[test]
+    fn a_live_shared_run_keeps_running() {
+        assert_eq!(timeout_action(true), TimeoutAction::KeepRunning);
+    }
+
+    /// When `unsubscribe` reports that nobody is left interested it has
+    /// already cancelled the ticket, so the caller hears "stopped".
+    #[test]
+    fn the_last_interested_party_stops_the_run() {
+        assert_eq!(timeout_action(false), TimeoutAction::Stopped);
     }
 }

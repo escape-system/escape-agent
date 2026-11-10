@@ -43,6 +43,137 @@ async fn interrupted_reason_is_durable_and_visible() {
 }
 
 #[tokio::test]
+async fn a_step_limited_success_keeps_its_reason_but_any_other_reason_does_not() {
+    let store = Store::open_memory().await.expect("memory store");
+    seed_session(&store, "ses_root").await;
+
+    // A step-limited turn still ends `succeeded`; the strict step-limit
+    // grammar is the one reason that survives next to it.
+    let limited = oc_types::step_limit_reason(7);
+    store
+        .mark_session_idle_with_reason("ses_root", 2_000, "succeeded", Some(&limited))
+        .await
+        .expect("step-limited idle");
+    let node = store
+        .session_node("ses_root")
+        .await
+        .expect("node")
+        .expect("row");
+    assert_eq!(node.status, "completed", "a step limit is not a failure");
+    assert_eq!(
+        node.idle_reason.as_deref(),
+        Some(limited.as_str()),
+        "the step-limit reason round-trips through the read filter"
+    );
+    assert_eq!(oc_types::parse_step_limit(&limited), Some(7));
+
+    // Any other reason on a succeeded row is still dropped: the
+    // interrupted-only rule stays intact for everything else.
+    store
+        .mark_session_idle_with_reason("ses_root", 3_000, "succeeded", Some("user"))
+        .await
+        .expect("unrelated reason");
+    let node = store
+        .session_node("ses_root")
+        .await
+        .expect("node")
+        .expect("row");
+    assert_eq!(node.status, "completed");
+    assert_eq!(
+        node.idle_reason, None,
+        "a succeeded row with an unrelated reason still stores NULL"
+    );
+
+    // A near-miss of the grammar is not a step limit either.
+    store
+        .mark_session_idle_with_reason(
+            "ses_root",
+            4_000,
+            "succeeded",
+            Some("step limit reached after 7 steps and more"),
+        )
+        .await
+        .expect("near miss");
+    let node = store
+        .session_node("ses_root")
+        .await
+        .expect("node")
+        .expect("row");
+    assert_eq!(
+        node.idle_reason, None,
+        "the grammar is strict; a trailing sentence is not a step limit"
+    );
+}
+
+/// The runtime's internal `step_limit` outcome is durable next to its reason:
+/// both columns round-trip, and the derived node status is `completed` because
+/// the model did answer — the budget ended the turn, not a failure.
+#[tokio::test]
+async fn a_step_limited_outcome_keeps_its_reason() {
+    let store = Store::open_memory().await.expect("memory store");
+    seed_session(&store, "ses_root").await;
+
+    let reason = oc_types::step_limit_reason(3);
+    store
+        .mark_session_idle_with_reason("ses_root", 2_000, "step_limit", Some(&reason))
+        .await
+        .expect("step-limited idle");
+
+    let session = store
+        .get_session("ses_root")
+        .await
+        .expect("session")
+        .expect("row");
+    assert_eq!(
+        session["outcome"], "step_limit",
+        "the internal outcome literal is stored verbatim"
+    );
+
+    let node = store
+        .session_node("ses_root")
+        .await
+        .expect("node")
+        .expect("row");
+    assert_eq!(
+        node.status, "completed",
+        "a step-limited turn is a completed turn"
+    );
+    assert_eq!(
+        node.idle_reason.as_deref(),
+        Some(reason.as_str()),
+        "the reason survives next to the step_limit outcome"
+    );
+
+    // A succeeded row with an unrelated reason still stores NULL.
+    seed_session(&store, "ses_plain").await;
+    store
+        .mark_session_idle_with_reason("ses_plain", 2_000, "succeeded", Some("user"))
+        .await
+        .expect("plain success");
+    let node = store
+        .session_node("ses_plain")
+        .await
+        .expect("node")
+        .expect("row");
+    assert_eq!(node.status, "completed");
+    assert_eq!(node.idle_reason, None);
+
+    // Any interrupted reason is kept, not just the `user` stop.
+    seed_session(&store, "ses_stopped").await;
+    store
+        .mark_session_idle_with_reason("ses_stopped", 2_000, "interrupted", Some("budget"))
+        .await
+        .expect("interrupted");
+    let node = store
+        .session_node("ses_stopped")
+        .await
+        .expect("node")
+        .expect("row");
+    assert_eq!(node.status, "interrupted");
+    assert_eq!(node.idle_reason.as_deref(), Some("budget"));
+}
+
+#[tokio::test]
 async fn a_non_interrupted_outcome_clears_the_reason() {
     let store = Store::open_memory().await.expect("memory store");
     seed_session(&store, "ses_root").await;
