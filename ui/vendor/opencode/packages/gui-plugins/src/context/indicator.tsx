@@ -44,23 +44,39 @@ export function SessionContextUsage(props: {
     props.session.id ? props.session.server.data.session.get(props.session.id) : undefined,
   )
 
-  // Same step as the TUI: after the last completed compaction and before an undo boundary.
+  // Per-step usage from `session.usage.updated` (live, resets on compaction). The
+  // denominator is the context ceiling, `window - max(15% of window, 16000)`: 100%
+  // is the hard limit, not the threshold. Compaction triggers below it by the
+  // buffer, at `ceiling - buffer` (unset `compaction.buffer` = `max(8_000, window/10)`).
+  // NOTE: `usage` below divides by the ceiling, not by the trigger, so the circle
+  // reaches 100% at the hard limit; compaction actually fires earlier, at ~88% of
+  // this denominator for a 200k window (150k of 170k). Also `usageLabel` still
+  // prints `limit`, the raw window, beside that percentage. Recomputing either is a
+  // separate change, deliberately not made here.
   const context = createMemo(() => {
-    const message = lastAssistantWithUsage(messages(), info()?.revert?.messageID)
+    const step = props.session.id ? props.session.server.data.session.lastStep(props.session.id) : undefined
+    const message = step ? undefined : lastAssistantWithUsage(messages(), info()?.revert?.messageID)
+    const tokens = step?.tokens ?? message?.tokens
 
-    if (!message) return
-    const model = catalogModel(props.session, message.model)?.model
+    if (!tokens) return
 
-    const total =
-      message.tokens.input +
-      message.tokens.output +
-      message.tokens.reasoning +
-      message.tokens.cache.read +
-      message.tokens.cache.write
+    const ref =
+      step === undefined
+        ? message!.model
+        : (info()?.model ?? messages().findLast((item) => item.type === "assistant")?.model)
+    const limit = ref ? catalogModel(props.session, ref)?.model?.limit.context : undefined
+
+    const total = tokens.input + tokens.output + tokens.reasoning + tokens.cache.read + tokens.cache.write
+    // Reserve room for the next output/protocol overhead, not the compaction buffer:
+    // `ceiling = window - max(15% of window, 16000)` matches `tokens::ceiling`. The
+    // buffer that lowers the compaction trigger is separate: `max(8_000, window/10)`
+    // when `compaction.buffer` is unset, so the trigger is `ceiling - buffer`.
+    const ceiling = limit ? Math.max(1, limit - Math.max(limit * 0.15, 16000)) : undefined
 
     return {
       total,
-      usage: model?.limit.context ? Math.round((total / model.limit.context) * 100) : null,
+      limit,
+      usage: ceiling ? Math.min(100, Math.round((total / ceiling) * 100)) : null,
     }
   })
 
@@ -113,12 +129,20 @@ export function SessionContextUsage(props: {
     </div>
   )
 
+  const usageLabel = createMemo(() => {
+    const c = context()
+    if (!c) return "—"
+    if (c.usage === null) return "—"
+    if (!c.limit) return `${c.usage}%`
+    return `${c.usage}% / ${c.limit.toLocaleString(i18n.locale())}`
+  })
+
   const tooltipValue = () => (
     <div class="flex w-[120px] flex-col gap-2">
       <Show when={showCost()}>
         <ContextTooltipRow name={ctx.t("usage.cost")} value={cost()} />
       </Show>
-      <ContextTooltipRow name={ctx.t("usage.usage")} value={`${context()?.usage ?? 0}%`} />
+      <ContextTooltipRow name={ctx.t("usage.usage")} value={usageLabel()} />
       <ContextTooltipRow name={ctx.t("usage.tokens")} value={context()?.total.toLocaleString(i18n.locale()) ?? "0"} />
     </div>
   )
@@ -136,6 +160,7 @@ export function SessionContextUsage(props: {
               type="button"
               variant="ghost-muted"
               class="group shrink-0"
+              title={context()?.limit ? `context window ${context()!.limit.toLocaleString(i18n.locale())}` : undefined}
               style={{ padding: "0 6px", color: "var(--v2-text-text-faint)" }}
               onClick={openContext}
               aria-expanded={layout.state(`${ctx.id}:main`, props.session) === "visible"}

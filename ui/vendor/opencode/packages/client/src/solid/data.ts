@@ -288,6 +288,7 @@ export function createData(config: CreateDataInput) {
   const [store, setStore] = createStore<Store>({
     session: {
       info: {},
+      lastStep: {},
       family: {},
       active: {},
       message: {},
@@ -657,6 +658,7 @@ export function createData(config: CreateDataInput) {
         delete draft.messageCursor[sessionID]
         delete draft.messageLoading[sessionID]
         delete draft.pending[sessionID]
+        delete draft.lastStep[sessionID]
         if (messages.length) draft.message[sessionID] = messages
         if (pending.length) draft.pending[sessionID] = pending
       }),
@@ -755,6 +757,11 @@ export function createData(config: CreateDataInput) {
         removeSession(event.data.sessionID)
         return
       case "session.usage.updated":
+        // `event.data.tokens` is this step's usage; `info.tokens` is the cumulative session total.
+        setStore("session", "lastStep", event.data.sessionID, {
+          tokens: event.data.tokens,
+          time: Date.now(),
+        })
         if (store.session.info[event.data.sessionID])
           setStore("session", "info", event.data.sessionID, {
             cost: event.data.cost,
@@ -1246,6 +1253,8 @@ export function createData(config: CreateDataInput) {
         })
         return
       case "session.compaction.ended":
+        // Drop the per-step number so a missed `started` row cannot leave a stale pre-compaction value.
+        setStore("session", "lastStep", event.data.sessionID, undefined)
         message.update(event.data.sessionID, (draft, index) => {
           const position = draft.findLastIndex((item) => item.type === "compaction" && item.status === "running")
           const current = draft[position]
@@ -1504,6 +1513,10 @@ export function createData(config: CreateDataInput) {
       },
       get(sessionID: string) {
         return store.session.info[sessionID]
+      },
+      // Most recent step's own usage, not the cumulative session total in `get().tokens`.
+      lastStep(sessionID: string) {
+        return store.session.lastStep[sessionID]
       },
       creating(sessionID: string) {
         return creating.has(sessionID)

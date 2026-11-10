@@ -1,0 +1,187 @@
+diff --git a/ui/vendor/opencode/packages/client/src/solid/data.ts b/ui/vendor/opencode/packages/client/src/solid/data.ts
+index 4b35625..4e923f0 100644
+--- a/ui/vendor/opencode/packages/client/src/solid/data.ts
++++ b/ui/vendor/opencode/packages/client/src/solid/data.ts
+@@ -288,6 +288,7 @@ export function createData(config: CreateDataInput) {
+   const [store, setStore] = createStore<Store>({
+     session: {
+       info: {},
++      lastStep: {},
+       family: {},
+       active: {},
+       message: {},
+@@ -657,6 +658,7 @@ export function createData(config: CreateDataInput) {
+         delete draft.messageCursor[sessionID]
+         delete draft.messageLoading[sessionID]
+         delete draft.pending[sessionID]
++        delete draft.lastStep[sessionID]
+         if (messages.length) draft.message[sessionID] = messages
+         if (pending.length) draft.pending[sessionID] = pending
+       }),
+@@ -755,6 +757,11 @@ export function createData(config: CreateDataInput) {
+         removeSession(event.data.sessionID)
+         return
+       case "session.usage.updated":
++        // `event.data.tokens` is this step's usage; `info.tokens` is the cumulative session total.
++        setStore("session", "lastStep", event.data.sessionID, {
++          tokens: event.data.tokens,
++          time: Date.now(),
++        })
+         if (store.session.info[event.data.sessionID])
+           setStore("session", "info", event.data.sessionID, {
+             cost: event.data.cost,
+@@ -1246,6 +1253,8 @@ export function createData(config: CreateDataInput) {
+         })
+         return
+       case "session.compaction.ended":
++        // Drop the per-step number so a missed `started` row cannot leave a stale pre-compaction value.
++        setStore("session", "lastStep", event.data.sessionID, undefined)
+         message.update(event.data.sessionID, (draft, index) => {
+           const position = draft.findLastIndex((item) => item.type === "compaction" && item.status === "running")
+           const current = draft[position]
+@@ -1505,6 +1514,10 @@ export function createData(config: CreateDataInput) {
+       get(sessionID: string) {
+         return store.session.info[sessionID]
+       },
++      // Most recent step's own usage, not the cumulative session total in `get().tokens`.
++      lastStep(sessionID: string) {
++        return store.session.lastStep[sessionID]
++      },
+       creating(sessionID: string) {
+         return creating.has(sessionID)
+       },
+diff --git a/ui/vendor/opencode/packages/gui-plugins/src/context/indicator.tsx b/ui/vendor/opencode/packages/gui-plugins/src/context/indicator.tsx
+index 1066dc3..b2ff9a9 100644
+--- a/ui/vendor/opencode/packages/gui-plugins/src/context/indicator.tsx
++++ b/ui/vendor/opencode/packages/gui-plugins/src/context/indicator.tsx
+@@ -44,23 +44,29 @@ export function SessionContextUsage(props: {
+     props.session.id ? props.session.server.data.session.get(props.session.id) : undefined,
+   )
+ 
+-  // Same step as the TUI: after the last completed compaction and before an undo boundary.
++  // Per-step usage from `session.usage.updated` (live, resets on compaction); the
++  // denominator is the window minus the compaction buffer, so 100% is the threshold.
+   const context = createMemo(() => {
+-    const message = lastAssistantWithUsage(messages(), info()?.revert?.messageID)
++    const step = props.session.id ? props.session.server.data.session.lastStep(props.session.id) : undefined
++    const message = step ? undefined : lastAssistantWithUsage(messages(), info()?.revert?.messageID)
++    const tokens = step?.tokens ?? message?.tokens
+ 
+-    if (!message) return
+-    const model = catalogModel(props.session, message.model)?.model
++    if (!tokens) return
+ 
+-    const total =
+-      message.tokens.input +
+-      message.tokens.output +
+-      message.tokens.reasoning +
+-      message.tokens.cache.read +
+-      message.tokens.cache.write
++    const ref =
++      step === undefined
++        ? message!.model
++        : (info()?.model ?? messages().findLast((item) => item.type === "assistant")?.model)
++    const limit = ref ? catalogModel(props.session, ref)?.model?.limit.context : undefined
++
++    const total = tokens.input + tokens.output + tokens.reasoning + tokens.cache.read + tokens.cache.write
++    // Keep room for the next prompt: the last 15% (or 16k tokens) of the window is the compaction budget.
++    const ceiling = limit ? Math.max(1, limit - Math.max(limit * 0.15, 16000)) : undefined
+ 
+     return {
+       total,
+-      usage: model?.limit.context ? Math.round((total / model.limit.context) * 100) : null,
++      limit,
++      usage: ceiling ? Math.min(100, Math.round((total / ceiling) * 100)) : null,
+     }
+   })
+ 
+@@ -113,12 +119,20 @@ export function SessionContextUsage(props: {
+     </div>
+   )
+ 
++  const usageLabel = createMemo(() => {
++    const c = context()
++    if (!c) return "—"
++    if (c.usage === null) return "—"
++    if (!c.limit) return `${c.usage}%`
++    return `${c.usage}% / ${c.limit.toLocaleString(i18n.locale())}`
++  })
++
+   const tooltipValue = () => (
+     <div class="flex w-[120px] flex-col gap-2">
+       <Show when={showCost()}>
+         <ContextTooltipRow name={ctx.t("usage.cost")} value={cost()} />
+       </Show>
+-      <ContextTooltipRow name={ctx.t("usage.usage")} value={`${context()?.usage ?? 0}%`} />
++      <ContextTooltipRow name={ctx.t("usage.usage")} value={usageLabel()} />
+       <ContextTooltipRow name={ctx.t("usage.tokens")} value={context()?.total.toLocaleString(i18n.locale()) ?? "0"} />
+     </div>
+   )
+@@ -136,6 +150,7 @@ export function SessionContextUsage(props: {
+               type="button"
+               variant="ghost-muted"
+               class="group shrink-0"
++              title={context()?.limit ? `context window ${context()!.limit.toLocaleString(i18n.locale())}` : undefined}
+               style={{ padding: "0 6px", color: "var(--v2-text-text-faint)" }}
+               onClick={openContext}
+               aria-expanded={layout.state(`${ctx.id}:main`, props.session) === "visible"}
+diff --git a/ui/vendor/opencode/packages/gui-plugins/src/context/tab.tsx b/ui/vendor/opencode/packages/gui-plugins/src/context/tab.tsx
+index 8a331bf..7542a56 100644
+--- a/ui/vendor/opencode/packages/gui-plugins/src/context/tab.tsx
++++ b/ui/vendor/opencode/packages/gui-plugins/src/context/tab.tsx
+@@ -108,29 +108,30 @@ export default function SessionContextTab(props: { session: MountedSession }) {
+       }),
+   )
+ 
+-  // Same step as the TUI and the header button: after the last completed compaction and before an undo boundary.
++  // Same step as the header: prefer the live per-step usage from `session.usage.updated`; the
++  // percentage is measured against the window minus the compaction buffer.
+   const context = createMemo(() => {
+-    const message = lastAssistantWithUsage(messages(), info()?.revert?.messageID)
++    const step = props.session.id ? data().session.lastStep(props.session.id) : undefined
++    const message = step ? undefined : lastAssistantWithUsage(messages(), info()?.revert?.messageID)
+ 
+-    if (!message) return
+-    const entry = catalogModel(props.session, message.model)
++    if (!step && !message) return
++    const ref = message?.model ?? info()?.model ?? messages().findLast((item) => item.type === "assistant")?.model
++    const entry = ref ? catalogModel(props.session, ref) : undefined
++    const tokens = step?.tokens ?? message!.tokens
+ 
+-    const total =
+-      message.tokens.input +
+-      message.tokens.output +
+-      message.tokens.reasoning +
+-      message.tokens.cache.read +
+-      message.tokens.cache.write
++    const total = tokens.input + tokens.output + tokens.reasoning + tokens.cache.read + tokens.cache.write
++    const limit = entry?.model?.limit.context
++    const ceiling = limit ? Math.max(1, limit - Math.max(limit * 0.15, 16000)) : undefined
+ 
+     return {
+       message,
+-      tokens: message.tokens,
+-      providerLabel: entry?.provider.name ?? message.model.providerID,
+-      modelLabel: entry?.model?.name ?? message.model.id,
+-      limit: entry?.model?.limit.context,
+-      input: message.tokens.input,
++      tokens,
++      providerLabel: entry?.provider.name ?? ref?.providerID ?? "—",
++      modelLabel: entry?.model?.name ?? ref?.id ?? "—",
++      limit,
++      input: tokens.input,
+       total,
+-      usage: entry?.model?.limit.context ? Math.round((total / entry.model.limit.context) * 100) : null,
++      usage: ceiling ? Math.min(100, Math.round((total / ceiling) * 100)) : null,
+     }
+   })
+ 
+@@ -198,7 +199,7 @@ export default function SessionContextTab(props: { session: MountedSession }) {
+     { label: "stats.assistantMessages", value: () => counts().assistant.toLocaleString(i18n.locale()) },
+     { label: "stats.totalCost", value: cost },
+     { label: "stats.sessionCreated", value: () => formatter().time(info()?.time.created) },
+-    { label: "stats.lastActivity", value: () => formatter().time(context()?.message.time.created) },
++    { label: "stats.lastActivity", value: () => formatter().time(context()?.message?.time.created) },
+   ] satisfies { label: string; value: () => JSX.Element }[]
+ 
+   const exportSession = async () => {

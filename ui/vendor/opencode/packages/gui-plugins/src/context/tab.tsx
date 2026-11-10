@@ -108,29 +108,30 @@ export default function SessionContextTab(props: { session: MountedSession }) {
       }),
   )
 
-  // Same step as the TUI and the header button: after the last completed compaction and before an undo boundary.
+  // Same step as the header: prefer the live per-step usage from `session.usage.updated`; the
+  // percentage is measured against the window minus the compaction buffer.
   const context = createMemo(() => {
-    const message = lastAssistantWithUsage(messages(), info()?.revert?.messageID)
+    const step = props.session.id ? data().session.lastStep(props.session.id) : undefined
+    const message = step ? undefined : lastAssistantWithUsage(messages(), info()?.revert?.messageID)
 
-    if (!message) return
-    const entry = catalogModel(props.session, message.model)
+    if (!step && !message) return
+    const ref = message?.model ?? info()?.model ?? messages().findLast((item) => item.type === "assistant")?.model
+    const entry = ref ? catalogModel(props.session, ref) : undefined
+    const tokens = step?.tokens ?? message!.tokens
 
-    const total =
-      message.tokens.input +
-      message.tokens.output +
-      message.tokens.reasoning +
-      message.tokens.cache.read +
-      message.tokens.cache.write
+    const total = tokens.input + tokens.output + tokens.reasoning + tokens.cache.read + tokens.cache.write
+    const limit = entry?.model?.limit.context
+    const ceiling = limit ? Math.max(1, limit - Math.max(limit * 0.15, 16000)) : undefined
 
     return {
       message,
-      tokens: message.tokens,
-      providerLabel: entry?.provider.name ?? message.model.providerID,
-      modelLabel: entry?.model?.name ?? message.model.id,
-      limit: entry?.model?.limit.context,
-      input: message.tokens.input,
+      tokens,
+      providerLabel: entry?.provider.name ?? ref?.providerID ?? "—",
+      modelLabel: entry?.model?.name ?? ref?.id ?? "—",
+      limit,
+      input: tokens.input,
       total,
-      usage: entry?.model?.limit.context ? Math.round((total / entry.model.limit.context) * 100) : null,
+      usage: ceiling ? Math.min(100, Math.round((total / ceiling) * 100)) : null,
     }
   })
 
@@ -198,7 +199,7 @@ export default function SessionContextTab(props: { session: MountedSession }) {
     { label: "stats.assistantMessages", value: () => counts().assistant.toLocaleString(i18n.locale()) },
     { label: "stats.totalCost", value: cost },
     { label: "stats.sessionCreated", value: () => formatter().time(info()?.time.created) },
-    { label: "stats.lastActivity", value: () => formatter().time(context()?.message.time.created) },
+    { label: "stats.lastActivity", value: () => formatter().time(context()?.message?.time.created) },
   ] satisfies { label: string; value: () => JSX.Element }[]
 
   const exportSession = async () => {

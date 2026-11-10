@@ -18,6 +18,17 @@ contains them, and `build.sh`/`build.ps1` do not apply them.
 - `0005-attachment-mime-guard.patch` — guards message attachments and composer prompt
   extraction against missing `mime` and `source`, and extracts mime from data URLs so
   image attachments without explicit mime fields don't throw TypeError on startsWith.
+- `0006-stop-interrupt.patch` — durable stop intent in the data store and composer,
+  so a stopped session reads idle even when a lagging event or racing status write
+  would otherwise make it look busy again.
+- `0007-token-counter-live-reset.patch` — the client stores the per-step `tokens`
+  from `session.usage.updated` as `session.lastStep` and clears it on
+  `session.compaction.ended`; the context indicator and tab prefer that live value,
+  fall back to `lastAssistantWithUsage`, and measure usage against the context
+  ceiling (`window − max(15% of window, 16000)`) instead of the raw window, so 100%
+  of the denominator is the hard limit, not the point where compaction fires.
+  Compaction triggers below the ceiling by the buffer: `ceiling − buffer`, where an
+  unset (or `0`) `compaction.buffer` means `max(8_000, window/10)`.
 
 Rules:
 
