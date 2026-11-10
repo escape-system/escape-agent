@@ -37,6 +37,8 @@ scope; the TUI must keep working against our server.
 | 21 | [grouping](21-grouping.md) | `metadata.group` label convention, rejected alternatives |
 | 22 | [audit report](22-audit-report.md) | Verification audit, defect resolutions and regression tests |
 | 23 | [release](23-release.md) | Tag-triggered builds, archive layout, version-must-match rule |
+| 24 | [UI performance](24-ui-performance.md) | Served web client audit, budgets, measured hot paths |
+| 25 | [context boxes](25-context-boxes.md) | Durable root-shared context, tool surface, expiry |
 
 ## Rules that apply to every doc
 

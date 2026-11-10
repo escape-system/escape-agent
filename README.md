@@ -66,12 +66,17 @@ Detailed architecture and interface specifications are available in the [`docs/`
 - [18 — Live Implementation Status](docs/18-status.md)
 - [20 — Engineering Guide](docs/20-handoff.md)
 
+### Prebuilt Binaries
+
+Ready-made builds are attached to [GitHub Releases](https://github.com/helloyigoza/escape-agent/releases)
+as `opencode-<version>-<os>-<arch>.tar.gz` plus a `.sha256` checksum sidecar; see
+[docs/23-release.md](docs/23-release.md) for the archive layout.
+
 ### Getting Started
 
 #### Prerequisites
-- Rust (stable toolchain, 1.85+)
+- Rust (stable toolchain, 1.90+)
 - Bun (for building the web UI)
-- SQLite3
 
 #### Building and Running the Server
 ```sh
@@ -171,12 +176,17 @@ Mimarinin derinlemesine incelendiği teknik şartnameler [`docs/`](docs/README.m
 - [18 — Güncel Uygulama Durumu](docs/18-status.md)
 - [20 — Mühendislik Rehberi](docs/20-handoff.md)
 
+### Hazır Derlenmiş Paketler
+
+Hazır derlenmiş sürümler [GitHub Releases](https://github.com/helloyigoza/escape-agent/releases)
+sayfasında `opencode-<sürüm>-<işletim sistemi>-<mimari>.tar.gz` ve `.sha256` sağlama toplamı
+dosyasıyla yayınlanır; arşiv düzeni için [docs/23-release.md](docs/23-release.md).
+
 ### Başlarken
 
 #### Gereksinimler
-- Rust (güncel stable sürüm, 1.85+)
+- Rust (güncel stable sürüm, 1.90+)
 - Bun (Web arayüzünü derlemek için)
-- SQLite3
 
 #### Sunucuyu Derleme ve Çalıştırma
 ```sh

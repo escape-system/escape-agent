@@ -11,7 +11,7 @@ This document provides the technical status, architectural verification logs, an
 - **Subtree-scoped temporary-box expiry** — compaction expires temporary boxes of the compacting subtree only, leaving sibling/child trees intact.
 - **Index truncation notice** — the prompt index reports truncation instead of silently dropping rows; empty box bodies are rejected.
 - **Observer in the server harness** — `crates/oc-server/tests/runtime` wires the real observer engine and proves a user-stopped session is never re-raised (16/16).
-- **Windows** — the workspace builds for `x86_64-pc-windows-gnu` (ConPTY/shell/config already cfg-gated); the release ships a Windows artefact.
+- **Windows** — the workspace builds for `x86_64-pc-windows-gnu` (ConPTY/shell/config already cfg-gated). The release workflow publishes a Linux archive only; Windows binaries are produced by cross-compiling locally (`cargo build --release --target x86_64-pc-windows-gnu`) and attached to the GitHub release by hand until the workflow gains a matrix.
 
 ## Snapshot
 
