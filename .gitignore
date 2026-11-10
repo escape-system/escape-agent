@@ -1,4 +1,5 @@
 /target
+/dist
 /web/dist
 /ui/.work
 /ui/vendor/opencode/node_modules/
