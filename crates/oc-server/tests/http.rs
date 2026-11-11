@@ -33,6 +33,7 @@ fn state(password: Option<&str>) -> AppState {
         password.map(str::to_owned),
         std::env::temp_dir(),
     )
+    .without_web_dist()
 }
 
 async fn json_body(response: axum::response::Response) -> Value {

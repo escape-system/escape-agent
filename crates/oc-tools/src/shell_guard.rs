@@ -230,7 +230,12 @@ fn split_shell_clauses(cmd: &str) -> Vec<(&str, ClauseSep)> {
 
     while i < len {
         match bytes[i] {
-            b';' | b'\n' => {
+            b'|' if i + 1 < len && bytes[i + 1] == b'|' => {
+                clauses.push((&cmd[start..i], ClauseSep::AndOr));
+                i += 2;
+                start = i;
+            }
+            b';' | b'\n' | b'|' => {
                 clauses.push((&cmd[start..i], ClauseSep::Seq));
                 i += 1;
                 start = i;
@@ -249,11 +254,6 @@ fn split_shell_clauses(cmd: &str) -> Vec<(&str, ClauseSep)> {
                     i += 1;
                     start = i;
                 }
-            }
-            b'|' if i + 1 < len && bytes[i + 1] == b'|' => {
-                clauses.push((&cmd[start..i], ClauseSep::AndOr));
-                i += 2;
-                start = i;
             }
             _ => {
                 i += 1;
@@ -399,6 +399,12 @@ mod tests {
                  ls -l /root/workspace/.verify"
             )
             .is_ok()
+        );
+        // Piped commands containing `/` in downstream filter clauses must not be
+        // mistaken for `rm -rf /`.
+        assert!(
+            check_shell_command("rm -rf /tmp/web-dist-bak-123 2>&1 | awk -F / '{print $NF}'")
+                .is_ok()
         );
     }
 

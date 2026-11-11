@@ -132,6 +132,95 @@ async fn edit_ambiguous_and_missing_match_errors() {
 }
 
 #[tokio::test]
+async fn edit_indented_tier_idempotent_retry_and_concurrent_file_locking() {
+    let dir = TempDir::new().unwrap();
+    let file = dir.path().join("code.rs");
+    fs::write(
+        &file,
+        "impl Server {\n    fn alpha(&self) -> i32 {\n        1\n    }\n\n    fn beta(&self) -> i32 {\n        2\n    }\n}\n",
+    )
+    .unwrap();
+
+    // 1. Indentation-shifted unique block match re-indents newString to match file indentation.
+    EditTool
+        .execute(
+            &ctx(dir.path()),
+            json!({
+                "path": "code.rs",
+                "oldString": "fn alpha(&self) -> i32 {\n    1\n}",
+                "newString": "fn alpha(&self) -> i32 {\n    10\n}"
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(read(&file).contains("    fn alpha(&self) -> i32 {\n        10\n    }"));
+
+    // 2. Repeating the already-applied edit succeeds idempotently instead of failing.
+    let retry = EditTool
+        .execute(
+            &ctx(dir.path()),
+            json!({
+                "path": "code.rs",
+                "oldString": "    fn alpha(&self) -> i32 {\n        1\n    }",
+                "newString": "    fn alpha(&self) -> i32 {\n        10\n    }"
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(retry.output.unwrap().contains("already present"));
+
+    // 3. Missing oldString with a recognizable anchor line includes numbered context lines.
+    let err = EditTool
+        .execute(
+            &ctx(dir.path()),
+            json!({
+                "path": "code.rs",
+                "oldString": "    fn beta(&self) -> i32 {\n        999\n    }",
+                "newString": "    fn beta(&self) -> i32 {\n        20\n    }"
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert!(err.message.contains("Could not find oldString"));
+    assert!(err.message.contains("Closest matching lines in code.rs"));
+    assert!(err.message.contains("fn beta(&self) -> i32"));
+
+    // 4. Concurrent same-file edits serialize via per-file lock so neither edit is lost.
+    let shared = dir.path().join("concurrent.txt");
+    let lines: Vec<String> = (1..=20).map(|i| format!("line_{i} = old\n")).collect();
+    let initial = lines.concat();
+    fs::write(&shared, &initial).unwrap();
+
+    let mut set = tokio::task::JoinSet::new();
+    for i in 1..=20 {
+        let c = ctx(dir.path());
+        set.spawn(async move {
+            EditTool
+                .execute(
+                    &c,
+                    json!({
+                        "path": "concurrent.txt",
+                        "oldString": format!("line_{i} = old"),
+                        "newString": format!("line_{i} = new")
+                    }),
+                )
+                .await
+                .unwrap();
+        });
+    }
+    while let Some(res) = set.join_next().await {
+        res.unwrap();
+    }
+    let final_text = read(&shared);
+    for i in 1..=20 {
+        assert!(
+            final_text.contains(&format!("line_{i} = new\n")),
+            "concurrent edit for line_{i} was lost"
+        );
+    }
+}
+
+#[tokio::test]
 async fn write_preserves_bom_and_creates_parents() {
     let dir = TempDir::new().unwrap();
     let file = dir.path().join("bom.txt");

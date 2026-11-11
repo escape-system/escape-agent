@@ -5,6 +5,8 @@
 //! Offsets are remapped to the source and replacements reuse the matched
 //! region's line endings.
 
+use std::fmt::Write as _;
+
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
@@ -64,6 +66,7 @@ impl Tool for EditTool {
         })
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn execute(&self, ctx: &ToolContext, input: Value) -> Result<ToolResult, ToolError> {
         let path = util::required_string(&input, "path")?;
         let old_string = util::required_string(&input, "oldString")?;
@@ -82,18 +85,23 @@ impl Tool for EditTool {
         }
 
         let absolute = util::resolve(ctx, &path);
+        let _file_guard = util::lock_file(&absolute).await;
         reject_oversized(&absolute, &path)?;
         let bytes = util::read_file(&absolute, &path)?;
         let (source_bom, source) = util::decode_bytes(&bytes);
 
         // Strings that differ only in \r change line endings themselves and
-        // therefore apply to the exact bytes instead of the LF view.
+        // therefore apply to the LF view only when line endings are not the target.
         let endings_only = old_string.replace('\r', "") == new_string.replace('\r', "");
 
-        let (spans, replacement) = if endings_only {
-            (find_occurrences(&source, &old_string), new_string.clone())
+        let (spans, replacement, view_for_hint) = if endings_only {
+            (
+                find_occurrences(&source, &old_string),
+                new_string.clone(),
+                None,
+            )
         } else {
-            let normalized_new = new_string.replace("\r\n", "\n");
+            let mut normalized_new = new_string.replace("\r\n", "\n");
             let (view, map) = lf_view(&source);
             let search = old_string.replace("\r\n", "\n");
 
@@ -116,13 +124,40 @@ impl Tool for EditTool {
                     .map(|span| to_source(span, &map))
                     .collect();
             }
-            (spans, normalized_new)
+            if spans.is_empty()
+                && !replace_all
+                && let Some((indented_span, reindented_new)) =
+                    find_unique_indented_occurrence(&view, &search, &normalized_new)
+            {
+                spans = vec![to_source(indented_span, &map)];
+                normalized_new = reindented_new;
+            }
+            (spans, normalized_new, Some(view))
         };
 
         let matches = spans.len();
         if matches == 0 {
+            if !replace_all
+                && let Some(ref view) = view_for_hint
+                && replacement.trim().len() >= 8
+                && find_occurrences(view, &replacement).len() == 1
+            {
+                let (_, source_body) = util::split_bom(&source);
+                let diff = crate::diff::file_diff(&path, source_body, source_body, "modified");
+                return Ok(ToolResult::new(
+                    Some(format!(
+                        "Edited {path} (0 replacements; target text is already present)"
+                    )),
+                    None,
+                    Some(json!({"files": [diff]})),
+                ));
+            }
+            let hint = view_for_hint
+                .as_deref()
+                .and_then(|view| closest_context_hint(view, &old_string, &path))
+                .unwrap_or_default();
             return Err(ToolError::new(format!(
-                "Could not find oldString in {path}. It must match exactly, including whitespace and indentation."
+                "Could not find oldString in {path}. It must match exactly, including whitespace and indentation.{hint}"
             )));
         }
         if matches > 1 && !replace_all {
@@ -334,4 +369,155 @@ fn find_line_occurrences(view: &str, search: &str) -> Vec<Span> {
         spans.push(span);
     }
     spans
+}
+
+fn leading_whitespace(line: &str) -> &str {
+    let bytes = line.as_bytes();
+    let mut idx = 0;
+    while idx < bytes.len() && (bytes[idx] == b' ' || bytes[idx] == b'\t') {
+        idx += 1;
+    }
+    &line[..idx]
+}
+
+fn find_unique_indented_occurrence(
+    view: &str,
+    search: &str,
+    normalized_new: &str,
+) -> Option<(Span, String)> {
+    let trailing_newline = search.ends_with('\n');
+    let mut expected: Vec<&str> = search.split('\n').collect();
+    if trailing_newline {
+        expected.pop();
+    }
+    let non_empty_count = expected.iter().filter(|l| !l.trim().is_empty()).count();
+    if non_empty_count == 0 {
+        return None;
+    }
+    if expected.len() == 1 && expected[0].trim().len() < 12 {
+        return None;
+    }
+
+    let lines = split_view_lines(view);
+    let mut matches: Vec<(Span, usize)> = Vec::new();
+
+    for index in 0..lines.len() {
+        if index + expected.len() > lines.len() {
+            break;
+        }
+        let actual = &lines[index..index + expected.len()];
+        let ok = actual.iter().zip(expected.iter()).all(|(line, wanted)| {
+            util::normalize_text(line.text.trim()) == util::normalize_text(wanted.trim())
+        });
+        if !ok {
+            continue;
+        }
+        let last = actual.last()?;
+        if trailing_newline && !last.newline {
+            continue;
+        }
+        let span = Span {
+            start: lines[index].start,
+            end: if trailing_newline {
+                last.end
+            } else {
+                last.content_end
+            },
+        };
+        if matches
+            .iter()
+            .any(|(existing, _)| existing.end > span.start && existing.start < span.end)
+        {
+            continue;
+        }
+        matches.push((span, index));
+        if matches.len() > 1 {
+            return None;
+        }
+    }
+
+    let (span, match_index) = matches.into_iter().next()?;
+    let actual = &lines[match_index..match_index + expected.len()];
+
+    let (first_actual, first_wanted) = actual
+        .iter()
+        .zip(expected.iter())
+        .find(|(_, wanted)| !wanted.trim().is_empty())?;
+    let actual_indent = leading_whitespace(first_actual.text);
+    let wanted_indent = leading_whitespace(first_wanted);
+
+    if actual_indent == wanted_indent {
+        return Some((span, normalized_new.to_string()));
+    }
+
+    // Only re-indent when all non-empty wanted lines share `wanted_indent` as a prefix.
+    let consistent_prefix = expected
+        .iter()
+        .filter(|l| !l.trim().is_empty())
+        .all(|l| l.starts_with(wanted_indent));
+    if !consistent_prefix {
+        return Some((span, normalized_new.to_string()));
+    }
+
+    let new_trailing_newline = normalized_new.ends_with('\n');
+    let mut new_lines: Vec<&str> = normalized_new.split('\n').collect();
+    if new_trailing_newline {
+        new_lines.pop();
+    }
+    let mut reindented = Vec::with_capacity(new_lines.len());
+    for line in new_lines {
+        if line.trim().is_empty() {
+            reindented.push(line.to_string());
+        } else if let Some(stripped) = line.strip_prefix(wanted_indent) {
+            reindented.push(format!("{actual_indent}{stripped}"));
+        } else {
+            reindented.push(line.to_string());
+        }
+    }
+    let mut out = reindented.join("\n");
+    if new_trailing_newline {
+        out.push('\n');
+    }
+    Some((span, out))
+}
+
+fn closest_context_hint(view: &str, old_string: &str, path: &str) -> Option<String> {
+    let lines = split_view_lines(view);
+    if lines.is_empty() {
+        return None;
+    }
+
+    let mut candidates: Vec<&str> = old_string
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.len() >= 4)
+        .collect();
+    candidates.sort_by_key(|l| std::cmp::Reverse(l.len()));
+
+    let mut anchor_idx = None;
+    for needle in candidates.into_iter().take(6) {
+        let norm_needle = util::normalize_text(needle).to_lowercase();
+        if let Some((idx, _)) = lines.iter().enumerate().find(|(_, line)| {
+            let norm_line = util::normalize_text(line.text.trim()).to_lowercase();
+            !norm_line.is_empty()
+                && (norm_line.contains(&norm_needle) || norm_needle.contains(&norm_line))
+        }) {
+            anchor_idx = Some(idx);
+            break;
+        }
+    }
+
+    let idx = anchor_idx?;
+    let start = idx.saturating_sub(3);
+    let end = (idx + 4).min(lines.len());
+    let mut snippet = String::new();
+    for (line_idx, line) in lines[start..end].iter().enumerate() {
+        let line_no = start + line_idx + 1;
+        let _ = write!(snippet, "\n{line_no}: {}", line.text);
+    }
+    Some(format!(
+        "\n\nClosest matching lines in {path} (lines {}-{}, omit the `N: ` prefix when copying):{snippet}",
+        start + 1,
+        end
+    ))
 }

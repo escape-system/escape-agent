@@ -455,6 +455,39 @@ async fn goal_change_wakes_and_done_requires_recent_evidence() {
         })
         .expect("goal notice");
     assert_eq!(goal_notice, oc_observer::GoalStatus::Done);
+
+    // Once the goal is terminal (`Done`) and the tree is idle, subsequent ticks
+    // must not re-wake the observer model.
+    let mut done_goal = GoalSnapshot {
+        id: "gol_1".to_owned(),
+        objective: "make tests pass".to_owned(),
+        total: 1,
+        done: 1,
+        status: oc_observer::GoalStatus::Done,
+        rounds: 1,
+        ..GoalSnapshot::default()
+    };
+    let mut idle_tree = tree();
+    for row in &mut idle_tree {
+        row.state = "idle".to_owned();
+    }
+    h.clock.set(60_000);
+    assert!(
+        h.engine
+            .tick("ses_root", idle_tree, Some(done_goal.clone()))
+            .await
+            .is_none()
+    );
+    assert_eq!(h.model.calls(), 1);
+    done_goal.rounds = 2;
+    h.clock.set(120_000);
+    assert!(
+        h.engine
+            .tick("ses_root", vec![], Some(done_goal))
+            .await
+            .is_none()
+    );
+    assert_eq!(h.model.calls(), 1);
 }
 
 // ---------------------------------------------------------------------------

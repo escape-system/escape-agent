@@ -80,6 +80,12 @@ impl Tool for PatchTool {
             return Err(ToolError::new("patch rejected: empty patch"));
         }
 
+        let lock_paths: Vec<PathBuf> = patch_targets(&patch_text)
+            .into_iter()
+            .map(|target| util::resolve(ctx, &target))
+            .collect();
+        let _file_guards = util::lock_files(&lock_paths).await;
+
         let mut state: HashMap<PathBuf, Option<String>> = HashMap::new();
         let mut prepared: Vec<Prepared> = Vec::new();
 

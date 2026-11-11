@@ -749,6 +749,19 @@ async fn talk_allows_siblings_parent_and_child_but_rejects_strangers() {
         Some(format!("note delivered to {b}").as_str())
     );
 
+    // Omitting `to` from a child session defaults to its parent session.
+    let parent_res = tool
+        .execute(
+            &tool_context(&harness, &a),
+            json!({"kind": "answer", "text": "done"}),
+        )
+        .await
+        .expect("child talk without `to` defaults to parent");
+    assert_eq!(
+        parent_res.output.as_deref(),
+        Some(format!("answer delivered to {}", harness.session).as_str())
+    );
+
     let denied = tool
         .execute(
             &tool_context(&harness, &a),

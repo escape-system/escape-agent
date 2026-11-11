@@ -144,17 +144,38 @@ pub fn resolve_model(
             chain,
         });
     }
-    if !available.iter().any(|model| model == &chosen.reference) {
-        return Err(crate::ModelError::Unavailable {
-            reference: chosen.reference.clone(),
-            origin: chosen.source.as_str(),
-            chain,
+    if let Some(exact) = available.iter().find(|model| *model == &chosen.reference) {
+        return Ok(ModelChoice {
+            reference: exact.clone(),
+            source: chosen.source,
         });
     }
-    Ok(ModelChoice {
+    let normalized_chosen = normalize_model_ref(&chosen.reference);
+    if let Some(aliased) = available
+        .iter()
+        .find(|model| normalize_model_ref(model) == normalized_chosen)
+    {
+        return Ok(ModelChoice {
+            reference: aliased.clone(),
+            source: chosen.source,
+        });
+    }
+    Err(crate::ModelError::Unavailable {
         reference: chosen.reference.clone(),
-        source: chosen.source,
+        origin: chosen.source.as_str(),
+        chain,
     })
+}
+
+fn normalize_model_ref(reference: &str) -> String {
+    match reference.split_once('#') {
+        Some((base, variant)) => format!(
+            "{}#{}",
+            base.to_ascii_lowercase().replace('.', "-"),
+            variant
+        ),
+        None => reference.to_ascii_lowercase().replace('.', "-"),
+    }
 }
 
 /// `provider/id` or `provider/id#variant`.

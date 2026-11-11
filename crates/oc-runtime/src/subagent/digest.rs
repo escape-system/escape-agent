@@ -13,9 +13,9 @@ use super::state::SubagentState;
 use super::tree::{authorize_digest, load_info, optional_str, store_error};
 
 /// Digest cache capacity per runtime.
-pub(super) const DIGEST_CACHE_CAPACITY: usize = 64;
+pub(super) const DIGEST_CACHE_CAPACITY: usize = 128;
 /// Digest requests allowed per caller per window.
-const DIGEST_RATE_LIMIT: usize = 30;
+const DIGEST_RATE_LIMIT: usize = 120;
 /// Digest rate window in milliseconds.
 const DIGEST_RATE_WINDOW_MS: i64 = 600_000;
 /// Maximum transcript messages read by `digest`.
@@ -69,10 +69,14 @@ impl Tool for DigestTool {
     async fn execute(&self, ctx: &ToolContext, input: Value) -> Result<ToolResult, ToolError> {
         let runtime = &self.runtime;
         let caller = ctx.session_id.clone();
-        let target = optional_str(&input, "session_id").unwrap_or_else(|| caller.clone());
+        let target = optional_str(&input, "session_id")
+            .or_else(|| optional_str(&input, "sessionID"))
+            .or_else(|| optional_str(&input, "target"))
+            .unwrap_or_else(|| caller.clone());
         let question = optional_str(&input, "question")
             .unwrap_or_else(|| "Summarize what this session did and any errors.".to_owned());
-        let tool_call_id = optional_str(&input, "tool_call_id");
+        let tool_call_id =
+            optional_str(&input, "tool_call_id").or_else(|| optional_str(&input, "toolCallID"));
         let max_tokens = input
             .get("max_tokens")
             .and_then(Value::as_u64)

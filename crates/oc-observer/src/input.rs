@@ -103,6 +103,9 @@ pub struct ActiveStrip {
 /// One settled strip.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecentStrip {
+    /// Tool call id (`tc_…` / `call_…`), omitted when empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
     /// Session id.
     pub sid: String,
     /// Tool name.
@@ -270,6 +273,7 @@ mod tests {
         let mut input = base();
         for index in 0..40 {
             input.recent.push(RecentStrip {
+                id: None,
                 sid: "ses_child".to_owned(),
                 tool: "shell".to_owned(),
                 outcome: Some("exit 1".to_owned()),

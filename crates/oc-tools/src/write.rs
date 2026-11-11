@@ -43,6 +43,7 @@ impl Tool for WriteTool {
         let path = util::required_string(&input, "path")?;
         let content = util::required_string(&input, "content")?;
         let absolute = util::resolve(ctx, &path);
+        let _file_guard = util::lock_file(&absolute).await;
 
         let existed = absolute.exists();
         let existing_bom = fs::read(&absolute).is_ok_and(|bytes| util::has_bom(&bytes));

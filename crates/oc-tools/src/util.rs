@@ -8,11 +8,12 @@ use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use globset::{GlobBuilder, GlobMatcher};
 use serde_json::Value;
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
 use crate::{ToolContext, ToolError};
 
@@ -88,6 +89,50 @@ pub fn resolve_from(base: &Path, input: &str) -> PathBuf {
     } else {
         base.join(path)
     }
+}
+
+fn file_lock_key(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| lexical_absolute(path))
+}
+
+/// Acquire per-file async locks in deterministic sorted order so concurrent
+/// `edit`, `write`, and `patch` tool calls within the same turn (or across
+/// sessions) serialize mutations to the same file without deadlocking or
+/// silently overwriting earlier edits.
+pub async fn lock_files(paths: &[PathBuf]) -> Vec<OwnedMutexGuard<()>> {
+    static LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<AsyncMutex<()>>>>> = OnceLock::new();
+    let map = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut keys: Vec<PathBuf> = paths.iter().map(|path| file_lock_key(path)).collect();
+    keys.sort();
+    keys.dedup();
+    let mutexes: Vec<Arc<AsyncMutex<()>>> = {
+        let mut guard = map
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        keys.into_iter()
+            .map(|key| {
+                Arc::clone(
+                    guard
+                        .entry(key)
+                        .or_insert_with(|| Arc::new(AsyncMutex::new(()))),
+                )
+            })
+            .collect()
+    };
+    let mut guards = Vec::with_capacity(mutexes.len());
+    for mutex in mutexes {
+        guards.push(mutex.lock_owned().await);
+    }
+    guards
+}
+
+/// Acquire the per-file async lock for a single `path`.
+pub async fn lock_file(path: &Path) -> OwnedMutexGuard<()> {
+    lock_files(&[path.to_path_buf()])
+        .await
+        .into_iter()
+        .next()
+        .expect("single file lock")
 }
 
 pub fn required_string(input: &Value, key: &str) -> Result<String, ToolError> {

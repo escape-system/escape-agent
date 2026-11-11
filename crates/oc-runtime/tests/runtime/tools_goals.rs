@@ -135,6 +135,51 @@ async fn goal_block_is_injected_into_the_instruction_prefix() {
     assert!(instructions.contains("<goal id=\"gol_prompt\""));
     assert!(instructions.contains("ship the goal prompt"));
     assert!(instructions.contains("render the block"));
+
+    // Once a goal is marked done, redundant goal_complete / progress goal_update
+    // calls from children succeed idempotently instead of failing the turn step.
+    harness
+        .store
+        .update_goal(
+            "gol_prompt",
+            oc_store::GoalPatch {
+                status: Some("done".to_owned()),
+                ..oc_store::GoalPatch::default()
+            },
+        )
+        .await
+        .expect("mark goal done");
+    let goal_registry = oc_runtime::GoalTools::new(harness.runtime.clone()).registry();
+    let complete_res = goal_registry
+        .get("goal_complete")
+        .expect("goal_complete")
+        .execute(
+            &tool_context(&harness, &harness.session),
+            json!({"evidence": ["msg_1"]}),
+        )
+        .await
+        .expect("idempotent goal_complete on done goal");
+    assert!(
+        complete_res
+            .output
+            .unwrap_or_default()
+            .contains("Goal is already done")
+    );
+    let update_res = goal_registry
+        .get("goal_update")
+        .expect("goal_update")
+        .execute(
+            &tool_context(&harness, &harness.session),
+            json!({"progress": "final check complete"}),
+        )
+        .await
+        .expect("idempotent goal_update progress on done goal");
+    assert!(
+        update_res
+            .output
+            .unwrap_or_default()
+            .contains("Goal is already done")
+    );
 }
 
 #[tokio::test]

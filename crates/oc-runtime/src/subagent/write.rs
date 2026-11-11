@@ -1,5 +1,7 @@
+use std::time::Duration;
+
 use oc_store::{Delivery, NewInbox};
-use oc_subagents::Policy;
+use oc_subagents::{BudgetError, Policy};
 use oc_tools::{Tool, ToolContext, ToolError, ToolResult};
 use oc_types::MessageId;
 use serde_json::{Value, json};
@@ -41,10 +43,17 @@ impl Tool for WriteSessionTool {
         })
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn execute(&self, ctx: &ToolContext, input: Value) -> Result<ToolResult, ToolError> {
         let runtime = &self.runtime;
         let caller = ctx.session_id.clone();
-        let to = required_str(&input, "session_id")?;
+        let to = match optional_str(&input, "session_id")
+            .or_else(|| optional_str(&input, "sessionID"))
+            .or_else(|| optional_str(&input, "to"))
+        {
+            Some(target) => target,
+            None => required_str(&input, "session_id")?,
+        };
         let text = required_str(&input, "text")?;
         let settings = settings_for_session(runtime, &caller).await;
         let delivery = match optional_str(&input, "delivery").as_deref() {
@@ -63,12 +72,35 @@ impl Tool for WriteSessionTool {
             .can_write(&from_node, &to_node, &tree)
             .map_err(|error| write_error(&error))?;
 
-        {
-            let mut state = runtime.inner.subagents.lock().expect("subagent state");
-            state
-                .write_budget(&caller, &settings.limits)
-                .try_write(oc_types::now_millis())
-                .map_err(|error| budget_error(&error))?;
+        loop {
+            let result = {
+                let mut state = runtime.inner.subagents.lock().expect("subagent state");
+                state
+                    .write_budget(&caller, &settings.limits)
+                    .try_write(oc_types::now_millis())
+            };
+            match result {
+                Ok(()) => break,
+                Err(
+                    ref error @ BudgetError::RateLimited {
+                        retry_after_ms,
+                        max_per_minute,
+                        ..
+                    },
+                ) if max_per_minute > 0 && retry_after_ms > 0 && retry_after_ms <= 15_000 => {
+                    let wait_ms = u64::try_from(retry_after_ms.saturating_add(25)).unwrap_or(25);
+                    let wait = Duration::from_millis(wait_ms);
+                    if let Some(cancel) = &ctx.cancel {
+                        tokio::select! {
+                            () = cancel.cancelled() => return Err(budget_error(error)),
+                            () = tokio::time::sleep(wait) => {}
+                        }
+                    } else {
+                        tokio::time::sleep(wait).await;
+                    }
+                }
+                Err(error) => return Err(budget_error(&error)),
+            }
         }
 
         if optional_bool(&input, "interrupt").unwrap_or(false) {

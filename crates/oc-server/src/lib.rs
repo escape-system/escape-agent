@@ -344,6 +344,13 @@ impl AppState {
         self
     }
 
+    /// Clear any environment-discovered web build directory (used by isolated tests).
+    #[must_use]
+    pub fn without_web_dist(mut self) -> Self {
+        self.web_dist = None;
+        self
+    }
+
     #[must_use]
     pub fn web_dist(&self) -> Option<&Path> {
         self.web_dist.as_deref().map(PathBuf::as_path)

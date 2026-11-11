@@ -462,6 +462,12 @@ impl ObserverEngine {
             if !snapshot.known_ids.contains(&strip.tool_call_id) {
                 snapshot.known_ids.push(strip.tool_call_id);
             }
+            if !snapshot.known_ids.contains(&strip.session_id) {
+                snapshot.known_ids.push(strip.session_id);
+            }
+        }
+        if !snapshot.known_ids.iter().any(|id| id == root_id) {
+            snapshot.known_ids.push(root_id.to_owned());
         }
         let prompt = goal::judge_prompt(&snapshot, recent);
         let text = match self.model.judge(&prompt, &self.cfg).await {
@@ -538,7 +544,8 @@ impl ObserverEngine {
         let now = self.clock.now_ms();
         let goal_changed = self.with_root(root_id, |state| {
             let current = goal.as_ref().map(|goal| (goal.status, goal.rounds));
-            let changed = current != state.last_goal && current.is_some();
+            let changed = current != state.last_goal
+                && goal.as_ref().is_some_and(|goal| !goal.status.is_terminal());
             state.last_goal = current;
             changed
         });
@@ -591,6 +598,20 @@ impl ObserverEngine {
         let pending = self.with_root(root_id, |state| {
             state.pending_wake || state.error_streak >= 3
         });
+
+        if !force
+            && !overdue
+            && !stall
+            && !busy
+            && active_strips.is_empty()
+            && goal.as_ref().is_some_and(|goal| goal.status.is_terminal())
+        {
+            self.with_root(root_id, |state| {
+                state.pending_wake = false;
+                state.error_streak = 0;
+            });
+            return None;
+        }
 
         if !force && !overdue && !pending && !goal_changed && !stall {
             return None;
@@ -743,7 +764,9 @@ impl ObserverEngine {
             .into_iter()
             .map(|strip| {
                 let took_s = strip.elapsed_s(now);
+                let id = (!strip.tool_call_id.is_empty()).then_some(strip.tool_call_id);
                 RecentStrip {
+                    id,
                     sid: strip.session_id,
                     tool: strip.tool,
                     outcome: strip.outcome,
@@ -861,7 +884,7 @@ impl ObserverEngine {
             }
             ObserverAction::Repair => self.apply_repair(root_id, tree, verdict, now).await,
             ObserverAction::GoalDone | ObserverAction::GoalBlocked | ObserverAction::GoalFailed => {
-                self.apply_goal(root_id, goal, verdict, now)
+                self.apply_goal(root_id, tree, goal, verdict, now)
             }
         }
     }
@@ -1069,6 +1092,7 @@ impl ObserverEngine {
     fn apply_goal(
         &self,
         root_id: &str,
+        tree: &[TreeRow],
         goal: Option<&GoalSnapshot>,
         verdict: &ObserverVerdict,
         now: i64,
@@ -1079,11 +1103,29 @@ impl ObserverEngine {
                 reason: "no active goal to update".to_owned(),
             };
         };
+        if goal.status.is_terminal() {
+            return ObserverRun::Verdict {
+                verdict: verdict.clone(),
+            };
+        }
         let mut snapshot = goal.clone();
         let mut known = snapshot.known_ids.clone();
+        for ev in &snapshot.evidence {
+            if !known.contains(ev) {
+                known.push(ev.clone());
+            }
+        }
         for strip in self.registry.recent(root_id, 32) {
             if !known.contains(&strip.tool_call_id) {
                 known.push(strip.tool_call_id);
+            }
+            if !known.contains(&strip.session_id) {
+                known.push(strip.session_id);
+            }
+        }
+        for row in tree {
+            if !known.contains(&row.sid) {
+                known.push(row.sid.clone());
             }
         }
         snapshot.known_ids = known;

@@ -352,6 +352,19 @@ fn model_resolution_order() {
     let choice = resolve_model(None, None, ModelDefaults::new(), "parent/model", &available)
         .expect("parent is the last resort");
     assert_eq!(choice.source, ModelSource::Parent);
+
+    let mut dotted_catalog = available.clone();
+    dotted_catalog.push("anthropic/claude-sonnet-4-5".to_owned());
+    let dotted = resolve_model(
+        Some("anthropic/claude-sonnet-4.5"),
+        Some("general"),
+        ModelDefaults::new(),
+        "parent/model",
+        &dotted_catalog,
+    )
+    .expect("dot-separated version alias resolves to catalog hyphenated id");
+    assert_eq!(dotted.reference, "anthropic/claude-sonnet-4-5");
+    assert_eq!(dotted.source, ModelSource::Call);
 }
 
 #[test]

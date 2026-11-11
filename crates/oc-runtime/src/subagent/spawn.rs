@@ -1,5 +1,7 @@
+use std::time::Duration;
+
 use oc_store::{NewSession, NewSessionTree};
-use oc_subagents::{Policy, SpawnError, resolve_model};
+use oc_subagents::{BudgetError, Policy, SpawnError, resolve_model};
 use oc_tools::{Tool, ToolContext, ToolError, ToolResult};
 use oc_types::SessionId;
 use serde_json::{Value, json};
@@ -83,15 +85,15 @@ impl Tool for SubagentTool {
                 "agent": { "type": "string", "description": self.agent_description() },
                 "description": { "type": "string", "description": "Short label shown in the session tree." },
                 "prompt": { "type": "string", "description": "Task text delivered to the child." },
-                "model": { "type": "string", "description": "Model override: provider/id or provider/id#variant." },
-                "sessionID": { "type": "string", "description": "Continue an existing direct child or descendant." },
+                "model": { "type": "string", "description": "Optional model override: provider/id or provider/id#variant. Omit to inherit the agent or parent model." },
+                "sessionID": { "type": "string", "description": "Continue an existing direct child or descendant. Omit when spawning a new child." },
                 "background": { "type": "boolean", "description": self.background_description() },
                 "role": { "type": "string", "enum": ["worker", "coordinator"], "description": "Child policy role." },
                 "spawn": {
                     "type": "object",
                     "properties": {
                         "allow": { "type": "boolean", "description": "Allow the child to spawn its own children." },
-                        "max_depth": { "type": "integer", "minimum": 0 }
+                        "max_depth": { "type": "integer", "minimum": 0, "description": "Absolute tree depth cap for this subtree (must be >= this child's depth, i.e. parent.depth + 1). Omit to use the configured default." }
                     },
                     "additionalProperties": false
                 },
@@ -114,7 +116,15 @@ impl Tool for SubagentTool {
         let prompt = required_str(&input, "prompt")?;
         let background = optional_bool(&input, "background").unwrap_or(settings.background_default);
 
-        if let Some(target) = optional_str(&input, "sessionID") {
+        if let Some(target) = optional_str(&input, "sessionID")
+            .or_else(|| optional_str(&input, "session_id"))
+            .filter(|s| {
+                !matches!(
+                    s.trim().to_ascii_lowercase().as_str(),
+                    "" | "none" | "null" | "undefined" | "new"
+                )
+            })
+        {
             return continue_child(
                 runtime,
                 &caller,
@@ -173,12 +183,35 @@ impl Tool for SubagentTool {
             plan.spawn_allowed = false;
         }
 
-        {
-            let mut state = runtime.inner.subagents.lock().expect("subagent state");
-            state
-                .spawn_budget(&caller, &limits, parent.child_count)
-                .try_spawn(oc_types::now_millis())
-                .map_err(|error| budget_error(&error))?;
+        loop {
+            let result = {
+                let mut state = runtime.inner.subagents.lock().expect("subagent state");
+                state
+                    .spawn_budget(&caller, &limits, parent.child_count)
+                    .try_spawn(oc_types::now_millis())
+            };
+            match result {
+                Ok(()) => break,
+                Err(
+                    ref error @ BudgetError::RateLimited {
+                        retry_after_ms,
+                        max_per_minute,
+                        ..
+                    },
+                ) if max_per_minute > 0 && retry_after_ms > 0 && retry_after_ms <= 25_000 => {
+                    let wait_ms = u64::try_from(retry_after_ms.saturating_add(25)).unwrap_or(25);
+                    let wait = Duration::from_millis(wait_ms);
+                    if let Some(cancel) = &ctx.cancel {
+                        tokio::select! {
+                            () = cancel.cancelled() => return Err(budget_error(error)),
+                            () = tokio::time::sleep(wait) => {}
+                        }
+                    } else {
+                        tokio::time::sleep(wait).await;
+                    }
+                }
+                Err(error) => return Err(budget_error(&error)),
+            }
         }
 
         let parent_model = parent

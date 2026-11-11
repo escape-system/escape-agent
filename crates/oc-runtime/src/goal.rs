@@ -222,6 +222,12 @@ impl Tool for GoalUpdateTool {
             .get("status")
             .and_then(Value::as_str)
             .unwrap_or("active");
+        if status == "done" && blocked.is_none() {
+            return Ok(ToolResult::text(format!(
+                "Goal is already done.\n{}",
+                pretty(&goal)
+            )));
+        }
         if is_terminal(status) {
             return Err(ToolError::new(format!(
                 "goal is already {status}; start a new goal with goal_set"
@@ -304,6 +310,12 @@ impl Tool for GoalCompleteTool {
             .get("status")
             .and_then(Value::as_str)
             .unwrap_or("active");
+        if status == "done" {
+            return Ok(ToolResult::text(format!(
+                "Goal is already done.\n{}",
+                pretty(&goal)
+            )));
+        }
         if is_terminal(status) {
             return Err(ToolError::new(format!("goal is already {status}")));
         }
