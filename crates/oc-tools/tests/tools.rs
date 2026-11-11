@@ -420,6 +420,34 @@ async fn shell_exports_session_environment() {
     assert_eq!(result.output.unwrap().trim(), "ses_test");
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn shell_reaps_background_children_in_process_group_on_exit() {
+    let dir = TempDir::new().unwrap();
+    let pid_file = dir.path().join("bg.pid");
+    let cmd = format!(
+        "sleep 60 >/dev/null 2>&1 & echo $! > {}; echo done",
+        pid_file.display()
+    );
+    let result = ShellTool
+        .execute(&ctx(dir.path()), json!({"command": cmd}))
+        .await
+        .unwrap();
+    assert_eq!(result.output.unwrap().trim(), "done");
+    let bg_pid: u32 = read(&pid_file).trim().parse().unwrap();
+    // Process group cleanup should have terminated the background sleep process.
+    let status = std::process::Command::new("kill")
+        .args(["-0", &bg_pid.to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap();
+    assert!(
+        !status.success(),
+        "background child pid {bg_pid} should be reaped when ShellTool completes"
+    );
+}
+
 #[tokio::test]
 async fn code_map_outline_and_symbol_operations() {
     let dir = TempDir::new().unwrap();

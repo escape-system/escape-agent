@@ -84,7 +84,20 @@ pub(super) fn tool_text(content: &[ToolContent]) -> String {
         .iter()
         .map(|part| match part {
             ToolContent::Text { text } => text.clone(),
-            ToolContent::File { uri, mime, .. } => format!("[file {mime}: {uri}]"),
+            ToolContent::File { uri, mime, name } => {
+                if uri.starts_with("data:") {
+                    let payload_len = uri
+                        .split_once(',')
+                        .map_or(uri.len(), |(_, rest)| rest.len());
+                    let approx_bytes = payload_len * 3 / 4;
+                    match name.as_deref().filter(|name| !name.is_empty()) {
+                        Some(name) => format!("[file {mime} ({name}): {approx_bytes} bytes]"),
+                        None => format!("[file {mime}: {approx_bytes} bytes]"),
+                    }
+                } else {
+                    format!("[file {mime}: {uri}]")
+                }
+            }
         })
         .collect::<Vec<_>>()
         .join("\n")

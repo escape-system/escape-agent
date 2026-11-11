@@ -77,35 +77,30 @@ impl ObserverModel for LlmObserverModel {
     ) -> BoxFuture<'a, Result<String, ObserverError>> {
         Box::pin(async move {
             let api_key = stored_credential_key(&self.store, &self.model.provider.id).await;
-            let request = LlmRequest {
-                model: self.model.clone(),
-                system: vec![system_prompt(cfg.nudge_max_chars)],
-                messages: vec![LlmMessage::user(input)],
-                tools: Vec::new(),
-                options: LlmOptions {
-                    temperature: Some(0.0),
-                    max_output_tokens: Some(VERDICT_MAX_TOKENS),
-                    cache_key: Some("ses_observer".to_owned()),
-                    api_key,
-                    ..LlmOptions::default()
-                },
+            let system = vec![system_prompt(cfg.nudge_max_chars)];
+            let messages = vec![LlmMessage::user(input)];
+            let options = LlmOptions {
+                temperature: Some(0.0),
+                max_output_tokens: Some(VERDICT_MAX_TOKENS),
+                cache_key: Some("ses_observer".to_owned()),
+                api_key,
+                ..LlmOptions::default()
             };
-            let mut stream = self
-                .client
-                .0
-                .stream(request)
-                .await
-                .map_err(|error| ObserverError::Model(error.to_string()))?;
-            let mut text = String::new();
-            while let Some(event) = stream.next().await {
-                match event {
-                    LlmEvent::TextDelta { delta } => text.push_str(&delta),
-                    LlmEvent::TextEnd { text: full } => text = full,
-                    LlmEvent::ProviderError { message } => {
-                        return Err(ObserverError::Model(message));
-                    }
-                    _ => {}
-                }
+            let mut text = stream_verdict(
+                &self.client,
+                self.model.clone(),
+                system.clone(),
+                messages.clone(),
+                options.clone(),
+            )
+            .await?;
+            if text.trim().is_empty() && self.model.variant.is_some() {
+                // High/max reasoning variants can exhaust `VERDICT_MAX_TOKENS`
+                // on reasoning before emitting the JSON verdict. Retry once
+                // without the variant override so the verdict is not starved.
+                let mut plain = self.model.clone();
+                plain.variant = None;
+                text = stream_verdict(&self.client, plain, system, messages, options).await?;
             }
             if text.trim().is_empty() {
                 return Err(ObserverError::Model(
@@ -115,6 +110,39 @@ impl ObserverModel for LlmObserverModel {
             Ok(text)
         })
     }
+}
+
+async fn stream_verdict(
+    client: &SharedLlmClient,
+    model: ResolvedModel,
+    system: Vec<String>,
+    messages: Vec<LlmMessage>,
+    options: LlmOptions,
+) -> Result<String, ObserverError> {
+    let request = LlmRequest {
+        model,
+        system,
+        messages,
+        tools: Vec::new(),
+        options,
+    };
+    let mut stream = client
+        .0
+        .stream(request)
+        .await
+        .map_err(|error| ObserverError::Model(error.to_string()))?;
+    let mut text = String::new();
+    while let Some(event) = stream.next().await {
+        match event {
+            LlmEvent::TextDelta { delta } => text.push_str(&delta),
+            LlmEvent::TextEnd { text: full } => text = full,
+            LlmEvent::ProviderError { message } => {
+                return Err(ObserverError::Model(message));
+            }
+            _ => {}
+        }
+    }
+    Ok(text)
 }
 
 /// System prompt: static contract only, no transcript or tool data.

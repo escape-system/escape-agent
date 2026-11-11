@@ -43,35 +43,25 @@ impl ScribeModel for LlmScribe {
     fn complete<'a>(&'a self, prompt: &'a str) -> BoxFuture<'a, Result<String, MemoryError>> {
         Box::pin(async move {
             let api_key = stored_credential_key(&self.store, &self.model.provider.id).await;
-            let request = LlmRequest {
-                model: self.model.clone(),
-                system: Vec::new(),
-                messages: vec![LlmMessage::user(prompt)],
-                tools: Vec::new(),
-                options: LlmOptions {
-                    temperature: Some(0.0),
-                    max_output_tokens: Some(SCRIBE_MAX_TOKENS),
-                    cache_key: Some("ses_scribe".to_owned()),
-                    api_key,
-                    ..LlmOptions::default()
-                },
+            let messages = vec![LlmMessage::user(prompt)];
+            let options = LlmOptions {
+                temperature: Some(0.0),
+                max_output_tokens: Some(SCRIBE_MAX_TOKENS),
+                cache_key: Some("ses_scribe".to_owned()),
+                api_key,
+                ..LlmOptions::default()
             };
-            let mut stream = self
-                .client
-                .0
-                .stream(request)
-                .await
-                .map_err(|error| MemoryError::Model(error.to_string()))?;
-            let mut text = String::new();
-            while let Some(event) = stream.next().await {
-                match event {
-                    LlmEvent::TextDelta { delta } => text.push_str(&delta),
-                    LlmEvent::TextEnd { text: full } => text = full,
-                    LlmEvent::ProviderError { message } => {
-                        return Err(MemoryError::Model(message));
-                    }
-                    _ => {}
-                }
+            let mut text = stream_scribe(
+                &self.client,
+                self.model.clone(),
+                messages.clone(),
+                options.clone(),
+            )
+            .await?;
+            if text.trim().is_empty() && self.model.variant.is_some() {
+                let mut plain = self.model.clone();
+                plain.variant = None;
+                text = stream_scribe(&self.client, plain, messages, options).await?;
             }
             let text = text.trim();
             if text.is_empty() {
@@ -82,6 +72,38 @@ impl ScribeModel for LlmScribe {
             Ok(text.to_owned())
         })
     }
+}
+
+async fn stream_scribe(
+    client: &SharedLlmClient,
+    model: ResolvedModel,
+    messages: Vec<LlmMessage>,
+    options: LlmOptions,
+) -> Result<String, MemoryError> {
+    let request = LlmRequest {
+        model,
+        system: Vec::new(),
+        messages,
+        tools: Vec::new(),
+        options,
+    };
+    let mut stream = client
+        .0
+        .stream(request)
+        .await
+        .map_err(|error| MemoryError::Model(error.to_string()))?;
+    let mut text = String::new();
+    while let Some(event) = stream.next().await {
+        match event {
+            LlmEvent::TextDelta { delta } => text.push_str(&delta),
+            LlmEvent::TextEnd { text: full } => text = full,
+            LlmEvent::ProviderError { message } => {
+                return Err(MemoryError::Model(message));
+            }
+            _ => {}
+        }
+    }
+    Ok(text)
 }
 
 /// Build the scribe when a digest model resolves.

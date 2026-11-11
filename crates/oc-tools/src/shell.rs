@@ -180,6 +180,8 @@ impl Tool for ShellTool {
             ToolError::new(format!("Unable to execute command: {command}: {error}"))
         })?;
         let pid = child.id().unwrap_or(0);
+        #[cfg(unix)]
+        let pg_guard = ProcessGroupGuard { pid };
 
         let mut timed_out = false;
         let status = if timeout_ms == 0 {
@@ -207,6 +209,8 @@ impl Tool for ShellTool {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         };
+        #[cfg(unix)]
+        drop(pg_guard);
 
         let (text, truncated, total, shown) = capture_tail(&output_path)
             .map_err(|error| ToolError::new(format!("Unable to read shell output: {error}")))?;
@@ -330,6 +334,21 @@ async fn kill_tree(child: &mut Child, pid: u32) -> io::Result<ExitStatus> {
         let _ = child.kill().await;
     }
     child.wait().await
+}
+
+#[cfg(unix)]
+struct ProcessGroupGuard {
+    pid: u32,
+}
+
+#[cfg(unix)]
+impl Drop for ProcessGroupGuard {
+    fn drop(&mut self) {
+        if self.pid > 1 {
+            send_signal(self.pid, "-TERM");
+            send_signal(self.pid, "-KILL");
+        }
+    }
 }
 
 #[cfg(unix)]

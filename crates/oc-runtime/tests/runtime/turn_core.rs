@@ -1145,6 +1145,77 @@ async fn auto_compaction_records_reason_auto() {
 }
 
 #[tokio::test]
+async fn compaction_does_not_keep_oversized_assistant_message_as_keep_id() {
+    let harness = Harness::new(
+        vec![
+            text_script("## Objective\nhandoff summary"),
+            text_script("answer after summarizing huge assistant step"),
+        ],
+        Arc::new(AllowAll),
+        json!({"compaction": {"auto": true}}),
+        None,
+    )
+    .await;
+    let now = oc_types::now_millis();
+    harness
+        .store
+        .append_message(oc_store::NewMessage {
+            id: "msg_user_before".to_owned(),
+            session_id: harness.session.clone(),
+            kind: "user".to_owned(),
+            data: json!({"time": {"created": now}, "text": "inspect output"}),
+            time_created: now,
+        })
+        .await
+        .expect("append user");
+    // An assistant message whose tool output alone exceeds both `keep_tokens`
+    // (15k) and the compaction trigger (75k) must be summarized by compaction,
+    // never preserved verbatim as `keepID`.
+    harness
+        .store
+        .append_message(oc_store::NewMessage {
+            id: "msg_huge_assistant".to_owned(),
+            session_id: harness.session.clone(),
+            kind: "assistant".to_owned(),
+            data: json!({
+                "time": {"created": now, "streamed": now, "completed": now},
+                "agent": "build",
+                "model": {"providerID": "test", "id": "alpha"},
+                "finish": "tool-calls",
+                "content": [{
+                    "type": "tool",
+                    "id": "call_huge",
+                    "name": "read",
+                    "executed": true,
+                    "state": {
+                        "status": "completed",
+                        "input": {"filePath": "huge.txt"},
+                        "content": [{"type": "text", "text": "x".repeat(360_000)}]
+                    },
+                    "time": {"created": now, "ran": now, "completed": now}
+                }]
+            }),
+            time_created: now + 1,
+        })
+        .await
+        .expect("append huge assistant");
+
+    harness.prompt("continue").await;
+
+    let messages = harness.messages().await;
+    let compaction = messages
+        .iter()
+        .find(|message| message.get("type").and_then(Value::as_str) == Some("compaction"))
+        .expect("compaction row");
+    assert_eq!(compaction["status"], "completed");
+    assert_ne!(
+        compaction["keepID"], "msg_huge_assistant",
+        "oversized assistant message must not be kept as keepID across compaction"
+    );
+    assert!(harness.sink.has("session.execution.succeeded"));
+}
+
+#[tokio::test]
 async fn auto_compaction_publishes_durable_lifecycle_events() {
     let harness = Harness::new(
         vec![

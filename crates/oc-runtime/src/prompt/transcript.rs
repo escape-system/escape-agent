@@ -129,6 +129,7 @@ fn assistant_messages(message: &Value, out: &mut Vec<LlmMessage>) {
     };
     let mut calls: Vec<ContentPart> = Vec::new();
     let mut results: Vec<LlmMessage> = Vec::new();
+    let mut attachments: Vec<ContentPart> = Vec::new();
     for part in parts {
         match part {
             AssistantPart::Text(text) => {
@@ -150,6 +151,7 @@ fn assistant_messages(message: &Value, out: &mut Vec<LlmMessage>) {
                         join_content(content),
                         false,
                     ));
+                    attachments.extend(tool_attachment_parts(content));
                 }
                 ToolState::Error {
                     input,
@@ -189,6 +191,9 @@ fn assistant_messages(message: &Value, out: &mut Vec<LlmMessage>) {
         out.push(LlmMessage::new(Role::Assistant, calls));
     }
     out.extend(results);
+    if !attachments.is_empty() {
+        out.push(LlmMessage::new(Role::User, attachments));
+    }
 }
 
 fn join_content(content: &[ToolContent]) -> String {
@@ -196,10 +201,44 @@ fn join_content(content: &[ToolContent]) -> String {
         .iter()
         .map(|part| match part {
             ToolContent::Text { text } => text.clone(),
-            ToolContent::File { uri, mime, .. } => format!("[file {mime}: {uri}]"),
+            ToolContent::File { uri, mime, name } => {
+                format_tool_file_summary(uri, mime, name.as_deref())
+            }
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn format_tool_file_summary(uri: &str, mime: &str, name: Option<&str>) -> String {
+    if uri.starts_with("data:") {
+        let payload = strip_data_url(uri);
+        let approx_bytes = payload.len() * 3 / 4;
+        match name.filter(|name| !name.is_empty()) {
+            Some(name) => format!("[file {mime} ({name}): {approx_bytes} bytes]"),
+            None => format!("[file {mime}: {approx_bytes} bytes]"),
+        }
+    } else {
+        format!("[file {mime}: {uri}]")
+    }
+}
+
+fn tool_attachment_parts(content: &[ToolContent]) -> Vec<ContentPart> {
+    let mut parts = Vec::new();
+    for item in content {
+        let ToolContent::File { uri, mime, name } = item else {
+            continue;
+        };
+        if !uri.starts_with("data:") {
+            continue;
+        }
+        let data = strip_data_url(uri);
+        if mime.starts_with("image/") {
+            parts.push(ContentPart::image(mime.clone(), data));
+        } else if mime == "application/pdf" {
+            parts.push(ContentPart::document(mime.clone(), data, name.clone()));
+        }
+    }
+    parts
 }
 
 fn message_type(message: &Value) -> Option<&str> {

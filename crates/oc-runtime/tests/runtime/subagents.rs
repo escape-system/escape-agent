@@ -737,6 +737,17 @@ async fn talk_allows_siblings_parent_and_child_but_rejects_strangers() {
     )
     .await
     .expect("parents may talk to children");
+    let steer_res = tool
+        .execute(
+            &tool_context(&harness, &harness.session),
+            json!({"to": b, "kind": "steer", "text": "wrap up soon"}),
+        )
+        .await
+        .expect("talk normalizes kind=steer to note");
+    assert_eq!(
+        steer_res.output.as_deref(),
+        Some(format!("note delivered to {b}").as_str())
+    );
 
     let denied = tool
         .execute(
@@ -1355,7 +1366,7 @@ async fn subagent_schemas_match_the_documented_keys() {
         ]
     );
     assert_eq!(keys("talk"), ["kind", "request_reply", "text", "to"]);
-    assert!(keys("roster").is_empty());
+    assert_eq!(keys("roster"), ["wait_seconds"]);
     assert_eq!(
         keys("session_write"),
         ["delivery", "interrupt", "session_id", "text"]
@@ -1490,4 +1501,41 @@ async fn subagent_spawn_records_group_in_metadata() {
     let metadata = session.get("metadata").expect("metadata exists");
     assert_eq!(metadata["group"], "wave-alpha");
     assert_eq!(metadata["lane"], "cargo");
+}
+
+#[tokio::test]
+async fn roster_wait_seconds_waits_for_running_child_to_settle() {
+    let harness = Harness::new(
+        vec![text_script("done after spawn")],
+        Arc::new(AllowAll),
+        json!({"subagents": {"background_default": true}}),
+        None,
+    )
+    .await;
+    let spawn = subagent_tool(&harness, "subagent");
+    spawn
+        .execute(
+            &tool_context(&harness, &harness.session),
+            json!({
+                "agent": "general",
+                "description": "background worker",
+                "prompt": "finish quickly",
+                "background": true,
+            }),
+        )
+        .await
+        .expect("spawn background child");
+
+    let roster = subagent_tool(&harness, "roster");
+    let result = roster
+        .execute(
+            &tool_context(&harness, &harness.session),
+            json!({"wait_seconds": 10}),
+        )
+        .await
+        .expect("roster with wait_seconds");
+    let body: Value = serde_json::from_str(&result.output.expect("output")).expect("json");
+    let children = body["children"].as_array().expect("children");
+    assert_eq!(children.len(), 1);
+    assert_eq!(children[0]["status"], "idle");
 }

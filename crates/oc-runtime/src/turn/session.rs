@@ -494,13 +494,17 @@ fn subagent_mode_instructions(mode: Option<&str>, depth: u32) -> Option<String> 
              - Hierarchy depth limit: max_depth = 3 (Root = depth 0; Level 1 = depth 1; Level 2 = depth 2; Level 3 = depth 3).\n\
              - You are the Root Primary Orchestrator (depth = 0). Do NOT call direct file or shell tools (`read`, `write`, `edit`, `patch`, `glob`, `grep`, `shell`) yourself.\n\
              - Delegate all file exploration, code modifications, and shell/test execution by spawning `subagent` workers or `role: \"coordinator\"` (\"abi/kardeş\" older-brother/sibling coordinator) subagents.\n\
-             - Level 1 and Level 2 subagents (especially with `role: \"coordinator\"`) can spawn their own child subagents up to depth 3 and coordinate with siblings via `talk`, `session_write`, `roster`, and `digest`."
+             - Level 1 and Level 2 subagents (especially with `role: \"coordinator\"`) can spawn their own child subagents up to depth 3 and coordinate with siblings via `talk`, `session_write`, `roster`, and `digest`.\n\
+             - Waiting & synchronization: When you need results from one or several subagents before taking the next step, pass `background: false` (up to 8 `subagent` calls in a single step run concurrently in parallel and return their final `<subagent>` results directly). If children are running with `background: true`, call `roster` with `wait_seconds` (e.g. `{\"wait_seconds\": 120}`) to wait until a child settles or a message arrives. NEVER spawn `explore` subagents with `sleep` commands or poll `roster`/`digest` in a tight loop.\n\
+             - Strict file ownership: Assign disjoint file paths to concurrent subagents. Never spawn a second writer for a file while an earlier writer is still `busy`; check `roster` first or steer the active owner via `session_write`/`talk`.\n\
+             - Context boxes (`box_write`) are for concise shared architecture specs, API contracts, and status notes — do NOT write full source code files into context boxes only to spawn subagents to copy them to disk."
                 .to_owned(),
         ),
         Some("complex") => Some(format!(
             "[Subagent Mode: /complex — 3-Level Hierarchy (current depth = {depth}/3)]\n\
              - This session tree runs in `/complex` mode (`max_depth = 3`).\n\
-             - {}Use `talk`, `roster`, `session_write`, and `digest` to coordinate with siblings and child subagents.",
+             - {}Use `talk`, `roster`, `session_write`, and `digest` to coordinate with siblings and child subagents.\n\
+             - Respect strict file ownership: only modify files assigned to your task, and use `roster(wait_seconds=...)` rather than `sleep` commands when waiting on running children.",
             if depth < 3 {
                 format!(
                     "You may spawn child subagents (up to depth 3; next child depth = {}) to parallelize subtasks. ",

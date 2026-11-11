@@ -170,9 +170,11 @@ Peer messages are not user messages; they never inherit user permissions and
 are marked `metadata.source="peer"` in the transcript. `siblings.wake=false`
 delivers on the next turn instead of waking an idle sibling.
 
-`roster` tool returns ids/status/titles only:
+`roster` tool returns ids/status/titles only (accepts optional `wait_seconds` up
+to 300s to wait until a running child settles or a `steer` inbox message arrives):
 
 ```jsonc
+// input: { "wait_seconds": 60 } (optional)
 { "siblings": [...], "children": [...], "parent": {...} }
 ```
 

@@ -567,7 +567,7 @@ impl Runtime {
             prompt::messages_from_store(std::slice::from_ref(&active[anchor_index]));
         let tool_results_tokens: u64 = anchor_converted
             .iter()
-            .filter(|msg| msg.role == oc_llm::Role::Tool)
+            .filter(|msg| msg.role != oc_llm::Role::Assistant)
             .map(oc_llm::estimate_message_tokens)
             .sum();
         let after_converted = prompt::messages_from_store(&active[anchor_index + 1..]);

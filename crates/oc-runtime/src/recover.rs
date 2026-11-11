@@ -316,7 +316,15 @@ impl Runtime {
                 };
                 let repaired_state = match settled {
                     Some(settled) => {
-                        settled.into_state(child.as_deref().unwrap_or_default(), &input)
+                        let parent_id = message
+                            .get("sessionID")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
+                        let limit =
+                            crate::subagent::settings::settings_for_session(self, parent_id)
+                                .await
+                                .report_char_limit;
+                        settled.into_state(child.as_deref().unwrap_or_default(), &input, limit)
                     }
                     None => tool_error_state(&input),
                 };
@@ -386,13 +394,13 @@ struct RecoveredChild {
 }
 
 impl RecoveredChild {
-    fn into_state(self, child: &str, input: &Map<String, Value>) -> Value {
+    fn into_state(self, child: &str, input: &Map<String, Value>, limit: usize) -> Value {
         let text = if self.text.trim().is_empty() {
             format!("subagent {}", self.state)
         } else {
             self.text
         };
-        let envelope = envelope(self.state, child, &text);
+        let envelope = envelope(self.state, child, &text, limit);
         if self.state == "completed" {
             let content = ToolContent::Text { text: envelope };
             json!({
@@ -413,8 +421,8 @@ impl RecoveredChild {
 }
 
 /// `<subagent>` envelope, matching `subagent/protocol.rs::envelope`.
-fn envelope(state: &str, child: &str, text: &str) -> String {
-    format!("<subagent sessionID=\"{child}\" state=\"{state}\">{text}</subagent>")
+fn envelope(state: &str, child: &str, text: &str, limit: usize) -> String {
+    crate::subagent::protocol::envelope(state, child, None, text, limit)
 }
 
 fn final_assistant_text(messages: &[Value]) -> String {

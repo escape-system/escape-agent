@@ -354,3 +354,101 @@ async fn crash_recovery_settles_an_interrupted_background_child_once() {
         .count();
     assert_eq!(synthetics, 1);
 }
+
+/// A child that answered with a huge final text must not replay all of it into
+/// the parent's repaired tool part: recovery goes through the same capped
+/// report builder as a live completion (`subagent/protocol.rs`).
+#[tokio::test]
+async fn recovered_child_report_is_capped_in_the_repaired_tool_part() {
+    let harness = Harness::new(
+        vec![],
+        Arc::new(AllowAll),
+        json!({"subagents": {"report_char_limit": 4000}}),
+        None,
+    )
+    .await;
+    let child = "ses_settled_child";
+    create_child(&harness, &harness.session, child, "general").await;
+    let now = oc_types::now_millis();
+    harness
+        .store
+        .mark_session_idle(child, now, "succeeded")
+        .await
+        .expect("child settled");
+    let long_answer = "a".repeat(10_000);
+    harness
+        .store
+        .append_message(NewMessage {
+            id: "msg_child_long".to_owned(),
+            session_id: child.to_owned(),
+            kind: "assistant".to_owned(),
+            data: json!({
+                "time": {"created": now, "streamed": now, "completed": now},
+                "agent": "general",
+                "model": {"providerID": "test", "id": "alpha"},
+                "finish": "stop",
+                "content": [{"type": "text", "text": long_answer}]
+            }),
+            time_created: now,
+        })
+        .await
+        .expect("child answer");
+    harness
+        .store
+        .append_message(NewMessage {
+            id: "msg_parent_running".to_owned(),
+            session_id: harness.session.clone(),
+            kind: "assistant".to_owned(),
+            data: json!({
+                "time": {"created": now},
+                "agent": "build",
+                "model": {"providerID": "test", "id": "alpha"},
+                "content": [{
+                    "type": "tool",
+                    "id": "call_subagent",
+                    "name": "subagent",
+                    "state": {
+                        "status": "running",
+                        "input": {"description": "child task", "prompt": "do the work"},
+                        "metadata": {"sessionID": child, "status": "running"}
+                    },
+                    "time": {"created": now}
+                }]
+            }),
+            time_created: now,
+        })
+        .await
+        .expect("parent message");
+
+    let runtime = harness.restart();
+    runtime.start().await.expect("start");
+
+    let parent = harness
+        .store
+        .get_message(&harness.session, "msg_parent_running")
+        .await
+        .expect("read parent")
+        .expect("parent row");
+    let text = parent["content"][0]["state"]["content"][0]["text"]
+        .as_str()
+        .expect("recovered report text")
+        .to_owned();
+    // `</subagent>` is 11 chars, the open tag is 58 for this id/state, and the
+    // marker is 135 chars for `ses_settled_child`; 4000 + 135 + 69 = 4204.
+    assert!(
+        text.chars().count() < 4300,
+        "recovered report kept {} chars: recovery bypasses the cap",
+        text.chars().count()
+    );
+    assert!(
+        text.contains("truncated: 6000 chars omitted"),
+        "{}",
+        &text[4000.min(text.len() - 120)..]
+    );
+    assert!(
+        text.starts_with("<subagent sessionID=\"ses_settled_child\" state=\"completed\">"),
+        "{}",
+        &text[..80.min(text.len())]
+    );
+    assert_eq!(text.chars().count(), 4000 + 135 + 69);
+}

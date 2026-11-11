@@ -1,10 +1,17 @@
+use std::collections::HashSet;
+use std::time::Duration;
+
 use oc_store::SessionNodeRow;
 use oc_tools::{Tool, ToolContext, ToolError, ToolResult};
 use serde_json::{Map, Value, json};
+use tokio_util::sync::CancellationToken;
 
 use crate::runtime::Runtime;
 
-use super::tree::{load_node, store_error};
+use super::tree::{load_node, runtime_error, store_error};
+
+const MAX_ROSTER_WAIT_SECONDS: u64 = 300;
+const ROSTER_WAIT_POLL: Duration = Duration::from_millis(200);
 
 #[derive(Debug, Clone)]
 pub(super) struct RosterTool {
@@ -18,20 +25,41 @@ impl Tool for RosterTool {
     }
 
     fn description(&self) -> &'static str {
-        "List the parent, siblings and children of this session. Returns ids, agents, statuses and titles only."
+        "List the parent, siblings and children of this session. Returns ids, agents, statuses and titles only. Pass `wait_seconds` to wait until a running child settles or a peer/subagent message arrives instead of polling or spawning sleep subagents."
     }
 
     fn schema(&self) -> Value {
         json!({
             "type": "object",
-            "properties": {},
+            "properties": {
+                "wait_seconds": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": MAX_ROSTER_WAIT_SECONDS,
+                    "description": "Optional seconds to wait until at least one running child settles or a peer/subagent message arrives in this session's inbox before returning."
+                }
+            },
             "additionalProperties": false
         })
     }
 
-    async fn execute(&self, ctx: &ToolContext, _input: Value) -> Result<ToolResult, ToolError> {
+    async fn execute(&self, ctx: &ToolContext, input: Value) -> Result<ToolResult, ToolError> {
         let runtime = &self.runtime;
         let caller = ctx.session_id.clone();
+        let wait_seconds = input
+            .get("wait_seconds")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            .min(MAX_ROSTER_WAIT_SECONDS);
+        if wait_seconds > 0 {
+            wait_for_roster_event(
+                runtime,
+                &caller,
+                Duration::from_secs(wait_seconds),
+                ctx.cancel.as_ref(),
+            )
+            .await?;
+        }
         let store = &runtime.inner.config.store;
         let node = load_node(runtime, &caller).await?;
         let mut children = store
@@ -102,4 +130,59 @@ async fn roster_entry(runtime: &Runtime, node: &SessionNodeRow) -> Result<Value,
         value.insert("title".to_owned(), Value::String(title.to_owned()));
     }
     Ok(Value::Object(value))
+}
+
+async fn wait_for_roster_event(
+    runtime: &Runtime,
+    caller: &str,
+    timeout: Duration,
+    cancel: Option<&CancellationToken>,
+) -> Result<(), ToolError> {
+    let store = &runtime.inner.config.store;
+    let initial_children = store
+        .children(caller)
+        .await
+        .map_err(|error| store_error(&error))?;
+    let busy_ids: HashSet<String> = initial_children
+        .into_iter()
+        .filter(|child| child.status != "idle")
+        .map(|child| child.id)
+        .collect();
+    if busy_ids.is_empty() {
+        return Ok(());
+    }
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if runtime.inner.shutdown.is_cancelled() {
+            return Err(runtime_error(&crate::RuntimeError::Shutdown));
+        }
+        if cancel.is_some_and(CancellationToken::is_cancelled) {
+            return Err(runtime_error(&crate::RuntimeError::Cancelled));
+        }
+        let inbox = store
+            .list_inbox(caller)
+            .await
+            .map_err(|error| store_error(&error))?;
+        let has_steer = inbox.iter().any(|item| {
+            item.get("delivery").and_then(Value::as_str) == Some("steer")
+                && matches!(
+                    item.get("type").and_then(Value::as_str),
+                    Some("user" | "synthetic" | "peer" | "observer")
+                )
+        });
+        if has_steer {
+            return Ok(());
+        }
+        let current_children = store
+            .children(caller)
+            .await
+            .map_err(|error| store_error(&error))?;
+        let any_settled = current_children
+            .iter()
+            .any(|child| busy_ids.contains(&child.id) && child.status == "idle");
+        if any_settled || tokio::time::Instant::now() >= deadline {
+            return Ok(());
+        }
+        tokio::time::sleep(ROSTER_WAIT_POLL).await;
+    }
 }

@@ -103,47 +103,197 @@ fn is_hardline_blocked(cmd: &str) -> bool {
     false
 }
 
+fn strip_data_heredocs(cmd: &str) -> String {
+    let mut out = String::with_capacity(cmd.len());
+    let mut pending_delim: Option<String> = None;
+
+    for line in cmd.lines() {
+        if let Some(delim) = &pending_delim {
+            if line.trim() == delim.as_str() {
+                pending_delim = None;
+            }
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+        if let Some(delim) = detect_heredoc_delimiter(line) {
+            pending_delim = Some(delim);
+        }
+    }
+    out
+}
+
+fn detect_heredoc_delimiter(line: &str) -> Option<String> {
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        if bytes[i] == b'<' && bytes[i + 1] == b'<' {
+            if i + 2 < bytes.len() && bytes[i + 2] == b'<' {
+                i += 3;
+                continue;
+            }
+            let prefix = line[..i].to_lowercase();
+            // Do not strip heredocs fed directly into a shell interpreter.
+            let feeds_shell =
+                prefix
+                    .split([';', '&', '|', '('])
+                    .next_back()
+                    .is_some_and(|clause| {
+                        let c = clause.trim();
+                        c == "sh"
+                            || c == "bash"
+                            || c == "zsh"
+                            || c.starts_with("sh ")
+                            || c.starts_with("bash ")
+                            || c.starts_with("zsh ")
+                    });
+            if feeds_shell {
+                return None;
+            }
+            let mut rest = &line[i + 2..];
+            if let Some(stripped) = rest.strip_prefix('-') {
+                rest = stripped;
+            }
+            rest = rest.trim_start_matches([' ', '\t']);
+            let token_end = rest
+                .find([' ', '\t', ';', '&', '|', ')'])
+                .unwrap_or(rest.len());
+            let raw_token = rest[..token_end]
+                .trim_matches('\'')
+                .trim_matches('"')
+                .trim_start_matches('\\');
+            if !raw_token.is_empty() {
+                return Some(raw_token.to_string());
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
 fn is_root_or_home_deletion(lower: &str) -> bool {
-    if !lower.contains("rm ") {
+    let stripped = strip_data_heredocs(lower);
+    if !stripped.contains("rm ") {
         return false;
     }
 
-    let tokens: Vec<&str> = lower.split_whitespace().collect();
-    let mut has_rm = false;
-    let mut has_recursive = false;
-    let mut has_force = false;
-    let mut targets_root_or_home = false;
+    for (raw_clause, _) in split_shell_clauses(&stripped) {
+        let mut has_rm = false;
+        let mut has_recursive = false;
+        let mut targets_root_or_home = false;
 
-    for token in tokens {
-        if token == "rm" {
-            has_rm = true;
-            continue;
-        }
-        if has_rm && token.starts_with('-') {
-            if token.contains('r') || token.contains('R') {
+        for token in raw_clause.split_whitespace() {
+            if token == "rm" {
+                has_rm = true;
+                continue;
+            }
+            if has_rm
+                && token.starts_with('-')
+                && (token == "--recursive"
+                    || (!token.starts_with("--") && (token.contains('r') || token.contains('R'))))
+            {
                 has_recursive = true;
             }
-            if token.contains('f') {
-                has_force = true;
+            if has_rm
+                && (token == "/"
+                    || token == "/*"
+                    || token == "~"
+                    || token == "$home"
+                    || token == "${home}")
+            {
+                targets_root_or_home = true;
             }
         }
-        if has_rm
-            && (token == "/"
-                || token == "/*"
-                || token == "~"
-                || token == "$home"
-                || token == "${home}")
-        {
-            targets_root_or_home = true;
+
+        if has_rm && has_recursive && targets_root_or_home {
+            return true;
         }
     }
 
-    let _ = has_force;
-    has_rm && has_recursive && targets_root_or_home
+    false
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClauseSep {
+    Seq,
+    AndOr,
+    Background,
+    End,
+}
+
+fn split_shell_clauses(cmd: &str) -> Vec<(&str, ClauseSep)> {
+    let bytes = cmd.as_bytes();
+    let len = bytes.len();
+    let mut clauses = Vec::new();
+    let mut start = 0;
+    let mut i = 0;
+
+    while i < len {
+        match bytes[i] {
+            b';' | b'\n' => {
+                clauses.push((&cmd[start..i], ClauseSep::Seq));
+                i += 1;
+                start = i;
+            }
+            b'&' => {
+                if i + 1 < len && bytes[i + 1] == b'&' {
+                    clauses.push((&cmd[start..i], ClauseSep::AndOr));
+                    i += 2;
+                    start = i;
+                } else if (i > 0 && (bytes[i - 1] == b'>' || bytes[i - 1] == b'<'))
+                    || (i + 1 < len && bytes[i + 1] == b'>')
+                {
+                    i += 1;
+                } else {
+                    clauses.push((&cmd[start..i], ClauseSep::Background));
+                    i += 1;
+                    start = i;
+                }
+            }
+            b'|' if i + 1 < len && bytes[i + 1] == b'|' => {
+                clauses.push((&cmd[start..i], ClauseSep::AndOr));
+                i += 2;
+                start = i;
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+
+    if start < len {
+        clauses.push((&cmd[start..len], ClauseSep::End));
+    }
+
+    clauses
+}
+
+fn normalize_clause(raw: &str) -> &str {
+    let mut s = raw
+        .trim()
+        .trim_start_matches('(')
+        .trim_end_matches(')')
+        .trim();
+    loop {
+        if let Some(rest) = s.strip_prefix("env ") {
+            s = rest.trim_start();
+            continue;
+        }
+        if let Some((first, rest)) = s.split_once(char::is_whitespace)
+            && first.contains('=')
+            && !first.starts_with('=')
+        {
+            s = rest.trim_start();
+            continue;
+        }
+        break;
+    }
+    s
 }
 
 fn check_foreground_long_lived(cmd: &str) -> Option<&'static str> {
-    let lower = cmd.to_lowercase();
+    let stripped = strip_data_heredocs(cmd);
+    let lower = stripped.to_lowercase();
     let trimmed = lower.trim();
 
     // Shell-level unmanaged backgrounding
@@ -154,27 +304,40 @@ fn check_foreground_long_lived(cmd: &str) -> Option<&'static str> {
              foreground or manage services through the designated supervisor.",
         );
     }
-    if trimmed.starts_with("nohup ")
-        || trimmed.starts_with("disown ")
-        || trimmed.starts_with("setsid ")
-    {
-        return Some(
-            "Foreground command uses shell background wrappers (nohup/disown/setsid). \
-             Run bounded commands in foreground or manage services through the designated supervisor.",
-        );
-    }
 
-    for pattern in SERVER_PATTERNS {
-        if trimmed == *pattern
-            || trimmed.starts_with(&format!("{pattern} "))
-            || trimmed.contains(&format!("; {pattern}"))
-            || trimmed.contains(&format!("&& {pattern}"))
+    let clauses = split_shell_clauses(trimmed);
+    for (idx, (raw_clause, sep)) in clauses.iter().enumerate() {
+        let clause = normalize_clause(raw_clause);
+        if clause.is_empty() {
+            continue;
+        }
+
+        if clause == "disown"
+            || clause.starts_with("nohup ")
+            || clause.starts_with("disown ")
+            || clause.starts_with("setsid ")
         {
             return Some(
-                "This command appears to start a long-lived foreground server or watcher process. \
-                 Running it in the foreground will hang the turn until the 120s timeout. \
-                 Run bounded verification commands (such as tests or builds) instead.",
+                "Foreground command uses shell background wrappers (nohup/disown/setsid). \
+                 Run bounded commands in foreground or manage services through the designated supervisor.",
             );
+        }
+
+        let matches_server = SERVER_PATTERNS
+            .iter()
+            .any(|pattern| clause == *pattern || clause.starts_with(&format!("{pattern} ")));
+        if matches_server {
+            let has_following_command = clauses[idx + 1..]
+                .iter()
+                .any(|(rest, _)| !normalize_clause(rest).is_empty());
+            let is_bounded_inline_bg = *sep == ClauseSep::Background && has_following_command;
+            if !is_bounded_inline_bg {
+                return Some(
+                    "This command appears to start a long-lived foreground server or watcher process. \
+                     Running it in the foreground will hang the turn until the 120s timeout. \
+                     Run bounded verification commands (such as tests or builds) instead.",
+                );
+            }
         }
     }
 
@@ -223,6 +386,20 @@ mod tests {
         assert!(check_shell_command("echo bad > /dev/sda").is_err());
         assert!(check_shell_command("reboot").is_err());
         assert!(check_shell_command("shutdown -h now").is_err());
+        // Regression for ses_e3922412df48OEb4ewmuhNpQRy: `rm -f out/...` followed
+        // by a README heredoc containing `| URL_PATH | / |` and `--enable-unsafe-swiftshader`
+        // must not be mistaken for `rm -rf /`.
+        assert!(
+            check_shell_command(
+                "cd /root/workspace/.verify && rm -f out/cube2.canvas.png out/cube3.canvas.png && cat > README.md <<'EOF'\n\
+                 | URL_PATH | / | path to open |\n\
+                 --no-sandbox --enable-unsafe-swiftshader\n\
+                 python3 -m http.server\n\
+                 EOF\n\
+                 ls -l /root/workspace/.verify"
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -237,6 +414,27 @@ mod tests {
         // Trailing ampersand
         assert!(check_shell_command("sleep 100 &").is_err());
         assert!(check_shell_command("nohup sleep 100").is_err());
+        assert!(
+            check_shell_command(
+                "cd /root/horse && setsid nohup python3 -m http.server 8123 >/dev/null 2>&1 & sleep 1"
+            )
+            .is_err()
+        );
+        assert!(check_shell_command("cd /root/horse && python3 -m http.server 8123").is_err());
+
+        // Bounded verification command with inline ephemeral server is allowed
+        assert!(
+            check_shell_command(
+                "cd /root/horse && python3 -m http.server 8123 > /dev/null 2>&1 & SRV=$!; sleep 1; node verify_test.js; kill $SRV 2>/dev/null || true"
+            )
+            .is_ok()
+        );
+        assert!(
+            check_shell_command(
+                "python3 -m http.server 8123 --directory /root/horse >/dev/null 2>&1 & PID=$!; sleep 1; node /tmp/test_horse.js; kill $PID"
+            )
+            .is_ok()
+        );
 
         // But docker compose up -d is allowed
         assert!(check_shell_command("docker compose up -d").is_ok());

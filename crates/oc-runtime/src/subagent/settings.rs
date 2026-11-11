@@ -14,7 +14,7 @@ use super::tree::{json_error, optional_str};
 
 /// Resolved `subagents` configuration plus the per-agent overrides the tools
 /// need.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct SubagentSettings {
     pub(super) limits: Limits,
     pub(super) timeout: Duration,
@@ -22,6 +22,9 @@ pub(crate) struct SubagentSettings {
     pub(super) digest_model: Option<String>,
     pub(super) siblings_wake: bool,
     pub(super) overrides: BTreeMap<String, AgentOverride>,
+    /// Cap on the child's final text embedded in the parent report.
+    // 0 = unlimited (default)
+    pub report_char_limit: usize,
 }
 
 /// One `subagents.agents.<id>` entry.
@@ -124,6 +127,11 @@ pub(crate) fn load_settings(config: &ConfigService) -> SubagentSettings {
             .and_then(Value::as_bool)
             .unwrap_or(true),
         overrides,
+        // 0 = unlimited (default): nothing is dropped unless configured.
+        report_char_limit: field("report_char_limit")
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+            .unwrap_or(0),
     }
 }
 
@@ -184,7 +192,7 @@ pub(crate) async fn session_subagent_mode(runtime: &Runtime, session_id: &str) -
 /// Resolve [`SubagentSettings`] for `session_id`, applying `/complex` (3-level
 /// hierarchy) or `/basic` (single-level hierarchy) overrides from the root
 /// session's metadata.
-pub(super) async fn settings_for_session(runtime: &Runtime, session_id: &str) -> SubagentSettings {
+pub(crate) async fn settings_for_session(runtime: &Runtime, session_id: &str) -> SubagentSettings {
     let mut resolved = settings(runtime);
     match session_subagent_mode(runtime, session_id).await.as_deref() {
         Some("complex") => {

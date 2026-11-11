@@ -22,10 +22,13 @@ impl SubagentState {
         limits: &Limits,
         current_children: u32,
     ) -> &mut SpawnBudget {
+        let rate = limits
+            .max_children
+            .clamp(oc_subagents::DEFAULT_SPAWNS_PER_MIN, 32);
         let budget = self
             .spawn
             .entry(session.to_owned())
-            .or_insert_with(|| SpawnBudget::with_default_rate(limits.max_children));
+            .or_insert_with(|| SpawnBudget::new(limits.max_children, rate));
         budget.sync_active(current_children);
         budget
     }

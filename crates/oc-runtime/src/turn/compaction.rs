@@ -498,8 +498,19 @@ impl Runtime {
             let mut accumulated = 0_u64;
             for index in (0..candidates.len()).rev() {
                 let next = accumulated.saturating_add(costs[index]);
-                if next > keep_tokens && accumulated > 0 {
-                    break;
+                if next > keep_tokens {
+                    // Only a fresh user/peer/synthetic prompt at the very end of
+                    // the transcript may exceed `keep_tokens` on its own; an
+                    // oversized assistant/tool message must be summarized rather
+                    // than replayed verbatim into the post-compaction context.
+                    let is_trigger_prompt = accumulated == 0
+                        && matches!(
+                            candidates[index].get("type").and_then(Value::as_str),
+                            Some("user" | "synthetic" | "peer")
+                        );
+                    if !is_trigger_prompt {
+                        break;
+                    }
                 }
                 accumulated = next;
                 keep_start = index;
@@ -575,23 +586,16 @@ pub(super) fn is_context_overflow_message(message: &str) -> bool {
         || lower.contains("exceeds the model's maximum context")
 }
 
-/// Mask oversized historical tool outputs when a compaction request itself
-/// exceeds the provider's context window.
+/// Mask oversized tool outputs and inline media when a compaction request
+/// itself exceeds the provider's context window.
 pub(super) fn shorten_messages_for_compaction(messages: &[LlmMessage]) -> Vec<LlmMessage> {
     const HEAD_CHARS: usize = 1_000;
     const TAIL_CHARS: usize = 500;
     const MAX_TOOL_CHARS: usize = 2_000;
 
-    let last_tool_msg = messages
-        .iter()
-        .rposition(|message| message.role == oc_llm::Role::Tool);
     messages
         .iter()
-        .enumerate()
-        .map(|(index, message)| {
-            if Some(index) == last_tool_msg {
-                return message.clone();
-            }
+        .map(|message| {
             let content = message
                 .content
                 .iter()
@@ -615,10 +619,54 @@ pub(super) fn shorten_messages_for_compaction(messages: &[LlmMessage]) -> Vec<Ll
                             is_error: *is_error,
                         }
                     }
+                    oc_llm::ContentPart::Image { media_type, data } => {
+                        oc_llm::ContentPart::text(format!(
+                            "[omitted {media_type} attachment ({} chars) during compaction]",
+                            data.len()
+                        ))
+                    }
+                    oc_llm::ContentPart::Document {
+                        media_type, data, ..
+                    } => oc_llm::ContentPart::text(format!(
+                        "[omitted {media_type} document ({} chars) during compaction]",
+                        data.len()
+                    )),
                     other => other.clone(),
                 })
                 .collect();
             LlmMessage::new(message.role, content)
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shorten_messages_for_compaction_truncates_oversized_last_tool_result_and_media() {
+        let huge = "x".repeat(100_000);
+        let messages = vec![
+            LlmMessage::user("read the screenshot"),
+            LlmMessage::tool_result("call_1", Some("read".to_owned()), huge, false),
+            LlmMessage::new(
+                oc_llm::Role::User,
+                vec![oc_llm::ContentPart::image("image/png", "A".repeat(50_000))],
+            ),
+        ];
+        let shortened = shorten_messages_for_compaction(&messages);
+        let oc_llm::ContentPart::ToolResult { content, .. } = &shortened[1].content[0] else {
+            panic!("expected ToolResult");
+        };
+        assert!(
+            content.chars().count() < 2_000,
+            "oversized last tool result must be shortened during compaction fallback, got {} chars",
+            content.chars().count()
+        );
+        assert!(content.contains("omitted 98500 chars during compaction"));
+        assert_eq!(
+            shortened[2].content[0].as_text(),
+            Some("[omitted image/png attachment (50000 chars) during compaction]")
+        );
+    }
 }

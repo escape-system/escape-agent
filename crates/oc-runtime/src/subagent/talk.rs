@@ -46,13 +46,19 @@ impl Tool for TalkTool {
         let runtime = &self.runtime;
         let caller = ctx.session_id.clone();
         let to = required_str(&input, "to")?;
-        let kind = required_str(&input, "kind")?;
+        let raw_kind = required_str(&input, "kind")?;
         let text = required_str(&input, "text")?;
-        if !matches!(kind.as_str(), "note" | "question" | "answer") {
-            return Err(ToolError::new(
-                "InvalidToolInput: kind must be note, question or answer",
-            ));
-        }
+        let kind = match raw_kind.as_str() {
+            "note" | "question" | "answer" => raw_kind,
+            // Models occasionally pass `delivery: "steer"`'s literal as `kind`;
+            // treat it as a peer note rather than failing the turn step.
+            "steer" => "note".to_owned(),
+            _ => {
+                return Err(ToolError::new(
+                    "InvalidToolInput: kind must be note, question or answer",
+                ));
+            }
+        };
         let request_reply = optional_bool(&input, "request_reply").unwrap_or(false);
         let settings = settings_for_session(runtime, &caller).await;
         let from_node = load_node(runtime, &caller).await?;

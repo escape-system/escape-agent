@@ -12,7 +12,7 @@ use crate::runtime::Runtime;
 use super::protocol::{
     after_prompt, assistant_failure, child_state, envelope, envelope_reason, final_assistant_text,
 };
-use super::settings::SubagentSettings;
+use super::settings::{SubagentSettings, settings_for_session};
 use super::tree::{runtime_error, store_error};
 
 /// Poll interval while a foreground `subagent` call waits for its child.
@@ -404,14 +404,18 @@ pub(crate) async fn deliver_subagent_result(
     (state, text, reason): (String, String, Option<String>),
 ) {
     persist_child_outcome(runtime, child, &state).await;
+    // Operator policy: `0` (the default) replays the full child report.
+    let limit = settings_for_session(runtime, parent)
+        .await
+        .report_char_limit;
     let text = if text.trim().is_empty() {
         "subagent failed".to_owned()
     } else {
         text
     };
     let mut body = match &reason {
-        Some(reason) => envelope_reason(&state, child, Some(description), reason, &text),
-        None => envelope(&state, child, Some(description), &text),
+        Some(reason) => envelope_reason(&state, child, Some(description), reason, &text, limit),
+        None => envelope(&state, child, Some(description), &text, limit),
     };
     let mut metadata = json!({
         "source": "subagent",
@@ -552,7 +556,7 @@ pub(super) async fn finish_foreground(
         return Err(error);
     }
     persist_child_outcome(runtime, child, &state).await;
-    let body = envelope(&state, child, None, &text);
+    let body = envelope(&state, child, None, &text, settings.report_char_limit);
     if matches!(state.as_str(), "failed" | "cancelled") {
         // A child that failed or was interrupted is not a result the parent may
         // plan on: returning `Ok` here would be reported as

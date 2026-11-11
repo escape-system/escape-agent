@@ -197,6 +197,28 @@ fn lower_message(message: &LlmMessage, output: &mut Vec<Value>) {
         }
         Role::User => {
             let content = lower_content(&message.content);
+            let has_media_only = message.content.iter().all(|part| {
+                matches!(
+                    part,
+                    ContentPart::Image { .. } | ContentPart::Document { .. }
+                )
+            });
+            if has_media_only
+                && let Some(last) = output.last_mut()
+                && last.get("role").and_then(Value::as_str) == Some("user")
+                && last
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .is_some_and(|blocks| {
+                        blocks.iter().any(|block| {
+                            block.get("type").and_then(Value::as_str) == Some("tool_result")
+                        })
+                    })
+                && let Some(blocks) = last.get_mut("content").and_then(Value::as_array_mut)
+            {
+                blocks.extend(content);
+                return;
+            }
             output.push(json!({"role": "user", "content": content}));
         }
         Role::Assistant => {

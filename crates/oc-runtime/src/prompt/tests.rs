@@ -91,6 +91,47 @@ fn assistant_tool_calls_are_replayed_with_results() {
 }
 
 #[test]
+fn tool_file_data_uri_does_not_inline_base64_into_tool_text_and_emits_image_part() {
+    let big_b64 = "A".repeat(120_000);
+    let uri = format!("data:image/png;base64,{big_b64}");
+    let messages = vec![json!({
+        "type": "assistant",
+        "content": [
+            {"type": "tool", "id": "call_img", "name": "read",
+             "state": {
+                 "status": "completed",
+                 "input": {"filePath": "shot.png"},
+                 "content": [{"type": "file", "uri": uri, "mime": "image/png"}]
+             },
+             "time": {"created": 1}}
+        ]
+    })];
+    let converted = messages_from_store(&messages);
+    assert_eq!(converted.len(), 3);
+    assert_eq!(converted[0].role, Role::Assistant);
+    assert_eq!(converted[1].role, Role::Tool);
+    let oc_llm::ContentPart::ToolResult { content, .. } = &converted[1].content[0] else {
+        panic!("expected ToolResult part");
+    };
+    assert!(
+        !content.contains(&big_b64),
+        "raw base64 must never be inlined into plain-text Role::Tool content"
+    );
+    assert_eq!(content, "[file image/png: 90000 bytes]");
+    assert_eq!(converted[2].role, Role::User);
+    assert_eq!(
+        converted[2].content,
+        vec![oc_llm::ContentPart::image("image/png", big_b64)]
+    );
+    // Token estimation charges IMAGE_TOKENS (1500), not 30,000+ text tokens.
+    let estimated = oc_llm::estimate_messages_tokens(&converted);
+    assert!(
+        estimated < 2_000,
+        "expected image token estimate (< 2000), got {estimated}"
+    );
+}
+
+#[test]
 fn model_references_parse_both_shapes() {
     assert_eq!(
         model_ref(&json!("test/alpha#fast")),

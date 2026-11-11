@@ -25,9 +25,9 @@ use oc_tools::ToolRegistry;
 use crate::runtime::Runtime;
 
 mod digest;
-mod protocol;
+pub(crate) mod protocol;
 mod roster;
-mod settings;
+pub(crate) mod settings;
 mod spawn;
 mod state;
 mod talk;
