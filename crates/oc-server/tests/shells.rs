@@ -165,18 +165,12 @@ fn program_on_path(program: &str) -> bool {
         return false;
     };
     std::env::split_paths(&paths).any(|directory| {
-        if directory.join(program).is_file() {
-            return true;
-        }
-        #[cfg(windows)]
-        {
-            if std::path::Path::new(program).extension().is_none() {
-                return ["exe", "cmd", "bat", "com"]
+        directory.join(program).is_file()
+            || (cfg!(windows)
+                && std::path::Path::new(program).extension().is_none()
+                && ["exe", "cmd", "bat", "com"]
                     .iter()
-                    .any(|extension| directory.join(format!("{program}.{extension}")).is_file());
-            }
-        }
-        false
+                    .any(|extension| directory.join(format!("{program}.{extension}")).is_file()))
     })
 }
 

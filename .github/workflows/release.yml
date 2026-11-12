@@ -47,7 +47,11 @@ jobs:
           ref: ${{ inputs.tag || github.ref }}
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
       - uses: Swatinem/rust-cache@v2
+      - name: Install Windows cross-compiler and zip
+        run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64 zip
       - name: Resolve and verify version
         id: v
         run: |
@@ -72,13 +76,16 @@ jobs:
           bun-version: "1.4.4"
       - name: Build web app
         run: bash ui/build.sh
-      - name: Build server binary
-        run: cargo build --release -p oc-cli --bin opencode
+      - name: Build server binaries (Linux and Windows)
+        run: |
+          cargo build --release -p oc-cli --bin opencode --target x86_64-unknown-linux-gnu
+          CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=x86_64-w64-mingw32-gcc \
+            cargo build --release -p oc-cli --bin opencode --target x86_64-pc-windows-gnu
       - name: Verify binary reports the tag version
         run: |
           set -euo pipefail
           VER="${{ steps.v.outputs.version }}"
-          GOT=$(./target/release/opencode --version)
+          GOT=$(./target/x86_64-unknown-linux-gnu/release/opencode --version)
           echo "binary reports: $GOT"
           if [ "$GOT" != "opencode $VER" ]; then
             echo "::error::binary reports '$GOT', expected 'opencode $VER'"
@@ -88,14 +95,26 @@ jobs:
         run: |
           set -euo pipefail
           VER="${{ steps.v.outputs.version }}"
-          NAME="opencode-${VER}-linux-x86_64"
-          mkdir -p "dist/$NAME/web"
-          cp target/release/opencode "dist/$NAME/opencode"
-          cp -a web/dist "dist/$NAME/web/dist"
-          cp README.md "dist/$NAME/" 2>/dev/null || true
-          if [ -f LICENSE ]; then cp LICENSE "dist/$NAME/"; fi
-          tar -C dist -czf "dist/$NAME.tar.gz" "$NAME"
-          ( cd dist && sha256sum "$NAME.tar.gz" > "$NAME.tar.gz.sha256" )
+          LINUX_NAME="opencode-${VER}-linux-x86_64"
+          WIN_NAME="opencode-${VER}-windows-x86_64"
+
+          mkdir -p "dist/$LINUX_NAME/web" "dist/$WIN_NAME/web"
+          cp target/x86_64-unknown-linux-gnu/release/opencode "dist/$LINUX_NAME/opencode"
+          cp target/x86_64-pc-windows-gnu/release/opencode.exe "dist/$WIN_NAME/opencode.exe"
+          for NAME in "$LINUX_NAME" "$WIN_NAME"; do
+            cp -a web/dist "dist/$NAME/web/dist"
+            cp README.md "dist/$NAME/" 2>/dev/null || true
+            if [ -f LICENSE ]; then cp LICENSE "dist/$NAME/"; fi
+            tar -C dist -czf "dist/$NAME.tar.gz" "$NAME"
+          done
+          ( cd dist && zip -qr "$WIN_NAME.zip" "$WIN_NAME" )
+          (
+            cd dist
+            sha256sum "$LINUX_NAME.tar.gz" > "$LINUX_NAME.tar.gz.sha256"
+            sha256sum "$WIN_NAME.tar.gz" > "$WIN_NAME.tar.gz.sha256"
+            sha256sum "$WIN_NAME.zip" > "$WIN_NAME.zip.sha256"
+            sha256sum "$LINUX_NAME.tar.gz" "$WIN_NAME.tar.gz" "$WIN_NAME.zip" > SHA256SUMS
+          )
           ls -l dist
       - name: Publish GitHub release
         env:
@@ -105,8 +124,9 @@ jobs:
           TAG="${{ steps.v.outputs.tag }}"
           git fetch --tags --force origin
           if gh release view "$TAG" >/dev/null 2>&1; then
-            echo "replacing existing release $TAG"
-            gh release delete "$TAG" --yes
+            echo "updating existing release $TAG"
+            gh release upload "$TAG" dist/*.tar.gz dist/*.zip dist/*.sha256 dist/SHA256SUMS --clobber
+          else
+            gh release create "$TAG" dist/*.tar.gz dist/*.zip dist/*.sha256 dist/SHA256SUMS \
+              --title "$TAG" --generate-notes --verify-tag
           fi
-          gh release create "$TAG" dist/*.tar.gz dist/*.sha256 \
-            --title "$TAG" --generate-notes --verify-tag
