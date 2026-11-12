@@ -30,3 +30,9 @@ test-run.log
 hermes-agent/
 opencode.prev
 opencode-deploy-restart.sh
+
+# Local scratch / agent artifacts that must never be committed.
+# session_audit_report.md carries a plaintext credential.
+session_audit_report.md
+session_audit_report.md.*
+.vscode/
