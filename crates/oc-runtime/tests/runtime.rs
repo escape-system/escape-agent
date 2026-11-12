@@ -29,6 +29,8 @@ mod subagents;
 mod support;
 #[path = "runtime/tools_goals.rs"]
 mod tools_goals;
+#[path = "runtime/turn_budget.rs"]
+mod turn_budget;
 #[path = "runtime/turn_core.rs"]
 mod turn_core;
 #[path = "runtime/write_budget.rs"]

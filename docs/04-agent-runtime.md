@@ -112,6 +112,12 @@ memory block (ours) → goal block (ours) → per-session entries
   records the grammar `step limit reached after N steps` in `idle_reason`. The
   store persists it for `interrupted` outcomes and for step-limit markers,
   whatever outcome records them; every other row keeps it `NULL` (`docs/03`).
+  A turn that reaches its step budget is evaluated once against its in-memory
+  tool evidence before it is allowed to end ([24](24-step-budget.md)). The
+  evaluation is a pure function: no model call, no IO, no clock. A turn showing
+  recent progress may receive a bounded extension, published as the durable
+  `session.execution.step_extended`; otherwise it ends exactly as before with
+  `step limit reached after N steps`.
 - Output limit: `finish === "length"` → synthetic `CONTINUE_AFTER_OUTPUT_LIMIT`;
   three consecutive → `output-limit` failure.
 - Mid-stream interruption → one `CONTINUE_AFTER_INCOMPLETE_STREAM` retry.

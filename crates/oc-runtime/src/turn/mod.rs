@@ -20,6 +20,7 @@ use crate::runtime::{ActorHandle, CancelToken, Runtime, RuntimeError, TerminalSt
 use crate::tokens;
 
 mod assistant;
+mod budget;
 mod compaction;
 mod finalize;
 mod permissions;
@@ -39,6 +40,30 @@ use assistant::assistant_text;
 use stats::TurnStats;
 use stats::collect_tool_lines;
 use types::{ExecutionOutcome, ResolvedTurn};
+
+/// `session.execution.step_extended` — published once per granted extension.
+///
+/// Runtime-local on purpose: `oc-types` owns the upstream wire catalog and this
+/// event is our observability for a turn that outlived `agent.steps`, so it
+/// must not pretend to be an upstream payload. `steps` is the size of this
+/// grant, `totalSteps` the cap after it, `grantIndex` the 1-based grant ordinal
+/// and `reason` the policy rule that granted it. See `docs/24-step-budget.md`.
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionExecutionStepExtended {
+    #[serde(rename = "sessionID")]
+    session_id: String,
+    steps: usize,
+    total_steps: usize,
+    grant_index: usize,
+    reason: &'static str,
+}
+
+impl oc_types::payload::EventPayload for SessionExecutionStepExtended {
+    const TYPE: &'static str = "session.execution.step_extended";
+    const DURABLE: bool = true;
+    const VERSION: u32 = 1;
+}
 
 /// Token pressure for one session, used by compaction and observer advice.
 ///
@@ -275,6 +300,18 @@ impl Runtime {
         let mut pending_stall_notice: Option<String> = None;
         let mut stall_guard = stall::StallGuard::default();
         let mut step_number = 0_usize;
+        // The live step budget. It starts at the configured `agent.steps` and
+        // only grows through `budget::evaluate` grants at the limit; see
+        // `docs/24-step-budget.md`. `turn.max_steps` remains the initial cap the
+        // ceiling and the `StepLimited` count are expressed in.
+        let mut cap = turn.max_steps;
+        let mut grants: Vec<usize> = Vec::new();
+        // Tool evidence for the whole turn, in execution order. It is
+        // accumulated from the steps that actually ran tools because the
+        // limit-reaching request is sent with tools disabled and the streamer
+        // skips every tool event on a `final_call` (`stream.rs`), so
+        // `step.state.content` at the limit branch only ever holds text.
+        let mut observations: Vec<budget::ToolObservation> = Vec::new();
         let compaction = self.compaction_config();
         let ceiling = if turn.context_window == 0 {
             u64::MAX
@@ -342,7 +379,7 @@ impl Runtime {
                 }
             }
 
-            let final_call = step_number >= turn.max_steps;
+            let final_call = step_number >= cap;
             let mut messages = context.clone();
             if let Some(supplement) = &turn.memory_supplement {
                 messages.push(LlmMessage::user(supplement.clone()));
@@ -358,15 +395,15 @@ impl Runtime {
             }
             if final_call {
                 messages.push(LlmMessage::user(MAX_STEPS_PROMPT));
-            } else if turn.max_steps >= 10 {
-                let remaining = turn.max_steps - step_number;
+            } else if cap >= 10 {
+                let remaining = cap - step_number;
                 if remaining == 5 || remaining == 1 {
                     messages.push(LlmMessage::user(format!(
                         "<system-reminder>\nStep budget notice: {remaining} tool-enabled step(s) remain \
                          before the hard step limit ({}/{}) disables tools. Finish any pending \
                          verification or git commit now and prepare your final summary.\n</system-reminder>",
                         step_number + 1,
-                        turn.max_steps
+                        cap
                     )));
                 }
             }
@@ -428,6 +465,7 @@ impl Runtime {
             }
             self.finish_step(session, turn, &mut step).await?;
             collect_tool_lines(stats, &step.state, step_number);
+            budget::observe(&mut observations, &step.state.content);
             if !final_call
                 && step.calls.is_empty()
                 && step.state.finish == Some(oc_types::message::FinishReason::Length)
@@ -470,9 +508,50 @@ impl Runtime {
                 stats.assistant_text = assistant_text(&step.state);
                 if final_call && step_number > 0 {
                     // The budget, not the model, ended the turn: tools were
-                    // disabled for this final request. The outcome carries the
-                    // consumed budget so settle can qualify the terminal and
-                    // persist the honest session outcome.
+                    // disabled for this final request. Before accepting that,
+                    // offer the deterministic policy a chance to extend the
+                    // budget from the in-memory tool evidence (no IO, no model
+                    // call). A grant re-enables tools and continues the loop;
+                    // anything else keeps the historical `StepLimited` return
+                    // byte-identical. See `docs/24-step-budget.md`.
+                    if cap >= budget::MIN_CAP_FOR_EXTENSION {
+                        let decision = budget::evaluate(
+                            &observations,
+                            stats.tool_calls,
+                            &grants,
+                            turn.max_steps,
+                        );
+                        if let Some(granted) = decision.grant.filter(|granted| *granted > 0) {
+                            cap = cap.saturating_add(granted);
+                            grants.push(granted);
+                            tracing::info!(
+                                session = %session,
+                                granted,
+                                cap,
+                                reason = decision.reason,
+                                "step budget extended"
+                            );
+                            self.emit(
+                                session,
+                                &turn.directory,
+                                SessionExecutionStepExtended {
+                                    session_id: session.to_owned(),
+                                    steps: granted,
+                                    total_steps: cap,
+                                    grant_index: grants.len(),
+                                    reason: decision.reason,
+                                },
+                            )
+                            .await?;
+                            // The finished step's assistant row is already
+                            // durable, so the extended request must see it.
+                            context = self.load_context(session).await?;
+                            continue;
+                        }
+                    }
+                    // The outcome carries the consumed budget so settle can
+                    // qualify the terminal and persist the honest session
+                    // outcome.
                     return Ok(ExecutionOutcome::StepLimited {
                         steps: u64::try_from(turn.max_steps).unwrap_or(u64::MAX),
                     });
