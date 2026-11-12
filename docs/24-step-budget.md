@@ -99,7 +99,7 @@ twice: rule 2 bounds the total, rule 1 the count.
   `denies_when_window_has_no_success`, `denies_at_extension_limit`,
   `denies_when_ceiling_would_be_exceeded`, `caller_enforces_min_cap_floor`.
 - `crates/oc-runtime/tests/runtime/turn_budget.rs` (registered at
-  `crates/oc-runtime/tests/runtime.rs:32`): `small_cap_is_never_extended` (:43),
+  `crates/oc-runtime/tests/runtime.rs:33`): `small_cap_is_never_extended` (:43),
   `progress_extensions_continue_the_turn` (:101), `thrashing_is_not_extended`
   (:202) and `extension_is_bounded` (:274). At cap 10 the ceiling binds before
   `MAX_EXTENSIONS`, so one 15-step grant fits and the next evaluation denies

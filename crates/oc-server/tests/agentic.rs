@@ -251,6 +251,11 @@ async fn goal_set_get_patch_history_conflicts() {
     assert_eq!(goal["status"], "active");
     assert_eq!(goal["criteria"][0], "tests pass");
     assert_eq!(goal["model"], "test/alpha");
+    // The wire carries integers, never null: one criterion, none satisfied yet.
+    assert!(goal["done"].is_i64(), "done must be an integer: {goal:?}");
+    assert!(goal["total"].is_i64(), "total must be an integer: {goal:?}");
+    assert_eq!(goal["done"], json!(0));
+    assert_eq!(goal["total"], json!(1));
 
     let (status, body) = call(
         &harness.app,
@@ -260,7 +265,18 @@ async fn goal_set_get_patch_history_conflicts() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(data(body)["id"], first.as_str());
+    let fetched = data(body);
+    assert_eq!(fetched["id"], first.as_str());
+    assert!(
+        fetched["done"].is_i64(),
+        "done must be an integer: {fetched:?}"
+    );
+    assert!(
+        fetched["total"].is_i64(),
+        "total must be an integer: {fetched:?}"
+    );
+    assert_eq!(fetched["done"], json!(0));
+    assert_eq!(fetched["total"], json!(1));
 
     let (status, body) = call(
         &harness.app,
@@ -273,6 +289,22 @@ async fn goal_set_get_patch_history_conflicts() {
     let patched = data(body);
     assert_eq!(patched["status"], "done");
     assert_eq!(patched["rounds"], 2);
+    // Accepting the goal is the only way a criterion counts as done.
+    assert_eq!(patched["done"], json!(1));
+    assert_eq!(patched["total"], json!(1));
+
+    let (status, body) = call(
+        &harness.app,
+        Method::GET,
+        &format!("/api/experimental/goal?sessionID={}", harness.root),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let accepted = data(body);
+    assert_eq!(accepted["id"], first.as_str());
+    assert_eq!(accepted["done"], json!(1));
+    assert_eq!(accepted["total"], json!(1));
 
     let (status, body) = call(
         &harness.app,
@@ -282,7 +314,12 @@ async fn goal_set_get_patch_history_conflicts() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(data(body).as_array().unwrap().len(), 1);
+    // The history projection derives `done`/`total` from the same row.
+    let history = data(body);
+    let rows = history.as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["done"], json!(1));
+    assert_eq!(rows[0]["total"], json!(1));
 
     let (status, _) = call(
         &harness.app,

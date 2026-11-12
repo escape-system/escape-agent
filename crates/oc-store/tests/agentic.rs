@@ -226,6 +226,12 @@ async fn goals_lifecycle_and_active_conflict() {
     assert_eq!(created["stalls"], 0);
     assert_eq!(created["evidence"], json!([]));
     assert_eq!(created["criteria"], json!(["tests pass", "docs updated"]));
+    // `done`/`total` are derived, emitted as integers: nothing is done while
+    // the goal is active, and `total` counts the criteria.
+    assert!(created["done"].is_u64());
+    assert!(created["total"].is_u64());
+    assert_eq!(created["done"], json!(0));
+    assert_eq!(created["total"], json!(2));
     assert_eq!(created["model"], "anthropic/claude");
     assert_eq!(created["time"]["created"], 1_000);
 
@@ -303,6 +309,54 @@ async fn goals_lifecycle_and_active_conflict() {
             .expect("touch")
             .is_some()
     );
+}
+
+#[tokio::test]
+async fn accepted_goal_reports_derived_done_and_total() {
+    let store = Store::open_memory().await.expect("store");
+    store.set_goal(goal("gol_1", 1_000)).await.expect("goal");
+    let paused = store
+        .update_goal(
+            "gol_1",
+            GoalPatch {
+                status: Some("paused".to_owned()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("pause")
+        .expect("goal exists");
+    assert_eq!(paused["done"], json!(0), "a paused goal claims no progress");
+    assert_eq!(paused["total"], json!(2));
+
+    // Accepting the goal is the only way criteria count as done: the row is
+    // still the same one and `total` does not move, but `done` becomes `total`.
+    let accepted = store
+        .update_goal(
+            "gol_1",
+            GoalPatch {
+                status: Some("done".to_owned()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("accept")
+        .expect("goal exists");
+    assert_eq!(accepted["status"], "done");
+    assert_eq!(accepted["done"], json!(2));
+    assert_eq!(accepted["total"], json!(2));
+
+    // `get_goal` and the `list_goals` projection derive the same fields.
+    let current = store
+        .get_goal("ses_root")
+        .await
+        .expect("get")
+        .expect("goal");
+    assert_eq!(current["done"], json!(2));
+    assert_eq!(current["total"], json!(2));
+    let goals = store.list_goals("ses_root").await.expect("list accepted");
+    assert_eq!(goals[0]["done"], json!(2));
+    assert_eq!(goals[0]["total"], json!(2));
 }
 
 #[tokio::test]

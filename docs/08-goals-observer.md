@@ -89,7 +89,8 @@ Input (hard cap `max_input_tokens`, default 600):
 
 ```jsonc
 {
-  "goal": {"id":"gol_…","objective":"…","status":"active","criteria":["…"],"done":1,"total":3},
+  // `done` is 0 until the goal is accepted `done`, then it equals `total`.
+  "goal": {"id":"gol_…","objective":"…","status":"active","criteria":["…"],"done":0,"total":3},
   "root": {"id":"ses_…","agent":"build","model":"…","step":7,"state":"busy"},
   "active": [
     {"sid":"ses_…","agent":"general","tool":"subagent","why":"20 workers; pass/fail list",
@@ -242,6 +243,12 @@ Tools:
 - `goal_status` — returns status, rounds, stalls, evidence.
 
 Statuses: `active | paused | blocked | done | failed | cancelled`.
+
+The goal object served by `GET/POST/PATCH /api/experimental/goal` and its
+`/history` route, and the `goal` object in a `goal.updated` event, both carry
+`done` and `total` as integers. Neither is a column: the store derives
+`total` from `criteria` and `done` as `total` only for a row whose status is
+`done`, otherwise `0` (`docs/08`, this section). They are never `null`.
 
 Prompt block (instruction source `oc/goal`, cache-stable per goal version):
 

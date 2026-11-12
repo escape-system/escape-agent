@@ -76,7 +76,8 @@ runtime.start().await?;          // starts the repair worker
 ```
 
 `StoreGoalStore` is the built-in `GoalStore` adapter: it maps goal rows to
-`GoalSnapshot` (`total` = criteria, `done` = evidence), and saves status,
+`GoalSnapshot` (`total` = number of criteria; `done` = `total` once the status
+is accepted `done`, else `0` — evidence ids are opaque and never counted), and saves status,
 rounds, stalls, progress and evidence through `update_goal`/`set_goal`.
 The host `ObserverNotifier` owns audit persistence (repair log, `goal.updated`).
 

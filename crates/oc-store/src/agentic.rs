@@ -625,14 +625,21 @@ fn goal_value(row: &Row<'_>) -> Result<Value, StoreError> {
     let time_created: Option<i64> = row.get(10)?;
     let time_updated: Option<i64> = row.get(11)?;
 
+    // `done`/`total` are derived from `criteria` and `status`, never stored:
+    // evidence ids are opaque handles with no per-criterion attribution, so a
+    // goal counts as fully done only once its row is accepted `done` (the same
+    // rule as `oc_runtime::goal_store::snapshot`). They are always integers.
+    let criteria = string_array(criteria.as_deref(), "goal criteria")?;
+    let total = u32::try_from(criteria.as_array().map_or(0, Vec::len)).unwrap_or(u32::MAX);
+    let done = if status == "done" { total } else { 0 };
+
     let mut map = Map::new();
     map.insert("id".to_owned(), Value::String(id));
     map.insert("rootID".to_owned(), Value::String(root_id));
     map.insert("objective".to_owned(), Value::String(objective));
-    map.insert(
-        "criteria".to_owned(),
-        string_array(criteria.as_deref(), "goal criteria")?,
-    );
+    map.insert("criteria".to_owned(), criteria);
+    map.insert("done".to_owned(), json!(done));
+    map.insert("total".to_owned(), json!(total));
     map.insert("status".to_owned(), Value::String(status));
     map.insert("rounds".to_owned(), json!(rounds.unwrap_or(0)));
     map.insert("stalls".to_owned(), json!(stalls.unwrap_or(0)));
