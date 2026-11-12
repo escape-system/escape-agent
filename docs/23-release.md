@@ -8,7 +8,7 @@ and `LICENSE`.
 Layout inside the archive:
 
 ```
-opencode-0.3.5-linux-x86_64/
+opencode-0.3.6-linux-x86_64/
   opencode
   README.md
   LICENSE
@@ -47,7 +47,7 @@ replaces the release (`gh release delete --yes` then create).
 ## The version-must-match rule
 
 The tag must equal `[workspace.package] version` in `Cargo.toml` (currently
-`0.3.5`) exactly, minus the leading `v`. The workflow fails before building if
+`0.3.6`) exactly, minus the leading `v`. The workflow fails before building if
 they differ:
 
 ```
@@ -61,21 +61,21 @@ allowed (`v0.2.0-rc.1`), as long as the Cargo version string matches verbatim.
 To release, bump the version and refresh the lockfile so CI sees it:
 
 ```sh
-# edit [workspace.package] version = "0.3.5" in Cargo.toml
+# edit [workspace.package] version = "0.3.6" in Cargo.toml
 cargo metadata --format-version 1 > /dev/null   # refreshes Cargo.lock
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 git add Cargo.toml Cargo.lock
-git commit -m "chore(release): 0.3.5"
+git commit -m "chore(release): 0.3.6"
 git push origin main
 ```
 
 ## Tagging
 
 ```sh
-git tag -a v0.3.5 -m "v0.3.5"
-git push origin v0.3.5
+git tag -a v0.3.6 -m "v0.3.6"
+git push origin v0.3.6
 ```
 
 The tag push triggers the workflow. Watch it with `gh run list` / `gh run watch`.
@@ -84,15 +84,15 @@ No manual asset upload; do not attach files by hand.
 To re-publish without a new tag:
 
 ```sh
-gh workflow run release.yml -f tag=v0.3.5
+gh workflow run release.yml -f tag=v0.3.6
 ```
 
 ## Running a released build
 
 ```sh
-tar xzf opencode-0.3.5-linux-x86_64.tar.gz
-cd opencode-0.3.5-linux-x86_64
-sha256sum -c ../opencode-0.3.5-linux-x86_64.tar.gz.sha256   # if the sidecar is alongside
+tar xzf opencode-0.3.6-linux-x86_64.tar.gz
+cd opencode-0.3.6-linux-x86_64
+sha256sum -c ../opencode-0.3.6-linux-x86_64.tar.gz.sha256   # if the sidecar is alongside
 ./opencode serve --hostname 0.0.0.0 --port 8788
 ```
 
