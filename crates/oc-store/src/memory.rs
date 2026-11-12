@@ -188,9 +188,10 @@ impl Store {
                         }
                         transaction.execute(
                             "UPDATE memory
-                             SET importance = ?2, confidence = ?3, updated = ?4, deleted = 0
+                             SET kind = ?2, text = ?3, tags = ?4, importance = ?5,
+                                 confidence = ?6, updated = ?7, deleted = 0
                              WHERE id = ?1",
-                            params![&existing, importance, confidence, time],
+                            params![&existing, &kind, &text, &tags, importance, confidence, time],
                         )?;
                         return Ok(existing);
                     }
@@ -648,5 +649,65 @@ fn fts_query(raw: &str) -> Option<String> {
         None
     } else {
         Some(tokens.join(" OR "))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn duplicate_write_updates_kind_text_and_tags() {
+        let store = Store::open_memory().await.expect("store");
+        let first = store
+            .write_memory(NewMemory {
+                id: "mem_first".to_owned(),
+                scope: "global".to_owned(),
+                scope_id: None,
+                kind: "fact".to_owned(),
+                text: "Prefer cargo nextest".to_owned(),
+                tags: vec!["rust".to_owned()],
+                importance: 2,
+                confidence: 0.6,
+                source: "user".to_owned(),
+                source_session: None,
+                source_message: None,
+            })
+            .await
+            .expect("first write");
+        assert_eq!(first["id"], "mem_first");
+
+        let second = store
+            .write_memory(NewMemory {
+                id: "mem_second".to_owned(),
+                scope: "global".to_owned(),
+                scope_id: None,
+                kind: "preference".to_owned(),
+                text: "  prefer   cargo  nextest ".to_owned(),
+                tags: vec!["rust".to_owned(), "tooling".to_owned()],
+                importance: 5,
+                confidence: 0.9,
+                source: "agent".to_owned(),
+                source_session: None,
+                source_message: None,
+            })
+            .await
+            .expect("duplicate write");
+
+        assert_eq!(second["id"], "mem_first");
+        assert_eq!(second["kind"], "preference");
+        assert_eq!(second["text"], "prefer   cargo  nextest");
+        assert_eq!(second["tags"], json!(["rust", "tooling"]));
+        assert_eq!(second["importance"], 5);
+
+        let hits = store
+            .search_memories(MemoryQuery {
+                query: Some("tooling".to_owned()),
+                ..Default::default()
+            })
+            .await
+            .expect("search updated tags");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, "mem_first");
     }
 }

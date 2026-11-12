@@ -143,6 +143,9 @@ describe("parseObserverState", () => {
     expect(parseObserverState({ budget: { rootUsed: 4, rootLimit: 10, exhausted: true, other: 1 } })).toEqual({
       budget: { used: 4, limit: 10, exhausted: true },
     })
+    expect(parseObserverState({ budget: { root_used: 7, root_limit: 12, exhausted: true } })).toEqual({
+      budget: { used: 7, limit: 12, exhausted: true },
+    })
     expect(parseObserverState({ budget: { rootUsed: 0, rootLimit: 0 } })).toEqual({
       budget: { used: 0, limit: 0, exhausted: false },
     })
@@ -208,7 +211,7 @@ describe("parseSubagentTree", () => {
   })
 
   test("keeps every documented state", () => {
-    const states = ["busy", "idle", "suspended", "failed", "interrupted", "archived"] as const
+    const states = ["busy", "idle", "completed", "suspended", "failed", "interrupted", "archived"] as const
     const tree = parseSubagentTree({ root: "ses_root", nodes: states.map((state, index) => ({ id: `ses_${index}`, state })) })
     expect(tree?.nodes.map((item) => item.state)).toEqual([...states])
   })

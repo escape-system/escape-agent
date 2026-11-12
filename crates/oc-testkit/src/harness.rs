@@ -219,6 +219,8 @@ impl ServerHarness {
             .stderr(Stdio::piped())
             .kill_on_drop(true)
             .env_clear();
+        #[cfg(unix)]
+        command.process_group(0);
 
         for key in [
             "PATH",
@@ -325,6 +327,7 @@ impl Drop for ServerHarness {
                 ..
             } = running;
             let _ = child.start_kill();
+            let _ = child.try_wait();
             stdout_task.abort();
             stderr_task.abort();
         }
@@ -369,4 +372,45 @@ fn kill_tree(pid: u32) {
 }
 
 #[cfg(not(windows))]
-fn kill_tree(_pid: u32) {}
+fn kill_tree(pid: u32) {
+    if pid <= 1 {
+        return;
+    }
+    let group = format!("-{pid}");
+    let _ = std::process::Command::new("kill")
+        .args(["-KILL", &group])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kill_tree_ignores_invalid_or_init_pids() {
+        kill_tree(0);
+        kill_tree(1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn kill_tree_terminates_process_group_children() {
+        use std::os::unix::process::CommandExt as _;
+
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn sleep in own process group");
+        let pid = child.id();
+        kill_tree(pid);
+        let status = child.wait().expect("reap killed process group leader");
+        assert!(!status.success());
+    }
+}

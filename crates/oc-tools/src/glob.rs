@@ -130,7 +130,6 @@ fn walk(
         .filter_entry(|entry| entry.file_name() != std::ffi::OsStr::new(".git"));
 
     let mut entries = Vec::new();
-    let mut truncated = false;
     for entry in builder.build() {
         let Ok(entry) = entry else { continue };
         if !entry.file_type().is_some_and(|kind| kind.is_file()) {
@@ -142,12 +141,41 @@ fn walk(
         if !matcher.is_match(&relative) {
             continue;
         }
-        if entries.len() >= limit {
-            truncated = true;
-            break;
-        }
         entries.push(util::relative_display(directory, path));
     }
     entries.sort();
+    let truncated = entries.len() > limit;
+    entries.truncate(limit);
     Ok((entries, truncated))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn ctx(dir: &Path) -> ToolContext {
+        ToolContext {
+            session_id: "ses_glob".to_string(),
+            directory: dir.to_path_buf(),
+            cwd: dir.to_path_buf(),
+            cancel: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn glob_truncation_sorts_before_applying_limit() {
+        let dir = TempDir::new().unwrap();
+        for name in ["z.rs", "m.rs", "a.rs", "b.rs"] {
+            fs::write(dir.path().join(name), "").unwrap();
+        }
+        let result = GlobTool
+            .execute(&ctx(dir.path()), json!({"pattern": "*.rs", "limit": 2}))
+            .await
+            .expect("glob should succeed");
+        let output = result.output.expect("text output");
+        assert!(output.starts_with("a.rs\nb.rs"), "{output}");
+        assert!(!output.contains("z.rs"), "{output}");
+        assert_eq!(result.metadata.unwrap()["truncated"], true);
+    }
 }

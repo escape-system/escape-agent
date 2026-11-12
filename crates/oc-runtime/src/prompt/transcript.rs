@@ -182,6 +182,12 @@ fn assistant_messages(message: &Value, out: &mut Vec<LlmMessage>) {
                         tool.name.clone(),
                         Value::Object(input.clone()),
                     ));
+                    results.push(LlmMessage::tool_result(
+                        tool.id.clone(),
+                        Some(tool.name.clone()),
+                        "Tool execution is still running.",
+                        false,
+                    ));
                 }
                 ToolState::Streaming { .. } => {}
             },
@@ -269,4 +275,37 @@ fn compaction_completed(message: &Value) -> bool {
             .get("summary")
             .and_then(Value::as_str)
             .is_some_and(|summary| !summary.trim().is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn running_tool_part_emits_paired_tool_result() {
+        let messages = vec![json!({
+            "type": "assistant",
+            "id": "msg_a1",
+            "content": [{
+                "type": "tool",
+                "id": "call_run_1",
+                "name": "shell",
+                "time": { "created": 1 },
+                "state": {
+                    "status": "running",
+                    "input": {"command": "cargo test"}
+                }
+            }]
+        })];
+        let llm = messages_from_store(&messages);
+        assert_eq!(llm.len(), 2);
+        assert_eq!(llm[0].role, Role::Assistant);
+        assert_eq!(llm[1].role, Role::Tool);
+        assert!(matches!(
+            &llm[1].content[0],
+            ContentPart::ToolResult { tool_call_id, .. } if tool_call_id == "call_run_1"
+        ));
+    }
 }

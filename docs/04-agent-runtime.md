@@ -145,10 +145,11 @@ user-role system nudge naming up to five changed files and asking for a real
 verification command; the model gets at most **2** nudges per turn, then the
 turn settles regardless. Docs-only edits do not trigger it (`.md`, `.txt`,
 `.lock`, `README`, `LICENSE`, … are excluded by `is_code_file`).
-Disable: default is **off**; enable with `verify_on_stop: true` (or
-`agent.verify_on_stop`) in config, or `OPENCODE_VERIFY_ON_STOP=1|true|yes|on`,
+Disable: default is **on** (`true`); disable with `verify_on_stop: false` (or
+`experimental.verify_on_stop: false`) in config, or `OPENCODE_VERIFY_ON_STOP=0|false|no|off`,
 which wins over config. Nothing new is published to the client — the nudge is a
-synthetic message in the transcript.
+synthetic message in the transcript. Verification matches real test/check command
+segments (`echo cargo test` or `grep cargo test` do not count).
 
 **Stall guard** — `crates/oc-runtime/src/turn/stall.rs` (`StallGuard`), recorded
 per tool call in `turn/mod.rs`. Trigger: the same tool name with byte-identical

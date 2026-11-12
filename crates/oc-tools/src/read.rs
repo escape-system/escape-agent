@@ -131,14 +131,15 @@ impl Tool for ReadTool {
             ));
         }
 
+        if bytes.contains(&0) {
+            return Err(ToolError::new(format!("Cannot read binary file: {path}")));
+        }
+
         let text = String::from_utf8_lossy(&bytes);
         let lines = split_lines(&text);
 
         let paged = offset.is_some() || limit.is_some() || bytes.len() > MAX_READ_BYTES;
         if !paged {
-            if bytes.contains(&0) {
-                return Err(ToolError::new(format!("Cannot read binary file: {path}")));
-            }
             let mut output = String::new();
             if lines.is_empty() {
                 let _ = write!(output, "Read file {path}, 0 lines");
@@ -175,9 +176,6 @@ impl Tool for ReadTool {
             if selected.len() >= requested || size >= MAX_READ_BYTES {
                 next = Some(number);
                 break;
-            }
-            if line.contains('\0') {
-                return Err(ToolError::new(format!("Cannot read binary file: {path}")));
             }
             let clamped = clamp_line(line);
             let line_size = clamped.len() + usize::from(!selected.is_empty());
@@ -484,5 +482,20 @@ mod tests {
                 error.message
             );
         }
+    }
+
+    #[tokio::test]
+    async fn rejects_binary_file_even_on_paged_text_slice() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("bin.dat"), b"\x00\x01bin\nline2\nline3\n").unwrap();
+
+        let error = ReadTool
+            .execute(
+                &ctx(dir.path()),
+                json!({"path": "bin.dat", "offset": 2, "limit": 2}),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.message.contains("binary"), "{}", error.message);
     }
 }

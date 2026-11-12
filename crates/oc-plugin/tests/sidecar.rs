@@ -195,6 +195,27 @@ async fn crash_before_handshake_reports_failure() {
 }
 
 #[tokio::test]
+async fn concurrent_startup_crashes_preserve_exit_reason() {
+    let mut set = tokio::task::JoinSet::new();
+    for _ in 0..8 {
+        set.spawn(async move {
+            Sidecar::start(config("crash"), vec!["fake.pkg".to_string()])
+                .await
+                .unwrap_err()
+        });
+    }
+    while let Some(res) = set.join_next().await {
+        match res.unwrap() {
+            SidecarError::Crashed { reason } => {
+                assert!(reason.contains("exited"), "{reason}");
+                assert!(reason.contains("code 3"), "{reason}");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
 async fn crash_after_handshake_is_detected() {
     let sidecar = start("crash_after_ready").await;
     assert!(

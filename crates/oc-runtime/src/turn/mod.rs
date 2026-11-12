@@ -460,8 +460,7 @@ impl Runtime {
                 stats.tool_calls = stats.tool_calls.saturating_add(step.calls.len());
                 for call in &step.calls {
                     if let Some(warning) = stall_guard.record_and_check(&call.name, &call.input) {
-                        pending_stall_notice = Some(warning);
-                        break;
+                        pending_stall_notice.get_or_insert(warning);
                     }
                 }
                 match self

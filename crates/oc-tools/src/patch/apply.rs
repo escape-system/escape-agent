@@ -123,15 +123,10 @@ pub(super) async fn execute(ctx: &ToolContext, input: Value) -> Result<ToolResul
                 let move_target = move_path
                     .map(|destination| {
                         let absolute = util::resolve(ctx, &destination);
-                        (
-                            absolute,
-                            util::relative_display(
-                                &ctx.directory,
-                                &util::resolve(ctx, &destination),
-                            ),
-                        )
+                        let display = util::relative_display(&ctx.directory, &absolute);
+                        (absolute, display)
                     })
-                    .filter(|(absolute, _)| absolute != &target);
+                    .filter(|(absolute, _)| !same_file(&target, absolute));
 
                 if let Some((absolute, _)) = &move_target {
                     state.insert(target.clone(), None);
@@ -153,60 +148,7 @@ pub(super) async fn execute(ctx: &ToolContext, input: Value) -> Result<ToolResul
     }
 
     let diffs: Vec<Value> = prepared.iter().map(Prepared::diff).collect();
-    let mut applied: Vec<(char, String)> = Vec::new();
-
-    for change in prepared {
-        match change {
-            Prepared::Add {
-                target,
-                resource,
-                after,
-            } => {
-                util::atomic_write(&target, after.as_bytes()).map_err(|error| {
-                    failure(format!("Failed to write {resource}: {error}"), &applied)
-                })?;
-                applied.push(('A', resource));
-            }
-            Prepared::Delete {
-                target, resource, ..
-            } => {
-                fs::remove_file(&target).map_err(|error| {
-                    failure(format!("Failed to delete {resource}: {error}"), &applied)
-                })?;
-                applied.push(('D', resource));
-            }
-            Prepared::Update {
-                target,
-                resource,
-                content,
-                move_target,
-                ..
-            } => {
-                if let Some((absolute, move_resource)) = move_target {
-                    util::atomic_write(&absolute, content.as_bytes()).map_err(|error| {
-                        failure(
-                            format!("Failed to write {move_resource}: {error}"),
-                            &applied,
-                        )
-                    })?;
-                    fs::remove_file(&target).map_err(|error| {
-                        failure(
-                            format!(
-                                "Wrote {move_resource} but failed to remove {resource}: {error}"
-                            ),
-                            &applied,
-                        )
-                    })?;
-                    applied.push(('M', move_resource));
-                } else {
-                    util::atomic_write(&target, content.as_bytes()).map_err(|error| {
-                        failure(format!("Failed to write {resource}: {error}"), &applied)
-                    })?;
-                    applied.push(('M', resource));
-                }
-            }
-        }
-    }
+    let applied = apply_prepared(prepared)?;
 
     let mut output = String::from("Success. Updated the following files:");
     for (kind, resource) in &applied {
@@ -287,9 +229,185 @@ fn verification(message: impl Into<String>) -> ToolError {
     ToolError::new(format!("patch verification failed: {}", message.into()))
 }
 
-fn failure(operation: String, applied: &[(char, String)]) -> ToolError {
-    if applied.is_empty() {
+fn same_file(left: &Path, right: &Path) -> bool {
+    if left == right {
+        return true;
+    }
+    match (fs::canonicalize(left), fs::canonicalize(right)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+fn apply_prepared(prepared: Vec<Prepared>) -> Result<Vec<(char, String)>, ToolError> {
+    let originals = snapshot_prepared(&prepared);
+    let mut applied: Vec<(char, String)> = Vec::new();
+    let mut touched: Vec<PathBuf> = Vec::new();
+
+    for change in prepared {
+        match change {
+            Prepared::Add {
+                target,
+                resource,
+                after,
+            } => {
+                if let Err(error) = util::atomic_write(&target, after.as_bytes()) {
+                    let rollback_errors = rollback_touched(&touched, &originals);
+                    return Err(failure(
+                        format!("Failed to write {resource}: {error}"),
+                        &applied,
+                        &rollback_errors,
+                    ));
+                }
+                record_touched(&mut touched, &target);
+                applied.push(('A', resource));
+            }
+            Prepared::Delete {
+                target, resource, ..
+            } => {
+                if let Err(error) = fs::remove_file(&target) {
+                    let rollback_errors = rollback_touched(&touched, &originals);
+                    return Err(failure(
+                        format!("Failed to delete {resource}: {error}"),
+                        &applied,
+                        &rollback_errors,
+                    ));
+                }
+                record_touched(&mut touched, &target);
+                applied.push(('D', resource));
+            }
+            Prepared::Update {
+                target,
+                resource,
+                content,
+                move_target,
+                ..
+            } => {
+                if let Some((absolute, move_resource)) = move_target {
+                    if let Err(error) = util::atomic_write(&absolute, content.as_bytes()) {
+                        let rollback_errors = rollback_touched(&touched, &originals);
+                        return Err(failure(
+                            format!("Failed to write {move_resource}: {error}"),
+                            &applied,
+                            &rollback_errors,
+                        ));
+                    }
+                    record_touched(&mut touched, &absolute);
+                    if let Err(error) = fs::remove_file(&target) {
+                        let rollback_errors = rollback_touched(&touched, &originals);
+                        return Err(failure(
+                            format!(
+                                "Wrote {move_resource} but failed to remove {resource}: {error}"
+                            ),
+                            &applied,
+                            &rollback_errors,
+                        ));
+                    }
+                    record_touched(&mut touched, &target);
+                    applied.push(('M', move_resource));
+                } else {
+                    if let Err(error) = util::atomic_write(&target, content.as_bytes()) {
+                        let rollback_errors = rollback_touched(&touched, &originals);
+                        return Err(failure(
+                            format!("Failed to write {resource}: {error}"),
+                            &applied,
+                            &rollback_errors,
+                        ));
+                    }
+                    record_touched(&mut touched, &target);
+                    applied.push(('M', resource));
+                }
+            }
+        }
+    }
+
+    Ok(applied)
+}
+
+#[derive(Clone)]
+enum OriginalState {
+    File(Vec<u8>),
+    Absent,
+    Unreadable,
+}
+
+fn snapshot_prepared(prepared: &[Prepared]) -> HashMap<PathBuf, OriginalState> {
+    let mut originals = HashMap::new();
+    for change in prepared {
+        match change {
+            Prepared::Add { target, .. } | Prepared::Delete { target, .. } => {
+                snapshot_original(&mut originals, target);
+            }
+            Prepared::Update {
+                target,
+                move_target,
+                ..
+            } => {
+                snapshot_original(&mut originals, target);
+                if let Some((absolute, _)) = move_target {
+                    snapshot_original(&mut originals, absolute);
+                }
+            }
+        }
+    }
+    originals
+}
+
+fn snapshot_original(originals: &mut HashMap<PathBuf, OriginalState>, path: &Path) {
+    if originals.contains_key(path) {
+        return;
+    }
+    let state = match fs::metadata(path) {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => OriginalState::Absent,
+        Ok(meta) if meta.is_file() => {
+            fs::read(path).map_or(OriginalState::Unreadable, OriginalState::File)
+        }
+        Err(_) | Ok(_) => OriginalState::Unreadable,
+    };
+    originals.insert(path.to_path_buf(), state);
+}
+
+fn record_touched(touched: &mut Vec<PathBuf>, path: &Path) {
+    if !touched.iter().any(|existing| existing == path) {
+        touched.push(path.to_path_buf());
+    }
+}
+
+fn rollback_touched(
+    touched: &[PathBuf],
+    originals: &HashMap<PathBuf, OriginalState>,
+) -> Vec<String> {
+    let mut errors = Vec::new();
+    for path in touched.iter().rev() {
+        let Some(state) = originals.get(path) else {
+            continue;
+        };
+        match state {
+            OriginalState::File(bytes) => {
+                if let Err(error) = util::atomic_write(path, bytes) {
+                    errors.push(format!("{}: {error}", path.display()));
+                }
+            }
+            OriginalState::Absent => match fs::remove_file(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => errors.push(format!("{}: {error}", path.display())),
+            },
+            OriginalState::Unreadable => {}
+        }
+    }
+    errors
+}
+
+fn failure(operation: String, applied: &[(char, String)], rollback_errors: &[String]) -> ToolError {
+    if applied.is_empty() && rollback_errors.is_empty() {
         return ToolError::new(operation);
+    }
+    if rollback_errors.is_empty() {
+        return ToolError::new(format!(
+            "{operation}. Rolled back {} earlier change(s).",
+            applied.len()
+        ));
     }
     let completed = applied
         .iter()
@@ -297,6 +415,89 @@ fn failure(operation: String, applied: &[(char, String)]) -> ToolError {
         .collect::<Vec<_>>()
         .join(", ");
     ToolError::new(format!(
-        "{operation}. Completed before failure: {completed}"
+        "{operation}. Rollback partially failed ({}); completed before failure: {completed}",
+        rollback_errors.join("; ")
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn ctx(dir: &Path) -> ToolContext {
+        ToolContext {
+            session_id: "ses_patch".to_string(),
+            directory: dir.to_path_buf(),
+            cwd: dir.to_path_buf(),
+            cancel: None,
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn update_moving_to_symlink_alias_of_same_file_does_not_delete_it() {
+        let dir = TempDir::new().unwrap();
+        let real = dir.path().join("real");
+        fs::create_dir(&real).unwrap();
+        fs::write(real.join("note.txt"), "hello\n").unwrap();
+        std::os::unix::fs::symlink(&real, dir.path().join("alias")).unwrap();
+
+        let patch = "\
+*** Begin Patch
+*** Update File: real/note.txt
+*** Move to: alias/note.txt
+@@
+-hello
++world
+*** End Patch";
+        execute(&ctx(dir.path()), json!({ "patchText": patch }))
+            .await
+            .expect("move to symlink alias should preserve the file");
+
+        assert_eq!(
+            fs::read_to_string(real.join("note.txt")).unwrap(),
+            "world\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_file_patch_rolls_back_earlier_changes_on_failure() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("keep.txt"), "before keep\n").unwrap();
+        fs::write(dir.path().join("restore_me.txt"), "before delete\n").unwrap();
+        fs::create_dir(dir.path().join("blocker")).unwrap();
+        fs::write(dir.path().join("blocker/inside.txt"), "occupied\n").unwrap();
+
+        let patch = "\
+*** Begin Patch
+*** Add File: created.txt
++transient
+*** Update File: keep.txt
+@@
+-before keep
++after keep
+*** Delete File: restore_me.txt
+*** Add File: blocker
++cannot overwrite directory
+*** End Patch";
+
+        let err = execute(&ctx(dir.path()), json!({ "patchText": patch }))
+            .await
+            .expect_err("overwriting directory must fail apply and roll back");
+        assert!(
+            err.message.contains("Rolled back 3 earlier change(s)"),
+            "{}",
+            err.message
+        );
+        assert!(!dir.path().join("created.txt").exists());
+        assert_eq!(
+            fs::read_to_string(dir.path().join("keep.txt")).unwrap(),
+            "before keep\n"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("restore_me.txt")).unwrap(),
+            "before delete\n"
+        );
+    }
 }

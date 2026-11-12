@@ -40,8 +40,18 @@ pub(super) fn collect_tool_lines(
             continue;
         };
         let line = match &tool.state {
-            ToolState::Completed { input, content, .. } => {
+            ToolState::Completed {
+                input,
+                content,
+                metadata,
+                ..
+            } => {
                 let text = tool_text(content);
+                let shell_failure = if tool.name == "shell" {
+                    verify::shell_failure_reason(metadata.as_ref())
+                } else {
+                    None
+                };
                 match tool.name.as_str() {
                     "write" | "edit" => {
                         if let Some(path) = input.get("path").and_then(Value::as_str)
@@ -60,7 +70,8 @@ pub(super) fn collect_tool_lines(
                         }
                     }
                     "shell" => {
-                        if let Some(command) = input.get("command").and_then(Value::as_str)
+                        if shell_failure.is_none()
+                            && let Some(command) = input.get("command").and_then(Value::as_str)
                             && verify::is_verification_command(command)
                         {
                             stats.record_verification(step_number);
@@ -68,7 +79,11 @@ pub(super) fn collect_tool_lines(
                     }
                     _ => {}
                 }
-                format!("- {}: ok{}", tool.name, tool_summary(&text))
+                if let Some(reason) = shell_failure {
+                    format!("- {}: error: {reason}{}", tool.name, tool_summary(&text))
+                } else {
+                    format!("- {}: ok{}", tool.name, tool_summary(&text))
+                }
             }
             ToolState::Error { error, .. } => {
                 format!("- {}: error: {}", tool.name, error.message)
@@ -125,4 +140,72 @@ pub(super) fn scribe_digest(stats: &TurnStats) -> String {
          Assistant final text:\n{assistant}\n\n\
          Tool outcomes:\n{tools}"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use oc_types::message::{ToolPart, ToolTime};
+    use oc_types::{MessageId, ModelRef};
+    use serde_json::{Map, json};
+
+    use super::*;
+
+    fn shell_step(command: &str, metadata: Option<Map<String, Value>>) -> AssistantState {
+        let mut input = Map::new();
+        input.insert("command".to_owned(), json!(command));
+        let mut state = AssistantState::new(
+            MessageId::from_wire("msg_1"),
+            "build".to_owned(),
+            ModelRef {
+                provider_id: "test".to_owned(),
+                id: "alpha".to_owned(),
+                variant: None,
+            },
+            1,
+        );
+        state.content.push(AssistantPart::Tool(Box::new(ToolPart {
+            id: "call_1".to_owned(),
+            name: "shell".to_owned(),
+            executed: Some(true),
+            native: None,
+            time: ToolTime {
+                created: 1,
+                ran: Some(1),
+                completed: Some(2),
+            },
+            state: ToolState::Completed {
+                input,
+                content: vec![ToolContent::Text {
+                    text: "test output".to_owned(),
+                }],
+                metadata,
+            },
+        })));
+        state
+    }
+
+    #[test]
+    fn failed_shell_verification_does_not_mark_step_verified() {
+        let mut stats = TurnStats::default();
+        let mut fail_meta = Map::new();
+        fail_meta.insert("status".to_owned(), json!("completed"));
+        fail_meta.insert("exit".to_owned(), json!(101));
+
+        collect_tool_lines(&mut stats, &shell_step("cargo test", Some(fail_meta)), 1);
+        assert_eq!(stats.last_verification_step, None);
+        assert!(
+            stats
+                .tool_lines
+                .iter()
+                .any(|line| line.contains("exited with code 101")),
+            "{:?}",
+            stats.tool_lines
+        );
+
+        let mut ok_meta = Map::new();
+        ok_meta.insert("status".to_owned(), json!("completed"));
+        ok_meta.insert("exit".to_owned(), json!(0));
+        collect_tool_lines(&mut stats, &shell_step("cargo test", Some(ok_meta)), 2);
+        assert_eq!(stats.last_verification_step, Some(2));
+    }
 }

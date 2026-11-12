@@ -108,42 +108,7 @@ impl LlmClient {
             deadline,
             finished: false,
         };
-        Ok(Box::pin(stream::unfold(state, |mut state| async move {
-            loop {
-                if let Some(event) = state.pending.pop_front() {
-                    return Some((event, state));
-                }
-                if state.finished || state.decoder.is_finished() {
-                    return None;
-                }
-                let next = match read_chunk(&mut state).await {
-                    Ok(next) => next,
-                    Err(event) => {
-                        state.pending.push_back(event);
-                        state.finished = true;
-                        continue;
-                    }
-                };
-                match next {
-                    None => {
-                        state.close();
-                        state.finished = true;
-                    }
-                    Some(bytes) => {
-                        let events = state.parser.push(&bytes);
-                        for event in events {
-                            state.pending.extend(state.decoder.event(&event));
-                        }
-                        if state.decoder.is_finished() {
-                            for event in state.parser.finish() {
-                                state.pending.extend(state.decoder.event(&event));
-                            }
-                            state.pending.extend(state.decoder.finish());
-                        }
-                    }
-                }
-            }
-        })))
+        Ok(into_llm_stream(state))
     }
 
     fn headers(request: &LlmRequest, model: &ResolvedModel) -> Vec<(String, String)> {
@@ -313,12 +278,66 @@ struct StreamState {
     finished: bool,
 }
 
+fn into_llm_stream(state: StreamState) -> LlmStream {
+    Box::pin(stream::unfold(state, |mut state| async move {
+        loop {
+            if let Some(event) = state.pending.pop_front() {
+                return Some((event, state));
+            }
+            if state.finished || state.decoder.is_finished() {
+                return None;
+            }
+            let next = match read_chunk(&mut state).await {
+                Ok(next) => next,
+                Err(event) => {
+                    state.pending.push_back(event);
+                    state.finished = true;
+                    continue;
+                }
+            };
+            match next {
+                None => {
+                    state.close();
+                    state.finished = true;
+                }
+                Some(bytes) => {
+                    let events = state.parser.push(&bytes);
+                    for event in events {
+                        state.pending.extend(state.decoder.event(&event));
+                    }
+                    if state.decoder.is_finished() {
+                        for event in state.parser.finish() {
+                            state.pending.extend(state.decoder.event(&event));
+                        }
+                        state.pending.extend(state.decoder.finish());
+                    }
+                }
+            }
+        }
+    }))
+}
+
 impl StreamState {
     fn close(&mut self) {
         for event in self.parser.finish() {
             self.pending.extend(self.decoder.event(&event));
         }
-        self.pending.extend(self.decoder.finish());
+        if self.decoder.had_completion() {
+            self.pending.extend(self.decoder.finish());
+        } else {
+            let mut tail = self.decoder.finish();
+            tail.retain(|event| !matches!(event, LlmEvent::Finish { .. }));
+            self.pending.extend(tail);
+            if !self
+                .pending
+                .iter()
+                .any(|event| matches!(event, LlmEvent::ProviderError { .. }))
+            {
+                self.pending.push_back(LlmEvent::ProviderError {
+                    message: "provider stream closed before completion".to_string(),
+                });
+            }
+        }
     }
 }
 
@@ -377,5 +396,73 @@ pub struct SharedLlmClient(pub Arc<LlmClient>);
 impl SharedLlmClient {
     pub fn new(client: LlmClient) -> Self {
         Self(Arc::new(client))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn collect_stream(chunks: Vec<&'static str>, protocol: Protocol) -> LlmStream {
+        let body = stream::iter(
+            chunks
+                .into_iter()
+                .map(|chunk| Ok::<Bytes, reqwest::Error>(Bytes::from_static(chunk.as_bytes()))),
+        );
+        into_llm_stream(StreamState {
+            body: Box::pin(body),
+            parser: SseParser::new(),
+            decoder: Decoder::new(protocol),
+            pending: VecDeque::new(),
+            chunk_timeout: Duration::from_secs(5),
+            deadline: None,
+            finished: false,
+        })
+    }
+
+    #[tokio::test]
+    async fn premature_eof_without_completion_emits_provider_error_not_stop() {
+        let mut s = collect_stream(
+            vec!["data: {\"choices\":[{\"delta\":{\"content\":\"half\"}}]}\n\n"],
+            Protocol::OpenAiChat,
+        );
+        let mut events = Vec::new();
+        while let Some(ev) = s.next().await {
+            events.push(ev);
+        }
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, LlmEvent::Finish { .. })),
+            "unexpected Finish on premature EOF: {events:?}"
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            LlmEvent::ProviderError { message } if message.contains("closed before completion")
+        )));
+    }
+
+    #[tokio::test]
+    async fn eof_after_finish_reason_without_done_marker_still_completes() {
+        let mut s = collect_stream(
+            vec![
+                "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            ],
+            Protocol::OpenAiChat,
+        );
+        let mut events = Vec::new();
+        while let Some(ev) = s.next().await {
+            events.push(ev);
+        }
+        assert!(events.iter().any(|event| matches!(
+            event,
+            LlmEvent::Finish { reason, .. } if reason == "stop"
+        )));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, LlmEvent::ProviderError { .. }))
+        );
     }
 }

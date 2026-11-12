@@ -336,6 +336,7 @@ struct TextBlock {
 pub(crate) struct Decoder {
     text: BTreeMap<u64, TextBlock>,
     tools: BTreeMap<u64, ToolAcc>,
+    tool_calls: u64,
     usage: Usage,
     finish_reason: Option<String>,
     pub(crate) done: bool,
@@ -495,6 +496,9 @@ impl Decoder {
                     events.push(LlmEvent::TextEnd { text: block.text });
                 }
                 if let Some(tool) = self.tools.remove(&index) {
+                    if tool.ready() {
+                        self.tool_calls += 1;
+                    }
                     events.extend(tool.close_events());
                 }
             }
@@ -521,6 +525,10 @@ impl Decoder {
         events
     }
 
+    pub(crate) fn had_completion(&self) -> bool {
+        self.done || self.finish_reason.is_some()
+    }
+
     pub(crate) fn finish(&mut self) -> Vec<LlmEvent> {
         if self.done {
             return Vec::new();
@@ -534,10 +542,14 @@ impl Decoder {
             }
         }
         let tools = std::mem::take(&mut self.tools);
-        let has_tools = !tools.is_empty();
+        let had_open_tools = !tools.is_empty();
         for (_, tool) in tools {
+            if tool.ready() {
+                self.tool_calls += 1;
+            }
             events.extend(tool.close_events());
         }
+        let has_tools = self.tool_calls > 0 || had_open_tools;
         events.push(finish_event(
             normalize_finish(self.finish_reason.as_deref(), has_tools),
             std::mem::take(&mut self.usage),

@@ -9,7 +9,7 @@ import { isConfigObject } from "@/settings/agentic/config"
  */
 
 /** `Store::session_node` derives exactly these states. */
-export type SubagentState = "busy" | "idle" | "suspended" | "failed" | "interrupted" | "archived"
+export type SubagentState = "busy" | "idle" | "completed" | "suspended" | "failed" | "interrupted" | "archived"
 
 export type SubagentNode = {
   id: string
@@ -124,6 +124,7 @@ function subagentState(value: unknown): SubagentState {
   const state = asText(value)
   switch (state) {
     case "busy":
+    case "completed":
     case "suspended":
     case "failed":
     case "interrupted":
@@ -172,8 +173,8 @@ export function parseObserverState(value: unknown): ObserverState {
 
   const budget = isConfigObject(value.budget)
     ? {
-        used: asCount(value.budget.rootUsed) ?? 0,
-        limit: asCount(value.budget.rootLimit) ?? 0,
+        used: asCount(value.budget.rootUsed ?? value.budget.root_used) ?? 0,
+        limit: asCount(value.budget.rootLimit ?? value.budget.root_limit) ?? 0,
         exhausted: value.budget.exhausted === true,
       }
     : undefined

@@ -921,6 +921,7 @@ export const dict = {
   "session.agentPanels.relation.descendant": "torun",
   "session.agentPanels.state.busy": "çalışıyor",
   "session.agentPanels.state.idle": "boşta",
+  "session.agentPanels.state.completed": "tamamlandı",
   "session.agentPanels.state.suspended": "duraklatıldı",
   "session.agentPanels.state.failed": "başarısız",
   "session.agentPanels.state.interrupted": "durduruldu",

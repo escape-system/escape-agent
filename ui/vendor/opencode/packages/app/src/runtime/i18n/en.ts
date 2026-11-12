@@ -1438,6 +1438,7 @@ export const dict = {
   "session.agentPanels.relation.descendant": "descendant",
   "session.agentPanels.state.busy": "running",
   "session.agentPanels.state.idle": "idle",
+  "session.agentPanels.state.completed": "completed",
   "session.agentPanels.state.suspended": "suspended",
   "session.agentPanels.state.failed": "failed",
   "session.agentPanels.state.interrupted": "interrupted",

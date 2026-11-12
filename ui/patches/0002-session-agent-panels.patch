@@ -1,7 +1,7 @@
 diff -r a/packages/app/src/runtime/i18n/en.ts b/packages/app/src/runtime/i18n/en.ts
 --- a/packages/app/src/runtime/i18n/en.ts	2026-10-29 20:34:38.147078500 +0300
 +++ b/packages/app/src/runtime/i18n/en.ts	2026-10-29 20:58:12.797120800 +0300
-@@ -1418,6 +1418,55 @@
+@@ -1418,6 +1418,56 @@
    "settings.lanes.unavailable.title": "Lane service not attached",
    "settings.lanes.unavailable.description":
      "This server is running without the lane service, so there is no live queue to show. Concurrency settings still apply once it is attached.",
@@ -19,6 +19,7 @@ diff -r a/packages/app/src/runtime/i18n/en.ts b/packages/app/src/runtime/i18n/en
 +  "session.agentPanels.relation.descendant": "descendant",
 +  "session.agentPanels.state.busy": "running",
 +  "session.agentPanels.state.idle": "idle",
++  "session.agentPanels.state.completed": "completed",
 +  "session.agentPanels.state.suspended": "suspended",
 +  "session.agentPanels.state.failed": "failed",
 +  "session.agentPanels.state.interrupted": "interrupted",
@@ -393,7 +394,7 @@ diff -r a/packages/app/src/session/agent-panels/agent-queries.ts b/packages/app/
 diff -r a/packages/app/src/session/agent-panels/agent-wire.ts b/packages/app/src/session/agent-panels/agent-wire.ts
 --- a/packages/app/src/session/agent-panels/agent-wire.ts	1970-01-01 02:00:00.000000000 +0200
 +++ b/packages/app/src/session/agent-panels/agent-wire.ts	2026-10-29 20:58:14.489167700 +0300
-@@ -0,0 +1,293 @@
+@@ -0,0 +1,294 @@
 +import { isConfigObject } from "@/settings/agentic/config"
 +
 +/**
@@ -405,7 +406,7 @@ diff -r a/packages/app/src/session/agent-panels/agent-wire.ts b/packages/app/src
 + */
 +
 +/** `Store::session_node` derives exactly these states. */
-+export type SubagentState = "busy" | "idle" | "suspended" | "failed" | "interrupted" | "archived"
++export type SubagentState = "busy" | "idle" | "completed" | "suspended" | "failed" | "interrupted" | "archived"
 +
 +export type SubagentNode = {
 +  id: string
@@ -520,6 +521,7 @@ diff -r a/packages/app/src/session/agent-panels/agent-wire.ts b/packages/app/src
 +  const state = asText(value)
 +  switch (state) {
 +    case "busy":
++    case "completed":
 +    case "suspended":
 +    case "failed":
 +    case "interrupted":
@@ -568,8 +570,8 @@ diff -r a/packages/app/src/session/agent-panels/agent-wire.ts b/packages/app/src
 +
 +  const budget = isConfigObject(value.budget)
 +    ? {
-+        used: asCount(value.budget.rootUsed) ?? 0,
-+        limit: asCount(value.budget.rootLimit) ?? 0,
++        used: asCount(value.budget.rootUsed ?? value.budget.root_used) ?? 0,
++        limit: asCount(value.budget.rootLimit ?? value.budget.root_limit) ?? 0,
 +        exhausted: value.budget.exhausted === true,
 +      }
 +    : undefined

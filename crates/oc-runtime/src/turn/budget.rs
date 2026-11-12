@@ -130,7 +130,15 @@ pub(super) fn observe(accumulated: &mut Vec<ToolObservation>, parts: &[Assistant
             continue;
         };
         let outcome = match &tool.state {
-            ToolState::Completed { .. } => Observation::Ok,
+            ToolState::Completed { metadata, .. } => {
+                if tool.name == "shell"
+                    && let Some(reason) = super::verify::shell_failure_reason(metadata.as_ref())
+                {
+                    Observation::Err(reason)
+                } else {
+                    Observation::Ok
+                }
+            }
             ToolState::Error { error, .. } => Observation::Err(error.message.clone()),
             ToolState::Streaming { .. } | ToolState::Running { .. } => Observation::Other,
         };
@@ -249,5 +257,39 @@ mod tests {
         let decision = evaluate(&observations, 1, &[], MIN_CAP_FOR_EXTENSION);
         assert_eq!(decision.grant, Some(EXTENSION_STEPS));
         assert_eq!(decision.reason, "recent tool progress");
+    }
+
+    #[test]
+    fn failing_shell_completed_results_count_as_errors_and_detect_thrashing() {
+        use oc_types::message::{ToolPart, ToolTime};
+        use serde_json::{Map, json};
+
+        let mut fail_meta = Map::new();
+        fail_meta.insert("status".to_owned(), json!("completed"));
+        fail_meta.insert("exit".to_owned(), json!(1));
+
+        let part = AssistantPart::Tool(Box::new(ToolPart {
+            id: "call_sh".to_owned(),
+            name: "shell".to_owned(),
+            executed: Some(true),
+            native: None,
+            time: ToolTime {
+                created: 1,
+                ran: Some(1),
+                completed: Some(2),
+            },
+            state: ToolState::Completed {
+                input: Map::new(),
+                content: Vec::new(),
+                metadata: Some(fail_meta),
+            },
+        }));
+        let mut observations = Vec::new();
+        for _ in 0..3 {
+            observe(&mut observations, std::slice::from_ref(&part));
+        }
+        let decision = evaluate(&observations, 3, &[], MIN_CAP_FOR_EXTENSION);
+        assert_eq!(decision.grant, None);
+        assert_eq!(decision.reason, "repeated identical tool failure");
     }
 }

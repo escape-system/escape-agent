@@ -239,8 +239,6 @@ async fn retained_exited_terminals_are_evicted_oldest_first() {
         if create_or_skip(&manager, exit_request(id)).is_none() {
             return;
         }
-    }
-    for id in ["e1", "e2", "e3"] {
         let exit = wait_exit(&mut events, id).await;
         assert_eq!(exit, Some(0), "unexpected exit for {id}");
     }

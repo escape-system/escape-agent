@@ -13,14 +13,7 @@ pub(crate) fn request(request: &LlmRequest) -> WireRequest {
     let mut contents: Vec<Value> = Vec::new();
     let mut tool_names: Map<String, Value> = Map::new();
     for message in &request.messages {
-        for part in &message.content {
-            if let ContentPart::ToolCall { id, name, .. } = part {
-                tool_names.insert(id.clone(), json!(name));
-            }
-        }
-    }
-    for message in &request.messages {
-        lower_message(message, &tool_names, &mut contents);
+        lower_message(message, &mut tool_names, &mut contents);
     }
 
     let mut generation = Map::new();
@@ -88,7 +81,11 @@ fn tool_config(choice: &str) -> Value {
     clippy::too_many_lines,
     reason = "one lowering table maps every role and content part to Gemini contents"
 )]
-fn lower_message(message: &LlmMessage, tool_names: &Map<String, Value>, output: &mut Vec<Value>) {
+fn lower_message(
+    message: &LlmMessage,
+    tool_names: &mut Map<String, Value>,
+    output: &mut Vec<Value>,
+) {
     match message.role {
         Role::System => {
             let text = message
@@ -127,6 +124,9 @@ fn lower_message(message: &LlmMessage, tool_names: &Map<String, Value>, output: 
                         "inlineData": {"mimeType": media_type, "data": data}
                     })),
                     ContentPart::ToolCall { name, input, id } => {
+                        if !id.is_empty() {
+                            tool_names.insert(id.clone(), json!(name));
+                        }
                         let mut call = Map::new();
                         call.insert("name".to_string(), json!(name));
                         call.insert("args".to_string(), input.clone());
@@ -306,6 +306,10 @@ impl Decoder {
         events
     }
 
+    pub(crate) fn had_completion(&self) -> bool {
+        self.done || self.finish_reason.is_some()
+    }
+
     pub(crate) fn finish(&mut self) -> Vec<LlmEvent> {
         if self.done {
             return Vec::new();
@@ -341,5 +345,48 @@ pub(crate) fn map_usage(usage: &Value) -> Usage {
         total_tokens: u64_at(usage, &["totalTokenCount"]),
         cost: usage.get("cost").and_then(Value::as_f64),
         requests: Some(1),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn multi_turn_tool_names_preserve_earlier_turn_on_id_collision() {
+        let messages = vec![
+            LlmMessage::new(
+                Role::Assistant,
+                vec![ContentPart::tool_call(
+                    "tool_1",
+                    "read",
+                    json!({"path": "a"}),
+                )],
+            ),
+            LlmMessage::tool_result("tool_1", None, "contents", false),
+            LlmMessage::new(
+                Role::Assistant,
+                vec![ContentPart::tool_call(
+                    "tool_1",
+                    "shell",
+                    json!({"command": "ls"}),
+                )],
+            ),
+            LlmMessage::tool_result("tool_1", None, "files", false),
+        ];
+        let mut tool_names = Map::new();
+        let mut contents = Vec::new();
+        for message in &messages {
+            lower_message(message, &mut tool_names, &mut contents);
+        }
+        assert_eq!(contents.len(), 4);
+        assert_eq!(
+            contents[1]["parts"][0]["functionResponse"]["name"],
+            json!("read")
+        );
+        assert_eq!(
+            contents[3]["parts"][0]["functionResponse"]["name"],
+            json!("shell")
+        );
     }
 }

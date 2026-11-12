@@ -40,9 +40,15 @@ pub(crate) enum Command {
         /// Emit raw JSONL event envelopes to stdout instead of formatted text.
         #[arg(long)]
         json: bool,
+        /// Prompt interactively on stderr before approving `permission.asked` requests (default: auto-approve).
+        #[arg(long)]
+        ask_permissions: bool,
     },
     /// Start an interactive multi-turn terminal chat session (default when no subcommand is given).
     Chat {
+        /// Prompt interactively on stderr before approving `permission.asked` requests (default: auto-approve).
+        #[arg(long)]
+        ask_permissions: bool,
         /// Model reference (`provider/id[#variant]`).
         #[arg(short, long)]
         model: Option<String>,
@@ -121,6 +127,7 @@ pub(crate) struct RunOptions {
     pub(crate) session: Option<String>,
     pub(crate) db: Option<PathBuf>,
     pub(crate) json: bool,
+    pub(crate) ask_permissions: bool,
 }
 
 pub(crate) struct ChatOptions {
@@ -129,4 +136,48 @@ pub(crate) struct ChatOptions {
     pub(crate) directory: Option<PathBuf>,
     pub(crate) session: Option<String>,
     pub(crate) db: Option<PathBuf>,
+    pub(crate) ask_permissions: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn permissions_default_to_auto_approve_and_flag_opts_in() {
+        let bare = Cli::try_parse_from(["opencode"]).unwrap();
+        assert!(bare.command.is_none());
+
+        let run_default = Cli::try_parse_from(["opencode", "run", "hi"]).unwrap();
+        match run_default.command.unwrap() {
+            Command::Run {
+                ask_permissions, ..
+            } => assert!(!ask_permissions),
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let run_ask = Cli::try_parse_from(["opencode", "run", "--ask-permissions", "hi"]).unwrap();
+        match run_ask.command.unwrap() {
+            Command::Run {
+                ask_permissions, ..
+            } => assert!(ask_permissions),
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let chat_default = Cli::try_parse_from(["opencode", "chat"]).unwrap();
+        match chat_default.command.unwrap() {
+            Command::Chat {
+                ask_permissions, ..
+            } => assert!(!ask_permissions),
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let chat_ask = Cli::try_parse_from(["opencode", "chat", "--ask-permissions"]).unwrap();
+        match chat_ask.command.unwrap() {
+            Command::Chat {
+                ask_permissions, ..
+            } => assert!(ask_permissions),
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
 }

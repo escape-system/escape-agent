@@ -275,13 +275,13 @@ impl Terminal {
             status.exit = exit;
         }
         self.status_changed.notify_all();
+        if let Some(shared) = self.shared.upgrade() {
+            shared.retire(&self.id);
+        }
         self.emit(PtyEvent::Exited {
             id: self.id.clone(),
             exit,
         });
-        if let Some(shared) = self.shared.upgrade() {
-            shared.retire(&self.id);
-        }
         true
     }
 

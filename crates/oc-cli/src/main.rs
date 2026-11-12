@@ -43,6 +43,7 @@ async fn main() -> anyhow::Result<()> {
             session,
             db,
             json,
+            ask_permissions,
         }) => {
             run_once(RunOptions {
                 prompt,
@@ -52,6 +53,7 @@ async fn main() -> anyhow::Result<()> {
                 session,
                 db,
                 json,
+                ask_permissions,
             })
             .await
         }
@@ -61,6 +63,7 @@ async fn main() -> anyhow::Result<()> {
             directory,
             session,
             db,
+            ask_permissions,
         }) => {
             run_chat(ChatOptions {
                 model,
@@ -68,6 +71,7 @@ async fn main() -> anyhow::Result<()> {
                 directory,
                 session,
                 db,
+                ask_permissions,
             })
             .await
         }
@@ -78,6 +82,7 @@ async fn main() -> anyhow::Result<()> {
                 directory: None,
                 session: None,
                 db: None,
+                ask_permissions: false,
             })
             .await
         }

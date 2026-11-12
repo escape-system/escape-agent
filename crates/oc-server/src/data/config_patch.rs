@@ -6,6 +6,8 @@
 //! loaded `ConfigService` snapshot is immutable.
 
 use std::path::PathBuf;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use axum::Json;
 use axum::extract::State;
@@ -18,6 +20,9 @@ use serde_json::{Map, Value};
 
 use crate::AppState;
 use crate::error::Respond;
+
+static CONFIG_LOCK: Mutex<()> = Mutex::new(());
+static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 const ALLOWED: [&str; 8] = [
     "shell",
@@ -43,8 +48,14 @@ pub async fn patch(State(_state): State<AppState>, Json(body): Json<Value>) -> R
         }
     }
 
-    if let Err(error) = patch_in(&global_dir(), object) {
-        return error.respond();
+    let dir = global_dir();
+    let object = object.clone();
+    match tokio::task::spawn_blocking(move || patch_in(&dir, &object)).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => return error.respond(),
+        Err(error) => {
+            return ApiError::internal(format!("config patch task failed: {error}")).respond();
+        }
     }
 
     let mut response = axum::http::StatusCode::NO_CONTENT.into_response();
@@ -80,6 +91,9 @@ pub(crate) fn update_document<F>(dir: &std::path::Path, edit: F) -> Result<PathB
 where
     F: FnOnce(&mut Map<String, Value>) -> Result<(), ApiError>,
 {
+    let _guard = CONFIG_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let path = target_file(dir);
     let mut document = read_document(&path)?;
     edit(&mut document)?;
@@ -145,22 +159,30 @@ fn write_document(path: &std::path::Path, document: &Map<String, Value>) -> Resu
     })?;
     let bytes = serde_json::to_vec_pretty(&Value::Object(document.clone()))
         .map_err(|error| ApiError::internal(format!("encode config: {error}")))?;
-    let temp = path.with_extension(format!("tmp.{}", std::process::id()));
-    std::fs::write(&temp, bytes)
-        .map_err(|error| ApiError::internal(format!("write config temp: {error}")))?;
-    #[cfg(not(windows))]
-    {
-        std::fs::rename(&temp, path)
-            .map_err(|error| ApiError::internal(format!("install config: {error}")))
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let temp = path.with_extension(format!("tmp.{}.{seq}", std::process::id()));
+    if let Err(error) = std::fs::write(&temp, bytes) {
+        let _ = std::fs::remove_file(&temp);
+        return Err(ApiError::internal(format!("write config temp: {error}")));
     }
-    #[cfg(windows)]
-    {
-        if path.exists() {
-            let _ = std::fs::remove_file(path);
+    let renamed = {
+        #[cfg(not(windows))]
+        {
+            std::fs::rename(&temp, path)
         }
-        std::fs::rename(&temp, path)
-            .map_err(|error| ApiError::internal(format!("install config: {error}")))
+        #[cfg(windows)]
+        {
+            if path.exists() {
+                let _ = std::fs::remove_file(path);
+            }
+            std::fs::rename(&temp, path)
+        }
+    };
+    if let Err(error) = renamed {
+        let _ = std::fs::remove_file(&temp);
+        return Err(ApiError::internal(format!("install config: {error}")));
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -240,5 +262,30 @@ mod tests {
             std::fs::read_to_string(dir.path().join("opencode.jsonc")).unwrap(),
             "{ broken"
         );
+    }
+
+    #[test]
+    fn concurrent_updates_preserve_all_keys_without_temp_file_races() {
+        let dir = tempfile::tempdir().unwrap();
+        std::thread::scope(|scope| {
+            for idx in 0..8 {
+                let path = dir.path();
+                scope.spawn(move || {
+                    update_document(path, |document| {
+                        document.insert(format!("k{idx}"), json!(idx));
+                        Ok(())
+                    })
+                    .expect("concurrent update should succeed");
+                });
+            }
+        });
+        let value: Value = jsonc_parser::parse_to_serde_value(
+            &std::fs::read_to_string(dir.path().join("opencode.jsonc")).unwrap(),
+            &ParseOptions::default(),
+        )
+        .unwrap();
+        for idx in 0..8 {
+            assert_eq!(value[format!("k{idx}")], json!(idx));
+        }
     }
 }

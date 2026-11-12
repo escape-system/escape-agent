@@ -72,6 +72,9 @@ impl CodeMapTool {
                     continue;
                 }
                 total_symbols += symbols.len();
+                if shown_symbols >= limit {
+                    continue;
+                }
                 let rel = relative_to(&ctx.directory, &path);
                 let _ = writeln!(out, "\n{rel} ({} symbols):", symbols.len());
                 for sym in &symbols {
@@ -86,9 +89,6 @@ impl CodeMapTool {
                         sym.signature
                     );
                     shown_symbols += 1;
-                }
-                if shown_symbols >= limit {
-                    break;
                 }
             }
         }
@@ -173,13 +173,13 @@ impl CodeMapTool {
         let files = collect_code_files(ctx, target_path)?;
         let mut hits = Vec::new();
 
-        for path in files {
+        'files: for path in files {
             if let Ok(content) = read_bounded_file(&path) {
                 for (idx, line) in content.lines().enumerate() {
                     if line.contains(query) {
                         hits.push((path.clone(), idx + 1, line.trim().to_string()));
                         if hits.len() >= limit.saturating_mul(2) {
-                            break;
+                            break 'files;
                         }
                     }
                 }
@@ -266,5 +266,38 @@ mod tests {
                 .expect("an unbounded limit should not overflow");
         let metadata = result.metadata.expect("metadata");
         assert_eq!(metadata["matches"], 1);
+    }
+
+    #[test]
+    fn outline_reports_truncation_when_first_file_hits_exact_limit() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("a.rs"),
+            "pub fn one() {}\npub fn two() {}\n",
+        )
+        .unwrap();
+        fs::write(dir.path().join("b.rs"), "pub fn three() {}\n").unwrap();
+
+        let result = CodeMapTool::execute_outline(&ctx(dir.path()), dir.path(), 2)
+            .expect("outline should succeed");
+        let output = result.output.expect("text output");
+        let metadata = result.metadata.expect("metadata");
+        assert_eq!(metadata["symbols"], 3);
+        assert_eq!(metadata["truncated"], true);
+        assert!(output.contains("showing 2 of 3 symbols"), "{output}");
+    }
+
+    #[test]
+    fn references_stops_scanning_across_files_at_twice_limit() {
+        let dir = TempDir::new().unwrap();
+        for name in ["a.rs", "b.rs", "c.rs"] {
+            fs::write(dir.path().join(name), "needle 1\nneedle 2\n").unwrap();
+        }
+
+        let result = CodeMapTool::execute_references(&ctx(dir.path()), dir.path(), "needle", 1)
+            .expect("references should succeed");
+        let metadata = result.metadata.expect("metadata");
+        assert_eq!(metadata["matches"], 2);
+        assert_eq!(metadata["truncated"], true);
     }
 }

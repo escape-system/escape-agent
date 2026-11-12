@@ -74,6 +74,14 @@ impl Decoder {
             Decoder::Gemini(decoder) => decoder.done,
         }
     }
+
+    pub(crate) fn had_completion(&self) -> bool {
+        match self {
+            Decoder::OpenAi(decoder) => decoder.had_completion(),
+            Decoder::Anthropic(decoder) => decoder.had_completion(),
+            Decoder::Gemini(decoder) => decoder.had_completion(),
+        }
+    }
 }
 
 /// A partially received tool call.
@@ -287,5 +295,45 @@ mod tests {
             "malformed tool input must not emit ProviderError"
         );
         assert_eq!(value, Value::String(raw.to_string()));
+    }
+
+    #[test]
+    fn anthropic_closed_tool_block_sets_tool_calls_finish_reason() {
+        let mut decoder = anthropic::Decoder::default();
+        let events_in = [
+            SseEvent {
+                event: Some("content_block_start".to_string()),
+                data: r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"read","input":{}}}"#.to_string(),
+            },
+            SseEvent {
+                event: Some("content_block_delta".to_string()),
+                data: r#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"a.txt\"}"}}"#.to_string(),
+            },
+            SseEvent {
+                event: Some("content_block_stop".to_string()),
+                data: r#"{"type":"content_block_stop","index":0}"#.to_string(),
+            },
+            SseEvent {
+                event: Some("message_delta".to_string()),
+                data: r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"}}"#.to_string(),
+            },
+            SseEvent {
+                event: Some("message_stop".to_string()),
+                data: r#"{"type":"message_stop"}"#.to_string(),
+            },
+        ];
+        let mut emitted = Vec::new();
+        for ev in &events_in {
+            emitted.extend(decoder.event(ev));
+        }
+        assert!(decoder.had_completion());
+        let finish = emitted
+            .iter()
+            .find_map(|event| match event {
+                LlmEvent::Finish { reason, .. } => Some(reason.as_str()),
+                _ => None,
+            })
+            .expect("finish event");
+        assert_eq!(finish, "tool-calls");
     }
 }

@@ -314,6 +314,10 @@ impl Decoder {
         events
     }
 
+    pub(crate) fn had_completion(&self) -> bool {
+        self.done || self.finish_reason.is_some()
+    }
+
     pub(crate) fn finish(&mut self) -> Vec<LlmEvent> {
         if self.done {
             return Vec::new();

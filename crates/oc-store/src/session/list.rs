@@ -27,6 +27,17 @@ use super::{SESSION_COLUMNS, SessionPage, SessionQuery};
 /// the snapshot CTE and in the outer `WHERE`) while its value is pushed once. The
 /// snapshot CTE appears textually before the filters, so the numbering — not the
 /// textual order — has to determine the binding.
+fn escape_like(raw: &str) -> String {
+    let mut escaped = String::with_capacity(raw.len());
+    for ch in raw.chars() {
+        if matches!(ch, '\\' | '%' | '_') {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    escaped
+}
+
 fn placeholder(values: &mut Vec<SqlValue>, value: SqlValue) -> String {
     values.push(value);
     format!("?{}", values.len())
@@ -47,8 +58,9 @@ impl Store {
         let mut conditions: Vec<String> = Vec::new();
         let mut values: Vec<SqlValue> = Vec::new();
         if let Some(search) = &anchor.filters.search {
-            let bound = placeholder(&mut values, SqlValue::Text(format!("%{search}%")));
-            conditions.push(format!("title LIKE {bound}"));
+            let escaped = escape_like(search);
+            let bound = placeholder(&mut values, SqlValue::Text(format!("%{escaped}%")));
+            conditions.push(format!("title LIKE {bound} ESCAPE '\\'"));
         }
         match &anchor.filters.parent {
             Some(Some(parent)) => {
@@ -464,5 +476,50 @@ mod tests {
             vec!["ses_c", "ses_a", "ses_b"],
             "a new walk sees the current order"
         );
+    }
+
+    #[tokio::test]
+    async fn search_escapes_sql_like_wildcards() {
+        let store = Store::open_memory().await.expect("store");
+        for (id, title, at) in [
+            ("ses_pct", "save 100% now", 1_000),
+            ("ses_nonpct", "save 100x now", 2_000),
+            ("ses_under", "foo_bar item", 3_000),
+            ("ses_nonunder", "fooxbar item", 4_000),
+        ] {
+            store
+                .create_session(NewSession {
+                    id: id.to_owned(),
+                    parent_id: None,
+                    project_id: "prj_1".to_owned(),
+                    directory: "/tmp/one".to_owned(),
+                    title: Some(title.to_owned()),
+                    agent: None,
+                    model: None,
+                    metadata: None,
+                    permissions: None,
+                    time_created: at,
+                })
+                .await
+                .expect("create session");
+        }
+
+        let pct = store
+            .list_sessions(SessionQuery {
+                search: Some("100%".to_owned()),
+                ..Default::default()
+            })
+            .await
+            .expect("pct query");
+        assert_eq!(ids(&pct), vec!["ses_pct"]);
+
+        let under = store
+            .list_sessions(SessionQuery {
+                search: Some("foo_bar".to_owned()),
+                ..Default::default()
+            })
+            .await
+            .expect("underscore query");
+        assert_eq!(ids(&under), vec!["ses_under"]);
     }
 }

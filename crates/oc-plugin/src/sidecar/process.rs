@@ -70,20 +70,35 @@ impl Inner {
         }
     }
 
-    async fn on_eof(self: &Arc<Self>) {
-        if matches!(*self.status.lock(), SidecarStatus::Stopped) {
+    async fn on_disconnect(self: &Arc<Self>, fallback: &str) {
+        if matches!(
+            *self.status.lock(),
+            SidecarStatus::Failed(_) | SidecarStatus::Stopped
+        ) {
             return;
         }
-        let code = {
+        let exited = {
             let mut guard = self.child.lock().await;
-            guard
-                .as_mut()
-                .and_then(|child| child.try_wait().ok().flatten())
-                .and_then(|status| status.code())
+            match guard.as_mut() {
+                Some(child) => match child.try_wait() {
+                    Ok(Some(status)) => Some(status),
+                    Ok(None) => tokio::time::timeout(Duration::from_millis(50), child.wait())
+                        .await
+                        .ok()
+                        .and_then(Result::ok),
+                    Err(_) => None,
+                },
+                None => None,
+            }
         };
-        let reason = code.map_or_else(
-            || "sidecar exited unexpectedly".to_string(),
-            |code| format!("sidecar exited unexpectedly with code {code}"),
+        let reason = exited.map_or_else(
+            || fallback.to_owned(),
+            |status| {
+                status.code().map_or_else(
+                    || "sidecar exited unexpectedly".to_owned(),
+                    |code| format!("sidecar exited unexpectedly with code {code}"),
+                )
+            },
         );
         self.fail(&reason);
     }
@@ -226,7 +241,7 @@ async fn write_loop(
         };
         if write.await.is_err() {
             if let Some(inner) = inner.upgrade() {
-                inner.fail("sidecar input closed");
+                inner.on_disconnect("sidecar input closed").await;
             }
             break;
         }
@@ -270,7 +285,7 @@ async fn read_loop(stdout: ChildStdout, inner: Weak<Inner>) {
         }
     }
     if let Some(inner) = inner.upgrade() {
-        inner.on_eof().await;
+        inner.on_disconnect("sidecar exited unexpectedly").await;
     }
 }
 

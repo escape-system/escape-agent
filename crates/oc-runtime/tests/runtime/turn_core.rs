@@ -1655,7 +1655,7 @@ async fn verify_on_stop_nudges_when_code_file_changed_without_test() {
                 "shell",
                 "call_run_test",
                 json!({
-                    "command": "echo cargo test ok",
+                    "command": "cargo test --help >/dev/null",
                     "expectation": expectation(),
                 }),
             ),
@@ -1723,6 +1723,137 @@ async fn verify_on_stop_stops_after_nudge_cap_if_unverified() {
 }
 
 #[tokio::test]
+async fn verify_on_stop_failed_shell_test_does_not_mark_verified() {
+    let harness = Harness::new(
+        vec![
+            // Step 1: LLM writes code
+            named_tool_script(
+                "write",
+                "call_write_code",
+                json!({
+                    "path": "src/main.rs",
+                    "content": "fn main() {}\n",
+                    "expectation": expectation(),
+                }),
+            ),
+            // Step 2: LLM tries to stop -> Nudge 1
+            text_script("Implemented without tests."),
+            // Step 3: Verification command exits non-zero -> must NOT count as verified
+            named_tool_script(
+                "shell",
+                "call_fail_test",
+                json!({
+                    "command": "cargo test --help >/dev/null && false",
+                    "expectation": expectation(),
+                }),
+            ),
+            // Step 4: LLM tries to stop after failing test -> Nudge 2 (still unverified)
+            text_script("Attempted test run."),
+            // Step 5: Passing verification command clears verify_on_stop
+            named_tool_script(
+                "shell",
+                "call_pass_test",
+                json!({
+                    "command": "cargo test --help >/dev/null",
+                    "expectation": expectation(),
+                }),
+            ),
+            // Step 6: LLM finishes cleanly
+            text_script("Tests passed after fix."),
+        ],
+        Arc::new(AllowAll),
+        json!({"verify_on_stop": true}),
+        None,
+    )
+    .await;
+
+    harness.prompt("implement main function").await;
+
+    assert!(harness.sink.has("session.execution.succeeded"));
+    assert_eq!(harness.model.calls(), 6);
+
+    let requests = harness.model.requests();
+    let fourth_req_nudged = requests[4].messages.iter().any(|m| {
+        m.role == Role::User
+            && m.content.iter().any(|c| match c {
+                oc_llm::ContentPart::Text { text } => text.contains("verification evidence"),
+                _ => false,
+            })
+    });
+    assert!(
+        fourth_req_nudged,
+        "request after failed verification command must still carry verification nudge"
+    );
+}
+
+#[tokio::test]
+async fn verify_on_stop_enabled_by_default_rejects_echo_spoof_and_can_be_disabled() {
+    let harness = Harness::new(
+        vec![
+            named_tool_script(
+                "write",
+                "call_write_default",
+                json!({
+                    "path": "src/main.rs",
+                    "content": "fn main() {}\n",
+                    "expectation": expectation(),
+                }),
+            ),
+            text_script("Done."),
+            named_tool_script(
+                "shell",
+                "call_fake_echo",
+                json!({
+                    "command": "echo cargo test ok",
+                    "expectation": expectation(),
+                }),
+            ),
+            text_script("Faked test with echo."),
+            named_tool_script(
+                "shell",
+                "call_real_test",
+                json!({
+                    "command": "cargo test --help >/dev/null",
+                    "expectation": expectation(),
+                }),
+            ),
+            text_script("Verified for real."),
+        ],
+        Arc::new(AllowAll),
+        json!({}),
+        None,
+    )
+    .await;
+
+    harness.prompt("implement main").await;
+    assert!(harness.sink.has("session.execution.succeeded"));
+    assert_eq!(harness.model.calls(), 6);
+
+    let disabled = Harness::new(
+        vec![
+            named_tool_script(
+                "write",
+                "call_write_disabled",
+                json!({
+                    "path": "src/main.rs",
+                    "content": "fn main() {}\n",
+                    "expectation": expectation(),
+                }),
+            ),
+            text_script("Done without verifying."),
+        ],
+        Arc::new(AllowAll),
+        json!({"verify_on_stop": false}),
+        None,
+    )
+    .await;
+
+    disabled.prompt("implement main").await;
+    assert!(disabled.sink.has("session.execution.succeeded"));
+    assert_eq!(disabled.model.calls(), 2);
+}
+
+#[tokio::test]
 async fn stall_guard_nudges_on_identical_consecutive_calls() {
     let harness = Harness::new(
         vec![
@@ -1768,6 +1899,85 @@ async fn stall_guard_nudges_on_identical_consecutive_calls() {
         warning_msg.is_some(),
         "fourth request must contain stall guard warning notice"
     );
+}
+
+#[tokio::test]
+async fn stall_guard_records_remaining_calls_after_warning_in_same_batch() {
+    let multi_read = |calls: &[(&str, u64)]| {
+        let mut events = vec![
+            LlmEvent::StepStart,
+            LlmEvent::TextStart,
+            LlmEvent::TextDelta {
+                delta: "checking".to_owned(),
+            },
+            LlmEvent::TextEnd {
+                text: "checking".to_owned(),
+            },
+        ];
+        for (call_id, offset) in calls {
+            let input =
+                json!({"path": "hello.txt", "offset": offset, "expectation": expectation()});
+            let text = input.to_string();
+            events.push(LlmEvent::ToolInputStart {
+                id: (*call_id).to_owned(),
+                name: "read".to_owned(),
+            });
+            events.push(LlmEvent::ToolInputDelta {
+                id: (*call_id).to_owned(),
+                delta: text.clone(),
+            });
+            events.push(LlmEvent::ToolInputEnd {
+                id: (*call_id).to_owned(),
+                text,
+            });
+            events.push(LlmEvent::ToolCall {
+                id: (*call_id).to_owned(),
+                name: "read".to_owned(),
+                input,
+            });
+        }
+        events.push(LlmEvent::Finish {
+            reason: "tool-calls".to_owned(),
+            usage: usage(),
+        });
+        Script::Events(events)
+    };
+
+    let harness = Harness::new(
+        vec![
+            // Step 1: 3x identical offset=1 triggers warning AND trailing offset=2 must still be recorded (count=1)
+            multi_read(&[("c1", 1), ("c2", 1), ("c3", 1), ("c4", 2)]),
+            // Step 2: 2x offset=2 reaches count=3 only if c4 from Step 1 was recorded
+            multi_read(&[("c5", 2), ("c6", 2)]),
+            // Step 3: Settle
+            text_script("Proceeding with a different approach."),
+        ],
+        Arc::new(AllowAll),
+        json!({}),
+        None,
+    )
+    .await;
+
+    harness.prompt("investigate hello.txt").await;
+
+    assert!(harness.sink.has("session.execution.succeeded"));
+    assert_eq!(harness.model.calls(), 3);
+
+    let requests = harness.model.requests();
+    for step_idx in [1usize, 2usize] {
+        let has_warning = requests[step_idx].messages.iter().any(|m| {
+            m.role == Role::User
+                && m.content.iter().any(|c| match c {
+                    oc_llm::ContentPart::Text { text } => text.contains("Stall Guard Warning"),
+                    _ => false,
+                })
+        });
+        assert!(
+            has_warning,
+            "request {} must contain stall guard warning notice",
+            step_idx + 1
+        );
+    }
 }
 
 #[tokio::test]

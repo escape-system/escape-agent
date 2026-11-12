@@ -27,10 +27,32 @@ impl TestConfig {
         }
     }
 
-    /// Register `providers.fake` targeting `base_url` and select
+    /// Register `providers.fake` targeting `base_url` using OpenAI-compatible
+    /// chat completions and select `fake/model` as the default model.
+    #[must_use]
+    pub fn with_provider(self, base_url: &str) -> Self {
+        self.with_provider_package(base_url, "@opencode/ai/providers/openai-compatible")
+    }
+
+    /// Register `providers.fake` targeting `base_url` with Anthropic Messages
+    /// protocol and select `fake/model` as the default model.
+    #[must_use]
+    pub fn with_anthropic_provider(self, base_url: &str) -> Self {
+        self.with_provider_package(base_url, "@ai-sdk/anthropic")
+    }
+
+    /// Register `providers.fake` targeting `base_url` with Gemini
+    /// `streamGenerateContent` protocol and select `fake/model` as the default
+    /// model.
+    #[must_use]
+    pub fn with_gemini_provider(self, base_url: &str) -> Self {
+        self.with_provider_package(base_url, "@ai-sdk/google")
+    }
+
+    /// Register `providers.fake` targeting `base_url` and `package`, and select
     /// `fake/model` as the default model.
     #[must_use]
-    pub fn with_provider(mut self, base_url: &str) -> Self {
+    pub fn with_provider_package(mut self, base_url: &str, package: &str) -> Self {
         let model = json!({
             "id": "model",
             "name": "Fake Model",
@@ -45,7 +67,7 @@ impl TestConfig {
         });
         let provider = json!({
             "name": "Fake Provider",
-            "package": "@opencode/ai/providers/openai-compatible",
+            "package": package,
             "activation": "enabled",
             "settings": {"baseURL": base_url},
             "models": {"model": model},

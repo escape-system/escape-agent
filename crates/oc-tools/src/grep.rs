@@ -194,7 +194,10 @@ fn search_in(
             continue;
         }
         let display = util::relative_display(directory, &path);
-        let mut searcher = SearcherBuilder::new().line_number(true).build();
+        let mut searcher = SearcherBuilder::new()
+            .binary_detection(grep_searcher::BinaryDetection::quit(b'\x00'))
+            .line_number(true)
+            .build();
         let sink = UTF8(|line_number, line| {
             let text = line.trim_end_matches(['\n', '\r']);
             hits.push(Hit {
@@ -246,5 +249,35 @@ fn clamp_line(line: &str) -> String {
         format!("{head}...")
     } else {
         line.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn ctx(dir: &Path) -> ToolContext {
+        ToolContext {
+            session_id: "ses_grep".to_string(),
+            directory: dir.to_path_buf(),
+            cwd: dir.to_path_buf(),
+            cancel: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn skips_binary_files_with_nul_bytes() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("binary.bin"), b"\x00needle\n").unwrap();
+        fs::write(dir.path().join("text.rs"), "let needle = 1;\n").unwrap();
+
+        let result = GrepTool
+            .execute(&ctx(dir.path()), json!({"pattern": "needle"}))
+            .await
+            .expect("grep should succeed");
+        let output = result.output.expect("text output");
+        assert!(output.contains("text.rs"), "{output}");
+        assert!(!output.contains("binary.bin"), "{output}");
     }
 }

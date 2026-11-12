@@ -13,7 +13,7 @@ use oc_types::{
     SessionId, SessionInboxEnqueued, now_millis, project_id_from_directory,
 };
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, BufReader, Lines, Stdin};
 use tokio::sync::broadcast;
 
 use crate::bootstrap::{attach_extensions, attach_runtime, open_services};
@@ -29,6 +29,7 @@ pub(crate) async fn run_once(options: RunOptions) -> anyhow::Result<()> {
         session,
         db,
         json: json_mode,
+        ask_permissions,
     } = options;
 
     let text = resolve_prompt_text(&prompt)?;
@@ -55,7 +56,14 @@ pub(crate) async fn run_once(options: RunOptions) -> anyhow::Result<()> {
     let mut rx = host.state.bus().subscribe();
     enqueue_user_prompt(&host.state, &session_id, &text).await?;
 
-    let outcome = stream_turn(&host, &session_id, &mut rx, json_mode).await;
+    let mut stdin_lines = (ask_permissions && !json_mode && std::io::stdin().is_terminal())
+        .then(|| BufReader::new(tokio::io::stdin()).lines());
+    let mut prompt_mode = if ask_permissions {
+        PermissionPrompt::Interactive(stdin_lines.as_mut())
+    } else {
+        PermissionPrompt::AutoApprove
+    };
+    let outcome = stream_turn(&host, &session_id, &mut rx, json_mode, &mut prompt_mode).await;
     host.shutdown().await;
     outcome
 }
@@ -69,6 +77,7 @@ pub(crate) async fn run_chat(options: ChatOptions) -> anyhow::Result<()> {
         directory,
         session,
         db,
+        ask_permissions,
     } = options;
 
     let directory = resolve_directory(directory)?;
@@ -207,7 +216,15 @@ pub(crate) async fn run_chat(options: ChatOptions) -> anyhow::Result<()> {
         if matches!(trimmed, "/compact" | "/compress") {
             let mut rx = host.state.bus().subscribe();
             enqueue_compaction(&host.state, &session_id).await?;
-            if let Err(error) = stream_turn(&host, &session_id, &mut rx, false).await {
+            let interactive_tty = ask_permissions && std::io::stdin().is_terminal();
+            let mut prompt_mode = if ask_permissions {
+                PermissionPrompt::Interactive(interactive_tty.then_some(&mut reader))
+            } else {
+                PermissionPrompt::AutoApprove
+            };
+            if let Err(error) =
+                stream_turn(&host, &session_id, &mut rx, false, &mut prompt_mode).await
+            {
                 eprintln!("\x1b[31m{error}\x1b[0m");
             } else {
                 eprintln!("\x1b[2m[session compacted]\x1b[0m");
@@ -217,7 +234,14 @@ pub(crate) async fn run_chat(options: ChatOptions) -> anyhow::Result<()> {
 
         let mut rx = host.state.bus().subscribe();
         enqueue_user_prompt(&host.state, &session_id, trimmed).await?;
-        if let Err(error) = stream_turn(&host, &session_id, &mut rx, false).await {
+        let interactive_tty = ask_permissions && std::io::stdin().is_terminal();
+        let mut prompt_mode = if ask_permissions {
+            PermissionPrompt::Interactive(interactive_tty.then_some(&mut reader))
+        } else {
+            PermissionPrompt::AutoApprove
+        };
+        if let Err(error) = stream_turn(&host, &session_id, &mut rx, false, &mut prompt_mode).await
+        {
             eprintln!("\x1b[31m{error}\x1b[0m");
         }
         println!();
@@ -434,12 +458,94 @@ async fn publish_inbox(
     Ok(())
 }
 
+enum PermissionPrompt<'a> {
+    AutoApprove,
+    Interactive(Option<&'a mut Lines<BufReader<Stdin>>>),
+}
+
+fn parse_permission_reply(input: &str) -> Option<PermissionReply> {
+    match input.trim().to_ascii_lowercase().as_str() {
+        "o" | "once" | "y" | "yes" | "1" => Some(PermissionReply::Once),
+        "a" | "always" | "all" => Some(PermissionReply::Always),
+        "" | "r" | "reject" | "n" | "no" | "d" | "deny" => Some(PermissionReply::Reject),
+        _ => None,
+    }
+}
+
+async fn decide_permission_reply(
+    host: &TerminalHost,
+    session_id: &str,
+    data: &Value,
+    json_mode: bool,
+    prompt_mode: &mut PermissionPrompt<'_>,
+) -> anyhow::Result<PermissionReply> {
+    let action = data.get("action").and_then(Value::as_str).unwrap_or("tool");
+    match prompt_mode {
+        PermissionPrompt::AutoApprove => {
+            if !json_mode {
+                eprintln!("\x1b[2m[permission] auto-approved {action}\x1b[0m");
+            }
+            Ok(PermissionReply::Once)
+        }
+        PermissionPrompt::Interactive(None) => {
+            if !json_mode {
+                eprintln!(
+                    "\x1b[33m[permission] denied {action} (non-interactive stdin with --ask-permissions)\x1b[0m"
+                );
+            }
+            Ok(PermissionReply::Reject)
+        }
+        PermissionPrompt::Interactive(Some(lines)) => {
+            let resources: Vec<&str> = data
+                .get("resources")
+                .and_then(Value::as_array)
+                .map(|items| items.iter().filter_map(Value::as_str).collect())
+                .unwrap_or_default();
+            let message = data.get("message").and_then(Value::as_str);
+            eprintln!();
+            if resources.is_empty() {
+                eprintln!("\x1b[33m[permission] {action}\x1b[0m");
+            } else {
+                eprintln!(
+                    "\x1b[33m[permission] {action}: {}\x1b[0m",
+                    resources.join(", ")
+                );
+            }
+            if let Some(msg) = message
+                && !msg.trim().is_empty()
+            {
+                eprintln!("  {msg}");
+            }
+            loop {
+                eprint!("  Allow? [o]nce / [a]lways / [r]eject (default: reject): ");
+                let _ = std::io::stderr().flush();
+                let line = tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {
+                        let _ = host.runtime.interrupt(session_id).await;
+                        eprintln!("\n\x1b[33m[interrupted]\x1b[0m");
+                        bail!("execution interrupted by user");
+                    }
+                    next = lines.next_line() => match next {
+                        Ok(Some(line)) => line,
+                        Ok(None) | Err(_) => return Ok(PermissionReply::Reject),
+                    }
+                };
+                if let Some(reply) = parse_permission_reply(&line) {
+                    return Ok(reply);
+                }
+                eprintln!("  Please enter 'o' (once), 'a' (always), or 'r' (reject).");
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 async fn stream_turn(
     host: &TerminalHost,
     session_id: &str,
     rx: &mut broadcast::Receiver<std::sync::Arc<EventEnvelope>>,
     json_mode: bool,
+    prompt_mode: &mut PermissionPrompt<'_>,
 ) -> anyhow::Result<()> {
     let mut tool_names: HashMap<String, String> = HashMap::new();
     let mut in_reasoning = false;
@@ -470,18 +576,16 @@ async fn stream_turn(
                 .get("id")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            let action = envelope
-                .data
-                .get("action")
-                .and_then(Value::as_str)
-                .unwrap_or("tool");
             if !ask_session.is_empty() && !request_id.is_empty() {
-                if !json_mode {
-                    eprintln!("\x1b[2m[permission] auto-approved {action}\x1b[0m");
-                }
-                let _ = host
-                    .broker
-                    .reply(ask_session, request_id, PermissionReply::Once, None);
+                let reply = decide_permission_reply(
+                    host,
+                    session_id,
+                    &envelope.data,
+                    json_mode,
+                    prompt_mode,
+                )
+                .await?;
+                let _ = host.broker.reply(ask_session, request_id, reply, None);
             }
             continue;
         }
@@ -679,4 +783,29 @@ async fn print_session_status(host: &TerminalHost, session_id: &str) -> anyhow::
     eprintln!("Model:    {model}");
     eprintln!("Messages: {}", page.items.len());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn permission_reply_parser_maps_choices_and_defaults_safely() {
+        assert_eq!(parse_permission_reply("o"), Some(PermissionReply::Once));
+        assert_eq!(parse_permission_reply("Once"), Some(PermissionReply::Once));
+        assert_eq!(parse_permission_reply("  y "), Some(PermissionReply::Once));
+        assert_eq!(parse_permission_reply("a"), Some(PermissionReply::Always));
+        assert_eq!(
+            parse_permission_reply("always"),
+            Some(PermissionReply::Always)
+        );
+        assert_eq!(parse_permission_reply("r"), Some(PermissionReply::Reject));
+        assert_eq!(
+            parse_permission_reply("reject"),
+            Some(PermissionReply::Reject)
+        );
+        assert_eq!(parse_permission_reply("n"), Some(PermissionReply::Reject));
+        assert_eq!(parse_permission_reply(""), Some(PermissionReply::Reject));
+        assert_eq!(parse_permission_reply("maybe"), None);
+    }
 }

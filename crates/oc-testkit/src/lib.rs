@@ -2,8 +2,8 @@
 //!
 //! The crate provides three pieces:
 //!
-//! - [`FakeProvider`] — an in-process OpenAI-compatible SSE provider that
-//!   records every request body and replays a scripted response;
+//! - [`FakeProvider`] — an in-process OpenAI/Anthropic/Gemini SSE provider
+//!   that records every request body and replays a scripted response;
 //! - [`ServerHarness`] — spawns `opencode serve` in an isolated temporary
 //!   environment, parses the bound URL from stdout, and tears the process tree
 //!   down on drop;
