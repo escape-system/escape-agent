@@ -525,14 +525,24 @@ async fn shell_reaps_background_children_in_process_group_on_exit() {
     assert_eq!(result.output.unwrap().trim(), "done");
     let bg_pid: u32 = read(&pid_file).trim().parse().unwrap();
     // Process group cleanup should have terminated the background sleep process.
-    let status = std::process::Command::new("kill")
-        .args(["-0", &bg_pid.to_string()])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .unwrap();
+    // A killed child stays visible to `kill -0` until its parent of last resort
+    // reaps it, so poll instead of sampling once: a single non-blocking check
+    // races with that reaping and fails intermittently.
+    let gone = |pid: u32| {
+        !std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap()
+            .success()
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !gone(bg_pid) && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
     assert!(
-        !status.success(),
+        gone(bg_pid),
         "background child pid {bg_pid} should be reaped when ShellTool completes"
     );
 }

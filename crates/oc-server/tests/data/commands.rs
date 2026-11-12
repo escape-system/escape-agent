@@ -258,3 +258,122 @@ async fn compress_command_and_prompt_alias_admit_compaction() {
         "the raw /compress alias must not be persisted as a user prompt: {messages:?}"
     );
 }
+
+/// The depth prefix is found by offset in the original string, so a multi-byte
+/// separator before it can never be cut through (it used to panic the handler).
+#[tokio::test]
+async fn subagent_depth_prefix_accepts_unicode_separators() {
+    let harness = harness().await;
+    let app = router(harness.state.clone());
+    let sid = session_id(&create_session(&app, json!({})).await);
+
+    for (text, depth, remainder) in [("\u{00a0}7 run", 7, "run"), ("\u{3000}3 abc", 3, "abc")] {
+        let (status, body) = call(
+            &app,
+            Method::POST,
+            &format!("/api/session/{sid}/command"),
+            Some(json!({"name": "complex", "text": text})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{text:?}: {body:?}");
+
+        let (_, body) = call(&app, Method::GET, &format!("/api/session/{sid}"), None).await;
+        let session = body.unwrap()["data"].clone();
+        assert_eq!(
+            session["metadata"]["maxDepth"], depth,
+            "{text:?}: {session:?}"
+        );
+        assert_eq!(session["metadata"]["subagentMode"], "complex", "{text:?}");
+
+        let (_, body) = call(
+            &app,
+            Method::GET,
+            &format!("/api/session/{sid}/message?order=asc"),
+            None,
+        )
+        .await;
+        let messages = body.unwrap();
+        let texts: Vec<&str> = messages["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|message| message["type"] == "user")
+            .filter_map(|message| message["text"].as_str())
+            .collect();
+        assert_eq!(
+            texts.last().copied(),
+            Some(remainder),
+            "{text:?}: {messages:?}"
+        );
+    }
+}
+
+/// Leading whitespace before the depth was counted as if it were the depth
+/// word, so `"  7 run"` parsed depth 7 and still forwarded `"7 run"`.
+#[tokio::test]
+async fn subagent_depth_prefix_skips_leading_whitespace() {
+    let harness = harness().await;
+    let app = router(harness.state.clone());
+    let sid = session_id(&create_session(&app, json!({})).await);
+
+    let (status, body) = call(
+        &app,
+        Method::POST,
+        &format!("/api/session/{sid}/command"),
+        Some(json!({"name": "complex", "text": "  7 run"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body:?}");
+
+    let (_, body) = call(&app, Method::GET, &format!("/api/session/{sid}"), None).await;
+    assert_eq!(body.unwrap()["data"]["metadata"]["maxDepth"], 7);
+
+    let (_, body) = call(
+        &app,
+        Method::GET,
+        &format!("/api/session/{sid}/message?order=asc"),
+        None,
+    )
+    .await;
+    let messages = body.unwrap();
+    let texts: Vec<&str> = messages["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|message| message["type"] == "user")
+        .filter_map(|message| message["text"].as_str())
+        .collect();
+    assert_eq!(texts, vec!["run"], "{messages:?}");
+}
+
+/// The `/mode` prompt path and the `/command` path share one parser, so they
+/// must agree on the depth prefix and leave user spacing alone.
+#[tokio::test]
+async fn mode_slash_command_keeps_user_spacing() {
+    let harness = harness().await;
+    let app = router(harness.state.clone());
+    let sid = session_id(&create_session(&app, json!({})).await);
+
+    let (status, body) = call(
+        &app,
+        Method::POST,
+        &format!("/api/session/{sid}/prompt"),
+        Some(json!({"text": "/basic hello   world"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body.unwrap()["data"]["payload"]["text"], "hello   world");
+
+    let (status, body) = call(
+        &app,
+        Method::POST,
+        &format!("/api/session/{sid}/prompt"),
+        Some(json!({"text": "/basic\u{3000}3 abc"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body.unwrap()["data"]["payload"]["text"], "abc");
+
+    let (_, body) = call(&app, Method::GET, &format!("/api/session/{sid}"), None).await;
+    assert_eq!(body.unwrap()["data"]["metadata"]["maxDepth"], 3);
+}

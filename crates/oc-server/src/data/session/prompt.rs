@@ -17,6 +17,23 @@ use crate::data::{
 };
 use crate::error::ErrorResponse;
 
+/// Splits an optional `1..=10` depth prefix off a subagent-mode argument list.
+///
+/// Both the `/mode` prompt path and the `/command` path funnel through this so
+/// the two copies cannot drift. The offset is derived from the string itself:
+/// [`str::split_whitespace`] accepts multi-byte separators (U+00A0, U+3000), so
+/// slicing at `word.len()` cuts through them and panics.
+fn split_depth_prefix(text: &str) -> Option<(u32, &str)> {
+    let start = text.find(|character: char| !character.is_whitespace())?;
+    let rest = &text[start..];
+    let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+    let depth = rest[..end]
+        .parse::<u32>()
+        .ok()
+        .filter(|depth| (1..=10).contains(depth))?;
+    Some((depth, rest[end..].trim()))
+}
+
 fn parse_mode_slash_command(raw: &str) -> Option<(&'static str, Option<u32>, &str)> {
     let trimmed = raw.trim();
     for (prefix, mode) in [("/complex", "complex"), ("/basic", "basic")] {
@@ -25,15 +42,10 @@ fn parse_mode_slash_command(raw: &str) -> Option<(&'static str, Option<u32>, &st
                 return Some((mode, None, ""));
             }
             if rest.starts_with(char::is_whitespace) {
-                let rest = rest.trim();
-                if let Some(first_word) = rest.split_whitespace().next()
-                    && let Ok(depth) = first_word.parse::<u32>()
-                    && (1..=10).contains(&depth)
-                {
-                    let remainder = rest[first_word.len()..].trim();
+                if let Some((depth, remainder)) = split_depth_prefix(rest) {
                     return Some((mode, Some(depth), remainder));
                 }
-                return Some((mode, None, rest));
+                return Some((mode, None, rest.trim()));
             }
         }
     }
@@ -534,12 +546,9 @@ pub async fn command(
         };
         let mut arguments = body.text.unwrap_or_default();
         let mut depth_override = None;
-        if let Some(first_word) = arguments.split_whitespace().next()
-            && let Ok(depth) = first_word.parse::<u32>()
-            && (1..=10).contains(&depth)
-        {
+        if let Some((depth, remainder)) = split_depth_prefix(&arguments) {
             depth_override = Some(depth);
-            arguments = arguments[first_word.len()..].trim().to_owned();
+            arguments = remainder.to_owned();
         }
         apply_subagent_mode(&state, &session_id, mode, depth_override).await?;
         if !arguments.trim().is_empty() {

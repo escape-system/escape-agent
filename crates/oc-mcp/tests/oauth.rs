@@ -142,3 +142,105 @@ async fn oauth_metadata_pkce_exchange_and_refresh() {
     assert_eq!(stored.tokens.expect("tokens").access_token, "access-2");
     assert!(stored.expires_at.is_some_and(|expires| expires > 0));
 }
+
+/// Spawns a fake authorization server whose token endpoint reports `expires_in`.
+async fn session_with_expires_in(expires_in: u64) -> (OAuthSession, Arc<MemoryCredentialStore>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let address = listener.local_addr().expect("address");
+    let base = format!("http://{address}");
+    let state = Arc::new(OAuthState {
+        base: base.clone(),
+        token_requests: std::sync::Mutex::new(Vec::new()),
+        refreshes: AtomicU32::new(0),
+    });
+    let metadata_base = base.clone();
+    let app = Router::new()
+        .route(
+            "/.well-known/oauth-authorization-server",
+            get(move || {
+                let base = metadata_base.clone();
+                async move {
+                    Json(json!({
+                        "issuer": base,
+                        "authorization_endpoint": format!("{base}/authorize"),
+                        "token_endpoint": format!("{base}/token"),
+                        "code_challenge_methods_supported": ["S256"],
+                        "token_endpoint_auth_methods_supported": ["none"]
+                    }))
+                }
+            }),
+        )
+        .route(
+            "/token",
+            post(move || async move {
+                Json(json!({
+                    "access_token": "access-hostile",
+                    "token_type": "Bearer",
+                    "expires_in": expires_in,
+                    "refresh_token": "refresh-hostile"
+                }))
+            }),
+        )
+        .with_state(state);
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve");
+    });
+
+    let store = Arc::new(MemoryCredentialStore::new());
+    let session = OAuthSession::new(
+        "remote",
+        url::Url::parse(&format!("{base}/mcp")).expect("url"),
+        OAuthConfig {
+            client_id: Some("client-id".to_owned()),
+            client_secret: None,
+            scope: None,
+            callback_port: None,
+            redirect_uri: None,
+            auth_server_metadata_url: Some(format!(
+                "{base}/.well-known/oauth-authorization-server"
+            )),
+        },
+        store.clone(),
+    )
+    .expect("session");
+    (session, store)
+}
+
+/// A hostile `expires_in` must not overflow the epoch conversion: debug builds
+/// panicked on `seconds * 1_000` and release builds wrapped to the past.
+#[tokio::test]
+async fn hostile_expires_in_does_not_overflow() {
+    const YEAR_MS: i64 = 366 * 24 * 60 * 60 * 1_000;
+    for expires_in in [u64::MAX, i64::MAX as u64] {
+        let (session, store) = session_with_expires_in(expires_in).await;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_millis();
+        let now = i64::try_from(now).expect("epoch millis fit");
+
+        session
+            .begin("http://127.0.0.1:43123/callback")
+            .await
+            .expect("begin");
+        let tokens = session.complete("code-123").await.expect("complete");
+        assert_eq!(tokens.expires_in, Some(expires_in));
+
+        let stored = store.load("remote").await.expect("load").expect("stored");
+        let expires_at = stored.expires_at.expect("expiry is recorded");
+        assert!(
+            expires_at > now,
+            "expires_in {expires_in}: token must not be born expired ({expires_at} <= {now})"
+        );
+        assert!(
+            expires_at <= now + YEAR_MS + 60_000,
+            "expires_in {expires_in}: lifetime must be clamped to a sane window ({expires_at})"
+        );
+
+        // The clamped credential is usable without a refresh round-trip.
+        assert_eq!(
+            session.access_token().await.expect("access token"),
+            "access-hostile"
+        );
+    }
+}

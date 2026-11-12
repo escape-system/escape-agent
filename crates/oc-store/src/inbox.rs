@@ -173,10 +173,17 @@ impl Store {
                 let body = message::body_with_time(&payload, time_created)?;
                 let encoded = db::encode_json(&body)?;
                 let seq = db::next_seq(transaction, &session_id)?;
-                transaction.execute(
+                let removed = transaction.execute(
                     "DELETE FROM session_inbox WHERE id = ?1 AND session_id = ?2",
                     params![&id, &session_id],
                 )?;
+                if removed == 0 {
+                    // Lost the race with another promoter (or the row vanished):
+                    // the item is already gone, so inserting here would
+                    // materialize a duplicate transcript message. `None` is the
+                    // documented "absent item" answer.
+                    return Ok(None);
+                }
                 transaction.execute(
                     "INSERT INTO session_message
                         (id, session_id, type, seq, data, time_created, time_updated)

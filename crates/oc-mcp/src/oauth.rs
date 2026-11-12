@@ -477,6 +477,26 @@ fn now_ms() -> i64 {
         })
 }
 
+/// Longest token lifetime accepted from a token endpoint: 366 days.
+const MAX_TOKEN_LIFETIME_SECONDS: u64 = 366 * 24 * 60 * 60;
+
+/// Converts a token endpoint's `expires_in` into an absolute epoch-millisecond
+/// deadline.
+///
+/// A hostile `expires_in` must not overflow the seconds-to-milliseconds
+/// conversion: `try_from` alone rejects only values above `i64::MAX`, so
+/// anything above `i64::MAX / 1_000` panicked in debug and wrapped to an
+/// already-expired instant in release. The lifetime is clamped to
+/// [`MAX_TOKEN_LIFETIME_SECONDS`] and the arithmetic saturates, so the result is
+/// always a future deadline.
+fn expiry_deadline(expires_in: Option<u64>) -> Option<i64> {
+    let seconds = expires_in?.min(MAX_TOKEN_LIFETIME_SECONDS);
+    let millis = i64::try_from(seconds)
+        .unwrap_or(i64::MAX)
+        .saturating_mul(1_000);
+    Some(now_ms().saturating_add(millis))
+}
+
 /// Result of beginning an interactive authorization.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Authorization {
@@ -595,10 +615,7 @@ impl OAuthSession {
             },
         )
         .await?;
-        let expires_at = tokens
-            .expires_in
-            .and_then(|seconds| i64::try_from(seconds).ok())
-            .map(|seconds| now_ms() + seconds * 1_000);
+        let expires_at = expiry_deadline(tokens.expires_in);
         self.store
             .save(
                 &self.server,
@@ -666,10 +683,7 @@ impl OAuthSession {
             server: self.server.clone(),
             message: format!("MCP authorization expired: {error}"),
         })?;
-        let expires_at = refreshed
-            .expires_in
-            .and_then(|seconds| i64::try_from(seconds).ok())
-            .map(|seconds| now_ms() + seconds * 1_000);
+        let expires_at = expiry_deadline(refreshed.expires_in);
         let merged = OAuthTokens {
             refresh_token: refreshed
                 .refresh_token

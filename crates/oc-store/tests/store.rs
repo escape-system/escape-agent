@@ -988,3 +988,164 @@ async fn active_child_count_propagates_a_sql_failure() {
         "expected a propagated sqlite error, got {error:?}"
     );
 }
+
+#[tokio::test]
+async fn session_transitions_report_a_missing_session() {
+    let store = Store::open_memory().await.expect("memory store");
+    let absent = "ses_absent";
+
+    // Each of these writes is immediately followed by a durable publish, so a
+    // silent `Ok(())` would announce state that no row carries.
+    let error = store
+        .mark_session_busy(absent, 2_000)
+        .await
+        .expect_err("busy on a missing session");
+    assert!(matches!(error, StoreError::NotFound(_)), "{error:?}");
+
+    let error = store
+        .mark_session_idle(absent, 2_000, "succeeded")
+        .await
+        .expect_err("idle on a missing session");
+    assert!(matches!(error, StoreError::NotFound(_)), "{error:?}");
+
+    let error = store
+        .mark_session_idle_with_reason(absent, 2_000, "interrupted", Some("user"))
+        .await
+        .expect_err("idle with reason on a missing session");
+    assert!(matches!(error, StoreError::NotFound(_)), "{error:?}");
+
+    let error = store
+        .add_session_usage(absent, 0.5, 1, 2, 3, 4, 5)
+        .await
+        .expect_err("usage on a missing session");
+    assert!(matches!(error, StoreError::NotFound(_)), "{error:?}");
+
+    // The guard must not reject a row that exists.
+    let session = seed_session(&store, "ses_live").await;
+    store
+        .mark_session_busy(&session, 2_000)
+        .await
+        .expect("busy on a live session");
+    store
+        .mark_session_idle(&session, 3_000, "succeeded")
+        .await
+        .expect("idle on a live session");
+    store
+        .add_session_usage(&session, 0.5, 1, 2, 3, 4, 5)
+        .await
+        .expect("usage on a live session");
+    let info = store
+        .get_session(&session)
+        .await
+        .expect("get")
+        .expect("live session");
+    assert_eq!(info["outcome"], "succeeded");
+    assert_eq!(info["cost"], 0.5);
+    assert_eq!(info["tokens"]["input"], 1);
+    assert_eq!(info["tokens"]["cache"]["read"], 4);
+}
+
+#[tokio::test]
+async fn projected_session_without_directory_falls_back_to_the_project_root() {
+    let store = Store::open_memory().await.expect("memory store");
+    // The project row carries the real directory; the projected session row
+    // below has no `location` and therefore a NULL `directory` column.
+    store
+        .create_session(new_session(
+            "ses_seed",
+            "prj_fallback",
+            "/tmp/fallback",
+            1_000,
+        ))
+        .await
+        .expect("seed session");
+    store
+        .append_event(NewEvent {
+            id: "evt_created_no_dir".to_owned(),
+            aggregate_id: "ses_no_dir".to_owned(),
+            kind: "session.created".to_owned(),
+            data: json!({
+                "sessionID": "ses_no_dir",
+                "projectID": "prj_fallback",
+                "title": "no dir",
+            }),
+            durable: true,
+            version: 1,
+            created: 2_000,
+        })
+        .await
+        .expect("created event");
+
+    // `Session.Info.location` is a required property, so every read path must
+    // fill it even when the session row has no directory of its own.
+    let info = store
+        .get_session("ses_no_dir")
+        .await
+        .expect("get")
+        .expect("projected session");
+    assert_eq!(info["location"]["directory"], "/tmp/fallback");
+
+    let listed = store
+        .list_sessions(SessionQuery {
+            limit: 10,
+            ..Default::default()
+        })
+        .await
+        .expect("list");
+    let row = listed
+        .items
+        .iter()
+        .find(|item| item["id"] == "ses_no_dir")
+        .expect("projected session listed");
+    assert_eq!(row["location"]["directory"], "/tmp/fallback");
+}
+
+#[tokio::test]
+async fn promoting_the_same_inbox_item_twice_yields_one_message() {
+    let store = Store::open_memory().await.expect("memory store");
+    let session = seed_session(&store, "ses_promote_twice").await;
+    store
+        .enqueue(NewInbox {
+            id: "msg_once".to_owned(),
+            session_id: session.clone(),
+            kind: "user".to_owned(),
+            payload: json!({ "text": "once" }),
+            delivery: Delivery::Queue,
+        })
+        .await
+        .expect("enqueue");
+
+    let first = store
+        .promote_inbox(&session, "msg_once")
+        .await
+        .expect("first promote")
+        .expect("promoted message");
+    assert_eq!(first["id"], "msg_once");
+
+    let second = store
+        .promote_inbox(&session, "msg_once")
+        .await
+        .expect("second promote");
+    assert!(
+        second.is_none(),
+        "a re-delivered item must not materialize a second message"
+    );
+
+    let page = store
+        .list_messages(MessageQuery {
+            limit: 50,
+            ..MessageQuery::new(&session)
+        })
+        .await
+        .expect("messages");
+    let matching = page
+        .items
+        .iter()
+        .filter(|item| item["id"] == "msg_once")
+        .count();
+    assert_eq!(
+        matching, 1,
+        "one inbox item must produce exactly one transcript message"
+    );
+    assert!(store.list_inbox(&session).await.expect("inbox").is_empty());
+}

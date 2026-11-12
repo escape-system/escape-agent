@@ -319,6 +319,10 @@ async fn persist_child_outcome(runtime: &Runtime, child: &str, state: &str) {
             return;
         }
     }
+    // Tolerance is deliberate and explicit: the store now reports `NotFound`
+    // for a session that no longer exists, and a child deleted concurrently is
+    // a legitimate outcome here. Nothing is faked — the parent-side report is
+    // already `failed`; this durable mirror simply has no row to write.
     if let Err(error) = store
         .mark_session_idle(child, oc_types::now_millis(), outcome)
         .await
