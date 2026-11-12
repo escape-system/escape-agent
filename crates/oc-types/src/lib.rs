@@ -30,7 +30,8 @@ pub use event::{Durable, EventEnvelope};
 pub use file::{FileDiff, FileEntry, FileKind, FileStatus};
 pub use id::{
     ContextBoxId, EventId, GoalId, LaneId, MemoryId, MessageId, ObservationId, PermissionRequestId,
-    ProjectId, SavedPermissionId, SessionId, message_id_from_event, project_id_from_directory,
+    ProjectId, RepairId, SavedPermissionId, SessionId, message_id_from_event,
+    project_id_from_directory,
 };
 pub use inbox::{Delivery, InboxItem, InboxKind};
 pub use info::{ServerCapabilities, ServerInfo, ServerPaths};

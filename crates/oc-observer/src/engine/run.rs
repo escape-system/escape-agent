@@ -2,8 +2,9 @@
 //! guards, wake decisions and the model call. Timer ticks and forced checks
 //! differ only by `force`.
 
+use crate::clock::EngineNow;
 use crate::input::{self, TreeRow};
-use crate::registry::StripState;
+use crate::registry::{MS_PER_SECOND, StripState};
 use crate::verdict;
 
 use super::ObserverEngine;
@@ -136,7 +137,7 @@ impl ObserverEngine {
         if !self.cfg.enabled {
             return None;
         }
-        let now = self.clock.now_ms();
+        let now = EngineNow::from_clock(self.clock.as_ref());
         let goal_changed = self.with_root(root_id, |state| {
             let current = goal.as_ref().map(|goal| (goal.status, goal.rounds));
             let changed = current != state.last_goal
@@ -169,9 +170,9 @@ impl ObserverEngine {
         let stall = busy
             && active_strips.is_empty()
             && self.with_root(root_id, |state| {
-                state
-                    .last_activity_ms
-                    .is_some_and(|last| now.saturating_sub(last) >= self.cfg.stall_seconds * 1_000)
+                state.last_activity_ms.is_some_and(|last| {
+                    now.wall_ms.saturating_sub(last) >= self.cfg.stall_seconds * MS_PER_SECOND
+                })
             });
         let overdue_ids: Vec<(String, u32)> = self.with_root(root_id, |state| {
             state
@@ -184,7 +185,7 @@ impl ObserverEngine {
                     state
                         .snoozed
                         .get(&strip.tool_call_id)
-                        .is_none_or(|until| *until <= now)
+                        .is_none_or(|until| *until <= now.mono_ms)
                 })
                 .map(|strip| (strip.tool_call_id.clone(), strip.intervene_s))
                 .collect()
@@ -213,7 +214,7 @@ impl ObserverEngine {
         }
 
         let gate = self.with_root(root_id, |state| {
-            prune_all(state, now, &self.cfg);
+            prune_all(state, now.wall_ms, &self.cfg);
             if state.escalated {
                 let root_used = u32::try_from(state.repairs.len()).unwrap_or(u32::MAX);
                 if root_used < self.cfg.max_repairs_per_10min {
@@ -234,9 +235,9 @@ impl ObserverEngine {
             let calls = state.calls.len();
             let rate_limited = u32::try_from(calls).unwrap_or(u32::MAX)
                 >= self.cfg.max_calls_per_min
-                || state
-                    .last_call_ms
-                    .is_some_and(|last| now.saturating_sub(last) < self.cfg.min_interval_ms);
+                || state.last_call_ms.is_some_and(|last| {
+                    now.wall_ms.saturating_sub(last) < self.cfg.min_interval_ms
+                });
             if rate_limited {
                 let reason =
                     if u32::try_from(calls).unwrap_or(u32::MAX) >= self.cfg.max_calls_per_min {
@@ -248,14 +249,14 @@ impl ObserverEngine {
             }
             state.pending_wake = false;
             state.error_streak = 0;
-            state.last_call_ms = Some(now);
-            state.calls.push(now);
-            state.last_activity_ms = Some(now);
+            state.last_call_ms = Some(now.wall_ms);
+            state.calls.push(now.wall_ms);
+            state.last_activity_ms = Some(now.wall_ms);
             for (id, intervene_s) in &overdue_ids {
-                let backoff = (i64::from(*intervene_s) * 1_000).max(MIN_OVERDUE_BACKOFF_MS);
+                let backoff = (i64::from(*intervene_s) * MS_PER_SECOND).max(MIN_OVERDUE_BACKOFF_MS);
                 state
                     .snoozed
-                    .insert(id.clone(), now.saturating_add(backoff));
+                    .insert(id.clone(), now.mono_ms.saturating_add(backoff));
             }
             Gate::Proceed
         });
@@ -293,7 +294,7 @@ impl ObserverEngine {
             }
         };
         Some(
-            self.apply(root_id, &tree, goal.as_ref(), &verdict, now)
+            self.apply(root_id, &tree, goal.as_ref(), &verdict, now.wall_ms)
                 .await,
         )
     }

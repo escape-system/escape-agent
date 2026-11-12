@@ -11,18 +11,39 @@ use oc_observer::{
     StripState, TreeRow,
 };
 
+/// Wall and monotonic readings held separately so a test can move one clock
+/// without moving the other (an NTP correction versus real elapsed time).
 #[derive(Debug, Default)]
-struct FakeClock(AtomicI64);
+struct FakeClock {
+    wall: AtomicI64,
+    mono: AtomicI64,
+}
 
 impl FakeClock {
+    /// Move both clocks together (real time passing with no correction).
     fn set(&self, now: i64) {
-        self.0.store(now, Ordering::SeqCst);
+        self.wall.store(now, Ordering::SeqCst);
+        self.mono.store(now, Ordering::SeqCst);
+    }
+
+    /// Move only the wall clock (an NTP correction).
+    fn set_wall(&self, now: i64) {
+        self.wall.store(now, Ordering::SeqCst);
+    }
+
+    /// Move only the monotonic clock (real elapsed time).
+    fn set_mono(&self, now: i64) {
+        self.mono.store(now, Ordering::SeqCst);
     }
 }
 
 impl Clock for FakeClock {
     fn now_ms(&self) -> i64 {
-        self.0.load(Ordering::SeqCst)
+        self.wall.load(Ordering::SeqCst)
+    }
+
+    fn mono_ms(&self) -> i64 {
+        self.mono.load(Ordering::SeqCst)
     }
 }
 
@@ -120,6 +141,8 @@ fn strip(id: &str, started_ms: i64, intervene_s: u32) -> FlightStrip {
         expect_s: 30,
         intervene_s,
         started_ms,
+        // Stamped on both clocks: the harness moves them together by default.
+        started_mono_ms: Some(started_ms),
         retryable: true,
         ..FlightStrip::default()
     }
@@ -763,7 +786,10 @@ async fn user_stopped_root_does_not_wake_the_observer() {
     h.engine
         .note_host_event("ses_root", HostFlag::ExecutionInterrupted);
     h.clock.set(1_000_000);
-    assert_eq!(h.engine.earliest_deadline("ses_root"), Some(10_000));
+    // The strip opened at mono 0 with a 10 s window, so it is long overdue:
+    // `earliest_deadline` is `now_wall + remaining_mono` = now, not the old
+    // wall-clock `started_ms + intervene_s`.
+    assert_eq!(h.engine.earliest_deadline("ses_root"), Some(1_000_000));
 
     let stopped = tree_with("interrupted", Some("user"));
     assert!(
@@ -860,4 +886,135 @@ async fn the_guard_lifts_after_a_new_execution() {
         "a new execution lifts the guard, got {run:?}"
     );
     assert_eq!(h.model.calls(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// T8: deadlines and snooze run on the monotonic clock
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_forward_wall_jump_does_not_make_every_strip_overdue() {
+    let h = harness(ObserverConfig::default(), vec![Ok(nudge())]);
+    // A ten-minute window, one second of real time elapsed.
+    h.engine.observe_start(strip("tc_1", 0, 600));
+    h.clock.set(1_000);
+
+    // An hour of NTP correction forwards while no real time passes. The old
+    // wall-clock arithmetic saw 3601 s of age and fired every strip at once.
+    h.clock.set_wall(1_000 + 3_600_000);
+
+    assert!(
+        h.engine.tick("ses_root", tree(), None).await.is_none(),
+        "a forward wall jump must not fire the intervention deadline"
+    );
+    assert_eq!(h.model.calls(), 0);
+}
+
+#[tokio::test]
+async fn a_real_monotonic_breach_wakes_the_observer() {
+    let h = harness(ObserverConfig::default(), vec![Ok(nudge())]);
+    h.engine.observe_start(strip("tc_1", 0, 10));
+
+    h.clock.set(9_999);
+    assert!(
+        h.engine.tick("ses_root", tree(), None).await.is_none(),
+        "one millisecond before the deadline must stay quiet"
+    );
+    assert_eq!(h.model.calls(), 0);
+
+    h.clock.set(10_000);
+    let run = h.engine.tick("ses_root", tree(), None).await;
+    assert!(
+        matches!(run, Some(ObserverRun::Verdict { .. })),
+        "a genuine intervene_s breach is overdue, got {run:?}"
+    );
+    assert_eq!(h.model.calls(), 1);
+}
+
+#[tokio::test]
+async fn a_backward_wall_jump_does_not_suppress_a_genuinely_overdue_strip() {
+    let cfg = ObserverConfig {
+        min_interval_ms: 0,
+        max_calls_per_min: 100,
+        ..ObserverConfig::default()
+    };
+    let none = r#"{"action":"none","reason":"still working"}"#.to_owned();
+    let h = harness(cfg, vec![Ok(none.clone()), Ok(none)]);
+    h.engine.observe_start(strip("tc_1", 0, 60));
+    h.clock.set(60_000);
+    // NTP corrects the wall clock back one hour; the strip is still overdue in
+    // real (monotonic) terms.
+    h.clock.set_wall(60_000 - 3_600_000);
+
+    assert!(
+        matches!(
+            h.engine.tick("ses_root", tree(), None).await,
+            Some(ObserverRun::Verdict { .. })
+        ),
+        "the first evaluation must fire"
+    );
+    assert_eq!(h.model.calls(), 1);
+
+    // The 60 s overdue backoff elapses on the monotonic clock. A wall-clock
+    // snooze deadline would now be an hour in the future and silently suppress
+    // the re-check; a monotonic one expires on schedule.
+    h.clock.set_mono(120_000);
+    assert!(
+        matches!(
+            h.engine.tick("ses_root", tree(), None).await,
+            Some(ObserverRun::Verdict { .. })
+        ),
+        "a backward wall jump must not extend the overdue backoff"
+    );
+    assert_eq!(h.model.calls(), 2);
+}
+
+#[tokio::test]
+async fn a_snoozed_entry_survives_a_backward_wall_jump() {
+    let cfg = ObserverConfig {
+        min_interval_ms: 0,
+        max_calls_per_min: 100,
+        ..ObserverConfig::default()
+    };
+    let none = r#"{"action":"none","reason":"still working"}"#.to_owned();
+    let h = harness(cfg, vec![Ok(none.clone()), Ok(none)]);
+    h.engine.observe_start(strip("tc_1", 0, 60));
+    h.clock.set(60_000);
+    h.engine.tick("ses_root", tree(), None).await;
+    assert_eq!(h.model.calls(), 1);
+    // The strip is snoozed until mono 120_000.
+
+    // A backward wall jump must neither drop the snooze nor let it fire: the
+    // entry is keyed on the monotonic clock, so nothing changes for it.
+    h.clock.set_wall(60_000 - 3_600_000);
+    assert!(
+        !matches!(
+            h.engine.tick("ses_root", tree(), None).await,
+            Some(ObserverRun::Verdict { .. })
+        ),
+        "the snooze must still hold inside its monotonic window"
+    );
+    assert_eq!(h.model.calls(), 1, "snooze survives a backward wall jump");
+
+    // A forward wall jump must not expire it early either.
+    h.clock.set_wall(60_000 + 3_600_000);
+    assert!(
+        !matches!(
+            h.engine.tick("ses_root", tree(), None).await,
+            Some(ObserverRun::Verdict { .. })
+        ),
+        "a forward wall jump must not expire the snooze early"
+    );
+    assert_eq!(h.model.calls(), 1);
+
+    // Only real elapsed time ends the snooze.
+    h.clock.set_mono(120_000);
+    assert!(
+        matches!(
+            h.engine.tick("ses_root", tree(), None).await,
+            Some(ObserverRun::Verdict { .. })
+        ),
+        "the snooze expires when its monotonic window ends"
+    );
+    assert_eq!(h.model.calls(), 2);
 }

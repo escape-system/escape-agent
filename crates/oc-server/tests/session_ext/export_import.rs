@@ -212,6 +212,60 @@ async fn sanitize_strips_nested_secret_keys_without_mutating_the_store() {
     assert_eq!(stored_messages[0]["private_key"], "pem");
 }
 
+/// An import that fails after `create_session` must not leave the session
+/// behind.
+///
+/// The failure is reached without any injection seam: `import.rs` remaps every
+/// message id to a fresh one, so an id used by another session cannot collide.
+/// Two messages sharing one id inside the *same* body can: both map to the same
+/// fresh identity, the first append commits, and the second one hits the
+/// database-wide `session_message.id` primary key (`append_message` only checks
+/// duplicates inside the target session). The handler then rolls the session
+/// back; the failure it returns is the append error.
+#[tokio::test]
+async fn failed_import_removes_the_partially_created_session() {
+    let harness = harness().await;
+    let app = router(harness.state.clone());
+    let (status, response) = call(
+        &app,
+        Method::POST,
+        "/api/experimental/session/import",
+        Some(json!({
+            "info": {"id": "ses_half_imported", "title": "half"},
+            "messages": [
+                {"id": "msg_import_dupe", "type": "user", "text": "first"},
+                {"id": "msg_import_dupe", "type": "user", "text": "second"},
+            ],
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{response:?}");
+    assert_eq!(response.unwrap()["_tag"], "ConflictError");
+
+    let (status, missing) = call(&app, Method::GET, "/api/session/ses_half_imported", None).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a failed import must roll back its session: {missing:?}"
+    );
+    assert_eq!(missing.unwrap()["_tag"], "SessionNotFoundError");
+
+    // Neither the session nor its first message may survive in a list.
+    let (status, listed) = call(&app, Method::GET, "/api/session", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let listed = listed.unwrap();
+    let ids: Vec<&str> = listed["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|session| session["id"].as_str())
+        .collect();
+    assert!(
+        !ids.contains(&"ses_half_imported"),
+        "rolled back session still listed: {ids:?}"
+    );
+}
+
 #[tokio::test]
 async fn import_rejects_a_message_without_type_before_creating_the_session() {
     let harness = harness().await;

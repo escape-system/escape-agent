@@ -28,12 +28,16 @@ pub(crate) struct RootState {
     pub(super) nudges: HashMap<String, Vec<i64>>,
     pub(super) inspects: Vec<i64>,
     pub(super) compacts: HashMap<String, i64>,
-    /// Overdue strips already evaluated, keyed by tool-call id, with the time
-    /// before which the same strip must not wake the observer again.
+    /// Overdue strips already evaluated, keyed by tool-call id, with the
+    /// **monotonic** time ([`crate::clock::Clock::mono_ms`]) before which the
+    /// same strip must not wake the observer again.
     ///
     /// Without this an overdue strip stays overdue on every tick, so one long
     /// `subagent` or `shell` call re-woke the model every `min_interval_ms`
     /// for as long as it ran.
+    ///
+    /// The deadline is monotonic on purpose: a backward wall-clock jump must
+    /// not suppress a genuinely overdue strip.
     pub(super) snoozed: HashMap<String, i64>,
 }
 

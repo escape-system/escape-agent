@@ -44,16 +44,36 @@ pub(crate) async fn publish_enqueued(
 }
 
 pub(super) fn created_event_data(session: &Value, version: &str) -> Value {
+    // Identity is guaranteed by the schema, not by this function:
+    // `session_v2.id` is a primary key, `session_v2.project_id` is
+    // `TEXT NOT NULL REFERENCES project(id)` (schema.rs:41), and
+    // `SESSION_COLUMNS` coalesces the nullable `session_v2.directory` onto
+    // `project.directory`, which is `TEXT NOT NULL` (schema.rs:18). The
+    // fallbacks below are therefore unreachable for a created session; the
+    // asserts turn a broken invariant into a loud debug failure instead of
+    // putting `""` on the wire. Release builds keep the old behavior.
     let id = session
         .get("id")
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_owned();
+    debug_assert!(!id.is_empty(), "created session row without id: {session}");
     let directory = session
         .pointer("/location/directory")
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_owned();
+    debug_assert!(
+        !directory.is_empty(),
+        "created session row without location.directory: {session}"
+    );
+    debug_assert!(
+        session
+            .get("projectID")
+            .and_then(Value::as_str)
+            .is_some_and(|project| !project.is_empty()),
+        "created session row without projectID: {session}"
+    );
 
     let mut map = Map::new();
     map.insert("sessionID".to_owned(), Value::String(id.clone()));

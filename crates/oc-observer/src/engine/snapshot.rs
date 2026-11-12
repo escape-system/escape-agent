@@ -1,6 +1,7 @@
 //! Input assembly for one observer model call: active strips, recent strips,
 //! the root row and the goal snapshot rendered into [`ObserverInput`].
 
+use crate::clock::EngineNow;
 use crate::goal::GoalSnapshot;
 use crate::input::{ActiveStrip, ObserverInput, RecentStrip, RootInput, TreeRow};
 
@@ -13,14 +14,14 @@ impl ObserverEngine {
         root_id: &str,
         tree: &[TreeRow],
         goal: Option<&GoalSnapshot>,
-        now: i64,
+        now: EngineNow,
     ) -> ObserverInput {
         let mut active: Vec<ActiveStrip> = self
             .registry
             .active(root_id)
             .into_iter()
             .map(|strip| {
-                let age_s = strip.elapsed_s(now);
+                let age_s = strip.elapsed_s(now.mono_ms);
                 let overdue = is_strip_overdue(&strip, tree, now);
                 ActiveStrip {
                     sid: strip.session_id,
@@ -47,7 +48,7 @@ impl ObserverEngine {
             .recent(root_id, 12)
             .into_iter()
             .map(|strip| {
-                let took_s = strip.elapsed_s(now);
+                let took_s = strip.elapsed_s(now.mono_ms);
                 let id = (!strip.tool_call_id.is_empty()).then_some(strip.tool_call_id);
                 RecentStrip {
                     id,

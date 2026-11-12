@@ -30,6 +30,7 @@ pub(super) async fn durable_rules(
             Some(Rule {
                 action: row.get("action")?.as_str()?.to_owned(),
                 resources: vec![row.get("resource")?.as_str()?.to_owned()],
+                durable: true,
             })
         })
         .collect())

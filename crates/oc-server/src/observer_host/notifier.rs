@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 
 use oc_observer::{GoalSnapshot, ObserverNotice, ObserverNotifier};
 use oc_store::{GoalPatch, NewRepair, Store};
-use oc_types::{EventEnvelope, EventId, EventLocation};
+use oc_types::{EventEnvelope, EventLocation, RepairId};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::sync::broadcast;
@@ -269,6 +269,7 @@ fn repair_args_hash(kind: &str, target: &str, reason: &str) -> String {
 }
 
 fn repair_id() -> String {
-    // Reuse the event-id generator; `obr_` marks an observer repair row.
-    EventId::new().into_inner().replacen("evt_", "obr_", 1)
+    // `obr_` marks an observer repair row; `RepairId` is the registered typed
+    // form of exactly that prefix (see `oc_types::id`).
+    RepairId::new().into_inner()
 }

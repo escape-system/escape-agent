@@ -36,7 +36,7 @@ pub use scribe::{
 pub use secret::{detect_secret, ensure_no_secret};
 pub use service::{
     DEFAULT_CONFIDENCE, DEFAULT_IMPORTANCE, LIST_DEFAULT, LIST_MAX, ListRequest, MAX_SEARCH_LIMIT,
-    MIN_SEARCH_LIMIT, MemoryBlock, MemoryService, NewMemoryInput, PINNED_IMPORTANCE,
-    RetrieveRequest, TEXT_CAP,
+    MIN_SEARCH_LIMIT, MemoryBlock, MemoryPage, MemoryService, NewMemoryInput, PINNED_IMPORTANCE,
+    RetrieveRequest, SEARCH_DEFAULT, TEXT_CAP,
 };
 pub use tools::{MemoryForgetTool, MemoryListTool, MemorySearchTool, MemoryTools, MemoryWriteTool};

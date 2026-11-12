@@ -103,6 +103,7 @@ id_type!(GoalId, "gol_", new, true);
 id_type!(MemoryId, "mem_", new, true);
 id_type!(ContextBoxId, "box_", new, false);
 id_type!(LaneId, "lan_", new, false);
+id_type!(RepairId, "obr_", new, false);
 
 /// Message ids for event-backed messages are derived by replacing the prefix.
 #[must_use]
@@ -137,6 +138,25 @@ mod tests {
         assert!(SessionId::new().as_str().starts_with("ses_"));
         assert!(EventId::new().as_str().starts_with("evt_"));
         assert!(ContextBoxId::new().as_str().starts_with("box_"));
+    }
+
+    #[test]
+    fn repair_id_keeps_the_obr_shape() {
+        // `notifier.rs` used to derive this by swapping the `evt_` prefix of a
+        // freshly generated `EventId`. The typed id must produce the same
+        // prefix and total length so persisted `observer_repair.id` values keep
+        // their shape.
+        let repair = RepairId::new();
+        assert!(repair.as_str().starts_with("obr_"), "{repair}");
+        assert_eq!(repair.as_str().len(), EventId::new().as_str().len());
+        // Same suffix width: 26 characters after the prefix.
+        assert_eq!(repair.as_str().len(), "obr_".len() + 26);
+        assert!(
+            repair.as_str()["obr_".len()..]
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric())
+        );
+        assert_ne!(RepairId::new(), RepairId::new());
     }
 
     #[test]

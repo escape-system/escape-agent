@@ -27,6 +27,13 @@ impl Clock for TestClock {
     fn now_ms(&self) -> i64 {
         self.0.load(Ordering::SeqCst)
     }
+
+    /// The same counter drives both clocks: the lanes service never reads the
+    /// monotonic clock, but a fake that inherits the default would silently
+    /// follow real time and make any future deadline assertion flaky.
+    fn mono_ms(&self) -> i64 {
+        self.0.load(Ordering::SeqCst)
+    }
 }
 
 #[derive(Debug, Default)]

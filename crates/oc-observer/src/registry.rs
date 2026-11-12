@@ -18,7 +18,7 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
-use crate::clock::Clock;
+use crate::clock::{Clock, EngineNow};
 
 /// Maximum characters retained from an `outcome` one-liner.
 pub const MAX_OUTCOME_CHARS: usize = 60;
@@ -30,6 +30,8 @@ pub const SETTLED_TTL_MS: i64 = 24 * 60 * 60 * 1_000;
 pub const MAX_SETTLED_PER_ROOT: usize = 10_000;
 /// Default active window for [`ExpectationRegistry::snapshot`].
 pub const SNAPSHOT_ACTIVE: usize = 24;
+/// Milliseconds in one second, for the `expect_s`/`intervene_s` conversions.
+pub const MS_PER_SECOND: i64 = 1_000;
 
 /// Lifecycle state of a flight strip.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
@@ -102,10 +104,23 @@ pub struct FlightStrip {
     pub expect_s: u32,
     /// Observer intervention deadline, seconds.
     pub intervene_s: u32,
-    /// Open time, epoch ms.
+    /// Open time, epoch ms (wall clock; published and audited).
     pub started_ms: i64,
-    /// Settle time, epoch ms.
+    /// Settle time, epoch ms (wall clock; published and audited).
     pub settled_ms: Option<i64>,
+    /// Open time on the process-monotonic clock.
+    ///
+    /// `None` means "unstamped" (a fixture or a strip opened by a producer that
+    /// predates this field). Deadline logic prefers this stamp and falls back
+    /// to the wall-clock path when it is absent.
+    #[serde(skip)]
+    pub started_mono_ms: Option<i64>,
+    /// Settle time on the process-monotonic clock.
+    ///
+    /// Used for the retention TTL and for settled elapsed time, so neither is
+    /// affected by a wall-clock jump.
+    #[serde(skip)]
+    pub settled_mono_ms: Option<i64>,
     /// Lifecycle state.
     pub state: StripState,
     /// One-line result, capped at [`MAX_OUTCOME_CHARS`].
@@ -134,6 +149,8 @@ impl Default for FlightStrip {
             intervene_s: 0,
             started_ms: 0,
             settled_ms: None,
+            started_mono_ms: None,
+            settled_mono_ms: None,
             state: StripState::Running,
             outcome: None,
             parent_call: None,
@@ -145,24 +162,75 @@ impl Default for FlightStrip {
 }
 
 impl FlightStrip {
-    /// Deadline at which the observer may intervene.
+    /// Wall-clock deadline at which the observer may intervene.
+    ///
+    /// This is the published/audited instant and keeps its exact previous
+    /// meaning. Deadline *decisions* use [`Self::deadline_mono_ms`], which a
+    /// wall-clock jump cannot move.
     #[must_use]
     pub fn deadline_ms(&self) -> i64 {
         self.started_ms
-            .saturating_add(i64::from(self.intervene_s).saturating_mul(1_000))
+            .saturating_add(i64::from(self.intervene_s).saturating_mul(MS_PER_SECOND))
+    }
+
+    /// Intervention window in milliseconds.
+    #[must_use]
+    pub fn intervene_ms(&self) -> i64 {
+        i64::from(self.intervene_s).saturating_mul(MS_PER_SECOND)
+    }
+
+    /// Monotonic deadline, when the strip carries a monotonic start stamp.
+    #[must_use]
+    pub fn deadline_mono_ms(&self) -> Option<i64> {
+        self.started_mono_ms
+            .map(|started| started.saturating_add(self.intervene_ms()))
+    }
+
+    /// Elapsed milliseconds on the monotonic clock, clamped at zero.
+    ///
+    /// Both monotonic stamps present: a pure monotonic duration. Only the start
+    /// stamp present: the running duration. No monotonic start stamp at all (a
+    /// fixture, or a producer that predates the field): the wall-clock duration
+    /// when the strip is settled, otherwise **zero** — an unstamped running
+    /// strip yields no deadline evidence rather than comparing a wall origin
+    /// against a monotonic now.
+    #[must_use]
+    pub fn elapsed_mono_ms(&self, now_mono_ms: i64) -> i64 {
+        match (self.started_mono_ms, self.settled_mono_ms) {
+            (Some(started), Some(settled)) => settled.saturating_sub(started).max(0),
+            (Some(started), None) => now_mono_ms.saturating_sub(started).max(0),
+            (None, _) => self
+                .settled_ms
+                .map_or(0, |settled| settled.saturating_sub(self.started_ms).max(0)),
+        }
+    }
+
+    /// Milliseconds left before the intervention deadline, clamped at zero.
+    ///
+    /// Derived from the monotonic elapsed time, so a wall-clock jump cannot
+    /// move it.
+    #[must_use]
+    pub fn remaining_ms(&self, now_mono_ms: i64) -> i64 {
+        self.intervene_ms()
+            .saturating_sub(self.elapsed_mono_ms(now_mono_ms))
+            .max(0)
     }
 
     /// True when the call is still running past its intervention deadline.
+    ///
+    /// `now_mono_ms` is a [`Clock::mono_ms`] value, never a wall clock.
     #[must_use]
-    pub fn is_overdue(&self, now_ms: i64) -> bool {
-        self.state == StripState::Running && self.deadline_ms() <= now_ms
+    pub fn is_overdue(&self, now_mono_ms: i64) -> bool {
+        self.state == StripState::Running
+            && self.elapsed_mono_ms(now_mono_ms) >= self.intervene_ms()
     }
 
-    /// Elapsed seconds, clamped at zero.
+    /// Elapsed seconds, clamped at zero, on the monotonic clock.
+    ///
+    /// A wall-clock jump cannot change this value.
     #[must_use]
-    pub fn elapsed_s(&self, now_ms: i64) -> i64 {
-        let end = self.settled_ms.unwrap_or(now_ms);
-        (end - self.started_ms).max(0) / 1_000
+    pub fn elapsed_s(&self, now_mono_ms: i64) -> i64 {
+        self.elapsed_mono_ms(now_mono_ms) / MS_PER_SECOND
     }
 }
 
@@ -276,6 +344,7 @@ impl ExpectationRegistry {
         let tool_call_id = strip.tool_call_id.clone();
         let root_id = strip.root_id.clone();
         let state = strip.state;
+        let now = EngineNow::from_clock(self.clock.as_ref());
         let mut data = self.data.lock();
 
         if let Some(previous) = data.strips.remove(&tool_call_id)
@@ -292,22 +361,22 @@ impl ExpectationRegistry {
         } else {
             index.settled.push_front(tool_call_id);
         }
-        prune_root(&mut data, &root_id, self.caps, self.clock.now_ms());
+        prune_root(&mut data, &root_id, self.caps, now.mono_ms);
     }
 
     /// Settle a strip. Returns false when the tool call is unknown.
     pub fn settle(&self, tool_call_id: &str, state: StripState, outcome: Option<&str>) -> bool {
-        let now = self.clock.now_ms();
+        let now = EngineNow::from_clock(self.clock.as_ref());
         self.settle_at(tool_call_id, state, outcome, now)
     }
 
-    /// Settle a strip at an explicit timestamp.
+    /// Settle a strip at an explicit pair of clock readings.
     pub fn settle_at(
         &self,
         tool_call_id: &str,
         state: StripState,
         outcome: Option<&str>,
-        now_ms: i64,
+        now: EngineNow,
     ) -> bool {
         let mut data = self.data.lock();
         let Some(strip) = data.strips.get_mut(tool_call_id) else {
@@ -316,7 +385,8 @@ impl ExpectationRegistry {
         let root_id = strip.root_id.clone();
         let was_running = strip.state == StripState::Running;
         strip.state = state;
-        strip.settled_ms = Some(now_ms);
+        strip.settled_ms = Some(now.wall_ms);
+        strip.settled_mono_ms = Some(now.mono_ms);
         strip.outcome = outcome.map(|text| truncate_chars(text, MAX_OUTCOME_CHARS));
 
         if let Some(index) = data.roots.get_mut(&root_id) {
@@ -325,14 +395,14 @@ impl ExpectationRegistry {
                 index.settled.push_front(tool_call_id.to_owned());
             }
         }
-        prune_root(&mut data, &root_id, self.caps, now_ms);
+        prune_root(&mut data, &root_id, self.caps, now.mono_ms);
         true
     }
 
     /// Cancel every running strip of a session (root cancelled or interrupted).
     /// Returns the number of strips settled.
     pub fn cancel_session(&self, session_id: &str) -> usize {
-        let now = self.clock.now_ms();
+        let now = EngineNow::from_clock(self.clock.as_ref());
         let mut data = self.data.lock();
         let ids: Vec<String> = data
             .strips
@@ -344,7 +414,8 @@ impl ExpectationRegistry {
         for id in &ids {
             if let Some(strip) = data.strips.get_mut(id) {
                 strip.state = StripState::Cancelled;
-                strip.settled_ms = Some(now);
+                strip.settled_ms = Some(now.wall_ms);
+                strip.settled_mono_ms = Some(now.mono_ms);
                 strip.outcome = Some("cancelled".to_owned());
                 roots.insert(strip.root_id.clone());
             }
@@ -356,7 +427,7 @@ impl ExpectationRegistry {
             }
         }
         for root_id in roots {
-            prune_root(&mut data, &root_id, self.caps, now);
+            prune_root(&mut data, &root_id, self.caps, now.mono_ms);
         }
         ids.len()
     }
@@ -393,12 +464,23 @@ impl ExpectationRegistry {
             .collect()
     }
 
-    /// Earliest intervention deadline among running strips.
+    /// Earliest intervention deadline among running strips, as an absolute
+    /// wall-clock instant.
+    ///
+    /// The remaining time comes from the monotonic clock and is added to the
+    /// current wall instant, so a wall-clock jump cannot move the result.
     #[must_use]
     pub fn earliest_deadline(&self, root_id: &str) -> Option<i64> {
+        let now = EngineNow::from_clock(self.clock.as_ref());
+        self.earliest_deadline_at(root_id, now)
+    }
+
+    /// [`Self::earliest_deadline`] at an explicit pair of clock readings.
+    #[must_use]
+    pub fn earliest_deadline_at(&self, root_id: &str, now: EngineNow) -> Option<i64> {
         self.active(root_id)
             .into_iter()
-            .map(|strip| strip.deadline_ms())
+            .map(|strip| now.wall_ms.saturating_add(strip.remaining_ms(now.mono_ms)))
             .min()
     }
 
@@ -406,17 +488,28 @@ impl ExpectationRegistry {
     /// window is otherwise capped at `max_active`.
     #[must_use]
     pub fn snapshot(&self, root_id: &str, max_active: usize) -> RegistrySnapshot {
-        let now = self.clock.now_ms();
+        let now = EngineNow::from_clock(self.clock.as_ref());
+        self.snapshot_at(root_id, max_active, now)
+    }
+
+    /// [`Self::snapshot`] at an explicit pair of clock readings.
+    #[must_use]
+    pub fn snapshot_at(
+        &self,
+        root_id: &str,
+        max_active: usize,
+        now: EngineNow,
+    ) -> RegistrySnapshot {
         let mut active = self.active(root_id);
         active.sort_by_key(|strip| {
-            let overdue = !strip.is_overdue(now);
-            (overdue, strip.deadline_ms(), strip.started_ms)
+            let overdue = !strip.is_overdue(now.mono_ms);
+            (overdue, strip.remaining_ms(now.mono_ms), strip.started_ms)
         });
         if active.len() > max_active {
             let mut kept = Vec::with_capacity(max_active.max(1));
             let mut overflow = active.len() - max_active;
             for strip in active {
-                if overflow > 0 && !strip.is_overdue(now) {
+                if overflow > 0 && !strip.is_overdue(now.mono_ms) {
                     overflow -= 1;
                     continue;
                 }
@@ -457,7 +550,13 @@ impl ExpectationRegistry {
     }
 }
 
-fn prune_root(data: &mut RegistryData, root_id: &str, caps: RegistryCaps, now_ms: i64) {
+/// Drop settled strips whose monotonic age exceeds the TTL, then trim the
+/// settled index to the cap.
+///
+/// `now_mono_ms` is a [`Clock::mono_ms`] value, so a wall-clock jump can neither
+/// freeze nor accelerate retention. A strip with no monotonic settle stamp (an
+/// unstamped fixture) is evicted only by the count cap.
+fn prune_root(data: &mut RegistryData, root_id: &str, caps: RegistryCaps, now_mono_ms: i64) {
     let Some(index) = data.roots.get_mut(root_id) else {
         return;
     };
@@ -466,8 +565,8 @@ fn prune_root(data: &mut RegistryData, root_id: &str, caps: RegistryCaps, now_ms
         let expired = data
             .strips
             .get(id)
-            .and_then(|strip| strip.settled_ms)
-            .is_some_and(|settled| settled.saturating_add(caps.settled_ttl_ms) <= now_ms);
+            .and_then(|strip| strip.settled_mono_ms)
+            .is_some_and(|settled| settled.saturating_add(caps.settled_ttl_ms) <= now_mono_ms);
         let over_cap = index.settled.len() > caps.max_settled_per_root;
         if !expired && !over_cap {
             break;
@@ -494,18 +593,39 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicI64, Ordering};
 
+    /// Wall and monotonic readings held separately, so a test can move one
+    /// clock without moving the other.
     #[derive(Debug, Default)]
-    struct FakeClock(AtomicI64);
+    struct FakeClock {
+        wall: AtomicI64,
+        mono: AtomicI64,
+    }
 
     impl FakeClock {
+        /// Move both clocks together (the common case).
         fn set(&self, value: i64) {
-            self.0.store(value, Ordering::SeqCst);
+            self.wall.store(value, Ordering::SeqCst);
+            self.mono.store(value, Ordering::SeqCst);
+        }
+
+        /// Move only the wall clock (an NTP correction).
+        fn set_wall(&self, value: i64) {
+            self.wall.store(value, Ordering::SeqCst);
+        }
+
+        /// Move only the monotonic clock (real elapsed time).
+        fn set_mono(&self, value: i64) {
+            self.mono.store(value, Ordering::SeqCst);
         }
     }
 
     impl Clock for FakeClock {
         fn now_ms(&self) -> i64 {
-            self.0.load(Ordering::SeqCst)
+            self.wall.load(Ordering::SeqCst)
+        }
+
+        fn mono_ms(&self) -> i64 {
+            self.mono.load(Ordering::SeqCst)
         }
     }
 
@@ -521,6 +641,8 @@ mod tests {
             expect_s: 10,
             intervene_s: intervene,
             started_ms: started,
+            // The helper stamps both clocks so a strip is never "unstamped".
+            started_mono_ms: Some(started),
             retryable: true,
             ..FlightStrip::default()
         }
@@ -603,5 +725,158 @@ mod tests {
             snapshot.active[0].tool_call_id, "tc_0",
             "overdue strips sort first"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // T8: deadlines run on the monotonic clock, wall time is only published
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn forward_wall_jump_does_not_make_running_strips_overdue() {
+        let clock = Arc::new(FakeClock::default());
+        clock.set(1_000);
+        let registry = ExpectationRegistry::new(clock.clone());
+        registry.open(strip("tc_1", "ses_root", "ses_root", 1_000, 10));
+
+        // One hour of NTP correction forwards; no real time passed.
+        clock.set_wall(1_000 + 3_600_000);
+
+        let now = EngineNow::from_clock(clock.as_ref());
+        let strip = &registry.active("ses_root")[0];
+        assert!(
+            !strip.is_overdue(now.mono_ms),
+            "a forward wall jump must not fire every overdue strip at once"
+        );
+        assert_eq!(strip.elapsed_s(now.mono_ms), 0, "no real time elapsed");
+        // 10 s of the window is still unused, so the deadline is 10 s after the
+        // *new* wall instant: an absolute wall time that the jump moved with it,
+        // while the decision itself stayed monotonic.
+        assert_eq!(registry.earliest_deadline("ses_root"), Some(3_611_000));
+    }
+
+    #[test]
+    fn backward_wall_jump_does_not_suppress_a_genuinely_overdue_strip() {
+        let clock = Arc::new(FakeClock::default());
+        clock.set(1_000_000);
+        let registry = ExpectationRegistry::new(clock.clone());
+        registry.open(strip("tc_1", "ses_root", "ses_root", 1_000_000, 10));
+
+        // 20 s of real elapsed time, then a backward wall jump of one hour.
+        clock.set_mono(1_020_000);
+        clock.set_wall(1_000_000 - 3_600_000);
+
+        let now = EngineNow::from_clock(clock.as_ref());
+        let strip = &registry.active("ses_root")[0];
+        assert!(
+            strip.is_overdue(now.mono_ms),
+            "a backward wall jump must not hide a real deadline breach"
+        );
+        assert_eq!(strip.elapsed_s(now.mono_ms), 20);
+        assert_eq!(strip.remaining_ms(now.mono_ms), 0);
+        assert_eq!(
+            registry.earliest_deadline("ses_root"),
+            Some(now.wall_ms),
+            "no time is left, so the earliest deadline is now"
+        );
+    }
+
+    #[test]
+    fn elapsed_s_is_immune_to_wall_clock_movement() {
+        let clock = Arc::new(FakeClock::default());
+        clock.set(50_000);
+        let registry = ExpectationRegistry::new(clock.clone());
+        registry.open(strip("tc_1", "ses_root", "ses_root", 50_000, 600));
+
+        clock.set_mono(65_000);
+        let before = registry.active("ses_root")[0].elapsed_s(clock.mono_ms());
+        assert_eq!(before, 15);
+
+        clock.set_wall(50_000 - 9_000_000);
+        assert_eq!(
+            registry.active("ses_root")[0].elapsed_s(clock.mono_ms()),
+            before,
+            "elapsed time must not follow the wall clock backwards"
+        );
+
+        clock.set_wall(50_000 + 9_000_000);
+        assert_eq!(
+            registry.active("ses_root")[0].elapsed_s(clock.mono_ms()),
+            before,
+            "elapsed time must not follow the wall clock forwards"
+        );
+    }
+
+    #[test]
+    fn a_real_monotonic_breach_is_overdue() {
+        let clock = Arc::new(FakeClock::default());
+        clock.set(7_000);
+        let registry = ExpectationRegistry::new(clock.clone());
+        registry.open(strip("tc_1", "ses_root", "ses_root", 7_000, 5));
+
+        clock.set_mono(7_000 + 4_999);
+        let now = EngineNow::from_clock(clock.as_ref());
+        assert!(!registry.active("ses_root")[0].is_overdue(now.mono_ms));
+
+        clock.set_mono(7_000 + 5_000);
+        let now = EngineNow::from_clock(clock.as_ref());
+        assert!(
+            registry.active("ses_root")[0].is_overdue(now.mono_ms),
+            "a genuine intervene_s breach must be overdue"
+        );
+    }
+
+    #[test]
+    fn pruning_follows_the_monotonic_ttl_not_the_wall_clock() {
+        let clock = Arc::new(FakeClock::default());
+        clock.set(0);
+        let registry = ExpectationRegistry::with_caps(
+            clock.clone(),
+            RegistryCaps {
+                max_settled_per_root: MAX_SETTLED_PER_ROOT,
+                settled_ttl_ms: SETTLED_TTL_MS,
+            },
+        );
+        registry.open(strip("tc_1", "ses_root", "ses_root", 0, 10));
+        registry.settle("tc_1", StripState::Ok, Some("ok"));
+        assert_eq!(registry.recent("ses_root", 10).len(), 1);
+
+        // A backward wall jump must not freeze the TTL.
+        clock.set_wall(-9_000_000);
+        clock.set_mono(SETTLED_TTL_MS + 1);
+        registry.open(strip("tc_2", "ses_root", "ses_root", 0, 10));
+        assert_eq!(
+            registry.recent("ses_root", 10).len(),
+            0,
+            "the monotonic TTL must still evict after a backward wall jump"
+        );
+    }
+
+    #[test]
+    fn an_unstamped_strip_is_not_treated_as_ancient() {
+        // A fixture (or a producer predating the monotonic field) has no start
+        // stamp. 0 is not a real origin, so it must read as freshly opened
+        // rather than as "started at process boot".
+        let mut fixture = FlightStrip {
+            state: StripState::Running,
+            intervene_s: 10,
+            started_ms: 0,
+            ..FlightStrip::default()
+        };
+        assert_eq!(
+            fixture.elapsed_mono_ms(9_000_000),
+            0,
+            "an unstamped running strip has no measurable monotonic age"
+        );
+        assert!(
+            !fixture.is_overdue(9_000_000),
+            "an unstamped strip must never look overdue"
+        );
+        assert_eq!(fixture.remaining_ms(9_000_000), 10_000);
+
+        // A settled unstamped strip still reports its wall-clock duration.
+        fixture.state = StripState::Ok;
+        fixture.started_ms = 1_000;
+        fixture.settled_ms = Some(6_000);
+        assert_eq!(fixture.elapsed_mono_ms(9_000_000), 5_000);
     }
 }

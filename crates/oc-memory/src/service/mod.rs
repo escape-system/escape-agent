@@ -14,6 +14,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use oc_store::Store;
+use serde_json::Value;
 
 mod input;
 mod list;
@@ -42,6 +43,8 @@ pub const MAX_SEARCH_LIMIT: usize = 50;
 pub const LIST_DEFAULT: usize = 20;
 /// Maximum page size for [`MemoryService::list`].
 pub const LIST_MAX: usize = 200;
+/// Output size used when a retrieval request asks for `0` results.
+pub const SEARCH_DEFAULT: usize = 8;
 
 /// One retrieval request: visible scopes, query text and rendering budget.
 #[derive(Debug, Clone, Default)]
@@ -111,6 +114,23 @@ pub struct ListRequest {
     pub limit: usize,
     /// Offset cursor from a previous page.
     pub cursor: Option<String>,
+}
+
+/// One page of [`MemoryService::list_page`].
+///
+/// `items` are the rows in the page, `more` says whether a further page exists
+/// and `window_exhausted` says the page stopped at the store's list cap rather
+/// than at the end of the data — the caller must not treat the end of `items`
+/// as the end of the result set.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MemoryPage {
+    /// Rows in this page, already ordered and sliced.
+    pub items: Vec<Value>,
+    /// Whether another page starts at `offset + items.len()`.
+    pub more: bool,
+    /// Whether this page ended because the pagination window (the store's list
+    /// cap) was reached while more rows may exist.
+    pub window_exhausted: bool,
 }
 
 /// Memory reads, writes and list operations over one store.

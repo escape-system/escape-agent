@@ -2,6 +2,7 @@
 //! export/import, statistics, instructions and saved permissions.
 
 mod context;
+mod created_event;
 mod errors;
 mod export_import;
 mod fork;

@@ -171,3 +171,134 @@ async fn always_auto_resolves_covered_pending_requests_in_the_same_session() {
     ));
     assert!(broker.pending(&session).is_empty());
 }
+
+/// `permission.replied{durable}`: an `always` whose saved rule fully committed
+/// reports `durable: true`, and the rule really is readable after a restart.
+#[tokio::test]
+async fn always_reports_durable_true_when_the_rule_committed() {
+    let fixture = Fixture::new().await;
+    let (broker, mut events) = fixture.broker();
+    let session = fixture.session_id.clone();
+    let asker = tokio::spawn({
+        let broker = broker.clone();
+        let session = session.clone();
+        async move { broker.resolve(ask(&session, "shell", &["echo ok"])).await }
+    });
+    let pending = wait_pending(&broker, &session, 1).await;
+    let id = request_id(&pending, "shell", &["echo ok"]);
+    broker
+        .reply(&session, &id, PermissionReply::Always, None)
+        .expect("reply");
+    assert_eq!(
+        timeout(WAIT, asker).await.expect("ask").expect("join"),
+        PermissionDecision::Allow
+    );
+
+    let event = next_replied(&mut events, &id).await;
+    assert_eq!(event["reply"], json!("always"));
+    assert_eq!(event["durable"], json!(true), "event: {event}");
+    let project_id = fixture.project_id.clone();
+    let saved = fixture
+        .store
+        .list_saved_permissions(Some(&project_id))
+        .await
+        .expect("saved");
+    assert_eq!(saved.len(), 1, "saved rules: {saved:?}");
+}
+
+/// `permission.replied{durable}`: when the durable write fails (here: the
+/// session row vanished, so `persist` cannot resolve the project) the event says
+/// `durable: false` and the in-memory mirror keeps answering the same ask.
+#[tokio::test]
+async fn always_reports_durable_false_and_still_allows_from_memory() {
+    let fixture = Fixture::new().await;
+    let (broker, mut events) = fixture.broker();
+    let session = fixture.session_id.clone();
+    let asker = tokio::spawn({
+        let broker = broker.clone();
+        let session = session.clone();
+        async move { broker.resolve(ask(&session, "shell", &["echo ok"])).await }
+    });
+    let pending = wait_pending(&broker, &session, 1).await;
+    let id = request_id(&pending, "shell", &["echo ok"]);
+    // `persist` resolves the project through the session row; without it the
+    // durable write cannot even start, which is exactly the failure it reports.
+    fixture
+        .store
+        .delete_session(&session)
+        .await
+        .expect("drop session row");
+    broker
+        .reply(&session, &id, PermissionReply::Always, None)
+        .expect("reply");
+
+    let event = next_replied(&mut events, &id).await;
+    assert_eq!(event["reply"], json!("always"));
+    assert_eq!(event["durable"], json!(false), "event: {event}");
+    assert_eq!(
+        timeout(WAIT, asker).await.expect("ask").expect("join"),
+        PermissionDecision::Allow
+    );
+    // Nothing was written, so no `psv_` row exists...
+    let saved = fixture
+        .store
+        .list_saved_permissions(Some(&fixture.project_id))
+        .await
+        .expect("saved");
+    assert!(saved.is_empty(), "unexpected durable rule: {saved:?}");
+    // ...but the answer is still in effect for this process.
+    assert_eq!(
+        timeout(WAIT, broker.resolve(ask(&session, "shell", &["echo ok"])))
+            .await
+            .expect("memory resolve"),
+        PermissionDecision::Allow
+    );
+}
+
+/// A sibling auto-resolved by a rule that only lives in memory is not durable
+/// either, so the event cannot claim otherwise.
+#[tokio::test]
+async fn auto_resolved_sibling_reports_durability_of_its_rule() {
+    let fixture = Fixture::new().await;
+    let (broker, mut events) = fixture.broker();
+    let session = fixture.session_id.clone();
+    let star = tokio::spawn({
+        let broker = broker.clone();
+        let session = session.clone();
+        async move { broker.resolve(ask(&session, "shell", &["*"])).await }
+    });
+    let covered = tokio::spawn({
+        let broker = broker.clone();
+        let session = session.clone();
+        async move { broker.resolve(ask(&session, "shell", &["echo ok"])).await }
+    });
+    let pending = wait_pending(&broker, &session, 2).await;
+    let star_id = request_id(&pending, "shell", &["*"]);
+    let covered_id = request_id(&pending, "shell", &["echo ok"]);
+    // Force the in-memory path: no session row means `persist` fails.
+    fixture
+        .store
+        .delete_session(&session)
+        .await
+        .expect("drop session row");
+    broker
+        .reply(&session, &star_id, PermissionReply::Always, None)
+        .expect("reply");
+
+    let event = next_replied(&mut events, &star_id).await;
+    assert_eq!(event["durable"], json!(false), "star event: {event}");
+    let event = next_replied(&mut events, &covered_id).await;
+    assert_eq!(event["reply"], json!("always"));
+    assert_eq!(event["durable"], json!(false), "covered event: {event}");
+    assert_eq!(
+        timeout(WAIT, star).await.expect("star").expect("join"),
+        PermissionDecision::Allow
+    );
+    assert_eq!(
+        timeout(WAIT, covered)
+            .await
+            .expect("covered")
+            .expect("join"),
+        PermissionDecision::Allow
+    );
+}

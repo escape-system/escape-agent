@@ -17,6 +17,9 @@ use crate::data::{
 };
 use crate::error::ErrorResponse;
 
+/// How many times a failed `cancel_inbox` is retried after the first attempt.
+const CANCEL_INBOX_RETRIES: u32 = 1;
+
 /// Splits an optional `1..=10` depth prefix off a subagent-mode argument list.
 ///
 /// Both the `/mode` prompt path and the `/command` path funnel through this so
@@ -410,7 +413,38 @@ async fn admit(
             })
             .await
     {
-        let _ = store.cancel_inbox(session_id, &id).await;
+        // The inbox row is already committed, so returning an error while it
+        // survives would let the runtime promote the leftover `steer` row on
+        // the next turn and run the text the client was told had failed.
+        // Cancelling here — after, not before, the append — is deliberate:
+        // cancelling first would delete the row and lose the prompt entirely if
+        // the append then failed. The accepted window is "cancel keeps
+        // failing": the message is absent from the transcript but the prompt may
+        // still run. One retry covers a transient writer hiccup.
+        let mut attempt = 0;
+        loop {
+            match store.cancel_inbox(session_id, &id).await {
+                Ok(_) => break,
+                Err(cancel) if attempt < CANCEL_INBOX_RETRIES => {
+                    attempt += 1;
+                    tracing::warn!(
+                        session = %session_id,
+                        inbox = %id,
+                        error = %cancel,
+                        "inbox cancel failed; retrying"
+                    );
+                }
+                Err(cancel) => {
+                    tracing::error!(
+                        session = %session_id,
+                        inbox = %id,
+                        error = %cancel,
+                        "inbox cancel failed: the prompt may still run on the next turn"
+                    );
+                    break;
+                }
+            }
+        }
         return Err(error.into());
     }
 

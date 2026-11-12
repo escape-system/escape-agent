@@ -82,10 +82,7 @@ pub async fn audit(
                 "activeStrips".to_owned(),
                 json!(engine.registry().active(&root).len()),
             );
-            data.insert(
-                "budget".to_owned(),
-                serde_json::to_value(engine.budget(&root)).unwrap_or(Value::Null),
-            );
+            data.insert("budget".to_owned(), budget_value(&engine.budget(&root)));
         }
         None => {
             data.insert("enabled".to_owned(), Value::Bool(false));
@@ -137,8 +134,91 @@ pub async fn check(
     Ok(no_content())
 }
 
+/// `budget` field of the observer audit.
+///
+/// `BudgetState` is a flat struct of `u32`/`String`/`bool`/`Vec` fields, so a
+/// serde round trip cannot fail; building the object directly removes the old
+/// `to_value(..).unwrap_or(Value::Null)` fallback, which would have put `null`
+/// under an object-shaped key. The field names and order are the serde ones, so
+/// the projection is byte-identical to the old serialization (a unit test pins
+/// that against `serde_json::to_value`).
+fn budget_value(budget: &oc_observer::BudgetState) -> Value {
+    json!({
+        "root_used": budget.root_used,
+        "root_limit": budget.root_limit,
+        "targets": budget
+            .targets
+            .iter()
+            .map(|target| {
+                json!({
+                    "target": target.target,
+                    "used": target.used,
+                    "limit": target.limit,
+                })
+            })
+            .collect::<Vec<_>>(),
+        "exhausted": budget.exhausted,
+    })
+}
+
 fn require_session(session_id: Option<String>) -> Result<String, ErrorResponse> {
     session_id
         .filter(|id| !id.trim().is_empty())
         .ok_or_else(|| ApiError::bad_request("sessionID is required").into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use oc_observer::{BudgetState, TargetBudget};
+
+    fn target(target: &str, used: u32, limit: u32) -> TargetBudget {
+        TargetBudget {
+            target: target.to_owned(),
+            used,
+            limit,
+        }
+    }
+
+    /// T13: the hand-built projection must be identical to what serde produces
+    /// for the same state. The old code was `to_value(..).unwrap_or(Null)`, so
+    /// this pins both the field names and their order against `Serialize`, and
+    /// proves the `Null` fallback can never appear under `budget`.
+    #[test]
+    fn budget_value_is_identical_to_serde_serialization() {
+        let states = [
+            BudgetState {
+                root_used: 3,
+                root_limit: 12,
+                targets: vec![target("writer", 2, 5), target("tester", 1, 5)],
+                exhausted: false,
+            },
+            // Empty `targets` is the shape a fresh root reports.
+            BudgetState {
+                root_used: 0,
+                root_limit: 12,
+                targets: Vec::new(),
+                exhausted: false,
+            },
+            // Exhausted, with a target at its limit.
+            BudgetState {
+                root_used: 12,
+                root_limit: 12,
+                targets: vec![target("writer", 5, 5)],
+                exhausted: true,
+            },
+        ];
+        for state in states {
+            let projected = budget_value(&state);
+            let serialized = serde_json::to_value(&state).expect("BudgetState serializes");
+            assert_eq!(projected, serialized, "value drift for {state:?}");
+            // `preserve_order` is on in this build, so equal text also pins order.
+            assert_eq!(
+                projected.to_string(),
+                serialized.to_string(),
+                "byte drift for {state:?}"
+            );
+            assert_ne!(projected, Value::Null);
+        }
+    }
 }

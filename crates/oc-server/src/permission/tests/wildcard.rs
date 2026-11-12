@@ -7,6 +7,7 @@ fn covered_uses_wildcard_rules() {
     let rules = vec![Rule {
         action: "read".to_owned(),
         resources: vec!["*.env".to_owned()],
+        durable: true,
     }];
     assert!(covered(&rules, "read", &["config/.env".to_owned()]));
     assert!(!covered(&rules, "read", &["config/.env.local".to_owned()]));
@@ -14,6 +15,7 @@ fn covered_uses_wildcard_rules() {
     let star = vec![Rule {
         action: "*".to_owned(),
         resources: vec!["*".to_owned()],
+        durable: true,
     }];
     assert!(covered(&star, "shell", &["rm x".to_owned()]));
 }

@@ -91,6 +91,8 @@ pub(crate) fn flight_strip(
         intervene_s: expectation.intervene_after_seconds,
         started_ms: now_millis(),
         settled_ms: None,
+        started_mono_ms: Some(oc_observer::clock::process_mono_ms()),
+        settled_mono_ms: None,
         state: StripState::Running,
         outcome: None,
         parent_call: None,

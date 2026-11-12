@@ -5,11 +5,12 @@
 //! more negative means better, so the score uses `-bm25` with the weights from
 //! `docs/06-memory.md`:
 //!
-//! `score = -bm25 * 1.0 + importance * 0.35 + recency * 0.25 + tag_overlap * 0.20`
+//! `score = -bm25 + importance * W_IMPORTANCE + recency * W_RECENCY + tag_overlap * W_TAG_OVERLAP`
 //!
-//! `recency = 1 / (1 + age_days / 30)` with `age_days` measured from
-//! `last_used ?? updated`. `tag_overlap` counts stored tags also requested by
-//! the query.
+//! `recency = 1 / (1 + age_days / RECENCY_SCALE_DAYS)` with `age_days` measured
+//! from `last_used ?? updated` in `MS_PER_DAY` units. `tag_overlap` counts
+//! stored tags also requested by the query. The constants live below; the SQL is
+//! assembled in [`score_expression`], the single construction site.
 
 use std::collections::HashSet;
 
@@ -29,6 +30,20 @@ const LIST_CAP: usize = 200;
 const PINNED_LIMIT: u8 = 3;
 const MAX_QUERY_TOKENS: usize = 32;
 const MAX_TAG_COUNT: usize = 32;
+
+/// Time unit of `memory.updated` / `memory.last_used` (epoch milliseconds),
+/// bound as a REAL divisor in the recency expression.
+const MS_PER_DAY: f64 = 86_400_000.0;
+/// Scale of the recency term in days (see the module doc): the recency term is
+/// halved once a memory is this old, so memories stay relevant for months
+/// instead of days.
+const RECENCY_SCALE_DAYS: f64 = 30.0;
+/// Weight of the stored `importance` (1..=5) in the hybrid score.
+const W_IMPORTANCE: f64 = 0.35;
+/// Weight of the recency term in the hybrid score.
+const W_RECENCY: f64 = 0.25;
+/// Weight of the tag-overlap count in the hybrid score.
+const W_TAG_OVERLAP: f64 = 0.20;
 
 pub(crate) const MEMORY_COLUMNS: &str = "id, scope, scope_id, kind, text, tags, importance, confidence, source, \
 source_session, source_message, created, updated, last_used, uses";
@@ -305,6 +320,11 @@ impl Store {
     }
 
     /// Bumps `uses` and `last_used` for the given ids in one statement.
+    ///
+    /// Forgotten rows are left alone: a memory retrieved before a `forget` and
+    /// touched at turn end must not keep accruing usage. Unknown ids are a
+    /// silent skip — a session-scoped memory may legitimately disappear between
+    /// retrieval and the touch, so that is not an error.
     pub async fn touch_memories(&self, ids: &[String], now: i64) -> Result<(), StoreError> {
         if ids.is_empty() {
             return Ok(());
@@ -315,7 +335,7 @@ impl Store {
                 let placeholders = vec!["?"; ids.len()].join(", ");
                 let sql = format!(
                     "UPDATE memory SET uses = coalesce(uses, 0) + 1, last_used = ?1
-                     WHERE id IN ({placeholders})"
+                     WHERE deleted = 0 AND id IN ({placeholders})"
                 );
                 let mut values: Vec<SqlValue> = Vec::with_capacity(ids.len() + 1);
                 values.push(SqlValue::Integer(now));
@@ -340,12 +360,58 @@ impl Store {
     }
 }
 
+/// The hybrid-score SQL, built once so the FTS branch and the plain-ranked
+/// branch cannot drift apart.
+///
+/// `score = bm25 + importance * W_IMPORTANCE + recency * W_RECENCY
+///          + tag_overlap * W_TAG_OVERLAP`
+///
+/// with `recency = 1 / (1 + age_days / RECENCY_SCALE_DAYS)` and
+/// `age_days = max(0, now - coalesce(last_used, updated)) / MS_PER_DAY`. The
+/// `max(0, …)` keeps a clock step backwards from yielding a negative age and
+/// therefore a recency above 1.
+///
+/// Every policy number is a bound `?` parameter (never a literal inside the
+/// SQL), so the constants above are the single definition. `?` order in the
+/// returned fragment: `W_IMPORTANCE`, `now`, `MS_PER_DAY`, `RECENCY_SCALE_DAYS`,
+/// `W_RECENCY`, the overlap-tag values (if any), `W_TAG_OVERLAP`.
+struct ScoreExpression {
+    sql: String,
+    params: Vec<SqlValue>,
+}
+
+fn score_expression(tags: &[String], now: i64, bm25: Option<&str>) -> ScoreExpression {
+    let (overlap_sql, overlap_params) = overlap_expression(tags);
+    // `1.0` is the constant term of the documented `1 / (1 + x)` recency curve,
+    // not a tunable policy number. The divisors are bound as REAL so the integer
+    // epoch-millisecond difference yields a fractional day count instead of
+    // SQLite's integer division.
+    let weighted = format!(
+        "(m.importance * ?)
+         + (1.0 / (1.0 + max(0, ? - coalesce(m.last_used, m.updated)) / ? / ?)) * ?
+         + ({overlap_sql}) * ?"
+    );
+    let sql = match bm25 {
+        Some(term) => format!("({term} + {weighted})"),
+        None => format!("({weighted})"),
+    };
+    let mut params = vec![
+        SqlValue::Real(W_IMPORTANCE),
+        SqlValue::Integer(now),
+        SqlValue::Real(MS_PER_DAY),
+        SqlValue::Real(RECENCY_SCALE_DAYS),
+        SqlValue::Real(W_RECENCY),
+    ];
+    params.extend(overlap_params);
+    params.push(SqlValue::Real(W_TAG_OVERLAP));
+    ScoreExpression { sql, params }
+}
+
 fn search_statement(query: &MemoryQuery, limit: usize, now: i64) -> (String, Vec<SqlValue>) {
     let match_query = query.query.as_deref().and_then(fts_query);
     let pinned = query
         .pinned_min_importance
         .map(|value| i64::from(value.clamp(1, 5)));
-    let (overlap_sql, overlap_params) = overlap_expression(&query.tags);
     let filters = build_filters(query);
     let pinned_flag = pinned.map_or_else(
         || "0".to_owned(),
@@ -358,8 +424,8 @@ fn search_statement(query: &MemoryQuery, limit: usize, now: i64) -> (String, Vec
         if let Some(threshold) = pinned {
             values.push(SqlValue::Integer(threshold));
         }
-        values.push(SqlValue::Integer(now));
-        values.extend(overlap_params);
+        let score = score_expression(&query.tags, now, Some("coalesce(h.bm, 0.0)"));
+        values.extend(score.params);
         values.extend(filters.params);
         if let Some(threshold) = pinned {
             values.push(SqlValue::Integer(threshold));
@@ -378,11 +444,7 @@ fn search_statement(query: &MemoryQuery, limit: usize, now: i64) -> (String, Vec
                  SELECT m.id AS id, m.kind AS kind, m.text AS text, m.tags AS tags,
                         m.importance AS importance, m.updated AS updated,
                         h.rid AS hit_rid, {pinned_flag} AS pinned_flag,
-                        (coalesce(h.bm, 0.0)
-                         + (m.importance * 0.35)
-                         + (1.0 / (1.0 + (max(0, ? - coalesce(m.last_used, m.updated))
-                                         / 86400000.0))) * 0.25
-                         + ({overlap_sql}) * 0.20) AS score
+                        {score_sql} AS score
                  FROM memory m
                  LEFT JOIN hits h ON h.rid = m.rowid
                  WHERE m.deleted = 0{filter_clause}
@@ -402,23 +464,21 @@ fn search_statement(query: &MemoryQuery, limit: usize, now: i64) -> (String, Vec
              ORDER BY pinned_flag DESC, score DESC, importance DESC, updated DESC
              LIMIT ?",
             filter_clause = filters.clause,
+            score_sql = score.sql,
         )
     } else {
-        values.push(SqlValue::Integer(now));
-        values.extend(overlap_params);
+        let score = score_expression(&query.tags, now, None);
+        values.extend(score.params);
         values.extend(filters.params);
         values.push(SqlValue::Integer(limit));
         format!(
-            "SELECT m.id, m.kind, m.text, m.tags, m.importance,
-                    ((m.importance * 0.35)
-                     + (1.0 / (1.0 + (max(0, ? - coalesce(m.last_used, m.updated))
-                                     / 86400000.0))) * 0.25
-                     + ({overlap_sql}) * 0.20) AS score
+            "SELECT m.id, m.kind, m.text, m.tags, m.importance, {score_sql} AS score
              FROM memory m
              WHERE m.deleted = 0{filter_clause}
              ORDER BY score DESC, m.importance DESC, m.updated DESC
              LIMIT ?",
             filter_clause = filters.clause,
+            score_sql = score.sql,
         )
     };
     (sql, values)

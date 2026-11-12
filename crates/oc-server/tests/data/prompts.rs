@@ -1,5 +1,6 @@
 use axum::http::{Method, StatusCode};
 use oc_server::router;
+use oc_types::now_millis;
 use serde_json::json;
 
 use crate::support::{SseReader, call, create_session, harness, session_id, sse};
@@ -314,4 +315,98 @@ async fn prompt_normalizes_data_url_file_attachments() {
     let f = &parsed.files.as_ref().unwrap()[0];
     assert_eq!(f.mime, "image/png");
     assert_eq!(f.name.as_deref(), Some("pixel.png"));
+}
+
+/// A steer prompt whose message append fails must not leave its inbox row
+/// behind: the runtime promotes surviving `steer` rows on the next turn, so a
+/// leftover row would run text the caller was told had failed.
+///
+/// The append is failed without an injection seam. `session_message.id` is a
+/// database-wide primary key while `admit` only pre-checks the *target*
+/// session, so a message id that already belongs to another session passes the
+/// pre-check, allows the enqueue to commit, and then fails the insert.
+///
+/// HONEST LIMIT: `cancel_inbox` routes through the same single serialized
+/// writer as every other write, so it cannot be made to fail from outside. The
+/// retry and exhausted-retry arms are therefore untestable here and are
+/// reported only; this test pins the invariant on the arm that is reachable.
+#[tokio::test]
+async fn failed_steer_append_removes_the_inbox_row() {
+    let harness = harness().await;
+    let app = router(harness.state.clone());
+    let owner = session_id(&create_session(&app, json!({"title": "owner"})).await);
+    let target = session_id(&create_session(&app, json!({"title": "target"})).await);
+
+    // Seed a message identity that belongs to `owner` only. It has no inbox
+    // row, so the enqueue below is free to allocate the same id.
+    harness
+        .state
+        .store()
+        .unwrap()
+        .append_message(oc_store::NewMessage {
+            id: "msg_t7_collision".to_owned(),
+            session_id: owner.clone(),
+            kind: "user".to_owned(),
+            data: json!({"text": "seed"}),
+            time_created: now_millis(),
+        })
+        .await
+        .unwrap();
+
+    let (status, body) = call(
+        &app,
+        Method::POST,
+        &format!("/api/session/{target}/prompt"),
+        Some(json!({
+            "id": "msg_t7_collision",
+            "text": "this must not run",
+            "delivery": "steer",
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body:?}");
+    assert_eq!(
+        body.unwrap()["_tag"],
+        "InternalError",
+        "the append failure is the error returned to the caller"
+    );
+
+    // The text must not be deliverable: neither as a pending inbox row nor as a
+    // committed transcript message.
+    let (_, inbox) = call(
+        &app,
+        Method::GET,
+        &format!("/api/session/{target}/inbox"),
+        None,
+    )
+    .await;
+    let inbox = inbox.unwrap();
+    assert!(
+        inbox["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| item["id"] != "msg_t7_collision"),
+        "failed steer prompt left its inbox row behind: {inbox}"
+    );
+    let (_, messages) = call(
+        &app,
+        Method::GET,
+        &format!("/api/session/{target}/message?order=asc"),
+        None,
+    )
+    .await;
+    assert!(messages.unwrap()["data"].as_array().unwrap().is_empty());
+
+    // The owner's message is untouched: the failed append wrote nothing.
+    let (_, owner_messages) = call(
+        &app,
+        Method::GET,
+        &format!("/api/session/{owner}/message?order=asc"),
+        None,
+    )
+    .await;
+    let owner_messages = owner_messages.unwrap();
+    assert_eq!(owner_messages["data"].as_array().unwrap().len(), 1);
+    assert_eq!(owner_messages["data"][0]["text"], "seed");
 }

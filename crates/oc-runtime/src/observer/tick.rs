@@ -400,6 +400,8 @@ impl Runtime {
             intervene_s: 3,
             started_ms: oc_types::now_millis(),
             settled_ms: None,
+            started_mono_ms: Some(oc_observer::clock::process_mono_ms()),
+            settled_mono_ms: None,
             state: oc_observer::StripState::Running,
             outcome: None,
             parent_call: None,

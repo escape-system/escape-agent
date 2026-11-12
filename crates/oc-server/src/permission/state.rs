@@ -1,5 +1,16 @@
 //! In-memory permission state: pending requests, saved-rule mirror and the
 //! reply state machine.
+//!
+//! Every `permission.replied` payload carries `durable`, the honest answer to
+//! "did this reply leave anything unwritten?".
+//!
+//! - `true`: a `reject`/`once` answer (nothing to persist), or an `always`
+//!   answer whose rule fully committed to `permission_saved`.
+//! - `false`: an `always` answer whose rule could not be written and lives only
+//!   in the in-memory mirror of this process. The answer is still in effect
+//!   until a restart, and `persist` writes resources one by one, so `false`
+//!   does not mean "nothing was written" — a partial write is possible and the
+//!   mirror only augments what committed.
 
 use std::sync::{Arc, Mutex};
 
@@ -51,6 +62,10 @@ struct SavedRule {
 pub(super) struct Rule {
     pub(super) action: String,
     pub(super) resources: Vec<String>,
+    /// Whether this rule came from `permission_saved` (survives a restart) or
+    /// only from the in-memory mirror. Used to report `permission.replied
+    /// .durable` for requests auto-resolved by it.
+    pub(super) durable: bool,
 }
 
 /// Whether `rules` cover every `resource` of `action`.
@@ -70,12 +85,32 @@ pub(super) fn covered(rules: &[Rule], action: &str, resources: &[String]) -> boo
     })
 }
 
+/// Like [`covered`], but every matching rule must be a durable one. A sibling
+/// that needs the in-memory mirror to be allowed is not durable.
+fn covered_durably(rules: &[Rule], action: &str, resources: &[String]) -> bool {
+    resources.iter().all(|resource| {
+        rules.iter().any(|rule| {
+            rule.durable
+                && oc_config::wildcard_match(action, &rule.action)
+                && rule
+                    .resources
+                    .iter()
+                    .any(|saved| oc_config::wildcard_match(resource, saved))
+        })
+    })
+}
+
 /// `permission.replied` payload.
-fn replied(entry: &Pending, reply: PermissionReply) -> Value {
+///
+/// `durable` says whether the reply's effect survives a restart: reject/once
+/// replies have nothing to persist, and an `always` reply is only `durable`
+/// when every saved-rule write committed. See the module doc.
+fn replied(entry: &Pending, reply: PermissionReply, durable: bool) -> Value {
     json!({
         "sessionID": entry.session_id,
         "requestID": entry.id,
         "reply": reply,
+        "durable": durable,
     })
 }
 
@@ -118,6 +153,7 @@ impl State {
             .map(|rule| Rule {
                 action: rule.action.clone(),
                 resources: rule.resources.clone(),
+                durable: false,
             })
             .collect()
     }
@@ -239,9 +275,12 @@ impl State {
                         message: message.clone(),
                     });
                 }
+                // A reject leaves no saved state, so it is durable as soon as
+                // the asker was failed.
+                let durable = true;
                 // The answered request is published first, then the siblings
                 // it failed (same order as the `always` path).
-                Self::publish(tx, "permission.replied", replied(&entry, reply));
+                Self::publish(tx, "permission.replied", replied(&entry, reply, durable));
                 let drained = {
                     let mut pending = self.pending.lock().expect("permission pending");
                     let mut drained = Vec::new();
@@ -261,14 +300,15 @@ impl State {
                             message: message.clone(),
                         });
                     }
-                    Self::publish(tx, "permission.replied", replied(&sibling, reply));
+                    Self::publish(tx, "permission.replied", replied(&sibling, reply, durable));
                 }
             }
             PermissionReply::Once => {
                 if let Some(sender) = sender {
                     let _ = sender.send(PermissionDecision::Allow);
                 }
-                Self::publish(tx, "permission.replied", replied(&entry, reply));
+                // A one-shot allow persists nothing.
+                Self::publish(tx, "permission.replied", replied(&entry, reply, true));
             }
             PermissionReply::Always => {
                 if let Some(sender) = sender {
@@ -309,16 +349,17 @@ impl State {
         let tx = tx.clone();
         let store = Arc::clone(store);
         handle.spawn(async move {
-            // Write first, event second: a received `permission.replied`
-            // implies the rule is durable (or, after a failed write, at least
-            // that it is held in memory).
-            if !persist(&store, &entry).await {
+            // Write first, event second: a received `permission.replied` means
+            // the rule committed, or — when `durable` is false — that it lives
+            // only in this process's memory until a restart.
+            let durable = persist(&store, &entry).await;
+            if !durable {
                 state.remember(&entry);
             }
             State::publish(
                 &tx,
                 "permission.replied",
-                replied(&entry, PermissionReply::Always),
+                replied(&entry, PermissionReply::Always, durable),
             );
             let rules = state.rules(Some(&store), &entry.session_id).await;
             state.auto_resolve(&tx, &entry.session_id, &rules);
@@ -332,13 +373,17 @@ impl State {
         Self::publish(
             tx,
             "permission.replied",
-            replied(entry, PermissionReply::Always),
+            replied(entry, PermissionReply::Always, false),
         );
         self.auto_resolve(tx, &entry.session_id, &self.memory_rules(&entry.session_id));
     }
 
     /// Allow every other pending request of `session_id` that `rules` fully
     /// cover, in arrival order, publishing each as an `always` resolution.
+    ///
+    /// A sibling is reported `durable: true` only when a rule that came from
+    /// `permission_saved` covers it; one allowed solely by the in-memory mirror
+    /// is reported `durable: false`, exactly like a directly answered `always`.
     fn auto_resolve(
         &self,
         tx: &broadcast::Sender<Arc<EventEnvelope>>,
@@ -353,17 +398,18 @@ impl State {
                 let entry = &pending[index];
                 if entry.session_id == session_id && covered(rules, &entry.action, &entry.resources)
                 {
+                    let durable = covered_durably(rules, &entry.action, &entry.resources);
                     let mut entry = pending.remove(index);
                     if let Some(sender) = entry.sender.take() {
                         let _ = sender.send(PermissionDecision::Allow);
                     }
-                    resolved.push(entry.id);
+                    resolved.push((entry.id, durable));
                 } else {
                     index += 1;
                 }
             }
         }
-        for request_id in resolved {
+        for (request_id, durable) in resolved {
             Self::publish(
                 tx,
                 "permission.replied",
@@ -371,6 +417,7 @@ impl State {
                     "sessionID": session_id,
                     "requestID": request_id,
                     "reply": PermissionReply::Always,
+                    "durable": durable,
                 }),
             );
         }
@@ -411,6 +458,8 @@ impl State {
                     "sessionID": entry.session_id,
                     "requestID": entry.id,
                     "reply": "reject",
+                    // A reject persists nothing, so it is durable once sent.
+                    "durable": true,
                 }),
             );
         }

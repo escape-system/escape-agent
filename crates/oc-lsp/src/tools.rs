@@ -215,7 +215,11 @@ pub async fn execute(supervisor: &LspSupervisor, input: &LspToolInput) -> Result
             };
             client.request(method, json!({ "item": item })).await
         }
-        LspOperation::WorkspaceSymbol | LspOperation::Diagnostics => unreachable!(),
+        // Both operations returned early above; keep the match exhaustive without a
+        // panic in a library path if that invariant ever changes.
+        LspOperation::WorkspaceSymbol | LspOperation::Diagnostics => Err(LspError::InvalidParams(
+            format!("operation `{}` is not handled here", input.operation),
+        )),
     }
 }
 

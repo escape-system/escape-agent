@@ -178,10 +178,16 @@ impl Store {
                     params![&id, &session_id],
                 )?;
                 if removed == 0 {
-                    // Lost the race with another promoter (or the row vanished):
-                    // the item is already gone, so inserting here would
-                    // materialize a duplicate transcript message. `None` is the
-                    // documented "absent item" answer.
+                    // Not reachable today: the SELECT above and this DELETE run in
+                    // one `TransactionBehavior::Immediate` transaction on the single
+                    // serialized writer thread (`db::spawn_writer`), no trigger
+                    // touches `session_inbox`, the only foreign key that could
+                    // cascade (`session_v2`) cannot change inside that transaction,
+                    // and a second process is excluded by the database PID lock. It
+                    // is kept as a cheap defence should a multi-writer future ever
+                    // appear: then the row could already be gone, and inserting
+                    // here would materialize a duplicate transcript message.
+                    // `None` is the documented "absent item" answer either way.
                     return Ok(None);
                 }
                 transaction.execute(

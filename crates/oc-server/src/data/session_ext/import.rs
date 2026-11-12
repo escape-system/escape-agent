@@ -159,7 +159,20 @@ pub async fn import(
             .await;
         if let Err(error) = appended {
             // A half-imported session would be worse than no import at all.
-            let _ = store.delete_session(&session_id).await;
+            // `create_session` and every `append_message` commit in their own
+            // transaction, so nothing encloses this rollback: when it fails the
+            // session row plus the messages copied so far stay committed and are
+            // fully usable (list, export, prompt). That cannot be reported
+            // through the wire shape here without changing the status mapping,
+            // so it is logged at `error!` and the *original* append error is
+            // returned. Delete the session manually if this fires.
+            if let Err(rollback) = store.delete_session(&session_id).await {
+                tracing::error!(
+                    session = %session_id,
+                    error = %rollback,
+                    "import rollback failed: the session may remain partially imported"
+                );
+            }
             return Err(error.into());
         }
     }

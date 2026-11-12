@@ -38,6 +38,17 @@ fn ids_of(hits: &[oc_store::MemoryHit]) -> Vec<String> {
     hits.iter().map(|hit| hit.id.clone()).collect()
 }
 
+/// Epoch milliseconds, matching `last_used` units so tests can age rows without
+/// reaching into the store.
+fn wall_clock_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock after the epoch")
+        .as_millis()
+        .try_into()
+        .expect("epoch millis fit in i64")
+}
+
 #[tokio::test]
 async fn write_dedupes_and_upserts() {
     let store = Store::open_memory().await.expect("store");
@@ -477,6 +488,203 @@ async fn search_limit_and_pinned_rows() {
     assert_eq!(capped.len(), 50, "search limit is capped at 50");
 }
 
+/// `T3`: the recency term must follow the documented `1 / (1 + age_days / 30)`
+/// scale, not the old `1 / (1 + age_days)`.
+///
+/// Ages are established through `last_used` (a completed `touch_memories`), so
+/// the only unknown is the millisecond drift between the touch and the search.
+/// That drift is negligible against a 30-day scale, so the 5e-5 tolerance is
+/// generous.
+#[tokio::test]
+async fn recency_decays_on_the_documented_thirty_day_scale() {
+    const MS_PER_DAY: i64 = 86_400_000;
+    const W_RECENCY: f64 = 0.25;
+
+    let store = Store::open_memory().await.expect("store");
+    // Three rows with identical importance and no tags, so the score differs
+    // only by the recency term.
+    for id in ["mem_fresh", "mem_week", "mem_month"] {
+        store
+            .write_memory(new_memory(
+                id,
+                "global",
+                None,
+                "fact",
+                &format!("decay probe {id}"),
+                3,
+            ))
+            .await
+            .expect("write");
+    }
+    // One minute of slack keeps `fresh` from sitting exactly at the search's
+    // `now_ms()`; either way the age is ~0 against a 30-day scale.
+    let now = wall_clock_ms() - 60_000;
+    store
+        .touch_memories(&["mem_fresh".to_owned()], now)
+        .await
+        .expect("touch fresh");
+    store
+        .touch_memories(&["mem_week".to_owned()], now - 7 * MS_PER_DAY)
+        .await
+        .expect("touch week");
+    store
+        .touch_memories(&["mem_month".to_owned()], now - 30 * MS_PER_DAY)
+        .await
+        .expect("touch month");
+
+    let hits = store
+        .search_memories(MemoryQuery {
+            limit: 10,
+            ..Default::default()
+        })
+        .await
+        .expect("search");
+    let recency_of = |id: &str| {
+        hits.iter()
+            .find(|hit| hit.id == id)
+            .unwrap_or_else(|| panic!("missing {id} in {hits:?}"))
+            .score
+    };
+    // Equal importance of 3 contributes 3 * 0.35 in every row.
+    let base = 3.0 * 0.35;
+    let fresh = recency_of("mem_fresh") - base;
+    let week = recency_of("mem_week") - base;
+    let month = recency_of("mem_month") - base;
+
+    // A 30-day-old memory keeps half of the recency weight; the old formula
+    // would have given ~1/31, thirty times less.
+    let expected_month = W_RECENCY * 0.5;
+    assert!(
+        (month - expected_month).abs() < 5e-5,
+        "30 days must halve the recency term: expected {expected_month}, got {month}"
+    );
+    let expected_week = W_RECENCY / (1.0 + 7.0 / 30.0);
+    assert!(
+        (week - expected_week).abs() < 5e-5,
+        "7 days must follow 1/(1+7/30): expected {expected_week}, got {week}"
+    );
+    // The old `1/(1+age_days)` formula scored a week-old memory at 0.125 of the
+    // recency weight (0.03125); the documented scale keeps it near 0.2.
+    assert!(
+        week > W_RECENCY / 4.0,
+        "a 7-day-old memory must score above the old 0.125 factor: got {week}"
+    );
+    assert!(
+        fresh <= W_RECENCY + 1e-9 && fresh > W_RECENCY * 0.999,
+        "a just-touched memory scores the full recency weight: got {fresh}"
+    );
+    assert!(
+        fresh > week && week > month,
+        "recency must decrease with age: fresh={fresh} week={week} month={month}"
+    );
+}
+
+/// Anti-drift guard for `T3`: the FTS branch and the plain-ranked branch must
+/// compute the same recency for the same row.
+///
+/// The two probe rows have the same token count and the same term frequency for
+/// the query token, so FTS5 assigns them the same bm25. Therefore
+/// `fts_score - plain_score` is a row-independent constant (the bm25 term), and
+/// the recency *difference* between the rows can be compared across branches
+/// without knowing bm25.
+#[tokio::test]
+async fn both_search_branches_agree_on_the_recency_term() {
+    const MS_PER_DAY: i64 = 86_400_000;
+    const W_RECENCY: f64 = 0.25;
+
+    let store = Store::open_memory().await.expect("store");
+    store
+        .write_memory(new_memory(
+            "mem_drift_fresh",
+            "global",
+            None,
+            "fact",
+            "drift probe alpha",
+            2,
+        ))
+        .await
+        .expect("fresh write");
+    store
+        .write_memory(new_memory(
+            "mem_drift_old",
+            "global",
+            None,
+            "fact",
+            "drift probe beta",
+            2,
+        ))
+        .await
+        .expect("old write");
+    let now = wall_clock_ms() - 60_000;
+    store
+        .touch_memories(&["mem_drift_fresh".to_owned()], now)
+        .await
+        .expect("touch fresh");
+    store
+        .touch_memories(&["mem_drift_old".to_owned()], now - 30 * MS_PER_DAY)
+        .await
+        .expect("touch old");
+
+    let ranked = store
+        .search_memories(MemoryQuery {
+            query: Some("drift".to_owned()),
+            limit: 10,
+            ..Default::default()
+        })
+        .await
+        .expect("fts branch");
+    let plain = store
+        .search_memories(MemoryQuery {
+            limit: 10,
+            ..Default::default()
+        })
+        .await
+        .expect("plain branch");
+    assert_eq!(ranked.len(), 2, "{ranked:?}");
+    assert_eq!(plain.len(), 2, "{plain:?}");
+    let find = |hits: &[oc_store::MemoryHit], id: &str| {
+        hits.iter()
+            .find(|hit| hit.id == id)
+            .unwrap_or_else(|| panic!("missing {id} in {hits:?}"))
+            .score
+    };
+
+    let fts_fresh = find(&ranked, "mem_drift_fresh");
+    let fts_old = find(&ranked, "mem_drift_old");
+    let plain_fresh = find(&plain, "mem_drift_fresh");
+    let plain_old = find(&plain, "mem_drift_old");
+
+    // bm25 is identical for both rows up to FTS5's floating-point noise, so the
+    // branch offset must be too. The tolerance is loose because the term itself
+    // is ~1e-6 here and depends on the corpus statistics, not on recency.
+    let offset_fresh = fts_fresh - plain_fresh;
+    let offset_old = fts_old - plain_old;
+    assert!(
+        (offset_fresh - offset_old).abs() < 1e-5,
+        "branches must agree per row: offsets {offset_fresh} vs {offset_old}"
+    );
+
+    // Both branches must show the 30-day recency drop: half of W_RECENCY.
+    let expected_drop = W_RECENCY * 0.5;
+    for (label, drop) in [
+        ("fts", fts_fresh - fts_old),
+        ("plain", plain_fresh - plain_old),
+    ] {
+        assert!(
+            (drop - expected_drop).abs() < 5e-5,
+            "{label} branch recency drop over 30 days: expected {expected_drop}, got {drop}"
+        );
+    }
+
+    // And the old row's absolute recency must match the documented formula in
+    // the plain branch (the FTS branch adds the unknown bm25 on top).
+    let expected_old = 2.0 * 0.35 + W_RECENCY * 0.5;
+    assert!(
+        (plain_old - expected_old).abs() < 5e-5,
+        "plain branch old-row score: expected {expected_old}, got {plain_old}"
+    );
+}
+
 #[tokio::test]
 async fn touch_bumps_uses_and_last_used() {
     let store = Store::open_memory().await.expect("store");
@@ -526,6 +734,122 @@ async fn touch_bumps_uses_and_last_used() {
         .touch_memories(&[], 70_000)
         .await
         .expect("empty touch");
+}
+
+/// `T9`: a forgotten memory must not keep accruing `uses` / `last_used`.
+#[tokio::test]
+async fn touch_skips_forgotten_memories() {
+    let store = Store::open_memory().await.expect("store");
+    store
+        .write_memory(new_memory(
+            "mem_live",
+            "global",
+            None,
+            "fact",
+            "live fact keeps usage",
+            3,
+        ))
+        .await
+        .expect("live");
+    store
+        .write_memory(new_memory(
+            "mem_gone",
+            "global",
+            None,
+            "fact",
+            "forgotten fact must not accrue usage",
+            3,
+        ))
+        .await
+        .expect("forgotten");
+    assert!(store.forget_memory("mem_gone").await.expect("forget"));
+
+    let ids = vec!["mem_live".to_owned(), "mem_gone".to_owned()];
+    store.touch_memories(&ids, 50_000).await.expect("touch");
+    store
+        .touch_memories(&ids, 60_000)
+        .await
+        .expect("touch again");
+
+    // The forgotten row is invisible to `list_memories`, so read it straight
+    // from the store's read path via the raw row helper's public surface: the
+    // rewrite path returns the row regardless of `deleted`.
+    let listed = store
+        .list_memories(MemoryQuery {
+            limit: 10,
+            ..Default::default()
+        })
+        .await
+        .expect("list");
+    assert_eq!(listed.len(), 1, "only the live memory is listed");
+    assert_eq!(listed[0]["id"], "mem_live");
+    assert_eq!(listed[0]["uses"], 2);
+    assert_eq!(listed[0]["lastUsed"], 60_000);
+
+    // Re-writing the forgotten row (a user rewrite, not a scribe retry)
+    // restores it, which is how the test observes its counters afterwards.
+    let restored = store
+        .write_memory(new_memory(
+            "mem_resurrect",
+            "global",
+            None,
+            "fact",
+            "forgotten fact must not accrue usage",
+            3,
+        ))
+        .await
+        .expect("user rewrite restores the row");
+    assert_eq!(restored["id"], "mem_gone");
+    assert_eq!(
+        restored["uses"], 0,
+        "the forgotten row must never have been touched: {restored:?}"
+    );
+    assert!(
+        restored.get("lastUsed").is_none(),
+        "a forgotten row must not gain last_used: {restored:?}"
+    );
+}
+
+/// `T9`: unknown ids stay a silent skip (a session-scoped memory can vanish
+/// between retrieval and turn end) and an empty slice is a no-op.
+#[tokio::test]
+async fn touch_ignores_unknown_ids_and_empty_slices() {
+    let store = Store::open_memory().await.expect("store");
+    store
+        .write_memory(new_memory(
+            "mem_known",
+            "global",
+            None,
+            "fact",
+            "known fact",
+            3,
+        ))
+        .await
+        .expect("known");
+
+    store
+        .touch_memories(&[], 10_000)
+        .await
+        .expect("empty slice is a no-op");
+    store
+        .touch_memories(&["mem_absent".to_owned()], 20_000)
+        .await
+        .expect("unknown ids are skipped, not an error");
+    store
+        .touch_memories(&["mem_known".to_owned(), "mem_absent".to_owned()], 30_000)
+        .await
+        .expect("mixed ids");
+
+    let listed = store
+        .list_memories(MemoryQuery {
+            limit: 10,
+            ..Default::default()
+        })
+        .await
+        .expect("list");
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0]["uses"], 1, "only the known row was bumped");
+    assert_eq!(listed[0]["lastUsed"], 30_000);
 }
 
 #[tokio::test]
