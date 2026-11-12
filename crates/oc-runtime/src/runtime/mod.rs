@@ -632,6 +632,31 @@ impl Runtime {
 }
 
 impl Runtime {
+    /// Mirror the in-flight step number into the session's actor.
+    ///
+    /// The counter is best-effort observability: a session without an actor
+    /// (idle, or never started) has no step and the call is a no-op.
+    pub(crate) fn set_step(&self, session: &str, step: u32) {
+        let handle = {
+            let actors = self.inner.actors.lock().expect("actor map");
+            actors.get(session).cloned()
+        };
+        if let Some(handle) = handle {
+            handle.step.store(step, Ordering::SeqCst);
+        }
+    }
+
+    /// The in-flight step number for `session`, or `None` when the session has
+    /// no actor. An idle/unstarted session yields `None`, which the observer
+    /// renders as step `0`.
+    pub(crate) fn current_step(&self, session: &str) -> Option<u32> {
+        let handle = {
+            let actors = self.inner.actors.lock().expect("actor map");
+            actors.get(session).cloned()
+        };
+        handle.map(|handle| handle.step.load(Ordering::SeqCst))
+    }
+
     pub(crate) async fn is_idle(&self, session: &str) -> Result<bool, RuntimeError> {
         let running = {
             let actors = self.inner.actors.lock().expect("actor map");

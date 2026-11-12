@@ -211,9 +211,12 @@ pub(crate) async fn run_execution(
     }
 
     let mut stats = TurnStats::default();
-    let outcome = runtime
-        .run_steps(session, &turn, cancel, &mut stats)
-        .await?;
+    let outcome = runtime.run_steps(session, &turn, cancel, &mut stats).await;
+    // Clear the live step counter here, not inside `run_steps`: the loop body
+    // has many `?` early returns, so any epilogue inside it is bypassable.
+    // This is the single point every `run_steps` exit flows through.
+    runtime.set_step(session, 0);
+    let outcome = outcome?;
     // A step-limited turn still answered on its final, tool-less request; it is
     // treated like a success for memory/scribe, but settles with the qualifier.
     let answered = matches!(
@@ -300,6 +303,10 @@ impl Runtime {
         let mut pending_stall_notice: Option<String> = None;
         let mut stall_guard = stall::StallGuard::default();
         let mut step_number = 0_usize;
+        // Publish the live step for `observer_pass` (`RootContext.step`). Every
+        // `step_number += 1` below re-publishes at the top of the next
+        // iteration, so the counter always names the request in flight.
+        self.set_step(session, 0);
         // The live step budget. It starts at the configured `agent.steps` and
         // only grows through `budget::evaluate` grants at the limit; see
         // `docs/24-step-budget.md`. `turn.max_steps` remains the initial cap the
@@ -328,6 +335,11 @@ impl Runtime {
         };
 
         loop {
+            // Publish the step this iteration is about to run. Placing it at
+            // the loop top covers all three `step_number += 1` sites below
+            // (length continuation, verification nudge, normal advance) with a
+            // single write instead of three.
+            self.set_step(session, u32::try_from(step_number).unwrap_or(u32::MAX));
             if cancel.is_cancelled() {
                 return Ok(ExecutionOutcome::Interrupted(cancel.reason()));
             }
@@ -732,6 +744,19 @@ impl Runtime {
                 },
             )
             .await?;
+            // A step-limited turn is not a failure, so the arms above skip it
+            // and a timer tick would never evaluate a now-idle root: by this
+            // point the idle row says `step limit reached after N steps` and
+            // nothing else is busy, pending or overdue. Wake the observer
+            // through the same host-flag path the failure/interruption arms
+            // use, after the idle commit above, so the next pass renders that
+            // reason. `HostFlag` has no step-limit variant on purpose (it is a
+            // `Copy` enum with an exhaustive match); the two waking flags only
+            // set `pending_wake` and `last_activity_ms`
+            // (`oc-observer/src/engine/run.rs:75-78`), so no observer state
+            // records this as an interruption. A granted turn never gets here:
+            // a grant continues the loop instead of returning `StepLimited`.
+            self.note_observer_execution(session, false).await;
         }
         Ok(())
     }

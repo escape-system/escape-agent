@@ -134,7 +134,9 @@ impl Runtime {
             RootContext {
                 agent: Some(node.agent.clone()),
                 model: node.model.clone(),
-                step: 0,
+                // Live step from the turn loop (`Runtime::set_step`); `0` for
+                // an idle or never-started session.
+                step: self.current_step(root).unwrap_or(0),
                 state: Some(node.status.clone()),
             },
         );

@@ -393,7 +393,7 @@ diff -r a/packages/app/src/session/agent-panels/agent-queries.ts b/packages/app/
 diff -r a/packages/app/src/session/agent-panels/agent-wire.ts b/packages/app/src/session/agent-panels/agent-wire.ts
 --- a/packages/app/src/session/agent-panels/agent-wire.ts	1970-01-01 02:00:00.000000000 +0200
 +++ b/packages/app/src/session/agent-panels/agent-wire.ts	2026-10-29 20:58:14.489167700 +0300
-@@ -0,0 +1,287 @@
+@@ -0,0 +1,293 @@
 +import { isConfigObject } from "@/settings/agentic/config"
 +
 +/**
@@ -450,6 +450,10 @@ diff -r a/packages/app/src/session/agent-panels/agent-wire.ts b/packages/app/src
 +  rounds: number
 +  stalls: number
 +  evidence: string[]
++  /** Criteria the server reports as satisfied; absent on rows that predate it. */
++  done?: number
++  /** Total criteria the server reports; absent on rows that predate it. */
++  total?: number
 +  model?: string
 +}
 +
@@ -588,6 +592,8 @@ diff -r a/packages/app/src/session/agent-panels/agent-wire.ts b/packages/app/src
 +    rounds: asCount(value.rounds) ?? 0,
 +    stalls: asCount(value.stalls) ?? 0,
 +    evidence: list(value.evidence).filter((item): item is string => typeof item === "string"),
++    done: asCount(value.done),
++    total: asCount(value.total),
 +    model: asText(value.model),
 +  }
 +}
@@ -684,7 +690,7 @@ diff -r a/packages/app/src/session/agent-panels/agent-wire.ts b/packages/app/src
 diff -r a/packages/app/src/session/agent-panels/goal-chip.tsx b/packages/app/src/session/agent-panels/goal-chip.tsx
 --- a/packages/app/src/session/agent-panels/goal-chip.tsx	1970-01-01 02:00:00.000000000 +0200
 +++ b/packages/app/src/session/agent-panels/goal-chip.tsx	2026-10-29 20:58:14.489678900 +0300
-@@ -0,0 +1,52 @@
+@@ -0,0 +1,59 @@
 +import { Icon } from "@opencode/ui/icon"
 +import { Show } from "solid-js"
 +import { useLanguage } from "@/runtime/i18n/language"
@@ -692,6 +698,7 @@ diff -r a/packages/app/src/session/agent-panels/goal-chip.tsx b/packages/app/src
 +import { useSettingsSurface } from "@/settings/surface"
 +import { createAgentEvents } from "./agent-events"
 +import { useSessionGoalQuery } from "./agent-queries"
++import type { Goal } from "./agent-wire"
 +
 +/**
 + * The composer chip for the session tree's goal (`docs/13-ui.md`):
@@ -706,6 +713,16 @@ diff -r a/packages/app/src/session/agent-panels/goal-chip.tsx b/packages/app/src
 +  const events = createAgentEvents({ sessionID: () => props.sessionID, root: () => props.sessionID })
 +
 +  const goal = () => events.goal() ?? (query.data?.available ? query.data.value : undefined)
++
++  // Prefer the server's own `done`/`total`: only the observer may accept a
++  // criterion, and evidence ids are opaque handles that are never attributed
++  // to individual criteria (`docs/08-goals-observer.md` §7). The evidence
++  // length is a display fallback for rows that predate those fields.
++  const progress = (current: Goal) => {
++    const total = current.total ?? current.criteria.length
++    const done = current.done ?? Math.min(current.evidence.length, total)
++    return { done: String(done), total: String(total) }
++  }
 +
 +  return (
 +    <Show when={goal()}>
@@ -725,11 +742,7 @@ diff -r a/packages/app/src/session/agent-panels/goal-chip.tsx b/packages/app/src
 +          </span>
 +          <Show when={current().criteria.length > 0}>
 +            <span class="shrink-0 tabular-nums text-v2-text-text-faint">
-+              {/* Evidence entries are the proven criteria; never more than the criteria themselves. */}
-+              {language.t("session.goal.criteria", {
-+                done: String(Math.min(current().evidence.length, current().criteria.length)),
-+                total: String(current().criteria.length),
-+              })}
++              {language.t("session.goal.criteria", progress(current()))}
 +            </span>
 +          </Show>
 +        </button>

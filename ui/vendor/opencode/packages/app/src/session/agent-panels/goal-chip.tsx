@@ -5,6 +5,7 @@ import { useServer } from "@/runtime/server/current"
 import { useSettingsSurface } from "@/settings/surface"
 import { createAgentEvents } from "./agent-events"
 import { useSessionGoalQuery } from "./agent-queries"
+import type { Goal } from "./agent-wire"
 
 /**
  * The composer chip for the session tree's goal (`docs/13-ui.md`):
@@ -19,6 +20,16 @@ export function SessionGoalChip(props: { sessionID: string }) {
   const events = createAgentEvents({ sessionID: () => props.sessionID, root: () => props.sessionID })
 
   const goal = () => events.goal() ?? (query.data?.available ? query.data.value : undefined)
+
+  // Prefer the server's own `done`/`total`: only the observer may accept a
+  // criterion, and evidence ids are opaque handles that are never attributed
+  // to individual criteria (`docs/08-goals-observer.md` §7). The evidence
+  // length is a display fallback for rows that predate those fields.
+  const progress = (current: Goal) => {
+    const total = current.total ?? current.criteria.length
+    const done = current.done ?? Math.min(current.evidence.length, total)
+    return { done: String(done), total: String(total) }
+  }
 
   return (
     <Show when={goal()}>
@@ -38,11 +49,7 @@ export function SessionGoalChip(props: { sessionID: string }) {
           </span>
           <Show when={current().criteria.length > 0}>
             <span class="shrink-0 tabular-nums text-v2-text-text-faint">
-              {/* Evidence entries are the proven criteria; never more than the criteria themselves. */}
-              {language.t("session.goal.criteria", {
-                done: String(Math.min(current().evidence.length, current().criteria.length)),
-                total: String(current().criteria.length),
-              })}
+              {language.t("session.goal.criteria", progress(current()))}
             </span>
           </Show>
         </button>

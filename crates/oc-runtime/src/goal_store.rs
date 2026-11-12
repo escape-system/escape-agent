@@ -2,9 +2,11 @@
 //!
 //! The runtime ships this adapter so a host can attach the observer without
 //! writing its own goal persistence. Goal rows keep criteria and evidence;
-//! [`oc_observer::GoalSnapshot`] derives `total` from criteria and `done` from
-//! the evidence list. Other snapshot fields (wait clocks, `known_ids`) are
-//! ephemeral engine bookkeeping and are not stored.
+//! [`oc_observer::GoalSnapshot`] derives `total` from criteria and reports a
+//! goal as fully done only when its status is accepted (`done`). Evidence ids
+//! are opaque handles and are surfaced verbatim, not counted as progress.
+//! Other snapshot fields (wait clocks, `known_ids`) are ephemeral engine
+//! bookkeeping and are not stored.
 //!
 //! [`load`](oc_observer::GoalStore::load) also records which root owns each
 //! goal id. [`save`](oc_observer::GoalStore::save) needs that mapping because a
@@ -85,7 +87,20 @@ fn snapshot_from_value(value: &Value, policy: GoalPolicy) -> GoalSnapshot {
     let criteria = string_list(value.get("criteria"));
     let evidence = string_list(value.get("evidence"));
     let total = u32::try_from(criteria.len()).unwrap_or(u32::MAX);
-    let done = u32::try_from(evidence.len()).unwrap_or(u32::MAX).min(total);
+    // Evidence ids are opaque session/message handles (`msg_`, `tc_`); nothing
+    // associates an id with a specific criterion, and `criteria` is only ever
+    // written at creation (`GoalPatch` has no `criteria`). Treating
+    // `evidence.len()` as a count of satisfied criteria would therefore claim
+    // work that was never attributed. A criterion is only "done" once the goal
+    // itself is accepted as done, so `done` is `total` for a done goal and 0
+    // otherwise. `evidence` is still surfaced verbatim to the prompt.
+    let status = parse_status(
+        value
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("active"),
+    );
+    let done = if status == GoalStatus::Done { total } else { 0 };
     GoalSnapshot {
         id: value
             .get("id")
@@ -100,12 +115,7 @@ fn snapshot_from_value(value: &Value, policy: GoalPolicy) -> GoalSnapshot {
         criteria,
         done,
         total,
-        status: parse_status(
-            value
-                .get("status")
-                .and_then(Value::as_str)
-                .unwrap_or("active"),
-        ),
+        status,
         rounds: value
             .get("rounds")
             .and_then(Value::as_u64)
@@ -214,5 +224,46 @@ impl GoalStore for StoreGoalStore {
             }
             Ok(())
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn goal_row(status: &str) -> Value {
+        json!({
+            "id": "gol_1",
+            "objective": "finish the task",
+            "criteria": ["a", "b"],
+            "evidence": ["msg_1", "msg_2"],
+            "status": status,
+        })
+    }
+
+    #[test]
+    fn evidence_ids_do_not_count_as_done_criteria() {
+        let snapshot = snapshot_from_value(&goal_row("active"), GoalPolicy::default());
+
+        assert_eq!(snapshot.total, 2);
+        assert_eq!(
+            snapshot.done, 0,
+            "unattributed evidence must not claim progress"
+        );
+        assert_eq!(snapshot.status, GoalStatus::Active);
+        assert_eq!(snapshot.evidence, vec!["msg_1", "msg_2"]);
+        assert_eq!(snapshot.criteria, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn accepted_goal_reports_every_criterion_done() {
+        let snapshot = snapshot_from_value(&goal_row("done"), GoalPolicy::default());
+
+        assert_eq!(snapshot.total, 2);
+        assert_eq!(snapshot.done, 2);
+        assert_eq!(snapshot.status, GoalStatus::Done);
+        assert_eq!(snapshot.evidence, vec!["msg_1", "msg_2"]);
+        assert_eq!(snapshot.criteria, vec!["a", "b"]);
     }
 }

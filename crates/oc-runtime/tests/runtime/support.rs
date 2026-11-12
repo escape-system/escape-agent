@@ -706,6 +706,8 @@ pub(crate) enum ObserverReply {
 pub(crate) struct FixedObserverModel {
     pub(crate) reply: ObserverReply,
     pub(crate) calls: AtomicUsize,
+    /// Every rendered observer input passed to `judge`, in call order.
+    pub(crate) prompts: Mutex<Vec<String>>,
 }
 
 impl FixedObserverModel {
@@ -713,6 +715,7 @@ impl FixedObserverModel {
         Arc::new(Self {
             reply: ObserverReply::Text(text.to_string()),
             calls: AtomicUsize::new(0),
+            prompts: Mutex::new(Vec::new()),
         })
     }
 
@@ -720,21 +723,28 @@ impl FixedObserverModel {
         Arc::new(Self {
             reply: ObserverReply::Error(message.to_owned()),
             calls: AtomicUsize::new(0),
+            prompts: Mutex::new(Vec::new()),
         })
     }
 
     pub(crate) fn calls(&self) -> usize {
         self.calls.load(Ordering::SeqCst)
     }
+
+    /// Rendered input documents this model was asked to judge.
+    pub(crate) fn prompts(&self) -> Vec<String> {
+        self.prompts.lock().expect("prompts").clone()
+    }
 }
 
 impl ObserverModel for FixedObserverModel {
     fn judge<'a>(
         &'a self,
-        _input: &'a str,
+        input: &'a str,
         _cfg: &'a ObserverConfig,
     ) -> oc_observer::BoxFuture<'a, Result<String, ObserverError>> {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        self.prompts.lock().expect("prompts").push(input.to_owned());
         let reply = match &self.reply {
             ObserverReply::Text(text) => Ok(text.clone()),
             ObserverReply::Error(message) => Err(ObserverError::Model(message.clone())),

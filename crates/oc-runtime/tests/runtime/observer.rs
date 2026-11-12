@@ -480,3 +480,87 @@ async fn cancel_tool_cancels_the_running_tool_without_interrupting_the_turn() {
     assert!(harness.sink.has("session.execution.succeeded"));
     assert!(!harness.sink.has("session.execution.interrupted"));
 }
+
+/// Root `step` values the observer model actually received, in call order.
+///
+/// `RootInput.step` is always serialized, so the rendered prompt carries the
+/// wire value the observer judged with.
+fn observed_steps(model: &FixedObserverModel) -> Vec<u32> {
+    const KEY: &str = "\"step\":";
+    model
+        .prompts()
+        .iter()
+        .filter_map(|prompt| {
+            let start = prompt.find(KEY)? + KEY.len();
+            let digits: String = prompt[start..]
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect();
+            digits.parse().ok()
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn observer_sees_the_live_turn_step() {
+    // Two requests: a tool step, then a slow text step. The tool has no
+    // `expectation`, so no flight strip opens and the busy root satisfies the
+    // stall condition (`stall_seconds: 0`) on every tick; that makes the
+    // observer evaluate repeatedly *during* the turn instead of once at its
+    // start, which is what exercises the live counter.
+    let harness = Harness::new(
+        vec![
+            named_tool_script("read", "call_step", json!({"path": "hello.txt"})),
+            delayed_text_script("done", Duration::from_millis(500)),
+        ],
+        Arc::new(AllowAll),
+        json!({}),
+        None,
+    )
+    .await;
+    let model = FixedObserverModel::text(&json!({"action": "none"}));
+    let engine = Arc::new(oc_observer::ObserverEngine::new(
+        oc_observer::ObserverConfig {
+            tick_ms: 20,
+            min_interval_ms: 0,
+            stall_seconds: 0,
+            max_calls_per_min: 60,
+            ..oc_observer::ObserverConfig::default()
+        },
+        Arc::new(oc_observer::SystemClock),
+        Arc::clone(&model) as Arc<dyn oc_observer::ObserverModel>,
+        Arc::new(NeverExecutor),
+        Arc::new(RecordingNotifier::default()),
+    ));
+    let (_, repairs) = RepairChannel::new();
+    let runtime = harness.restart().with_observer(ObserverBinding {
+        engine: Arc::clone(&engine),
+        goals: goals(&harness),
+        repairs,
+    });
+    runtime.start().await.expect("start");
+
+    harness.enqueue("go").await;
+    runtime.notify(&harness.session).await.expect("notify");
+    runtime
+        .wait_idle(&harness.session, Duration::from_secs(10))
+        .await
+        .expect("idle");
+
+    let steps = observed_steps(&model);
+    assert!(
+        !steps.is_empty(),
+        "observer never evaluated during the turn"
+    );
+    // Before the live counter every evaluation carried the hardcoded `0`; the
+    // regression property is that a busy turn is judged at its real step.
+    assert_eq!(
+        steps.iter().copied().max(),
+        Some(1),
+        "the observer must have judged the second, in-flight request as step 1: {steps:?}"
+    );
+    assert!(
+        steps.iter().all(|step| *step <= 1),
+        "the step of a two-request turn can never exceed 1: {steps:?}"
+    );
+}

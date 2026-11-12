@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
@@ -13,6 +13,10 @@ pub(crate) struct ActorHandle {
     pub(crate) wake: Notify,
     pub(crate) idle: Notify,
     pub(crate) running: AtomicBool,
+    /// Step number of the execution currently in flight; mirrored from the
+    /// turn loop so the observer's `RootContext.step` is the live value.
+    /// Reset to `0` once `run_steps` returns (see `turn::run_execution`).
+    pub(crate) step: AtomicU32,
     /// Set by [`Runtime::request_background`] while an execution is running.
     /// The turn's foreground `subagent` wait consumes it and detaches; the
     /// actor resets it before every execution.
@@ -32,6 +36,7 @@ impl ActorHandle {
             wake: Notify::new(),
             idle: Notify::new(),
             running: AtomicBool::new(false),
+            step: AtomicU32::new(0),
             background: AtomicBool::new(false),
             cancel: Mutex::new(None),
             join: Mutex::new(None),

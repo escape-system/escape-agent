@@ -56,9 +56,9 @@ impl GoalTools {
 /// Render the cache-stable `<goal>` block shown to the model.
 ///
 /// The block contains no clocks or session ids, so it changes only when the
-/// goal row does. Criteria are completed in order: the snapshot's `done` count
-/// corresponds to the first `done` evidence ids, matching
-/// [`crate::StoreGoalStore`].
+/// goal row does. Criteria are marked done in order; evidence ids are opaque
+/// handles listed once on a separate `Evidence:` line rather than attributed
+/// per criterion.
 #[must_use]
 pub fn render_goal(snapshot: &GoalSnapshot) -> String {
     let mut out = String::with_capacity(256);
@@ -76,16 +76,12 @@ pub fn render_goal(snapshot: &GoalSnapshot) -> String {
     } else {
         let done = usize::try_from(snapshot.done).unwrap_or(usize::MAX);
         for (index, criterion) in snapshot.criteria.iter().enumerate() {
-            let marker = if index < done {
-                match snapshot.evidence.get(index) {
-                    Some(evidence) => format!("[done: {evidence}]"),
-                    None => "[done]".to_owned(),
-                }
-            } else {
-                "[open]".to_owned()
-            };
+            let marker = if index < done { "[done]" } else { "[open]" };
             let _ = writeln!(out, "{}. {} {marker}", index + 1, criterion);
         }
+    }
+    if !snapshot.evidence.is_empty() {
+        let _ = writeln!(out, "Evidence: {}", snapshot.evidence.join(", "));
     }
     let next = snapshot
         .criteria
@@ -556,10 +552,26 @@ mod tests {
             "<goal id=\"gol_test\" status=\"active\" round=\"3\">\n\
              Objective: Ship it\n\
              Criteria:\n\
-             1. build passes [done: msg_one]\n\
+             1. build passes [done]\n\
              2. docs updated [open]\n\
+             Evidence: msg_one\n\
              Next: docs updated\n\
              </goal>"
+        );
+    }
+
+    #[test]
+    fn evidence_is_never_attributed_to_an_individual_criterion() {
+        let mut goal = snapshot();
+        goal.done = 2;
+        goal.evidence = vec!["msg_one".to_owned(), "msg_push".to_owned()];
+        let rendered = render_goal(&goal);
+        assert!(rendered.contains("1. build passes [done]"), "{rendered}");
+        assert!(rendered.contains("2. docs updated [done]"), "{rendered}");
+        assert!(!rendered.contains("[done: msg_push]"), "{rendered}");
+        assert!(
+            rendered.contains("Evidence: msg_one, msg_push"),
+            "{rendered}"
         );
     }
 

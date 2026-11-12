@@ -54,6 +54,10 @@ export type Goal = {
   rounds: number
   stalls: number
   evidence: string[]
+  /** Criteria the server reports as satisfied; absent on rows that predate it. */
+  done?: number
+  /** Total criteria the server reports; absent on rows that predate it. */
+  total?: number
   model?: string
 }
 
@@ -192,6 +196,8 @@ export function parseGoal(value: unknown): Goal | undefined {
     rounds: asCount(value.rounds) ?? 0,
     stalls: asCount(value.stalls) ?? 0,
     evidence: list(value.evidence).filter((item): item is string => typeof item === "string"),
+    done: asCount(value.done),
+    total: asCount(value.total),
     model: asText(value.model),
   }
 }

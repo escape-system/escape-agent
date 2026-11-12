@@ -229,8 +229,8 @@ is silent.
 A goal belongs to a root session. One active goal per root.
 
 ```sql
-goal(id, root_id, objective, criteria_json, status, created, updated,
-     rounds, stalls, last_progress_ms, evidence_json, model)
+goal(id, root_id, objective, criteria, status, rounds, stalls,
+     last_progress, evidence, model, time_created, time_updated)
 ```
 
 Tools:
@@ -249,11 +249,20 @@ Prompt block (instruction source `oc/goal`, cache-stable per goal version):
 <goal id="gol_…" status="active" round="7">
 Objective: …
 Criteria:
-1. … [done: evidence]
+1. … [done]
 2. … [open]
+Evidence: msg_…, tc_…
 Next: …
 </goal>
 ```
+
+Criteria carry only `[done]`/`[open]`; evidence ids are opaque session and
+message handles (`msg_`, `tc_`) listed once on the `Evidence:` line and are
+never attributed to an individual criterion. `done` equals `total` only once
+the goal itself is accepted `done`, otherwise it is `0`, so a done marker means
+the whole goal was accepted, not that a specific criterion was verified.
+Per-criterion attribution would need a new column and is intentionally out of
+scope.
 
 Observer judging (defaults copied from upstream `GoalPlugin`): max 50 rounds,
 max 3 stalls, wait limit 30 min. Verdicts `done | continue | blocked | paused |
