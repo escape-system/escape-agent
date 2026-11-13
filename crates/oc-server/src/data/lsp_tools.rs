@@ -186,3 +186,163 @@ impl oc_runtime::ToolProvider for LspToolProvider {
         ]
     }
 }
+
+/// Host post-edit diagnostics hook powered by [`LspSupervisor`].
+#[derive(Debug, Clone)]
+pub struct LspEditDiagnosticsHook {
+    supervisor: Arc<LspSupervisor>,
+}
+
+impl LspEditDiagnosticsHook {
+    #[must_use]
+    pub fn new(supervisor: Arc<LspSupervisor>) -> Self {
+        Self { supervisor }
+    }
+}
+
+#[async_trait::async_trait]
+impl oc_runtime::EditDiagnosticsHook for LspEditDiagnosticsHook {
+    async fn after_edit(
+        &self,
+        root: &std::path::Path,
+        files: &[String],
+    ) -> oc_runtime::PostEditDiagnostics {
+        let mut texts = Vec::new();
+        let mut all_diagnostics = Vec::new();
+        let mut error_count = 0usize;
+
+        for rel in files.iter().take(6) {
+            let candidate = PathBuf::from(rel);
+            let abs = if candidate.is_absolute() {
+                candidate
+            } else {
+                root.join(candidate)
+            };
+            if let Ok(Some(diag)) = oc_lsp::tools::edit_diagnostics(&self.supervisor, &abs).await {
+                if let Some(items) = diag.metadata.as_array() {
+                    for item in items {
+                        if item.get("severity").and_then(Value::as_i64) == Some(1) {
+                            error_count += 1;
+                        }
+                        all_diagnostics.push(item.clone());
+                    }
+                }
+                if let Some(formatted) = diag.text
+                    && !formatted.trim().is_empty()
+                {
+                    texts.push(formatted);
+                }
+            }
+        }
+
+        let formatted = (!texts.is_empty()).then(|| {
+            format!(
+                "<lsp_diagnostics>\n{}\n</lsp_diagnostics>",
+                texts.join("\n")
+            )
+        });
+        let metadata = (!all_diagnostics.is_empty()).then_some(Value::Array(all_diagnostics));
+
+        oc_runtime::PostEditDiagnostics {
+            formatted,
+            error_count,
+            metadata,
+        }
+    }
+}
+
+/// Compiler-resolved semantic oracle forwarding `code_map` precision queries to
+/// [`LspSupervisor`].
+#[derive(Debug, Clone)]
+pub struct LspSemanticOracle {
+    supervisor: Arc<LspSupervisor>,
+}
+
+impl LspSemanticOracle {
+    #[must_use]
+    pub fn new(supervisor: Arc<LspSupervisor>) -> Self {
+        Self { supervisor }
+    }
+}
+
+#[async_trait::async_trait]
+impl oc_tools::code_map::SemanticPrecisionOracle for LspSemanticOracle {
+    async fn query(&self, req: oc_tools::code_map::SemanticRequest) -> Result<Value, String> {
+        use oc_tools::code_map::SemanticRequest;
+        let input = match req {
+            SemanticRequest::Definition {
+                file_path,
+                line,
+                character,
+            } => LspToolInput {
+                operation: "goToDefinition".to_owned(),
+                file_path: Some(file_path),
+                line: Some(line),
+                character: Some(character),
+                query: None,
+            },
+            SemanticRequest::References {
+                file_path,
+                line,
+                character,
+            } => LspToolInput {
+                operation: "findReferences".to_owned(),
+                file_path: Some(file_path),
+                line: Some(line),
+                character: Some(character),
+                query: None,
+            },
+            SemanticRequest::Implementations {
+                file_path,
+                line,
+                character,
+            } => LspToolInput {
+                operation: "goToImplementation".to_owned(),
+                file_path: Some(file_path),
+                line: Some(line),
+                character: Some(character),
+                query: None,
+            },
+            SemanticRequest::IncomingCalls {
+                file_path,
+                line,
+                character,
+            } => LspToolInput {
+                operation: "incomingCalls".to_owned(),
+                file_path: Some(file_path),
+                line: Some(line),
+                character: Some(character),
+                query: None,
+            },
+            SemanticRequest::OutgoingCalls {
+                file_path,
+                line,
+                character,
+            } => LspToolInput {
+                operation: "outgoingCalls".to_owned(),
+                file_path: Some(file_path),
+                line: Some(line),
+                character: Some(character),
+                query: None,
+            },
+            SemanticRequest::WorkspaceSymbol { query } => LspToolInput {
+                operation: "workspaceSymbol".to_owned(),
+                file_path: None,
+                line: None,
+                character: None,
+                query: Some(query),
+            },
+            SemanticRequest::Diagnostics { file_path } => LspToolInput {
+                operation: "diagnostics".to_owned(),
+                file_path: Some(file_path),
+                line: None,
+                character: None,
+                query: None,
+            },
+        };
+        self.supervisor
+            .execute_tool(&input)
+            .await
+            .map_err(|error| error.to_string())
+    }
+}

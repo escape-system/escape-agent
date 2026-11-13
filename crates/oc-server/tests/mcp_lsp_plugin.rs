@@ -18,7 +18,9 @@ use oc_config::{ConfigService, LoadOptions};
 use oc_lsp::{LspConfig, LspServerConfig, LspSupervisor, SupervisorOptions};
 use oc_mcp::McpConfig;
 use oc_plugin::{Plugin, PluginRegistry, RpcError, RpcNamespace, Tier};
-use oc_server::data::lsp_tools::{LspDiagnosticsTool, LspTool};
+use oc_server::data::lsp_tools::{
+    LspDiagnosticsTool, LspEditDiagnosticsHook, LspSemanticOracle, LspTool,
+};
 use oc_server::data::mcp::McpManager;
 use oc_server::data::mcp_tools::{McpToolAdapter, McpToolProvider};
 use oc_server::{AppState, router};
@@ -759,4 +761,182 @@ async fn rpc_dispatch_maps_errors_and_returns_output() {
     let (status, value) = call(&app, Method::POST, "/api/rpc/demo/reject", None).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(value.unwrap()["type"], "rpc.invalid_input");
+}
+
+#[cfg(unix)]
+fn write_fake_lsp_script(dir: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
+    let lsp_script = dir.join("fake-lsp.py");
+    std::fs::write(
+        &lsp_script,
+        r#"#!/usr/bin/env python3
+import json, sys
+
+def read_msg():
+    headers = {}
+    while True:
+        line = sys.stdin.buffer.readline()
+        if not line:
+            return None
+        s = line.decode("ascii", errors="ignore").strip()
+        if not s:
+            break
+        if ":" in s:
+            k, v = s.split(":", 1)
+            headers[k.strip().lower()] = v.strip()
+    length = int(headers.get("content-length", "0"))
+    body = sys.stdin.buffer.read(length)
+    return json.loads(body.decode("utf-8"))
+
+def send_msg(obj):
+    raw = json.dumps(obj).encode("utf-8")
+    sys.stdout.buffer.write(f"Content-Length: {len(raw)}\r\n\r\n".encode("ascii") + raw)
+    sys.stdout.buffer.flush()
+
+while True:
+    msg = read_msg()
+    if msg is None:
+        break
+    method = msg.get("method")
+    rid = msg.get("id")
+    params = msg.get("params") or {}
+    if method == "initialize":
+        send_msg({"jsonrpc": "2.0", "id": rid, "result": {
+            "capabilities": {
+                "definitionProvider": True,
+                "referencesProvider": True,
+                "callHierarchyProvider": True
+            }
+        }})
+    elif method in ("textDocument/didOpen", "textDocument/didChange"):
+        uri = params["textDocument"]["uri"]
+        send_msg({"jsonrpc": "2.0", "method": "textDocument/publishDiagnostics", "params": {
+            "uri": uri,
+            "diagnostics": [{
+                "range": {"start": {"line": 0, "character": 28}, "end": {"line": 0, "character": 38}},
+                "severity": 1,
+                "message": "unresolved name `broken_sym`"
+            }]
+        }})
+    elif method == "textDocument/prepareCallHierarchy":
+        uri = params["textDocument"]["uri"]
+        send_msg({"jsonrpc": "2.0", "id": rid, "result": [{
+            "name": "helper_fn",
+            "kind": 12,
+            "uri": uri,
+            "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 40}},
+            "selectionRange": {"start": {"line": 0, "character": 7}, "end": {"line": 0, "character": 16}}
+        }]})
+    elif method == "callHierarchy/incomingCalls":
+        uri = params["item"]["uri"]
+        send_msg({"jsonrpc": "2.0", "id": rid, "result": [{
+            "from": {
+                "name": "lsp_live_caller",
+                "kind": 12,
+                "uri": uri,
+                "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 40}},
+                "selectionRange": {"start": {"line": 0, "character": 7}, "end": {"line": 0, "character": 16}}
+            },
+            "fromRanges": []
+        }]})
+    elif method == "textDocument/diagnostic":
+        send_msg({"jsonrpc": "2.0", "id": rid, "result": {"kind": "full", "items": []}})
+    elif method == "shutdown":
+        send_msg({"jsonrpc": "2.0", "id": rid, "result": None})
+    elif method == "exit":
+        break
+    elif rid is not None:
+        send_msg({"jsonrpc": "2.0", "id": rid, "result": None})
+"#,
+    )
+    .unwrap();
+    let mut perms = std::fs::metadata(&lsp_script).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&lsp_script, perms).unwrap();
+    lsp_script
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn lsp_edit_diagnostics_hook_and_semantic_oracle_bridge() {
+    use oc_runtime::EditDiagnosticsHook;
+
+    let workspace = tempfile::tempdir().unwrap();
+    let canon_root = std::fs::canonicalize(workspace.path()).unwrap();
+    let src_dir = canon_root.join("src");
+    std::fs::create_dir_all(&src_dir).unwrap();
+    std::fs::write(
+        src_dir.join("lib.rs"),
+        "pub fn helper_fn() -> i32 { broken_sym }\n",
+    )
+    .unwrap();
+
+    let lsp_script = write_fake_lsp_script(&canon_root);
+
+    let cfg = LspConfig {
+        enabled: true,
+        servers: vec![LspServerConfig {
+            id: "fake-rust".to_owned(),
+            name: "Fake Rust".to_owned(),
+            command: vec![lsp_script.to_string_lossy().into_owned()],
+            extensions: vec![".rs".to_owned()],
+            disabled: false,
+            env: std::collections::BTreeMap::new(),
+            initialization: None,
+        }],
+        ..LspConfig::default()
+    };
+    let supervisor = Arc::new(LspSupervisor::with_options(
+        cfg,
+        canon_root.clone(),
+        SupervisorOptions {
+            start_sweeper: false,
+            diagnostics_wait: Duration::from_millis(500),
+            ..SupervisorOptions::default()
+        },
+    ));
+
+    let hook = LspEditDiagnosticsHook::new(Arc::clone(&supervisor));
+    let diag = hook
+        .after_edit(&canon_root, &["src/lib.rs".to_owned()])
+        .await;
+    assert_eq!(diag.error_count, 1);
+    let formatted = diag.formatted.expect("formatted diagnostics");
+    assert!(formatted.contains("<lsp_diagnostics>"));
+    assert!(formatted.contains("unresolved name `broken_sym`"));
+    assert!(diag.metadata.is_some());
+
+    let oracle = Arc::new(LspSemanticOracle::new(Arc::clone(&supervisor)));
+    let ctx = ToolContext {
+        session_id: "ses_lsp_bridge".to_owned(),
+        directory: canon_root.clone(),
+        cwd: canon_root,
+        cancel: None,
+    };
+    let out = oc_tools::code_map::with_semantic_oracle(Some(oracle), async {
+        oc_tools::CodeMapTool
+            .execute(
+                &ctx,
+                json!({
+                    "operation": "impact",
+                    "query": "helper_fn",
+                    "precision": "lsp"
+                }),
+            )
+            .await
+    })
+    .await
+    .expect("code_map impact with live LspSemanticOracle");
+    let text = out.output.expect("output");
+    assert!(
+        text.contains("<lsp_precision") && text.contains("lsp_live_caller"),
+        "expected LSP incoming call in code_map output: {text}"
+    );
+    assert!(
+        text.contains("unresolved name `broken_sym`"),
+        "expected live LSP diagnostic overlaid in <lsp_precision>: {text}"
+    );
+
+    supervisor.shutdown_all().await;
 }

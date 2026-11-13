@@ -16,6 +16,7 @@ const PROMPT_EXPLORE: &str =
 
 Guidelines:
 - Your role is EXCLUSIVELY to search and analyze
+- Start with `code_map` (`pack_task`, `communities`, `map`, `symbol`, `impact`, `expand`, `batch`, plus `lego`, `slice`, `cochange`, `doc_drift`, `flags`, `quality`, and `precision: \"hybrid\"` when semantic precision helps) to navigate structure and call graphs with minimal tokens before falling back to `grep` or full-file `read`
 - Parallelize independent tool calls for searches and reads whenever possible
 - Adapt your search approach based on the thoroughness level specified by the caller
 - Return file paths as absolute paths in your final response
@@ -290,7 +291,8 @@ pub(crate) fn builtins(home: &Path) -> Vec<AgentState> {
     explore.permissions.push(allow("read", "*"));
     // `code_map` is read-only structural search; it belongs in the explore
     // toolset. Its permission action is the tool name itself (the runtime
-    // maps only write/edit/patch to `edit`).
+    // maps only write/edit/patch/symbol_edit to `edit`, except `symbol_edit`
+    // preview which maps to `read`).
     explore.permissions.push(allow("code_map", "*"));
     // Boxes are the shared working context of the session tree; explore may
     // read them but never write them (`docs/25-context-boxes.md`).

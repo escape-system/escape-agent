@@ -22,16 +22,17 @@ namespace exists. `execute` is reserved for Code Mode.
 
 | id | Params | Semantics | Limits |
 |---|---|---|---|
-| `code_map` | `operation`, `path?`, `query?`, `limit?`, `max_tokens?` | Structural code intelligence: `outline` (signatures/symbols of a file or directory), `map` (ranked structural code map for a query/task), `symbol` (symbol definition lookup), `references` (symbol usage/call sites). `outline`/`symbol`/`references` are pure Rust for Rust, TS/JS, Python, Go, C/C++, Markdown. `map` delegates to `ripwire` whenever a binary is found — an empty query no longer forces the native engine: no query → `--max-tokens=<N> --top-k=<limit>`; query → `--for=<query> --token-budget=<N>` (ripwire 0.6.8 silently ignores `--max-tokens`/`--top-k` under `--for`, so passing them only writes a warning to stderr). Discovery order: `RIPWIRE_PATH` → `$HOME/.local/bin/ripwire` → `PATH`; a candidate must be a regular file with the executable bit. stderr is captured and surfaced as `metadata.ripwire_stderr` (exit 0 with stderr is still success). A timeout is a hard error, never a masked fallback. Native fallback reports `metadata.engine:"native"` + `ripwire_error`; the install tip and `ripwire_install_command` appear only when no binary was found. Ripwire metadata: `engine:"ripwire"`, `token_budget`, `limit` (default map only), `ripwire_stderr`. | 50 default `limit`; 1200-token default budget; 30 s ripwire timeout (`OPENCODE_RIPWIRE_TIMEOUT_MS`) |
+| `code_map` | `operation`, `path?`, `query?`, `limit?`, `max_tokens?`, `rank_by?`, `start_line?`, `end_line?`, `compress?`, `queries?`, `partitions?`, `var?`, `flow?`, `depth?`, `precision?` | Structural & call-graph code intelligence (`pack_task`, `map`, `communities`, `outline`, `symbol`, `expand`, `impact`, `references`, `connect`, `affected`, `trace`, `batch`, plus deep analysis modes `lego`, `slice`, `cochange`, `doc_drift`, `flags`, `quality`). Optional `partitions` (2..16) splits `pack_task` into shared core + disjoint worker slices; `precision` (`fast`\|`scip`\|`lsp`\|`hybrid`) overlays an `index.scip` index (`ripwire --scip`) and/or live `oc-lsp` semantic oracle (`goToImplementation`, `findReferences`, `incomingCalls`/`outgoingCalls`, `diagnostics`) to resolve dynamic/trait ambiguity. Lazily pools persistent `ripwire --mcp` daemons (pool cap 2, 5 min idle eviction, 1x `legend-dict/full` read) with CLI and cached pure-Rust fallbacks. | 50 default `limit`; 1200-token default budget; 16 batch items; 2..16 partitions; 30 s ripwire timeout (`OPENCODE_RIPWIRE_TIMEOUT_MS`) |
 | `read` | `path`, `offset?`, `limit?` | File (numbered lines) or directory listing; images/PDF as media | 2000 lines, 50 KiB, 2000 chars/line, media ≤ 20 MiB |
 | `write` | `path`, `content` | Overwrite/create, parent dirs, BOM preserved, formatter run | — |
 | `edit` | `path`, `oldString`, `newString`, `replaceAll?` | Three-tier replace (exact → Unicode-normalized → line-trimmed) | 0 matches/ambiguous ⇒ error |
+| `symbol_edit` | `symbol`, `operation?`, `path?`, `content?`, `post_check?` | Atomic AST/symbol edit (`replace` \| `insert_before` \| `insert_after` \| `preview`) via `ripwire --mcp` (`replace_symbol_body` / `insert_{before,after}_symbol` / `edit_check`) with pure-Rust span-matching fallback. Preserves BOM/EOL, emits `metadata.files` unified diffs, and optionally returns post-edit contract (`edit_check`) + impacted test radar (`situational_awareness`). | `MAX_FILE_BYTES` (10 MiB); unique target required |
 | `patch` | `patchText` | `*** Begin Patch` envelope: add/delete/update/move, `@@` hunks | all-or-nothing per file |
 | `glob` | `pattern`, `path?`, `hidden?`, `limit?` | ripgrep `--files --glob`; dotfiles hidden by default | 100 default, 30 s |
 | `grep` | `pattern`, `path?`, `include?`, `literal?`, `caseSensitive?`, `limit?` | ripgrep JSON matches, excludes `.git` | 100 default, 30 s, 2000-char lines |
 | `shell` | `command`, `workdir?`, `timeout?`, `background?` | Shell exec, file-backed output | 120 s foreground default; `0` = no timeout; 2000 lines/50 KiB tail |
 | `todowrite` | `todos[{content,status}]` | Replace the todo list | registered only if `experimental.todo` |
-| `subagent` | `agent`, `description`, `prompt`, `model?`, `sessionID?`, `background?` (+ our fields) | Child session; a completed child that exhausted its step budget keeps `status: "completed"` and adds the qualifier line | depth 1 upstream; ours see [05](05-subagents.md) |
+| `subagent` | `agent`, `description`, `prompt`, `model?`, `sessionID?`, `background?`, `partitions?`, `partition_index?`, `partition_count?` (+ our fields) | Child session (or `partitions` 2..16 graph-partitioned parallel worker fan-out with disjoint `<partition>` + `<shared_core>`); a completed child that exhausted its step budget keeps `status: "completed"` and adds the qualifier line | depth 1 upstream; ours see [05](05-subagents.md) |
 | `skill` | `id` | Load `<skill_content>` + base dir + file sample | permission `skill` |
 | `question` | `questions[{question,header,options[{label,description}],multiple?}]` | Asks the user via a Form | non-empty |
 | `webfetch` | `url`, `format?: text\|markdown\|html`, `timeout?` | GET → text; redirects checked | 30 s default, 120 max, byte cap |
@@ -49,7 +50,7 @@ Code Mode (when enabled): `execute {code}` with a JS sandbox and a catalog of
 tool; Code Mode is a tool transport, not an extra loop.
 
 Our additions: `talk`, `roster`, `session_write`, `digest`, `memory_*`,
-`goal_*`, `lane`, `skill_write`, `skill_lint`, `code_map` — see their docs.
+`goal_*`, `lane`, `skill_write`, `skill_lint`, `code_map`, `symbol_edit` — see their docs.
 
 ## Input repair and validation
 
@@ -191,7 +192,7 @@ in-flight request is never mutated.
 todowrite, question, image_generate, external_directory, list_mcp_resources,
 read_mcp_resource, lsp, memory:write, goal, lane, skill:write`, plus the full
 MCP tool name. V1 aliases (`bash→shell`, `task→subagent`,
-`write|patch→edit`) are accepted in config and never emitted.
+`write|patch|symbol_edit→edit`) are accepted in config and never emitted. (`symbol_edit` preview uses `read`.)
 
 Every file tool asserts `external_directory` before its own action when the
 path escapes the location.

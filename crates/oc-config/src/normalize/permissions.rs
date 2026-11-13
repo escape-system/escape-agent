@@ -124,7 +124,7 @@ pub(super) fn rule(action: &str, resource: &str, effect: &str) -> Value {
 
 pub(super) fn normalize_action(action: &str) -> String {
     match action {
-        "write" | "patch" | "apply_patch" => "edit".to_owned(),
+        "write" | "patch" | "apply_patch" | "symbol_edit" => "edit".to_owned(),
         "task" => "subagent".to_owned(),
         "bash" => "shell".to_owned(),
         other => other.to_owned(),

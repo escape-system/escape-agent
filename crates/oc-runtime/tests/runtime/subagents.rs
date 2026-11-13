@@ -1372,6 +1372,9 @@ async fn subagent_schemas_match_the_documented_keys() {
             "group",
             "lane",
             "model",
+            "partition_count",
+            "partition_index",
+            "partitions",
             "prompt",
             "role",
             "sessionID",
@@ -1551,4 +1554,121 @@ async fn roster_wait_seconds_waits_for_running_child_to_settle() {
     let children = body["children"].as_array().expect("children");
     assert_eq!(children.len(), 1);
     assert_eq!(children[0]["status"], "idle");
+}
+
+#[tokio::test]
+async fn subagent_partitions_spawns_disjoint_slices_and_collects_foreground() {
+    let harness = Harness::new_with_setup(
+        vec![
+            text_script("slice 0 verified"),
+            text_script("slice 1 verified"),
+        ],
+        Arc::new(AllowAll),
+        json!({"subagents": {"background_default": false, "max_children": 4}}),
+        None,
+        |work| {
+            std::fs::create_dir_all(work.join("src")).unwrap();
+            std::fs::write(
+                work.join("src/auth.rs"),
+                "pub fn verify_user(u: &str) -> bool { !u.is_empty() }\n",
+            )
+            .unwrap();
+            std::fs::write(
+                work.join("src/billing.rs"),
+                "pub fn charge_card(cents: u64) -> bool { cents > 0 }\n",
+            )
+            .unwrap();
+        },
+    )
+    .await;
+    let spawn = subagent_tool(&harness, "subagent");
+    let result = spawn
+        .execute(
+            &tool_context(&harness, &harness.session),
+            json!({
+                "agent": "general",
+                "description": "parallel module audit",
+                "prompt": "Audit verify_user and charge_card modules for panics",
+                "partitions": 2,
+                "background": false,
+            }),
+        )
+        .await
+        .expect("partitioned foreground subagents");
+
+    let output = result.output.expect("output");
+    assert!(
+        output.contains("<subagent-partition index=\"0\"")
+            && output.contains("<subagent-partition index=\"1\""),
+        "expected both partitions in combined output: {output}"
+    );
+    let meta = result.metadata.expect("metadata");
+    assert_eq!(meta["status"], "completed");
+    assert_eq!(meta["partitions"], 2);
+
+    let children = harness
+        .store
+        .children(&harness.session)
+        .await
+        .expect("children");
+    assert_eq!(children.len(), 2, "must spawn two partition workers");
+    for child in &children {
+        let row = harness
+            .store
+            .get_session(&child.id)
+            .await
+            .expect("session row")
+            .expect("exists");
+        assert_eq!(row["metadata"]["partition_count"], 2);
+        assert!(row["metadata"]["partition_index"].is_number());
+        let msgs = session_messages(&harness.store, &child.id).await;
+        let user_text = msgs[0]["text"].as_str().unwrap_or_default();
+        assert!(
+            user_text.contains("<partition index="),
+            "child must receive its <partition> slice: {user_text}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn subagent_partition_batch_enforces_child_limit_atomically() {
+    let harness = Harness::new_with_setup(
+        vec![],
+        Arc::new(AllowAll),
+        json!({"subagents": {"max_children_per_session": 2}}),
+        None,
+        |work| {
+            std::fs::create_dir_all(work.join("src")).unwrap();
+            std::fs::write(work.join("src/a.rs"), "pub fn alpha() {}\n").unwrap();
+            std::fs::write(work.join("src/b.rs"), "pub fn beta() {}\n").unwrap();
+            std::fs::write(work.join("src/c.rs"), "pub fn gamma() {}\n").unwrap();
+        },
+    )
+    .await;
+    let spawn = subagent_tool(&harness, "subagent");
+    let err = spawn
+        .execute(
+            &tool_context(&harness, &harness.session),
+            json!({
+                "description": "too many partitions",
+                "prompt": "Audit alpha beta gamma",
+                "partitions": 3,
+                "background": true,
+            }),
+        )
+        .await
+        .expect_err("batch exceeding max_children_per_session must fail atomically");
+    assert!(
+        err.message.contains("SpawnLimit")
+            || err.message.contains("limit")
+            || err.message.contains("maximum"),
+        "unexpected error: {}",
+        err.message
+    );
+    let children = harness
+        .store
+        .children(&harness.session)
+        .await
+        .expect("children");
+    assert_eq!(children.len(), 0, "no partial children may be created");
 }

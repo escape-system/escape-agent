@@ -360,9 +360,13 @@ pub(super) fn shell_failure_reason(metadata: Option<&Map<String, Value>>) -> Opt
     None
 }
 
-/// Formats the synthetic follow-up prompt when code was edited without fresh verification evidence.
+/// Formats the synthetic follow-up verification prompt enriched with graph radar
+/// intelligence (targeted tests, forgotten co-change partners, quality regressions).
 #[must_use]
-pub fn build_verification_nudge(changed_paths: &[String]) -> String {
+pub fn build_verification_nudge_with_radar(
+    changed_paths: &[String],
+    radar: Option<&oc_tools::code_map::EditRadarReport>,
+) -> String {
     let mut files_list = String::new();
     for path in changed_paths.iter().take(5) {
         let _ = writeln!(files_list, "- `{path}`");
@@ -371,11 +375,43 @@ pub fn build_verification_nudge(changed_paths: &[String]) -> String {
         let _ = writeln!(files_list, "- ... (and {} more)", changed_paths.len() - 5);
     }
 
+    let mut extra = String::new();
+    if let Some(report) = radar.filter(|r| r.is_actionable()) {
+        if !report.suggested_tests.is_empty() {
+            let _ = writeln!(
+                extra,
+                "\nTarget tests to run:\n- {}",
+                report.suggested_tests.join("\n- ")
+            );
+        }
+        if !report.forgotten_partners.is_empty() {
+            let _ = writeln!(
+                extra,
+                "\nPotentially forgotten co-change files (verify whether updates are needed):\n- {}",
+                report.forgotten_partners.join("\n- ")
+            );
+        }
+        if !report.contract_warnings.is_empty() {
+            let _ = writeln!(
+                extra,
+                "\nContract / invariant warnings:\n- {}",
+                report.contract_warnings.join("\n- ")
+            );
+        }
+        if !report.regressions.is_empty() {
+            let _ = writeln!(
+                extra,
+                "\nQuality delta warnings:\n- {}",
+                report.regressions.join("\n- ")
+            );
+        }
+    }
+
     format!(
         "[System: You edited code in this turn, but the workspace does not have fresh passing verification evidence yet.\n\
          \n\
          Changed code files:\n\
-         {files_list}\n\
+         {files_list}{extra}\n\
          Run the relevant verification command now (e.g. `cargo test`, `cargo check`, `npm test`, `pytest`), read any failure, repair the code, and summarize what passed. If verification is not possible, explain the concrete blocker instead of claiming the work is fully verified.]"
     )
 }
@@ -483,9 +519,27 @@ mod tests {
     #[test]
     fn formats_nudge_with_paths() {
         let paths = vec!["src/main.rs".to_owned(), "src/lib.rs".to_owned()];
-        let nudge = build_verification_nudge(&paths);
+        let nudge = build_verification_nudge_with_radar(&paths, None);
         assert!(nudge.contains("`src/main.rs`"));
         assert!(nudge.contains("`src/lib.rs`"));
         assert!(nudge.contains("verification evidence"));
+        assert!(!nudge.contains("Target tests to run:"));
+    }
+
+    #[test]
+    fn formats_nudge_with_radar_findings() {
+        let paths = vec!["src/auth.rs".to_owned()];
+        let radar = oc_tools::code_map::EditRadarReport {
+            suggested_tests: vec!["tests/auth_test.rs".to_owned()],
+            forgotten_partners: vec!["src/session.rs".to_owned()],
+            contract_warnings: vec!["trait SessionStore signature changed".to_owned()],
+            blast_radius_files: vec!["src/session.rs".to_owned()],
+            regressions: vec!["complexity: `login` (src/auth.rs:10)".to_owned()],
+        };
+        let nudge = build_verification_nudge_with_radar(&paths, Some(&radar));
+        assert!(nudge.contains("tests/auth_test.rs"));
+        assert!(nudge.contains("src/session.rs"));
+        assert!(nudge.contains("trait SessionStore signature changed"));
+        assert!(nudge.contains("complexity: `login`"));
     }
 }

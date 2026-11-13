@@ -110,8 +110,9 @@ pub use prompt::{
     default_system_prompt, instruction_sources,
 };
 pub use runtime::{
-    EventSink, LlmClientAdapter, ModelClient, PermissionAsk, PermissionDecision, PermissionHandler,
-    Runtime, RuntimeConfig, RuntimeError, ToolProvider,
+    EditDiagnosticsHook, EventSink, LlmClientAdapter, ModelClient, PermissionAsk,
+    PermissionDecision, PermissionHandler, PostEditDiagnostics, Runtime, RuntimeConfig,
+    RuntimeError, ToolProvider,
 };
 pub use skill::SkillTools;
 pub use subagent::SubagentTools;

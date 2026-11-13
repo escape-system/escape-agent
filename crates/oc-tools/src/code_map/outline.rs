@@ -7,6 +7,7 @@ use serde_json::json;
 
 use super::CodeMapTool;
 use super::files::{collect_code_files, read_bounded_file, relative_to};
+use super::native_index::native_outline;
 use super::parsers::parse_symbols;
 use crate::{ToolContext, ToolError, ToolResult};
 
@@ -52,119 +53,15 @@ impl CodeMapTool {
             })));
         }
 
-        // Directory outline
-        let files = collect_code_files(ctx, target_path)?;
-        let mut out = format!(
-            "Directory outline for {} ({} files):\n",
-            target_path.display(),
-            files.len()
-        );
-        let mut total_symbols = 0;
-        let mut shown_symbols = 0;
-
-        for path in files {
-            if let Ok(content) = read_bounded_file(&path) {
-                let symbols = parse_symbols(
-                    &content,
-                    path.extension().and_then(|ext| ext.to_str()).unwrap_or(""),
-                );
-                if symbols.is_empty() {
-                    continue;
-                }
-                total_symbols += symbols.len();
-                if shown_symbols >= limit {
-                    continue;
-                }
-                let rel = relative_to(&ctx.directory, &path);
-                let _ = writeln!(out, "\n{rel} ({} symbols):", symbols.len());
-                for sym in &symbols {
-                    if shown_symbols >= limit {
-                        break;
-                    }
-                    let _ = writeln!(
-                        out,
-                        "  L{:<4} [{}] {}",
-                        sym.line,
-                        sym.kind.as_str(),
-                        sym.signature
-                    );
-                    shown_symbols += 1;
-                }
-            }
-        }
-
-        if shown_symbols < total_symbols {
-            let _ = writeln!(
-                out,
-                "\n[showing {shown_symbols} of {total_symbols} symbols; pass a specific file `path` to narrow down]"
-            );
-        }
-
+        let (out, total_symbols, truncated) = native_outline(ctx, target_path, limit)?;
         Ok(ToolResult::text(out).with_metadata(json!({
             "operation": "outline",
             "symbols": total_symbols,
-            "truncated": shown_symbols < total_symbols
+            "truncated": truncated
         })))
     }
 
-    pub(super) fn execute_symbol(
-        ctx: &ToolContext,
-        target_path: &Path,
-        query: &str,
-        limit: usize,
-    ) -> Result<ToolResult, ToolError> {
-        let q_lower = query.to_lowercase();
-        let files = collect_code_files(ctx, target_path)?;
-        let mut matches = Vec::new();
-
-        for path in files {
-            if let Ok(content) = read_bounded_file(&path) {
-                let symbols = parse_symbols(
-                    &content,
-                    path.extension().and_then(|ext| ext.to_str()).unwrap_or(""),
-                );
-                for sym in symbols {
-                    let s_name_lower = sym.name.to_lowercase();
-                    if s_name_lower == q_lower || s_name_lower.contains(&q_lower) {
-                        let is_exact = s_name_lower == q_lower;
-                        matches.push((is_exact, path.clone(), sym));
-                    }
-                }
-            }
-        }
-
-        // Sort exact matches first, then by line count
-        matches.sort_by_key(|a| std::cmp::Reverse(a.0));
-
-        let total = matches.len();
-        let mut out = format!("Symbol matches for \"{query}\" ({total} found):\n");
-        if total == 0 {
-            out.push_str("  No matching symbol definitions found.\n");
-        } else {
-            for (_, path, sym) in matches.iter().take(limit) {
-                let rel = relative_to(&ctx.directory, path);
-                let _ = writeln!(
-                    out,
-                    "  {}:{:<4} [{}] {}",
-                    rel,
-                    sym.line,
-                    sym.kind.as_str(),
-                    sym.signature
-                );
-            }
-            if total > limit {
-                let _ = writeln!(out, "  [showing {limit} of {total} matches; truncated]");
-            }
-        }
-
-        Ok(ToolResult::text(out).with_metadata(json!({
-            "operation": "symbol",
-            "matches": total,
-            "truncated": total > limit
-        })))
-    }
-
-    pub(super) fn execute_references(
+    pub(super) fn execute_references_native(
         ctx: &ToolContext,
         target_path: &Path,
         query: &str,
@@ -249,8 +146,9 @@ mod tests {
         assert!(!line.is_char_boundary(100));
         fs::write(dir.path().join("src.rs"), &line).unwrap();
 
-        let result = CodeMapTool::execute_references(&ctx(dir.path()), dir.path(), "needle", 10)
-            .expect("references should not panic on multi-byte input");
+        let result =
+            CodeMapTool::execute_references_native(&ctx(dir.path()), dir.path(), "needle", 10)
+                .expect("references should not panic on multi-byte input");
         let output = result.output.expect("text output");
         assert!(output.contains("..."), "preview is truncated: {output}");
     }
@@ -261,9 +159,13 @@ mod tests {
         let dir = TempDir::new().unwrap();
         fs::write(dir.path().join("src.rs"), "needle\n").unwrap();
 
-        let result =
-            CodeMapTool::execute_references(&ctx(dir.path()), dir.path(), "needle", usize::MAX)
-                .expect("an unbounded limit should not overflow");
+        let result = CodeMapTool::execute_references_native(
+            &ctx(dir.path()),
+            dir.path(),
+            "needle",
+            usize::MAX,
+        )
+        .expect("an unbounded limit should not overflow");
         let metadata = result.metadata.expect("metadata");
         assert_eq!(metadata["matches"], 1);
     }
@@ -294,8 +196,9 @@ mod tests {
             fs::write(dir.path().join(name), "needle 1\nneedle 2\n").unwrap();
         }
 
-        let result = CodeMapTool::execute_references(&ctx(dir.path()), dir.path(), "needle", 1)
-            .expect("references should succeed");
+        let result =
+            CodeMapTool::execute_references_native(&ctx(dir.path()), dir.path(), "needle", 1)
+                .expect("references should succeed");
         let metadata = result.metadata.expect("metadata");
         assert_eq!(metadata["matches"], 2);
         assert_eq!(metadata["truncated"], true);

@@ -508,8 +508,16 @@ impl Runtime {
                     };
                 if needs_verification && stats.verify_nudges < 2 {
                     stats.verify_nudges += 1;
-                    pending_verify_nudge =
-                        Some(verify::build_verification_nudge(&stats.changed_code_files));
+                    let radar = oc_tools::code_map::collect_post_edit_radar(
+                        std::path::Path::new(&turn.directory),
+                        &stats.changed_code_files,
+                        true,
+                    )
+                    .await;
+                    pending_verify_nudge = Some(verify::build_verification_nudge_with_radar(
+                        &stats.changed_code_files,
+                        Some(&radar),
+                    ));
                     step_number += 1;
                     context = self.load_context(session).await?;
                     continue;

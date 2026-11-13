@@ -80,6 +80,25 @@ pub trait ToolProvider: Send + Sync {
     fn tools(&self, session: &SessionInfo, agent: &str) -> Vec<Arc<dyn oc_tools::Tool>>;
 }
 
+/// Host-supplied post-edit diagnostics (typically LSP errors/warnings) so
+/// `oc-runtime` stays decoupled from `oc-lsp`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PostEditDiagnostics {
+    /// Preformatted diagnostic block (for example `<lsp_diagnostics>...</lsp_diagnostics>`),
+    /// omitted when there are no actionable diagnostics.
+    pub formatted: Option<String>,
+    /// Total diagnostic count surfaced for the edited files.
+    pub error_count: usize,
+    /// Optional structured diagnostic payload stored on `metadata.diagnostics`.
+    pub metadata: Option<serde_json::Value>,
+}
+
+/// Optional host hook invoked after non-preview code mutations.
+#[async_trait::async_trait]
+pub trait EditDiagnosticsHook: Send + Sync {
+    async fn after_edit(&self, root: &std::path::Path, files: &[String]) -> PostEditDiagnostics;
+}
+
 /// Construction inputs for [`crate::Runtime`].
 #[derive(Clone)]
 pub struct RuntimeConfig {

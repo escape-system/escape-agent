@@ -92,9 +92,206 @@ fn ripwire_timeout_ms(raw: Option<&OsStr>) -> u64 {
         .unwrap_or(DEFAULT_RIPWIRE_TIMEOUT_MS)
 }
 
-fn configured_ripwire_timeout() -> Duration {
+pub(crate) fn configured_ripwire_timeout() -> Duration {
     let raw = std::env::var_os(RIPWIRE_TIMEOUT_ENV);
     Duration::from_millis(ripwire_timeout_ms(raw.as_deref()))
+}
+
+/// Strip ripwire's inline glossary comments (`<!-- ripwire ... -->` and
+/// `<!-- t=... -->`) while leaving telemetry comments and non-ripwire output
+/// untouched.
+pub(super) fn compact_ripwire_cli_output(raw: &str) -> String {
+    if !raw.contains("<!-- ripwire ") && !raw.contains("<!-- t=") {
+        return raw.to_string();
+    }
+    let mut out = String::with_capacity(raw.len());
+    let mut rest = raw;
+    while let Some(start) = rest.find("<!--") {
+        let (before, after_open) = rest.split_at(start);
+        out.push_str(before);
+        let Some(end_rel) = after_open.find("-->") else {
+            out.push_str(after_open);
+            rest = "";
+            break;
+        };
+        let comment = &after_open[..end_rel + 3];
+        let is_glossary = comment.starts_with("<!-- ripwire ") || comment.starts_with("<!-- t=");
+        if !is_glossary {
+            out.push_str(comment);
+        }
+        rest = &after_open[end_rel + 3..];
+    }
+    out.push_str(rest);
+    collapse_blank_lines(&out).trim().to_string()
+}
+
+/// Filter and budget-trim `ripwire --mcp` `analyze` / `rank_by` `<r>...</r>` XML
+/// so empty-query `map` fills `max_tokens` with symbols instead of glossary text.
+pub(super) fn trim_analyze_xml_to_budget(
+    xml: &str,
+    rel_prefix: Option<&str>,
+    max_tokens: usize,
+    limit: usize,
+) -> String {
+    let cleaned = compact_ripwire_cli_output(xml);
+    let max_chars = max_tokens.saturating_mul(4).max(200);
+    let Some(r_start) = cleaned.find("<r>") else {
+        return truncate_to_char_budget(&cleaned, max_chars);
+    };
+
+    let normalized_prefix = rel_prefix
+        .map(|p| p.replace('\\', "/").trim_matches('/').to_string())
+        .filter(|p| !p.is_empty() && p != ".");
+
+    let mut stats_comment = None;
+    if let Some(files_idx) = cleaned.find("<!-- files=")
+        && let Some(end_rel) = cleaned[files_idx..].find("-->")
+    {
+        stats_comment = Some(&cleaned[files_idx..files_idx + end_rel + 3]);
+    }
+    let footer_reserve = stats_comment.map_or(0, |s| s.len() + 1) + 16;
+
+    let mut out = String::from("<r>\n");
+    let mut cursor = r_start + 3;
+    let mut kept_files = 0usize;
+    let mut kept_symbols = 0usize;
+
+    while let Some(rel_f) = cleaned[cursor..].find("<f ") {
+        let f_start = cursor + rel_f;
+        let Some(f_end_rel) = cleaned[f_start..].find("</f>") else {
+            break;
+        };
+        let block = &cleaned[f_start..f_start + f_end_rel + 4];
+        cursor = f_start + f_end_rel + 4;
+
+        let file_path = extract_xml_attr(block, "p").unwrap_or_default();
+        if let Some(prefix) = &normalized_prefix {
+            let file_norm = file_path.replace('\\', "/");
+            let matches = file_norm == *prefix || file_norm.starts_with(&format!("{prefix}/"));
+            if !matches {
+                continue;
+            }
+        }
+
+        let block_syms = block.matches("<s ").count().max(1);
+        if kept_symbols > 0 && kept_symbols + block_syms > limit {
+            break;
+        }
+        if out.len() + block.len() + footer_reserve > max_chars && kept_files > 0 {
+            break;
+        }
+
+        out.push_str("  ");
+        out.push_str(block);
+        out.push('\n');
+        kept_files += 1;
+        kept_symbols += block_syms;
+    }
+
+    if let Some(stats) = stats_comment {
+        out.push_str(stats);
+        out.push('\n');
+    }
+    out.push_str("</r>");
+    out
+}
+
+/// Remove comment-only lines and collapse blank line runs for `expand` with
+/// `compress: true`. Preserves Rust attributes (`#[...]` / `#![...]`).
+pub(super) fn strip_comments_and_blank_runs(body: &str) -> String {
+    let mut out = String::with_capacity(body.len());
+    let mut in_block_comment = false;
+    let mut prev_blank = false;
+
+    for line in body.lines() {
+        let trimmed = line.trim();
+        if in_block_comment {
+            if let Some(end_idx) = trimmed.find("*/") {
+                in_block_comment = false;
+                let after = trimmed[end_idx + 2..].trim();
+                if !after.is_empty() {
+                    out.push_str(after);
+                    out.push('\n');
+                    prev_blank = false;
+                }
+            }
+            continue;
+        }
+
+        if trimmed.is_empty() {
+            if !prev_blank && !out.is_empty() {
+                out.push('\n');
+                prev_blank = true;
+            }
+            continue;
+        }
+
+        if trimmed.starts_with("/*") {
+            if !trimmed.contains("*/") {
+                in_block_comment = true;
+            }
+            continue;
+        }
+
+        let is_hash_comment = trimmed.starts_with('#')
+            && !trimmed.starts_with("#[")
+            && !trimmed.starts_with("#![")
+            && !trimmed.starts_with("#include")
+            && !trimmed.starts_with("#define")
+            && !trimmed.starts_with("#if")
+            && !trimmed.starts_with("#else")
+            && !trimmed.starts_with("#endif");
+        if trimmed.starts_with("//") || trimmed.starts_with("-- ") || is_hash_comment {
+            continue;
+        }
+
+        out.push_str(line);
+        out.push('\n');
+        prev_blank = false;
+    }
+
+    out.trim_end().to_string()
+}
+
+fn extract_xml_attr<'a>(tag: &'a str, attr: &str) -> Option<&'a str> {
+    let needle = format!("{attr}=\"");
+    let start = tag.find(&needle)? + needle.len();
+    let end = tag[start..].find('"')?;
+    Some(&tag[start..start + end])
+}
+
+fn collapse_blank_lines(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut prev_blank = false;
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            if !prev_blank && !out.is_empty() {
+                out.push('\n');
+                prev_blank = true;
+            }
+        } else {
+            out.push_str(line);
+            out.push('\n');
+            prev_blank = false;
+        }
+    }
+    out
+}
+
+fn truncate_to_char_budget(text: &str, max_chars: usize) -> String {
+    if text.len() <= max_chars {
+        return text.to_string();
+    }
+    let mut end = max_chars;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    if let Some(nl) = text[..end].rfind('\n')
+        && nl > max_chars / 2
+    {
+        end = nl;
+    }
+    format!("{}\n<!-- truncated to {max_chars} chars -->", &text[..end])
 }
 
 /// Trim captured stderr to at most [`RIPWIRE_STDERR_LIMIT_BYTES`] and return
@@ -129,10 +326,18 @@ pub(super) async fn run_ripwire(
     limit: usize,
 ) -> Result<RipwireOutput, RipwireFailure> {
     let invocation = RipwireInvocation::new(target, query, max_tokens, limit);
+    run_ripwire_args(binary, &invocation.args).await
+}
+
+/// Run `ripwire` with explicit CLI arguments under [`configured_ripwire_timeout`].
+pub(super) async fn run_ripwire_args<S: AsRef<OsStr>>(
+    binary: &Path,
+    args: &[S],
+) -> Result<RipwireOutput, RipwireFailure> {
     let timeout = configured_ripwire_timeout();
 
     let mut child = Command::new(binary)
-        .args(&invocation.args)
+        .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -266,7 +471,7 @@ fn resolve_ripwire_binary(
     None
 }
 
-pub(super) fn find_ripwire_binary() -> Option<PathBuf> {
+pub(crate) fn find_ripwire_binary() -> Option<PathBuf> {
     let ripwire_path = std::env::var_os("RIPWIRE_PATH");
     let home = std::env::var_os("HOME");
     let path_var = std::env::var_os("PATH");
@@ -465,5 +670,55 @@ mod tests {
         // Multi-byte input must not panic on a non-char-boundary cut.
         let unicode = "é".repeat(RIPWIRE_STDERR_LIMIT_BYTES);
         assert!(trimmed_stderr(unicode.as_bytes()).is_some());
+    }
+
+    #[test]
+    fn compact_cli_strips_only_glossary_comments() {
+        let sample = "<!-- ripwire communities schema=v1 glossary -->\n\
+                      <communities>\n\
+                      <!-- t=modscope glossary -->\n\
+                      <community id=\"c1\"/>\n\
+                      <!-- files=10 symbols=42 -->\n\
+                      </communities>";
+        let compacted = compact_ripwire_cli_output(sample);
+        assert!(!compacted.contains("ripwire communities"));
+        assert!(!compacted.contains("t=modscope"));
+        assert!(compacted.contains("<community id=\"c1\"/>"));
+        assert!(compacted.contains("<!-- files=10 symbols=42 -->"));
+
+        let mock_echo = "/tmp/repo\n--max-tokens=1200\n--top-k=7\n";
+        assert_eq!(compact_ripwire_cli_output(mock_echo), mock_echo);
+    }
+
+    #[test]
+    fn trim_analyze_xml_filters_prefix_and_fills_budget() {
+        let xml = "<r>\
+            <f p=\"src/a.rs\"><s t=\"fn\" n=\"alpha\"></s><s t=\"fn\" n=\"beta\"></s></f>\
+            <f p=\"src/b.rs\"><s t=\"fn\" n=\"gamma\"></s><s t=\"fn\" n=\"delta\"></s></f>\
+            <f p=\"other/c.rs\"><s t=\"fn\" n=\"zeta\"></s></f>\
+            <!-- files=3 symbols=5 -->\
+            <about schema=\"ripwire.map/v1\"/></r>";
+
+        let scoped = trim_analyze_xml_to_budget(xml, Some("src"), 400, 10);
+        assert!(scoped.contains("src/a.rs"));
+        assert!(scoped.contains("src/b.rs"));
+        assert!(!scoped.contains("other/c.rs"));
+        assert!(scoped.contains("alpha"));
+        assert!(scoped.contains("<!-- files=3 symbols=5 -->"));
+
+        let capped_syms = trim_analyze_xml_to_budget(xml, None, 1200, 2);
+        assert!(capped_syms.contains("src/a.rs"));
+        assert!(!capped_syms.contains("src/b.rs"));
+    }
+
+    #[test]
+    fn strip_comments_preserves_rust_attributes_and_code() {
+        let body = "#[derive(Debug)]\n// doc comment\npub fn run() {\n    /* block\n       comment */\n\n\n    let x = 1;\n}\n";
+        let compressed = strip_comments_and_blank_runs(body);
+        assert!(compressed.contains("#[derive(Debug)]"));
+        assert!(!compressed.contains("doc comment"));
+        assert!(!compressed.contains("block"));
+        assert!(compressed.contains("pub fn run() {"));
+        assert!(compressed.contains("let x = 1;"));
     }
 }

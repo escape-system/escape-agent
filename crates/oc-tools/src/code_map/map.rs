@@ -1,19 +1,19 @@
-//! `map` operation: ripwire delegation when available, then the native scored structural map.
+//! `map` operation: persistent `ripwire --mcp` first, then CLI fallback, then
+//! the graph-centrality native engine.
 
-use std::fmt::Write as _;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde_json::json;
 
-use super::files::{collect_code_files, read_bounded_file, relative_to};
-use super::parsers::parse_symbols;
+use super::CodeMapTool;
+use super::graph_ops::{McpAttempt, add_fallback_metadata, run_mcp_mode, timeout_error};
+use super::native_index::{native_map, relative_scope, tree_root_for};
+use super::precision::{PrecisionMode, append_lsp_precision, scip_for_mode};
 use super::ripwire::{
-    RIPWIRE_INSTALL_CMD, RipwireFailure, find_ripwire_binary, run_ripwire, trimmed_stderr,
+    RipwireFailure, compact_ripwire_cli_output, find_ripwire_binary, run_ripwire,
+    trim_analyze_xml_to_budget, trimmed_stderr,
 };
-use super::{CodeMapTool, Symbol, SymbolKind, Visibility};
 use crate::{ToolContext, ToolError, ToolResult};
-
-type ScoredFile = (f32, PathBuf, Vec<(f32, Symbol)>);
 
 impl CodeMapTool {
     #[allow(clippy::too_many_lines)]
@@ -21,195 +21,253 @@ impl CodeMapTool {
         ctx: &ToolContext,
         target_path: &Path,
         query: &str,
+        rank_by: Option<&str>,
         max_tokens: usize,
         limit: usize,
+        precision: PrecisionMode,
     ) -> Result<ToolResult, ToolError> {
-        // Delegation is unconditional when the binary is available: a `map`
-        // without a query is ripwire's default ranked map, not a reason to keep
-        // the weaker native engine.
         let ripwire_binary = find_ripwire_binary();
+        let root = tree_root_for(ctx, target_path);
+        let rel_scope = relative_scope(&root, target_path);
+
         let mut ripwire_failure: Option<String> = None;
         let mut ripwire_stderr: Option<String> = None;
 
         if let Some(ripwire_path) = ripwire_binary.as_ref() {
-            match run_ripwire(ripwire_path, target_path, query, max_tokens, limit).await {
-                Ok(run) => {
-                    if let Some(stderr) = trimmed_stderr(&run.stderr) {
-                        ripwire_stderr = Some(stderr);
-                    }
-                    if !run.stdout.trim().is_empty() {
+            let (mcp_tool, mcp_args) = if let Some(mode) = rank_by {
+                let ripwire_mode = match mode {
+                    "coupling" => "hub",
+                    "risk" => "rrf",
+                    "churn" => "churn",
+                    _ => "pagerank",
+                };
+                (
+                    "rank_by",
+                    json!({
+                        "path": root,
+                        "rank_by": ripwire_mode,
+                    }),
+                )
+            } else if query.is_empty() {
+                ("analyze", json!({ "path": root }))
+            } else {
+                let scoped_task = match &rel_scope {
+                    Some(rel) => format!("{query} (scope: {rel})"),
+                    None => query.to_string(),
+                };
+                (
+                    "for",
+                    json!({
+                        "path": root,
+                        "task": scoped_task,
+                        "budget_tokens": max_tokens,
+                    }),
+                )
+            };
+
+            let (mcp_attempt, used_scip) =
+                run_mcp_mode(ctx, &root, precision, "map", mcp_tool, &mcp_args).await?;
+            match mcp_attempt {
+                Some(McpAttempt::Ok(out)) => {
+                    ripwire_stderr = trimmed_stderr(&out.stderr);
+                    if !out.text.trim().is_empty() {
+                        let mut formatted = if query.is_empty() || rank_by.is_some() {
+                            trim_analyze_xml_to_budget(
+                                &out.text,
+                                rel_scope.as_deref(),
+                                max_tokens,
+                                limit,
+                            )
+                        } else {
+                            compact_ripwire_cli_output(&out.text)
+                        };
                         let mut metadata = json!({
                             "operation": "map",
                             "engine": "ripwire",
+                            "transport": "mcp",
                             "query": query,
-                            "token_budget": max_tokens
+                            "token_budget": max_tokens,
                         });
-                        // The task lens has no row window, so `limit` is only a
-                        // real bound on the default map.
+                        if used_scip {
+                            metadata["scip_overlay"] = json!(true);
+                        }
+                        if precision != PrecisionMode::Fast {
+                            metadata["precision"] = json!(precision.as_str());
+                        }
+                        if let Some(mode) = rank_by {
+                            metadata["rank_by"] = json!(mode);
+                        }
                         if query.is_empty() {
                             metadata["limit"] = json!(limit);
                         }
                         if let Some(stderr) = ripwire_stderr {
                             metadata["ripwire_stderr"] = json!(stderr);
                         }
-                        return Ok(ToolResult::text(run.stdout).with_metadata(metadata));
+                        if !query.is_empty() {
+                            append_lsp_precision(
+                                ctx,
+                                target_path,
+                                "map",
+                                query,
+                                precision,
+                                &mut formatted,
+                                &mut metadata,
+                            )
+                            .await;
+                        }
+                        return Ok(ToolResult::text(formatted).with_metadata(metadata));
                     }
-                    // An empty map from a successful run is not a usable answer.
                     ripwire_failure = Some("ripwire returned no output".to_string());
                 }
-                Err(RipwireFailure::Timeout { timeout }) => {
-                    return Err(ToolError::new(format!(
-                        "ripwire did not finish within {} ms; raise OPENCODE_RIPWIRE_TIMEOUT_MS \
-                         or pass `query` to narrow the scan",
-                        timeout.as_millis()
-                    ))
-                    .with_metadata(json!({
-                        "operation": "map",
-                        "engine": "ripwire",
-                        "timeout_ms": timeout.as_millis()
-                    })));
-                }
-                Err(RipwireFailure::Spawn { message }) => {
-                    ripwire_failure = Some(message);
-                }
-                Err(RipwireFailure::Exit { code, stderr }) => {
+                Some(McpAttempt::Fallback { error, stderr }) => {
                     ripwire_stderr = trimmed_stderr(&stderr);
-                    ripwire_failure = Some(format!(
-                        "ripwire exited with status {}",
-                        code.map_or_else(|| "signal".to_string(), |code| code.to_string())
-                    ));
-                }
-            }
-        }
-
-        // Native pure-Rust structural code map engine
-        let q_terms: Vec<String> = query
-            .split_whitespace()
-            .map(|term| term.trim().to_lowercase())
-            .filter(|term| !term.is_empty())
-            .collect();
-
-        let files = collect_code_files(ctx, target_path)?;
-        let mut file_scores: Vec<ScoredFile> = Vec::new();
-
-        for path in files {
-            if let Ok(content) = read_bounded_file(&path) {
-                let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-                let symbols = parse_symbols(&content, ext);
-                let rel = relative_to(&ctx.directory, &path).to_lowercase();
-
-                let mut path_score = 0.0_f32;
-                for term in &q_terms {
-                    if rel.contains(term) {
-                        path_score += 4.0;
+                    // When `rank_by=churn` refuses (e.g. repo without git), retry `analyze` via MCP.
+                    if rank_by.is_some()
+                        && mcp_tool == "rank_by"
+                        && let (Some(McpAttempt::Ok(analyze_out)), retry_scip) = run_mcp_mode(
+                            ctx,
+                            &root,
+                            precision,
+                            "map",
+                            "analyze",
+                            &json!({ "path": root }),
+                        )
+                        .await?
+                        && !analyze_out.text.trim().is_empty()
+                    {
+                        let mut formatted = trim_analyze_xml_to_budget(
+                            &analyze_out.text,
+                            rel_scope.as_deref(),
+                            max_tokens,
+                            limit,
+                        );
+                        let mut metadata = json!({
+                            "operation": "map",
+                            "engine": "ripwire",
+                            "transport": "mcp",
+                            "query": query,
+                            "token_budget": max_tokens,
+                            "limit": limit,
+                        });
+                        if retry_scip {
+                            metadata["scip_overlay"] = json!(true);
+                        }
+                        if precision != PrecisionMode::Fast {
+                            metadata["precision"] = json!(precision.as_str());
+                        }
+                        if let Some(s) =
+                            ripwire_stderr.or_else(|| trimmed_stderr(&analyze_out.stderr))
+                        {
+                            metadata["ripwire_stderr"] = json!(s);
+                        }
+                        if !query.is_empty() {
+                            append_lsp_precision(
+                                ctx,
+                                target_path,
+                                "map",
+                                query,
+                                precision,
+                                &mut formatted,
+                                &mut metadata,
+                            )
+                            .await;
+                        }
+                        return Ok(ToolResult::text(formatted).with_metadata(metadata));
                     }
+                    ripwire_failure = Some(error);
                 }
-
-                let mut scored_symbols = Vec::new();
-                for sym in symbols {
-                    let mut score = 0.0_f32;
-                    let name_lower = sym.name.to_lowercase();
-                    let sig_lower = sym.signature.to_lowercase();
-                    let doc_lower = sym.doc.as_deref().unwrap_or("").to_lowercase();
-
-                    if q_terms.is_empty() {
-                        // Unconditional default map: boost public structs/classes/interfaces/functions
-                        score = match sym.kind {
-                            SymbolKind::Struct
-                            | SymbolKind::Class
-                            | SymbolKind::Interface
-                            | SymbolKind::Trait => 3.0,
-                            SymbolKind::Function | SymbolKind::Method => 2.0,
-                            _ => 1.0,
-                        };
-                    } else {
-                        for term in &q_terms {
-                            if name_lower == *term {
-                                score += 15.0;
-                            } else if name_lower.contains(term) {
-                                score += 8.0;
+                Some(McpAttempt::CliOnly { stderr }) => {
+                    ripwire_stderr = trimmed_stderr(&stderr);
+                    // Mock scripts and CLI-only ripwire builds route through the CLI invocation.
+                    match run_ripwire(ripwire_path, target_path, query, max_tokens, limit).await {
+                        Ok(run) => {
+                            let cli_stderr = trimmed_stderr(&run.stderr).or(ripwire_stderr.clone());
+                            if !run.stdout.trim().is_empty() {
+                                let mut compacted = compact_ripwire_cli_output(&run.stdout);
+                                let mut metadata = json!({
+                                    "operation": "map",
+                                    "engine": "ripwire",
+                                    "query": query,
+                                    "token_budget": max_tokens,
+                                });
+                                if scip_for_mode(&root, precision).is_some() {
+                                    metadata["scip_overlay"] = json!(true);
+                                }
+                                if query.is_empty() {
+                                    metadata["limit"] = json!(limit);
+                                }
+                                if let Some(stderr) = cli_stderr {
+                                    metadata["ripwire_stderr"] = json!(stderr);
+                                }
+                                if !query.is_empty() {
+                                    append_lsp_precision(
+                                        ctx,
+                                        target_path,
+                                        "map",
+                                        query,
+                                        precision,
+                                        &mut compacted,
+                                        &mut metadata,
+                                    )
+                                    .await;
+                                }
+                                return Ok(ToolResult::text(compacted).with_metadata(metadata));
                             }
-                            if sig_lower.contains(term) {
-                                score += 3.0;
-                            }
-                            if doc_lower.contains(term) {
-                                score += 2.0;
-                            }
+                            ripwire_failure = Some("ripwire returned no output".to_string());
+                            ripwire_stderr = cli_stderr;
+                        }
+                        Err(RipwireFailure::Timeout { timeout }) => {
+                            return Err(timeout_error("map", timeout));
+                        }
+                        Err(RipwireFailure::Spawn { message }) => {
+                            ripwire_failure = Some(message);
+                        }
+                        Err(RipwireFailure::Exit { code, stderr }) => {
+                            ripwire_stderr = trimmed_stderr(&stderr);
+                            ripwire_failure = Some(format!(
+                                "ripwire exited with status {}",
+                                code.map_or_else(|| "signal".to_string(), |c| c.to_string())
+                            ));
                         }
                     }
-
-                    if sym.visibility == Visibility::Public {
-                        score *= 1.2;
-                    }
-
-                    if score > 0.0 {
-                        scored_symbols.push((score, sym));
-                    }
                 }
-
-                scored_symbols.sort_by(|a, b| b.0.total_cmp(&a.0));
-
-                let file_sym_sum: f32 = scored_symbols.iter().take(5).map(|(s, _)| *s).sum();
-                let total_file_score = path_score + file_sym_sum;
-
-                if total_file_score > 0.0 {
-                    file_scores.push((total_file_score, path, scored_symbols));
-                }
+                None => {}
             }
         }
 
-        file_scores.sort_by(|a, b| b.0.total_cmp(&a.0));
-
-        let mut out = format!(
-            "<code_map query=\"{query}\" root=\"{}\">\n",
-            relative_to(&ctx.directory, target_path)
-        );
-
-        let max_chars = max_tokens.saturating_mul(4);
-        let mut total_symbols_emitted = 0;
-        let mut total_files_emitted = 0;
-
-        for (_, path, syms) in file_scores.iter().take(limit) {
-            if out.len() >= max_chars {
-                break;
-            }
-            let rel = relative_to(&ctx.directory, path);
-            let _ = writeln!(out, "{rel}:");
-            total_files_emitted += 1;
-
-            for (_, sym) in syms.iter().take(8) {
-                if out.len() >= max_chars {
-                    break;
-                }
-                let _ = writeln!(out, "  L{:<4} {}", sym.line, sym.signature);
-                total_symbols_emitted += 1;
-            }
-        }
-
-        out.push_str("</code_map>\n");
+        // Cached pure-Rust graph-boosted fallback.
+        let (mut out, total_files_emitted, total_symbols_emitted) =
+            native_map(ctx, target_path, query, rank_by, max_tokens, limit)?;
 
         let mut metadata = json!({
             "operation": "map",
             "engine": "native",
             "query": query,
             "files": total_files_emitted,
-            "symbols": total_symbols_emitted
+            "symbols": total_symbols_emitted,
         });
-
-        // The install tip is only truthful when discovery found no binary.
-        if ripwire_binary.is_none() {
-            let _ = writeln!(
-                out,
-                "\n[Tip: For deep call graphs and Personalized PageRank, install ripwire: `{RIPWIRE_INSTALL_CMD}`]"
-            );
-            metadata["ripwire_install_command"] = json!(RIPWIRE_INSTALL_CMD);
-        } else if let Some(reason) = ripwire_failure {
-            metadata["ripwire_error"] = json!(reason);
+        if let Some(mode) = rank_by {
+            metadata["rank_by"] = json!(mode);
         }
-        if let Some(stderr) = ripwire_stderr {
-            metadata["ripwire_stderr"] = json!(stderr);
+        add_fallback_metadata(
+            &mut out,
+            &mut metadata,
+            ripwire_binary.is_none(),
+            ripwire_failure,
+            ripwire_stderr,
+        );
+        if !query.is_empty() {
+            append_lsp_precision(
+                ctx,
+                target_path,
+                "map",
+                query,
+                precision,
+                &mut out,
+                &mut metadata,
+            )
+            .await;
         }
-
         Ok(ToolResult::text(out).with_metadata(metadata))
     }
 }

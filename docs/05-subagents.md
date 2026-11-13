@@ -86,9 +86,22 @@ as `state="failed"` instead of hanging the parent.
   "background": true,
   "role": "worker",                    // worker | coordinator
   "spawn": { "allow": false, "max_depth": 1 },
-  "lane": "build"                      // hint for the lane service
+  "lane": "build",                     // hint for the lane service
+  "partitions": 3,                     // optional 2..16: graph-partitioned parallel fan-out
+  "partition_index": 0,                // optional 0..15: single slice index when fan-out is manual
+  "partition_count": 3                 // optional 2..16: paired with partition_index
 }
 ```
+
+When `partitions` (`2..16`, without `sessionID`) is supplied, `subagent` checks
+policy + atomic `SpawnBudget::try_spawn_batch` upfront, partitions `prompt` across
+disjoint call-graph slices (`ripwire --mcp` `explore(partition=N)` with cached
+pure-Rust fallback), and spawns parallel child sessions—each receiving
+`<shared_core>` plus its non-overlapping `<partition>` slice. Child session
+metadata records `partition_index`, `partition_count`, and `partition_files`.
+Background mode returns `{ status: "running", partitions: N, sessions: [...] }`;
+foreground mode awaits all children concurrently and aggregates their
+`<subagent-partition>` results in index order.
 
 Output (tool result metadata; a background spawn or a foreground wait that was
 detached returns immediately, a settled foreground child returns its result):

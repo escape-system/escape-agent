@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use oc_memory::{MemoryService, ScribeModel};
+use oc_tools::code_map::SemanticPrecisionOracle;
 use oc_types::payload::EventPayload;
 use oc_types::{Durable, EventEnvelope, EventLocation, InterruptReason, SessionId, SessionInfo};
 use serde_json::Value;
@@ -18,8 +19,9 @@ mod traits;
 
 pub(crate) use actor::{ActorHandle, CancelToken, TerminalState};
 pub use traits::{
-    EventSink, LlmClientAdapter, ModelClient, PermissionAsk, PermissionDecision, PermissionHandler,
-    RuntimeConfig, RuntimeError, ToolProvider,
+    EditDiagnosticsHook, EventSink, LlmClientAdapter, ModelClient, PermissionAsk,
+    PermissionDecision, PermissionHandler, PostEditDiagnostics, RuntimeConfig, RuntimeError,
+    ToolProvider,
 };
 
 /// Runtime handle. Cloning is cheap and shares the actor map.
@@ -90,6 +92,8 @@ pub(crate) struct Inner {
     pub(crate) memory: Mutex<Option<Arc<MemoryService>>>,
     pub(crate) scribe: Mutex<Option<Arc<dyn ScribeModel>>>,
     pub(crate) tool_providers: Mutex<Vec<Arc<dyn ToolProvider>>>,
+    pub(crate) edit_diagnostics: Mutex<Option<Arc<dyn EditDiagnosticsHook>>>,
+    pub(crate) semantic_oracle: Mutex<Option<Arc<dyn SemanticPrecisionOracle>>>,
     pub(crate) lanes: Mutex<Option<Arc<oc_lanes::LaneService>>>,
     pub(crate) subagents: Mutex<crate::subagent::SubagentState>,
     pub(crate) tool_cancels: Mutex<HashMap<String, ToolCancelEntry>>,
@@ -123,6 +127,8 @@ impl Runtime {
                 memory: Mutex::new(None),
                 scribe: Mutex::new(None),
                 tool_providers: Mutex::new(Vec::new()),
+                edit_diagnostics: Mutex::new(None),
+                semantic_oracle: Mutex::new(None),
                 lanes: Mutex::new(None),
                 subagents: Mutex::new(crate::subagent::SubagentState::default()),
                 tool_cancels: Mutex::new(HashMap::new()),
@@ -198,6 +204,67 @@ impl Runtime {
     pub fn with_lanes(self, lanes: Arc<oc_lanes::LaneService>) -> Self {
         *self.inner.lanes.lock().expect("lanes slot") = Some(lanes);
         self
+    }
+
+    /// Attach a host post-edit LSP diagnostics hook.
+    #[must_use]
+    pub fn with_edit_diagnostics(self, hook: Arc<dyn EditDiagnosticsHook>) -> Self {
+        *self
+            .inner
+            .edit_diagnostics
+            .lock()
+            .expect("edit diagnostics slot") = Some(hook);
+        self
+    }
+
+    /// Set or replace the post-edit LSP diagnostics hook after construction.
+    pub fn set_edit_diagnostics_hook(&self, hook: Arc<dyn EditDiagnosticsHook>) {
+        *self
+            .inner
+            .edit_diagnostics
+            .lock()
+            .expect("edit diagnostics slot") = Some(hook);
+    }
+
+    /// The attached post-edit LSP diagnostics hook, if any.
+    #[must_use]
+    pub fn edit_diagnostics(&self) -> Option<Arc<dyn EditDiagnosticsHook>> {
+        self.inner
+            .edit_diagnostics
+            .lock()
+            .expect("edit diagnostics slot")
+            .clone()
+    }
+
+    /// Attach a semantic precision oracle (typically backed by `LspSupervisor`)
+    /// forwarded to `code_map` calls asking for `lsp` or `hybrid` precision.
+    #[must_use]
+    pub fn with_semantic_oracle(self, oracle: Arc<dyn SemanticPrecisionOracle>) -> Self {
+        *self
+            .inner
+            .semantic_oracle
+            .lock()
+            .expect("semantic oracle slot") = Some(oracle);
+        self
+    }
+
+    /// Set or replace the semantic precision oracle after construction.
+    pub fn set_semantic_oracle(&self, oracle: Arc<dyn SemanticPrecisionOracle>) {
+        *self
+            .inner
+            .semantic_oracle
+            .lock()
+            .expect("semantic oracle slot") = Some(oracle);
+    }
+
+    /// The attached semantic precision oracle, if any.
+    #[must_use]
+    pub fn semantic_oracle(&self) -> Option<Arc<dyn SemanticPrecisionOracle>> {
+        self.inner
+            .semantic_oracle
+            .lock()
+            .expect("semantic oracle slot")
+            .clone()
     }
 
     /// The attached lane service, when the host configured one.

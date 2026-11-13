@@ -47,14 +47,23 @@ impl Window {
     }
 
     fn try_take(&mut self, now_ms: i64, max_per_minute: u32) -> Result<(), BudgetError> {
+        self.try_take_batch(now_ms, max_per_minute, 1)
+    }
+
+    fn try_take_batch(
+        &mut self,
+        now_ms: i64,
+        max_per_minute: u32,
+        count: u32,
+    ) -> Result<(), BudgetError> {
         self.advance(now_ms);
-        if self.count >= max_per_minute {
+        if self.count.saturating_add(count) > max_per_minute {
             return Err(BudgetError::RateLimited {
                 max_per_minute,
                 retry_after_ms: self.retry_after_ms(now_ms),
             });
         }
-        self.count += 1;
+        self.count += count;
         Ok(())
     }
 }
@@ -97,13 +106,18 @@ impl SpawnBudget {
     }
 
     pub fn try_spawn(&mut self, now_ms: i64) -> Result<(), BudgetError> {
-        if self.total >= self.per_session {
+        self.try_spawn_batch(1, now_ms)
+    }
+
+    /// Atomically reserve `count` spawn slots against both session and rate limits.
+    pub fn try_spawn_batch(&mut self, count: u32, now_ms: i64) -> Result<(), BudgetError> {
+        if self.total.saturating_add(count) > self.per_session {
             return Err(BudgetError::SessionLimit {
                 max: self.per_session,
             });
         }
-        self.window.try_take(now_ms, self.per_minute)?;
-        self.total += 1;
+        self.window.try_take_batch(now_ms, self.per_minute, count)?;
+        self.total += count;
         Ok(())
     }
 
@@ -254,5 +268,14 @@ mod tests {
                 retry_after_ms: 60_000,
             })
         );
+    }
+
+    #[test]
+    fn spawn_budget_batch_is_atomic_on_session_and_rate_limits() {
+        let mut budget = super::SpawnBudget::new(3, 5);
+        assert!(budget.try_spawn_batch(4, 100).is_err());
+        assert_eq!(budget.total(), 0);
+        assert!(budget.try_spawn_batch(3, 100).is_ok());
+        assert_eq!(budget.total(), 3);
     }
 }

@@ -33,6 +33,18 @@ fn skill_write_guidance_appears_with_tool() {
 }
 
 #[test]
+fn code_map_guidance_appears_only_with_the_code_map_tool() {
+    let with = default_system_prompt(&["read".to_owned(), "code_map".to_owned()], "/work");
+    assert!(with.contains("`code_map`"), "{with}");
+    assert!(with.contains("pack_task"), "{with}");
+    assert!(with.contains("impact"), "{with}");
+    assert!(with.contains("batch"), "{with}");
+    let without = default_system_prompt(&["read".to_owned()], "/work");
+    assert!(!without.contains("`code_map`"), "{without}");
+    assert!(!without.contains("pack_task"), "{without}");
+}
+
+#[test]
 fn system_prefix_is_two_parts() {
     let parts = system_parts(Some("custom"), &[], "/work");
     assert_eq!(parts.len(), 2);

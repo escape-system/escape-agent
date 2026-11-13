@@ -641,3 +641,31 @@ fn configured_agent_overrides_and_custom_agents() {
     assert_eq!(service.agents()[0]["id"], "build");
     assert_eq!(service.default_agent(), "build");
 }
+
+#[test]
+fn symbol_edit_permission_alias_normalizes_to_edit() {
+    let fixture = Fixture::new();
+    let project = fixture.project();
+    fixture.write(
+        "project/opencode.json",
+        r#"{
+  "permission": {
+    "symbol_edit": "deny"
+  }
+}
+"#,
+    );
+    let service = fixture.load(&project);
+    assert_eq!(
+        service.evaluate(Some("build"), "edit", "src/lib.rs"),
+        Effect::Deny
+    );
+    assert_eq!(
+        service.evaluate(Some("explore"), "edit", "src/lib.rs"),
+        Effect::Deny
+    );
+    assert_eq!(
+        service.evaluate(Some("explore"), "read", "src/lib.rs"),
+        Effect::Allow
+    );
+}

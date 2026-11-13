@@ -73,7 +73,7 @@ pub(super) fn is_code_extension(path: &Path) -> bool {
     )
 }
 
-pub(super) fn relative_to(root: &Path, target: &Path) -> String {
+pub(crate) fn relative_to(root: &Path, target: &Path) -> String {
     if let Ok(rel) = target.strip_prefix(root) {
         rel.to_string_lossy().into_owned()
     } else {

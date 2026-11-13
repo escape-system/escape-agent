@@ -69,6 +69,33 @@ pub(super) fn collect_tool_lines(
                             }
                         }
                     }
+                    "symbol_edit" => {
+                        let input_val = Value::Object(input.clone());
+                        if !crate::snapshot::is_symbol_edit_preview(&input_val) {
+                            let mut recorded = false;
+                            if let Some(files) = metadata
+                                .as_ref()
+                                .and_then(|m| m.get("files"))
+                                .and_then(Value::as_array)
+                            {
+                                for entry in files {
+                                    if let Some(file) = entry.get("file").and_then(Value::as_str) {
+                                        recorded = true;
+                                        if verify::is_code_file(file) {
+                                            stats.record_code_mutation(file, step_number);
+                                        }
+                                    }
+                                }
+                            }
+                            if !recorded
+                                && let Some(path) =
+                                    crate::snapshot::symbol_edit_target_path(&input_val)
+                                && verify::is_code_file(&path)
+                            {
+                                stats.record_code_mutation(&path, step_number);
+                            }
+                        }
+                    }
                     "shell" => {
                         if shell_failure.is_none()
                             && let Some(command) = input.get("command").and_then(Value::as_str)

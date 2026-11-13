@@ -154,8 +154,8 @@ public surface; `cargo doc -p <crate> --no-deps` is the reference.
   token when the execution is interrupted, and tools that spawn detached
   helpers (the foreground subagent wait) use it to stop them instead of
   orphaning work when the tool future is dropped. Built-ins: `code_map`, `read`,
-  `write`, `edit`, `patch`, `glob`, `grep`, `shell`, `todowrite`, `webfetch`;
-  no permission/expectation logic (the runtime adds it).
+  `write`, `edit`, `symbol_edit`, `patch`, `glob`, `grep`, `shell`, `todowrite`,
+  `webfetch`, `websearch`; no permission/expectation logic (the runtime adds it).
 
 ### `oc-mcp`
 - `McpConfig::from_value`, `McpClient::{connect, list_tools, call_tool,
@@ -705,11 +705,16 @@ pub struct ToolResult { pub output: Option<String>, pub content: Option<Value>, 
 pub struct ToolError { pub message: String, pub metadata: Option<Value> }  // thiserror + helpers
 ```
 
-Landed built-ins: `code_map`, `read`, `write`, `edit`, `patch`, `glob`, `grep`, `shell`,
-`todowrite`, `webfetch`. Exact schemas/limits/error strings per
-`docs/12-tools.md`; tests cover edit three-tier matching, CRLF, patch grammar,
-glob/grep limits, shell timeout/kill, webfetch SSRF guards. No `expectation`
-injection here; the runtime adds it.
+Landed built-ins: `code_map`, `read`, `write`, `edit`, `symbol_edit`, `patch`,
+`glob`, `grep`, `shell`, `todowrite`, `webfetch`, `websearch`. Exact
+schemas/limits/error strings per `docs/12-tools.md`; tests cover edit
+three-tier matching, CRLF, atomic symbol editing, patch grammar, glob/grep
+limits, shell timeout/kill, webfetch SSRF guards. No `expectation` injection
+here; the runtime adds it. Hosts may attach a semantic oracle
+(`oc_tools::code_map::SemanticPrecisionOracle`) and an
+`oc_runtime::EditDiagnosticsHook` (implemented over `LspSupervisor` in
+`oc-server::data::lsp_tools`) for post-edit radar and `lsp`/`hybrid` precision
+resolution.
 
 Note the `&str` return type is deliberate: dynamic tool names (MCP) need to be
 backed by an owned `String`. Do not change it back to `&'static str`.
@@ -732,6 +737,7 @@ across sibling modules are `pub(super)`.
 | `oc-mcp` | `client` → `types, handler, session, request, catalog, accessors, handshake` |
 | `oc-lsp` | `client` → `types, spawn, accessors, handshake, request, sync, diagnostics, lifecycle, dispatch, io, json` |
 | `oc-cli` | `cli, serve, bootstrap, schedule, lane, paths, auth, net` |
+| `oc-tools` | `code_map` → `files, graph_ops, map, native_index, outline, parsers, precision, radar, ripwire, ripwire_mcp`; `symbol_edit` |
 
 Rules for future splits: move item bodies byte-identically; keep serde shapes,
 route tables, error tags and publish ordering untouched; keep `#[allow]`

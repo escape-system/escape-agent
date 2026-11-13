@@ -85,7 +85,9 @@ pub fn default_system_prompt_with_memory(
             "- When the user explicitly asks you to spawn subagents, call `subagent` before reading \
              files or running commands; give each child a self-contained prompt. Otherwise delegate \
              self-contained parallel work with `subagent` instead of doing everything yourself; omit \
-             `agent` to use the configured default, and use `explore` for read-only searches. For complex \
+             `agent` to use the configured default, and use `explore` for read-only searches. Pass \
+             `partitions` (2..16) to auto-split cross-module tasks using `code_map` graph partitioning \
+             so parallel workers stay disjoint with minimal `<shared_core>` overhead. For complex \
              multi-phase work, delegate to a coordinator (`role: \"coordinator\"`) to manage sub-tasks \
              hierarchically. Use `sessionID` to continue an existing child rather than spawning duplicates. \
              Several independent spawns may be issued in one step; `background: true` returns immediately \
@@ -110,9 +112,15 @@ pub fn default_system_prompt_with_memory(
     }
     if tool_names.iter().any(|name| name == "code_map") {
         prompt.push_str(
-            "- Use `code_map` to extract file outlines, search symbol definitions, or get a task-focused \
-             structural map before reading large files. For deep call-graph ranking, ripwire can be \
-             installed via: curl -fsSL https://raw.githubusercontent.com/redhat-et/ripwire/main/install.sh | sh\n",
+            "- Prefer `code_map` FIRST before repeated `grep` or whole-file `read` calls:\n  \
+               - Start unfamiliar tasks with `code_map(operation=\"pack_task\", query=...)` (or add `partitions=N` for multi-agent slices), or `communities` / `map` for module hubs and architecture.\n  \
+               - Use `symbol` + `expand` (with `compress: true` to strip comments) instead of reading whole files, `impact` before modifying shared symbols, `connect` / `trace` / `affected` to trace call paths, stack traces, or impacted tests, and `batch` for up to 16 lookups in one call.\n  \
+               - For deeper analysis use `lego` (trait/interface contracts), `slice` (data/variable flow), `cochange` (files historically edited together), `doc_drift`, `flags`, and `quality` (`delta`/`dead_code`/`clones`/`hotspots`/`deps`/`seams`); pass `precision: \"scip\" | \"lsp\" | \"hybrid\"` when compiler-exact typing is needed.\n",
+        );
+    }
+    if tool_names.iter().any(|name| name == "symbol_edit") {
+        prompt.push_str(
+            "- Prefer `symbol_edit` (`replace`, `insert_before`, `insert_after`, `preview`) over brittle text matching when replacing or annotating whole functions, structs, methods, or classes by symbol name; act on any `<lsp_diagnostics>` or `<post_edit_radar>` surfaced after edits.\n",
         );
     }
     if tool_names.iter().any(|name| name == "skill_write") {

@@ -58,11 +58,10 @@ impl Expectation {
     #[must_use]
     pub fn derived(tool: &str) -> Self {
         let (expect, why) = match tool {
-            "read" | "glob" | "grep" | "lsp" | "lsp_diagnostics" | "roster" | "digest" => {
-                (10, "inspect the workspace and return a compact result")
-            }
+            "read" | "glob" | "grep" | "lsp" | "lsp_diagnostics" | "code_map" | "roster"
+            | "digest" => (10, "inspect the workspace and return a compact result"),
             "skill" | "skill_lint" => (10, "inspect a skill and return its content"),
-            "write" | "edit" | "patch" | "memory_write" => {
+            "write" | "edit" | "patch" | "symbol_edit" | "memory_write" => {
                 (20, "apply a deterministic file or memory change")
             }
             "skill_write" => (30, "persist a skill change on disk"),

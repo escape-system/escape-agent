@@ -110,7 +110,14 @@ pub(crate) async fn attach_runtime(
         sink: Arc::new(oc_server::BusSink::from_state(&state)),
         permissions: broker.clone(),
     });
-    runtime = runtime.with_lanes(Arc::clone(&extensions.lanes));
+    runtime = runtime
+        .with_lanes(Arc::clone(&extensions.lanes))
+        .with_edit_diagnostics(Arc::new(
+            oc_server::data::lsp_tools::LspEditDiagnosticsHook::new(Arc::clone(&extensions.lsp)),
+        ))
+        .with_semantic_oracle(Arc::new(
+            oc_server::data::lsp_tools::LspSemanticOracle::new(Arc::clone(&extensions.lsp)),
+        ));
     for provider in &extensions.providers {
         runtime.add_tool_provider(Arc::clone(provider));
     }

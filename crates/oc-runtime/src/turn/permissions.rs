@@ -143,7 +143,7 @@ impl Runtime {
 
 pub(super) fn tool_action(name: &str) -> &str {
     match name {
-        "write" | "edit" | "patch" => "edit",
+        "write" | "edit" | "patch" | "symbol_edit" => "edit",
         "subagent" => "subagent",
         "talk" | "session_write" | "roster" | "digest" | "memory_search" | "memory_list" => "read",
         "memory_write" | "memory_forget" => "memory:write",
@@ -173,6 +173,19 @@ pub(super) fn permission_target(
             let path = normalize_path(directory, raw);
             let external = (!inside(directory, &path)).then(|| path.clone());
             (action, path, external)
+        }
+        "symbol_edit" => {
+            let input_val = Value::Object(input.clone());
+            let effective_action = if crate::snapshot::is_symbol_edit_preview(&input_val) {
+                "read".to_owned()
+            } else {
+                action
+            };
+            let raw = crate::snapshot::symbol_edit_target_path(&input_val)
+                .unwrap_or_else(|| directory.to_owned());
+            let path = normalize_path(directory, &raw);
+            let external = (!inside(directory, &path)).then(|| path.clone());
+            (effective_action, path, external)
         }
         "shell" => {
             let command = input

@@ -103,6 +103,7 @@ ERROR [line:col] message
 
   Full diagnostics go to tool `metadata.diagnostics` (severity, code, source,
   range), not into the model text.
+- `edit_diagnostics` (severity-1 `<diagnostics>` errors) is wired via `oc_runtime::EditDiagnosticsHook` (`LspEditDiagnosticsHook` in `oc_server::data::lsp_tools`) into post-edit tool results (`write`/`edit`/`patch`/`symbol_edit`), and `LspSemanticOracle` implements `oc_tools::code_map::SemanticPrecisionOracle` so `code_map` `precision: "lsp" | "hybrid"` resolves trait implementations (`goToImplementation`), references (`findReferences`), call hierarchy (`incomingCalls`/`outgoingCalls`), definitions (`goToDefinition`), workspace symbols, and diagnostics alongside the graph index.
 - `read` warms the client (`touchFile(file,false)`) but never waits.
 - Cache bounds: 10k paths / 8 MiB per client; cleared on eviction; versioned so
   a stale publish is ignored.

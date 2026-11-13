@@ -20,13 +20,14 @@ use ts_js::parse_ts_js_symbols;
 /// Pure-Rust multi-language parser for signatures and symbols.
 #[must_use]
 pub fn parse_symbols(content: &str, ext: &str) -> Vec<Symbol> {
+    let clean = content.strip_prefix('\u{feff}').unwrap_or(content);
     match ext.to_lowercase().as_str() {
-        "rs" => parse_rust_symbols(content),
-        "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" => parse_ts_js_symbols(content),
-        "py" => parse_python_symbols(content),
-        "go" => parse_go_symbols(content),
-        "c" | "cpp" | "cc" | "h" | "hpp" => parse_c_cpp_symbols(content),
-        "md" => parse_markdown_headings(content),
+        "rs" => parse_rust_symbols(clean),
+        "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" => parse_ts_js_symbols(clean),
+        "py" => parse_python_symbols(clean),
+        "go" => parse_go_symbols(clean),
+        "c" | "cpp" | "cc" | "h" | "hpp" => parse_c_cpp_symbols(clean),
+        "md" => parse_markdown_headings(clean),
         _ => Vec::new(),
     }
 }

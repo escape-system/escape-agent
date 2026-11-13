@@ -104,6 +104,35 @@ workspace total, and the `803` snapshot above predates these entries.
   `docs/14-config-permissions.md` now lists `code_map` in the `explore`
   toolset.
 
+### Wave: code_map graph engine (lazy ripwire MCP pool + cached native index)
+
+Workspace test suite in this wave: **1,140 passed, 0 failed, 3 ignored**
+(1,137 unit/integration + 3 doctests passed; 3 pre-existing doctests ignored).
+
+- **`oc-tools` (`crates/oc-tools/src/code_map/`)**: Expanded `code_map` from 4
+  to 12 operations (`map`, `outline`, `pack_task`, `communities`, `symbol`,
+  `expand`, `references`, `impact`, `connect`, `affected`, `trace`, `batch`),
+  plus optional `rank_by`, `start_line`, `end_line`, `compress`, and `queries`
+  parameters (`strict`/`additionalProperties: false`, no `oneOf`/`anyOf`).
+  Added a lazy bounded `ripwire <root> --mcp` stdio JSON-RPC pool in
+  `ripwire_mcp.rs` (2 daemons per tokio runtime, cross-runtime cap 16, 300 s idle
+  eviction, 1x `ripwire://legend-dict/full` schema read, `CliOnly` binary
+  capability caching, hard timeout/cancel kill-and-evict, broken-pipe 1x
+  respawn), glossary-comment compaction and `analyze` XML budget packing in
+  `ripwire.rs`, and an mtime+size-cached pure-Rust symbol+call-graph fallback in
+  `native_index.rs`. Omitted `limit` on MCP `for`/`explore` calls so ripwire 0.6.8
+  returns full `<ctx>` bundles rather than 1-row `candidate-page/v1` summaries.
+  `oc-tools` carries 94 tests (`code_map_ripwire.rs` covers CLI contract,
+  persistent MCP pool + all 12 ops, and pure-Rust native fallback).
+- **`oc-runtime` & `oc-config`**: Strengthened graph-first `code_map` workflow
+  guidance in `crates/oc-runtime/src/prompt/mod.rs` (removing the hardcoded
+  install URL from the cached prompt prefix), added `"code_map"` to fast
+  inspection expectations (`crates/oc-runtime/src/expectation.rs`), and updated
+  `PROMPT_EXPLORE` (`crates/oc-config/src/agents.rs`) to start with `code_map`
+  before `grep` or full-file `read`. `oc-config` carries 41 tests;
+  `oc-runtime` carries 268 unit/integration tests + 1 doctest.
+- **Docs**: Updated `docs/12-tools.md` (`code_map` 12-operation contract) and
+  `docs/17-interfaces.md` (`oc-tools` `code_map/` module layout).
 
 - **Sessions**: list/create/get/patch/delete/active, agent/model/move,
   interrupt/background, prompt/synthetic/compact/command, fork,
@@ -440,6 +469,16 @@ registered, websearch providers list is empty, usage limits are `null`, and
 - No retention/maintenance sweep is implemented; rows accumulate (see
   `docs/03-storage.md`).
 - `session.v1` import is rejected; only the v2 schema is read.
+
+## Code Intelligence, Partitioned Subagents & LSP Precision
+
+Verified workspace suite for this release wave: **1,155 passed, 0 failed, 3 ignored** (1,152 unit/integration + 3 doctests passed; 3 pre-existing doctests ignored; `oc-tools`: 100, `oc-runtime`: 274 + 1 doctest, `oc-config`: 42, `oc-subagents`: 22, `oc-server`: 254), expanding the earlier 12-operation `code_map` engine above to 18 operations plus atomic symbol editing:
+
+- `symbol_edit` tool in `oc-tools` (`replace` | `insert_before` | `insert_after` | `preview`) via `ripwire --mcp` with pure-Rust AST-span fallback, BOM/CRLF preservation, and unified diffs in `metadata.files`; preview calls map to `read` permission and skip snapshot/mutation tracking, while edits map to `edit` permission (including `symbol_edit` → `edit` config normalization in `oc-config`).
+- Zero-noise post-edit radar (`oc_tools::code_map::collect_post_edit_radar`) and `oc_runtime::EditDiagnosticsHook` (`PostEditDiagnostics`) run on non-preview code mutations (`write`, `edit`, `patch`, `symbol_edit`) and append `<lsp_diagnostics>` / `<post_edit_radar>` only when actionable findings exist; `verify_on_stop` nudges include top radar blockers via `build_verification_nudge_with_radar`.
+- `code_map` expanded with `pack_task`, `lego`, `slice`, `cochange`, `doc_drift`, `flags`, `quality` (`delta` | `dead_code` | `clones` | `hotspots` | `deps` | `seams`), `var`, `flow`, `depth`, `partitions` (2..16), and `precision` (`fast` | `scip` | `lsp` | `hybrid`) plus `ripwire --mcp --scip=<path>` support and `SemanticPrecisionOracle` (`tokio::task_local!` via `with_semantic_oracle`).
+- `subagent` tool supports atomic `partitions` (2..16) parallel fan-out via `SpawnBudget::try_spawn_batch` (injecting `<shared_core>` + `<partition>` slices and `<subagent-partition>` aggregation) as well as manual `partition_index`/`partition_count`.
+- `oc-server` (`LspEditDiagnosticsHook`, `LspSemanticOracle`) and `oc-cli` (`bootstrap.rs`) wire `LspSupervisor` directly into `Runtime` for live post-edit diagnostics and `lsp`/`hybrid` `code_map` precision.
 
 ## Verification & Development Flow
 

@@ -37,6 +37,7 @@ async fn registry_definitions_are_sorted_without_expectation() {
             "patch",
             "read",
             "shell",
+            "symbol_edit",
             "todowrite",
             "webfetch",
             "websearch",

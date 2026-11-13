@@ -447,3 +447,155 @@ async fn writes_outside_the_session_directory_are_not_snapshotted() {
         .expect("snapshots");
     assert!(rows.is_empty(), "{rows:?}");
 }
+
+struct MockEditDiagnosticsHook;
+
+#[async_trait::async_trait]
+impl oc_runtime::EditDiagnosticsHook for MockEditDiagnosticsHook {
+    async fn after_edit(
+        &self,
+        _root: &std::path::Path,
+        files: &[String],
+    ) -> oc_runtime::PostEditDiagnostics {
+        oc_runtime::PostEditDiagnostics {
+            formatted: Some(format!(
+                "<lsp_diagnostics>\nLSP errors detected in {}:\nERROR [2:1] expected `;`\n</lsp_diagnostics>",
+                files.join(", ")
+            )),
+            error_count: 1,
+            metadata: Some(json!({ "errors": 1, "files": files })),
+        }
+    }
+}
+
+struct MockRuntimeOracle;
+
+#[async_trait::async_trait]
+impl oc_tools::code_map::SemanticPrecisionOracle for MockRuntimeOracle {
+    async fn query(&self, req: oc_tools::code_map::SemanticRequest) -> Result<Value, String> {
+        match req {
+            oc_tools::code_map::SemanticRequest::IncomingCalls { .. } => Ok(json!([
+                {
+                    "from": {
+                        "name": "lsp_target",
+                        "uri": "file:///src/lib.rs",
+                        "range": { "start": { "line": 3, "character": 0 } }
+                    }
+                }
+            ])),
+            _ => Ok(json!([])),
+        }
+    }
+}
+
+#[tokio::test]
+async fn symbol_edit_snapshots_attaches_diagnostics_radar_and_triggers_verify_nudge() {
+    let harness = Harness::new_with_setup(
+        vec![
+            named_tool_script(
+                "symbol_edit",
+                "call_sym_edit",
+                json!({
+                    "operation": "replace",
+                    "path": "src/auth.rs",
+                    "symbol": "validate_token",
+                    "content": "pub fn validate_token(tok: &str) -> bool {\n    !tok.is_empty()\n}",
+                    "expectation": expectation(),
+                }),
+            ),
+            text_script("I updated validate_token."),
+            text_script("Cannot run tests in offline harness."),
+        ],
+        Arc::new(AllowAll),
+        json!({}),
+        None,
+        |work| {
+            std::fs::create_dir_all(work.join("src")).unwrap();
+            std::fs::create_dir_all(work.join("tests")).unwrap();
+            std::fs::write(
+                work.join("src/auth.rs"),
+                "pub fn validate_token(tok: &str) -> bool {\n    tok.len() > 2\n}\n",
+            )
+            .unwrap();
+            std::fs::write(
+                work.join("tests/auth_test.rs"),
+                "use crate::auth::validate_token;\nfn test_auth() { assert!(validate_token(\"abc\")); }\n",
+            )
+            .unwrap();
+        },
+    )
+    .await;
+    harness
+        .runtime
+        .set_edit_diagnostics_hook(Arc::new(MockEditDiagnosticsHook));
+
+    harness.prompt("fix validate_token").await;
+
+    assert!(!harness.sink.has("session.tool.failed"));
+    let updated = std::fs::read_to_string(harness.work.join("src/auth.rs")).unwrap();
+    assert!(updated.contains("!tok.is_empty()"));
+
+    let snapshots = harness
+        .store
+        .snapshots_after(&harness.session, -1)
+        .await
+        .expect("snapshots");
+    assert_eq!(snapshots.len(), 1);
+    assert!(snapshots[0].existed);
+
+    let requests = harness.model.requests();
+    assert!(
+        requests.len() >= 3,
+        "verify-on-stop must fire after symbol_edit: {}",
+        requests.len()
+    );
+    let tool_res = request_tool_result(&requests[1], 0);
+    assert!(
+        tool_res.contains("<lsp_diagnostics>") && tool_res.contains("expected `;`"),
+        "post-edit LSP diagnostics missing from tool result: {tool_res}"
+    );
+    assert!(
+        tool_res.contains("<post_edit_radar>") && tool_res.contains("tests/auth_test.rs"),
+        "post-edit radar missing suggested test: {tool_res}"
+    );
+}
+
+#[tokio::test]
+async fn runtime_forwards_semantic_oracle_to_code_map() {
+    let harness = Harness::new_with_setup(
+        vec![
+            named_tool_script(
+                "code_map",
+                "call_cm_lsp",
+                json!({
+                    "operation": "impact",
+                    "query": "helper_fn",
+                    "precision": "lsp",
+                    "expectation": expectation(),
+                }),
+            ),
+            text_script("done"),
+        ],
+        Arc::new(AllowAll),
+        json!({}),
+        None,
+        |work| {
+            std::fs::create_dir_all(work.join("src")).unwrap();
+            std::fs::write(work.join("src/lib.rs"), "pub fn helper_fn() {}\n").unwrap();
+        },
+    )
+    .await;
+    harness
+        .runtime
+        .set_semantic_oracle(Arc::new(MockRuntimeOracle));
+
+    harness.prompt("analyze impact").await;
+
+    let requests = harness.model.requests();
+    assert!(requests.len() >= 2);
+    let tool_res = request_tool_result(&requests[1], 0);
+    assert!(
+        tool_res.contains("<lsp_precision") && tool_res.contains("lsp_target"),
+        "expected forwarded semantic oracle in code_map result: {tool_res}"
+    );
+}

@@ -26,6 +26,39 @@ const CONTENT_CAP: u64 = 5 * 1024 * 1024;
 /// Only mutating file tools are captured. Targets are resolved against
 /// `directory` and anything that escapes it (lexically or through a symlink)
 /// is skipped: external edits are not the session's to revert.
+pub(crate) fn is_symbol_edit_preview(input: &Value) -> bool {
+    input.get("operation").and_then(Value::as_str) == Some("preview")
+}
+
+pub(crate) fn symbol_edit_target_path(input: &Value) -> Option<String> {
+    if let Some(raw) = input
+        .get("path")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return Some(raw.to_owned());
+    }
+    let sym = input.get("symbol").and_then(Value::as_str)?.trim();
+    if let Some(rest) = sym.strip_prefix('@') {
+        let file = rest
+            .rsplit_once(':')
+            .filter(|(_, suffix)| !suffix.contains(['/', '\\']))
+            .map_or(rest, |(f, _)| f)
+            .trim();
+        return (!file.is_empty()).then(|| file.to_owned());
+    }
+    if !sym.contains("::")
+        && let Some((file, suffix)) = sym.rsplit_once(':')
+        && !suffix.trim().is_empty()
+        && !suffix.contains(['/', '\\'])
+    {
+        let trimmed = file.trim();
+        return (!trimmed.is_empty()).then(|| trimmed.to_owned());
+    }
+    None
+}
+
 pub(crate) async fn capture_before_tool(
     runtime: &Runtime,
     session_id: &str,
@@ -44,6 +77,15 @@ pub(crate) async fn capture_before_tool(
             Some(text) => oc_tools::patch::patch_targets(text),
             None => Vec::new(),
         },
+        "symbol_edit" => {
+            if is_symbol_edit_preview(input) {
+                return;
+            }
+            match symbol_edit_target_path(input) {
+                Some(raw) => vec![raw],
+                None => Vec::new(),
+            }
+        }
         _ => return,
     };
 
@@ -229,5 +271,35 @@ mod tests {
         let id = snapshot_id();
         assert!(id.starts_with("snap_"), "got {id}");
         assert_eq!(id.len(), 31);
+    }
+
+    #[test]
+    fn symbol_edit_target_path_handles_at_line_and_drive_letters() {
+        use serde_json::json;
+
+        assert_eq!(
+            symbol_edit_target_path(&json!({ "path": "src/lib.rs", "symbol": "foo" })).as_deref(),
+            Some("src/lib.rs")
+        );
+        assert_eq!(
+            symbol_edit_target_path(&json!({ "symbol": "@src/lib.rs:42" })).as_deref(),
+            Some("src/lib.rs")
+        );
+        assert_eq!(
+            symbol_edit_target_path(&json!({ "symbol": "@C:\\repo\\src\\lib.rs:42" })).as_deref(),
+            Some("C:\\repo\\src\\lib.rs")
+        );
+        assert_eq!(
+            symbol_edit_target_path(&json!({ "symbol": "C:\\repo\\src\\lib.rs:foo" })).as_deref(),
+            Some("C:\\repo\\src\\lib.rs")
+        );
+        assert_eq!(
+            symbol_edit_target_path(&json!({ "symbol": "Type::method" })),
+            None
+        );
+        assert_eq!(
+            symbol_edit_target_path(&json!({ "symbol": "@C:\\repo\\src\\lib.rs" })).as_deref(),
+            Some("C:\\repo\\src\\lib.rs")
+        );
     }
 }
