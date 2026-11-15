@@ -1,0 +1,8 @@
+# Published Linux binaries must run on every x86-64-v2 CPU (SSE4.2 + POPCNT,
+# roughly 2009 and newer). Never build release artifacts with
+# `-C target-cpu=native` or a Zen4/Zen5 target: a binary built on this host
+# used AVX-512 and died with SIGILL on AVX2-only machines (v0.3.10 regression,
+# fixed in v0.3.11). Keep this in sync with the portability gate in
+# .github/workflows/release.yml.
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "target-cpu=x86-64-v2"]

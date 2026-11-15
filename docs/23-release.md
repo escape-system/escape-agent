@@ -25,6 +25,18 @@ extracted archive serves the app without `--web-dist`. The flag and
 `web/dist` is git-ignored (`.gitignore:2:/web/dist`); it is built in CI, never
 committed.
 
+## CPU portability
+
+Release binaries are baseline **x86-64-v2** (SSE4.2 + POPCNT, roughly 2009 and
+newer). `.cargo/config.toml` pins `-C target-cpu=x86-64-v2` so a release built
+on any host — including a Zen 4/5 machine — never picks up AVX-512. The release
+workflow scans the Linux binary for `%zmm` registers and fails if AVX-512
+instructions are present.
+
+v0.3.10 shipped an AVX-512 build produced with the machine-local
+`target-cpu=znver5` flag and crashed with `SIGILL` on AVX2-only CPUs; v0.3.11
+fixes that.
+
 ## Triggers
 
 Two paths, one workflow (`.github/workflows/release.yml`):
@@ -48,7 +60,7 @@ replaces the release (`gh release delete --yes` then create).
 ## The version-must-match rule
 
 The tag must equal `[workspace.package] version` in `Cargo.toml` (currently
-`0.3.8`) exactly, minus the leading `v`. The workflow fails before building if
+`0.3.11`) exactly, minus the leading `v`. The workflow fails before building if
 they differ:
 
 ```
