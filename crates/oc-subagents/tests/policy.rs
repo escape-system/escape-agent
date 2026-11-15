@@ -1,7 +1,7 @@
 use oc_subagents::{
-    BudgetError, Limits, MessageError, ModelDefaults, ModelError, ModelSource, NodeState, Policy,
-    Role, SessionNode, SessionTree, SiblingBudget, SpawnBudget, SpawnError, WriteError,
-    resolve_model,
+    BudgetError, CandidateFilter, Limits, MessageError, ModelDefaults, ModelError, ModelSkip,
+    ModelSource, NodeState, Policy, Role, SessionNode, SessionTree, SiblingBudget, SkipReason,
+    SpawnBudget, SpawnError, WriteError, resolve_model, resolve_model_with,
 };
 
 fn node(
@@ -46,7 +46,7 @@ fn tree(nodes: &[SessionNode]) -> SessionTree {
 }
 
 fn agents() -> Vec<String> {
-    ["general", "explore", "build"]
+    ["general", "explore", "engineer"]
         .iter()
         .map(|agent| (*agent).to_owned())
         .collect()
@@ -125,10 +125,11 @@ fn spawn_rejects_unknown_and_primary_only_agents() {
         Err(SpawnError::UnknownAgent { .. })
     ));
     assert!(matches!(
-        policy.spawn(&root(), "build", None, &agents()),
+        policy.spawn(&root(), "engineer", None, &agents()),
         Err(SpawnError::PrimaryOnlyAgent { .. })
     ));
     assert!(policy.spawn(&root(), "explore", None, &agents()).is_ok());
+    assert!(policy.spawn(&root(), "general", None, &agents()).is_ok());
 }
 
 #[test]
@@ -283,6 +284,7 @@ fn writes_are_descendant_only_except_coordinator_scope_and_self() {
 fn available_models() -> Vec<String> {
     [
         "call/model",
+        "chain/model",
         "agent/model",
         "policy/model",
         "default/model",
@@ -310,6 +312,25 @@ fn model_resolution_order() {
     )
     .expect("call wins");
     assert_eq!(choice.source, ModelSource::Call);
+    assert_eq!(choice.source.as_str(), "call");
+    assert_eq!(choice.reference, "call/model");
+    assert!(choice.skipped.is_empty(), "{:?}", choice.skipped);
+
+    // The chain sits between the call and the agent rows.
+    let chain = vec!["chain/model".to_owned()];
+    let filter = CandidateFilter::new(&chain, &[]);
+    let choice = resolve_model_with(
+        None,
+        Some("general"),
+        defaults.clone(),
+        "parent/model",
+        &available,
+        Some(&filter),
+    )
+    .expect("chain entry wins over the agent model");
+    assert_eq!(choice.reference, "chain/model");
+    assert_eq!(choice.source, ModelSource::Chain);
+    assert_eq!(choice.source.as_str(), "chain");
 
     let choice = resolve_model(
         None,
@@ -324,6 +345,7 @@ fn model_resolution_order() {
         oc_subagents::ModelChoice {
             reference: "agent/model".to_owned(),
             source: ModelSource::Agent,
+            skipped: Vec::new(),
         }
     );
 
@@ -348,10 +370,12 @@ fn model_resolution_order() {
     )
     .expect("default wins over the parent");
     assert_eq!(choice.source, ModelSource::Default);
+    assert_eq!(choice.reference, "default/model");
 
     let choice = resolve_model(None, None, ModelDefaults::new(), "parent/model", &available)
         .expect("parent is the last resort");
     assert_eq!(choice.source, ModelSource::Parent);
+    assert_eq!(choice.reference, "parent/model");
 
     let mut dotted_catalog = available.clone();
     dotted_catalog.push("anthropic/claude-sonnet-4-5".to_owned());
@@ -368,64 +392,148 @@ fn model_resolution_order() {
 }
 
 #[test]
-fn model_errors_carry_the_candidate_chain() {
+fn model_resolution_falls_through_bad_candidates() {
     let available = available_models();
     let defaults = ModelDefaults::new()
         .with_agent_model("general", "agent/model")
         .with_policy_model("general", "policy/model")
         .with_default_model("default/model");
+    let chain = vec!["chain/model".to_owned()];
+    let filter = CandidateFilter::new(&chain, &[]);
 
-    let error = resolve_model(
+    // An unavailable call model now falls through to the chain entry; the
+    // rejected call reference is surfaced in `skipped`.
+    let choice = resolve_model_with(
         Some("missing/model"),
         Some("general"),
         defaults,
         "parent/model",
         &available,
+        Some(&filter),
     )
-    .expect_err("an unavailable call model must not fall through");
-    match error {
-        ModelError::Unavailable {
-            reference,
-            origin,
-            chain,
-        } => {
-            assert_eq!(reference, "missing/model");
-            assert_eq!(origin, "call");
-            let refs: Vec<&str> = chain.iter().map(|entry| entry.reference.as_str()).collect();
-            assert_eq!(
-                refs,
-                [
-                    "missing/model",
-                    "agent/model",
-                    "policy/model",
-                    "default/model",
-                    "parent/model",
-                ]
-            );
-        }
-        other => panic!("unexpected error: {other:?}"),
-    }
+    .expect("the next candidate is used, not an error");
+    assert_eq!(choice.reference, "chain/model");
+    assert_eq!(choice.source, ModelSource::Chain);
+    assert_eq!(
+        choice.skipped,
+        vec![ModelSkip::new(
+            "missing/model",
+            ModelSource::Call,
+            SkipReason::NotAvailable
+        )]
+    );
+    assert_eq!(choice.skipped[0].reason.as_str(), "not_available");
 
-    let bad_variant = resolve_model(
+    // An unknown variant is just another unavailable candidate.
+    let choice = resolve_model(
         Some("call/model#unknown"),
         None,
         ModelDefaults::new(),
         "parent/model",
         &available,
+    )
+    .expect("the parent model is used");
+    assert_eq!(choice.reference, "parent/model");
+    assert_eq!(
+        choice.skipped,
+        vec![ModelSkip::new(
+            "call/model#unknown",
+            ModelSource::Call,
+            SkipReason::NotAvailable
+        )]
     );
-    assert!(matches!(bad_variant, Err(ModelError::Unavailable { .. })));
 
-    let malformed = resolve_model(
+    // A malformed call reference falls through too.
+    let choice = resolve_model(
         Some("nonsense"),
         None,
         ModelDefaults::new(),
         "parent/model",
         &available,
+    )
+    .expect("the parent model is used");
+    assert_eq!(choice.reference, "parent/model");
+    assert_eq!(
+        choice.skipped,
+        vec![ModelSkip::new(
+            "nonsense",
+            ModelSource::Call,
+            SkipReason::Malformed
+        )]
     );
-    assert!(matches!(
-        malformed,
-        Err(ModelError::InvalidReference { .. })
-    ));
+}
+
+#[test]
+fn model_errors_carry_the_candidate_chain() {
+    let available = available_models();
+    // Nothing usable at all: the error carries the ordered chain and every
+    // skipped entry, and its Display names each reference with reason/source.
+    let chain = vec!["missing/chain".to_owned()];
+    let deny = vec!["agent/model".to_owned()];
+    let filter = CandidateFilter::new(&chain, &deny);
+    let error = resolve_model_with(
+        Some("nonsense"),
+        Some("general"),
+        ModelDefaults::new()
+            .with_agent_model("general", "agent/model")
+            .with_default_model("missing/default"),
+        "missing/parent",
+        &available,
+        Some(&filter),
+    )
+    .expect_err("nothing is usable");
+    match &error {
+        ModelError::NoUsableCandidate { chain, skipped } => {
+            let refs: Vec<&str> = chain.iter().map(|entry| entry.reference.as_str()).collect();
+            assert_eq!(
+                refs,
+                [
+                    "nonsense",
+                    "missing/chain",
+                    "agent/model",
+                    "missing/default",
+                    "missing/parent",
+                ]
+            );
+            let skips: Vec<(&str, &str, &str)> = skipped
+                .iter()
+                .map(|skip| {
+                    (
+                        skip.reference.as_str(),
+                        skip.reason.as_str(),
+                        skip.source.as_str(),
+                    )
+                })
+                .collect();
+            assert_eq!(
+                skips,
+                [
+                    ("nonsense", "malformed", "call"),
+                    ("missing/chain", "not_available", "chain"),
+                    ("agent/model", "denied", "agent"),
+                    ("missing/default", "not_available", "default"),
+                    ("missing/parent", "not_available", "parent"),
+                ]
+            );
+        }
+        other @ ModelError::NoCandidate { .. } => panic!("unexpected error: {other:?}"),
+    }
+    let message = error.to_string();
+    for expected in [
+        "nonsense (malformed, call)",
+        "missing/chain (not_available, chain)",
+        "agent/model (denied, agent)",
+        "missing/default (not_available, default)",
+        "missing/parent (not_available, parent)",
+        "candidates: nonsense (call)",
+    ] {
+        assert!(message.contains(expected), "{message}");
+    }
+
+    // An empty candidate list is a distinct error.
+    let error = resolve_model(None, None, ModelDefaults::new(), "", &available)
+        .expect_err("no candidate at all");
+    assert!(matches!(error, ModelError::NoCandidate { .. }), "{error:?}");
 }
 
 #[test]

@@ -280,7 +280,7 @@ async fn max_steps_makes_one_final_tool_less_call() {
             ),
         ],
         Arc::new(AllowAll),
-        json!({"agents": {"build": {"steps": 2}}}),
+        json!({"agents": {"engineer": {"steps": 2}}}),
         None,
     )
     .await;
@@ -472,7 +472,7 @@ async fn step_limit_emits_a_durable_qualifier() {
             ),
         ],
         Arc::new(AllowAll),
-        json!({"agents": {"build": {"steps": 2}}}),
+        json!({"agents": {"engineer": {"steps": 2}}}),
         None,
     )
     .await;
@@ -572,7 +572,7 @@ async fn a_model_that_stops_on_its_own_emits_no_step_limit_event() {
             text_script("all done"),
         ],
         Arc::new(AllowAll),
-        json!({"agents": {"build": {"steps": 2}}}),
+        json!({"agents": {"engineer": {"steps": 2}}}),
         None,
     )
     .await;
@@ -611,7 +611,7 @@ async fn a_model_that_stops_on_its_own_records_no_step_limit_reason() {
             text_script("finished on my own"),
         ],
         Arc::new(AllowAll),
-        json!({"agents": {"build": {"steps": 2}}}),
+        json!({"agents": {"engineer": {"steps": 2}}}),
         None,
     )
     .await;
@@ -666,7 +666,7 @@ async fn step_limited_turn_still_publishes_the_succeeded_terminal() {
             ),
         ],
         Arc::new(AllowAll),
-        json!({"agents": {"build": {"steps": 2}}}),
+        json!({"agents": {"engineer": {"steps": 2}}}),
         None,
     )
     .await;
@@ -740,7 +740,7 @@ async fn a_step_limited_session_can_run_again() {
             text_script("second turn ran"),
         ],
         Arc::new(AllowAll),
-        json!({"agents": {"build": {"steps": 2}}}),
+        json!({"agents": {"engineer": {"steps": 2}}}),
         None,
     )
     .await;
@@ -1179,7 +1179,7 @@ async fn compaction_does_not_keep_oversized_assistant_message_as_keep_id() {
             kind: "assistant".to_owned(),
             data: json!({
                 "time": {"created": now, "streamed": now, "completed": now},
-                "agent": "build",
+                "agent": "engineer",
                 "model": {"providerID": "test", "id": "alpha"},
                 "finish": "tool-calls",
                 "content": [{
@@ -1356,7 +1356,7 @@ async fn crash_recovery_repairs_rows_and_wakes_inbox() {
             kind: "assistant".to_owned(),
             data: json!({
                 "time": {"created": now},
-                "agent": "build",
+                "agent": "engineer",
                 "model": {"providerID": "test", "id": "alpha"},
                 "content": [{
                     "type": "tool",
@@ -1475,7 +1475,7 @@ async fn recovery_is_idempotent_for_assistant_rows() {
             kind: "assistant".to_owned(),
             data: json!({
                 "time": {"created": now},
-                "agent": "build",
+                "agent": "engineer",
                 "model": {"providerID": "test", "id": "alpha"},
                 "content": [{
                     "type": "tool",

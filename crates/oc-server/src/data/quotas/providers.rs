@@ -21,15 +21,32 @@ use super::credentials::{
 use super::openrouter::resolve_openrouter_management_key;
 use super::types::{ManagementKeySource, ProviderLocalUsage, ProviderQuotaEntry, QuotaWindowEntry};
 
+/// Inputs that describe one probe pass rather than one provider.
+pub(super) struct ProbePass<'a> {
+    pub(super) available_ids: &'a BTreeSet<String>,
+    pub(super) catalog: Option<&'a Catalog>,
+    pub(super) config: Option<&'a ConfigService>,
+    pub(super) credentials: &'a [Value],
+    /// Re-probe even when the cached snapshot is still fresh.
+    pub(super) force_refresh: bool,
+    /// `false` means cache-first: never await a provider probe.
+    pub(super) allow_probe: bool,
+    pub(super) now_ms: i64,
+}
+
 pub(super) async fn probe_live_providers(
     state: &AppState,
-    available_ids: &BTreeSet<String>,
-    catalog: Option<&Catalog>,
-    config: Option<&ConfigService>,
-    credentials: &[Value],
-    force_refresh: bool,
-    now_ms: i64,
+    pass: ProbePass<'_>,
 ) -> BTreeMap<String, (ProviderQuotaProbeResult, bool)> {
+    let ProbePass {
+        available_ids,
+        catalog,
+        config,
+        credentials,
+        force_refresh,
+        allow_probe,
+        now_ms,
+    } = pass;
     let mut results = BTreeMap::new();
     let mut to_probe = Vec::new();
     let openrouter_mgmt = resolve_openrouter_management_key(credentials, config).map(|key| key.key);
@@ -44,11 +61,15 @@ pub(super) async fn probe_live_providers(
             if capability != QuotaCapability::LiveApi {
                 continue;
             }
-            if !force_refresh
-                && let Some(cached) = cache.probes.get(id)
-                && now_ms.saturating_sub(cached.fetched_at_ms) < CACHE_TTL_MS
-            {
+            let cached = cache.probes.get(id);
+            if !force_refresh && let Some(cached) = cached {
                 results.insert(id.clone(), (cached.clone(), true));
+                let fresh = now_ms.saturating_sub(cached.fetched_at_ms) < CACHE_TTL_MS;
+                if fresh || !allow_probe {
+                    continue;
+                }
+            } else if !allow_probe {
+                // Cache-first read: serve nothing rather than await a probe.
                 continue;
             }
             if let Some(api_key) = resolve_provider_api_key(id, catalog, config, credentials) {
@@ -165,6 +186,7 @@ pub(super) fn build_provider_entry(input: ProviderEntryInput<'_>) -> ProviderQuo
             spend_summary: probe.spend_summary.clone(),
             rate_limit: input.rate_limit,
             accounts: Vec::new(),
+            keys: Vec::new(),
             local_usage: input.usage,
             warnings: probe.warnings.clone(),
             error: probe.error.clone(),
@@ -201,6 +223,7 @@ pub(super) fn build_provider_entry(input: ProviderEntryInput<'_>) -> ProviderQuo
         spend_summary: None,
         rate_limit: input.rate_limit,
         accounts: Vec::new(),
+        keys: Vec::new(),
         local_usage: input.usage,
         warnings: Vec::new(),
         error: None,

@@ -53,7 +53,10 @@ pub use budget::{DEFAULT_SPAWNS_PER_MIN, SiblingBudget, SpawnBudget, WINDOW_MS, 
 pub use error::{BudgetError, MessageError, ModelError, SpawnError, WriteError};
 pub use limits::Limits;
 pub use message::{SessionTree, TreeLookup};
-pub use model::{ModelCandidate, ModelChoice, ModelDefaults, ModelSource, resolve_model};
+pub use model::{
+    CandidateFilter, ModelCandidate, ModelChoice, ModelDefaults, ModelSkip, ModelSource,
+    SkipReason, resolve_model, resolve_model_with,
+};
 pub use node::{NodeState, Role, SessionNode};
 pub use policy::Policy;
 pub use spawn::{ChildPlan, PRIMARY_ONLY_AGENTS};

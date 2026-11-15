@@ -84,6 +84,7 @@ pub mod expectation;
 pub mod goal;
 mod goal_store;
 pub mod instructions;
+mod key_health;
 pub mod lane;
 mod observer;
 pub mod prompt;
@@ -116,6 +117,7 @@ pub use runtime::{
 };
 pub use skill::SkillTools;
 pub use subagent::SubagentTools;
+pub use subagent::settings::{FallbackPolicy, ModelsPolicy, models_policy};
 pub use tokens::{
     IMAGE_TOKENS, PDF_TOKENS, PromptEstimate, compaction_ceiling, estimate_after_anchor,
     estimate_text, precompute_threshold, reserve, should_compact,

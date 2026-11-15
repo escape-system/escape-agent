@@ -21,48 +21,88 @@ use super::types::{ResolvedTurn, SessionInstructionsUpdated};
 const DEFAULT_STEPS: u64 = 50;
 
 impl Runtime {
-    /// Stored credential for `provider`, preferring the integration's active
-    /// row. Returns the tagged value's `key`, or an OAuth token as fallback.
-    /// Store failures are logged; the client still falls back to the provider's
-    /// environment variables.
-    pub(super) async fn credential_key(&self, provider: &str) -> Option<String> {
-        let credentials = match self.inner.config.store.list_credentials().await {
-            Ok(credentials) => credentials,
+    /// Every usable credential for `provider`, in rotation priority.
+    ///
+    /// The store's pool order decides ([`oc_store::Store::credential_pool`]:
+    /// active row first, then ids ascending), the provider's environment
+    /// variable is appended last as the final fallback, and
+    /// [`oc_llm::KeyPool::select`] drops keys that are still cooling down after
+    /// a quota/auth/rate-limit failure. The result is therefore ordered: the
+    /// first element is the key a request should use right now.
+    ///
+    /// Store failures are logged and treated as "no stored key"; the client
+    /// additionally falls back to the provider's environment variables, so an
+    /// empty pool is not an error.
+    ///
+    /// Key material never leaves this type: [`oc_llm::PoolKey`] redacts it in
+    /// `Debug` and it is never logged here.
+    pub(super) async fn credential_pool(
+        &self,
+        provider: &str,
+        now_ms: i64,
+    ) -> Vec<oc_llm::PoolKey> {
+        let mut keys: Vec<oc_llm::PoolKey> = Vec::new();
+        match self.inner.config.store.credential_pool(provider).await {
+            Ok(rows) => {
+                for row in rows {
+                    let Some(key) = credential_value_key(&row.value) else {
+                        continue;
+                    };
+                    keys.push(oc_llm::PoolKey {
+                        credential_id: Some(row.id),
+                        key,
+                    });
+                }
+            }
             Err(error) => {
-                tracing::warn!(%error, provider, "could not read stored credentials");
-                return None;
+                tracing::warn!(%error, provider, "could not read the stored credential pool");
             }
-        };
-
-        let mut fallback = None;
-        for entry in credentials {
-            if entry.get("integrationID").and_then(Value::as_str) != Some(provider) {
-                continue;
-            }
-            let Some(value) = entry.get("value") else {
-                continue;
-            };
-            let key = match value.get("type").and_then(Value::as_str) {
-                Some("oauth") => value
-                    .get("access")
-                    .or_else(|| value.get("access_token"))
-                    .or_else(|| value.get("key")),
-                _ => value
-                    .get("key")
-                    .or_else(|| value.get("access"))
-                    .or_else(|| value.get("access_token")),
-            }
-            .and_then(Value::as_str)
-            .filter(|key| !key.is_empty());
-            let Some(key) = key else {
-                continue;
-            };
-            if entry.get("active").and_then(Value::as_bool) == Some(true) {
-                return Some(key.to_owned());
-            }
-            fallback.get_or_insert_with(|| key.to_owned());
         }
-        fallback
+
+        // The environment key is a credential too, just without a stored row:
+        // it gets `credential_id: None` and its own cooldown slot. It is only
+        // appended when it carries material no stored row already provides, so
+        // a rotation never retries the same secret under a second identity.
+        if let Some(key) = self.env_credential_key(provider)
+            && !keys.iter().any(|entry| entry.key == key)
+        {
+            keys.push(oc_llm::PoolKey {
+                credential_id: None,
+                key,
+            });
+        }
+
+        self.key_pool().select(provider, keys, now_ms)
+    }
+
+    /// The provider's environment credential, resolved through the catalog's
+    /// `env` list exactly like [`oc_llm::ResolvedModel::api_key_from_env`].
+    fn env_credential_key(&self, provider: &str) -> Option<String> {
+        self.inner
+            .config
+            .catalog
+            .provider(provider)?
+            .env
+            .iter()
+            .find_map(|name| std::env::var(name).ok().filter(|value| !value.is_empty()))
+    }
+
+    /// Resolve the turn's agent id and its config entry.
+    ///
+    /// A stored session may carry a pre-rename agent id (`build`, `plan`,
+    /// `reviewer`); resolving it through [`oc_config::normalize_agent_id`] keeps
+    /// a legacy row working instead of failing with `AgentNotFound`.
+    fn resolve_agent(&self, info: &SessionInfo) -> Result<(String, Value), RuntimeError> {
+        let config = &self.inner.config;
+        let agent_id = info.agent.as_deref().map_or_else(
+            || config.config.default_agent().to_owned(),
+            |id| oc_config::normalize_agent_id(id).to_owned(),
+        );
+        let agent = config
+            .config
+            .agent(&agent_id)
+            .ok_or_else(|| RuntimeError::AgentNotFound(agent_id.clone()))?;
+        Ok((agent_id, agent))
     }
 
     pub(super) fn resolve_turn(
@@ -71,14 +111,7 @@ impl Runtime {
         directory: &str,
     ) -> Result<ResolvedTurn, RuntimeError> {
         let config = &self.inner.config;
-        let agent_id = info
-            .agent
-            .clone()
-            .unwrap_or_else(|| config.config.default_agent().to_owned());
-        let agent = config
-            .config
-            .agent(&agent_id)
-            .ok_or_else(|| RuntimeError::AgentNotFound(agent_id.clone()))?;
+        let (agent_id, agent) = self.resolve_agent(info)?;
 
         let model_ref = info
             .model
@@ -126,6 +159,9 @@ impl Runtime {
             merged.extend(&crate::goal::GoalTools::new(self.clone()).registry());
             merged.extend(&crate::context_box::BoxTools::new(self.clone()).registry());
             merged.extend(&crate::skill::SkillTools::new(self.clone()).registry());
+            // Read-only credential health (`docs/27-key-pool.md`): the tool owns
+            // no state, `turn/tools/run.rs` binds the runtime as its source.
+            merged.register(Arc::new(oc_tools::KeyHealthTool));
             // LaneTools replaces the built-in `shell` with the lane-aware one.
             merged.extend(&crate::lane::LaneTools::new(self.clone()).registry());
             Arc::new(merged)
@@ -313,6 +349,12 @@ impl Runtime {
         if let Some(mode_block) = subagent_mode_instructions(subagent_mode.as_deref(), depth) {
             turn.system.push(mode_block);
         }
+        // `<key-health>` is appended only while a key is cooling down, so a
+        // healthy pool leaves the cached prefix untouched
+        // (`docs/27-key-pool.md`).
+        if let Some(key_health) = crate::key_health::key_health_block(self).await {
+            turn.system.push(key_health);
+        }
         Ok(())
     }
 
@@ -486,6 +528,28 @@ impl Runtime {
         }
         effect
     }
+}
+
+/// Extract the usable secret from a stored credential's tagged value.
+///
+/// OAuth rows carry a token under `access`/`access_token` (the `key` field is a
+/// last-resort compatibility read); plain API keys live under `key`. Empty
+/// strings are treated as absent so a blank row never shadows a usable one.
+pub(super) fn credential_value_key(value: &Value) -> Option<String> {
+    let field = match value.get("type").and_then(Value::as_str) {
+        Some("oauth") => value
+            .get("access")
+            .or_else(|| value.get("access_token"))
+            .or_else(|| value.get("key")),
+        _ => value
+            .get("key")
+            .or_else(|| value.get("access"))
+            .or_else(|| value.get("access_token")),
+    };
+    field
+        .and_then(Value::as_str)
+        .filter(|key| !key.is_empty())
+        .map(str::to_owned)
 }
 
 pub(crate) fn is_complex_root_restricted_tool(name: &str) -> bool {

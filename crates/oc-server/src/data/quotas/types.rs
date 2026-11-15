@@ -18,6 +18,11 @@ pub(super) struct UnifiedQuotasResponse {
     pub(super) fetched_at_ms: i64,
     pub(super) summary: UnifiedQuotaSummary,
     pub(super) providers: Vec<ProviderQuotaEntry>,
+    /// True when this payload came from a missing or stale cache and the server
+    /// started (or joined) a background probe behind it. Omitted when false,
+    /// never `null`, so a client that does not know the field keeps working.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub(super) refreshing: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -65,12 +70,48 @@ pub(super) struct ProviderQuotaEntry {
     pub(super) rate_limit: Option<ProviderRateLimit>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(super) accounts: Vec<AccountStatusSummary>,
+    /// Stored credentials of this provider in rotation order (active first),
+    /// each joined with the runtime's per-key cooldown state. Omitted when the
+    /// provider owns no credential row, never null.
+    #[serde(rename = "keys", skip_serializing_if = "Vec::is_empty")]
+    pub(super) keys: Vec<ProviderKeyEntry>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) local_usage: Option<ProviderLocalUsage>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(super) warnings: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) error: Option<String>,
+}
+
+/// One stored credential of a provider, joined with its rotation state.
+///
+/// `limited`/`cooldown_until_ms`/`kind`/`failures` come from the runtime-owned
+/// [`oc_llm::KeyPool`]; `active` is the stored selection from `oc_store`. A
+/// provider with several credentials lists them in rotation order, so `keys[0]`
+/// is the key a request would try first.
+///
+/// `used_cost_usd` / `used_requests` are always `0`: the usage rollup keys on
+/// `model.providerID` alone (see `quotas/usage.rs`), so per-key attribution does
+/// not exist yet. They stay on the wire so a client can render the column
+/// without a second shape once attribution lands.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct ProviderKeyEntry {
+    #[serde(rename = "credentialID")]
+    pub(super) credential_id: String,
+    pub(super) label: String,
+    pub(super) active: bool,
+    pub(super) limited: bool,
+    #[serde(rename = "cooldownUntilMs", skip_serializing_if = "Option::is_none")]
+    pub(super) cooldown_until_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) failures: Option<u32>,
+    #[serde(rename = "usedCostUsd")]
+    pub(super) used_cost_usd: f64,
+    #[serde(rename = "usedRequests")]
+    pub(super) used_requests: u64,
 }
 
 /// Where the `OpenRouter` management key the probe uses comes from.

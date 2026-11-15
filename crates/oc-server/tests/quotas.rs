@@ -738,7 +738,9 @@ async fn verify_openrouter_management_flow(app: &Router, counters: &MockProvider
     assert_eq!(status, StatusCode::OK, "{put_resp:?}");
     assert_eq!(put_resp.unwrap()["data"]["configured"], true);
 
-    let (status, after_mgmt) = call(app, Method::GET, "/api/quotas", None).await;
+    // A PUT invalidates the cached `openrouter` entry, and `GET /api/quotas` is
+    // cache-first: the blocking refresh is what re-probes with the new key.
+    let (status, after_mgmt) = call(app, Method::POST, "/api/quotas/refresh", None).await;
     assert_eq!(status, StatusCode::OK);
     let after_mgmt = after_mgmt.unwrap();
     assert_no_nulls(&after_mgmt, "$");
@@ -879,12 +881,113 @@ async fn quotas_probes_live_apis_caches_and_manages_openrouter_key() {
     verify_openrouter_management_flow(&app, &harness.upstream.counters).await;
 }
 
+/// `GET /api/quotas` is cache-first: a cold cache answers immediately with an
+/// unprobed snapshot plus `refreshing: true`, exactly one background probe pass
+/// follows, and a second GET inside the TTL re-probes nothing.
+#[tokio::test]
+async fn quotas_get_is_cache_first_and_refreshes_in_the_background() {
+    let harness = setup_harness().await;
+    let app = router(harness.state.clone());
+    let counters = harness.upstream.counters.clone();
+
+    // Cold cache: the read path never awaits a provider probe.
+    let started = std::time::Instant::now();
+    let (status, cold) = call(&app, Method::GET, "/api/quotas", None).await;
+    let elapsed = started.elapsed();
+    println!("cold cache-first GET elapsed = {elapsed:?}");
+    assert_eq!(status, StatusCode::OK, "{cold:?}");
+    let cold = cold.unwrap();
+    assert_no_nulls(&cold, "$");
+    assert!(
+        elapsed < std::time::Duration::from_millis(300),
+        "a cache-first GET must not await a probe: {elapsed:?}"
+    );
+    assert_eq!(
+        cold["data"]["refreshing"], true,
+        "a missing snapshot reports the background refresh: {cold}"
+    );
+    // The provider set still comes from credentials/config (it needs no probe),
+    // but nothing in it carries live probe data yet.
+    let cold_openrouter = find_provider(&cold, "openrouter");
+    assert!(
+        cold_openrouter.get("cached").is_none(),
+        "nothing has been probed yet: {cold_openrouter}"
+    );
+    assert!(
+        cold_openrouter.get("windows").is_none(),
+        "a cold snapshot carries no live windows: {cold_openrouter}"
+    );
+    assert!(
+        find_provider(&cold, "deepseek").get("balances").is_none(),
+        "a cold snapshot carries no live balance: {cold}"
+    );
+
+    // The background pass fills the snapshot; bounded poll instead of a sleep.
+    let mut polled = Value::Null;
+    for _ in 0..80 {
+        let (status, body) = call(&app, Method::GET, "/api/quotas", None).await;
+        assert_eq!(status, StatusCode::OK);
+        let body = body.unwrap();
+        if body["data"].get("refreshing").is_none() {
+            polled = body;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert!(
+        !polled.is_null(),
+        "the background refresh never completed within 2 s"
+    );
+    assert_no_nulls(&polled, "$");
+    let openrouter = find_provider(&polled, "openrouter");
+    assert!(
+        openrouter["windows"]
+            .as_array()
+            .is_some_and(|windows| !windows.is_empty()),
+        "the background refresh must land the probed windows: {openrouter}"
+    );
+    assert_eq!(
+        openrouter["cached"], true,
+        "the polled read serves the cache: {openrouter}"
+    );
+
+    // Inside the TTL another GET re-probes nothing.
+    let probes = counters.openrouter_key.load(Ordering::SeqCst);
+    assert_eq!(probes, 1, "exactly one probe pass ran");
+    let (status, warm) = call(&app, Method::GET, "/api/quotas", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let warm = warm.unwrap();
+    assert!(
+        warm["data"].get("refreshing").is_none(),
+        "a fresh snapshot needs no refresh: {warm}"
+    );
+    assert_eq!(counters.openrouter_key.load(Ordering::SeqCst), probes);
+    assert_eq!(counters.deepseek_balance.load(Ordering::SeqCst), 1);
+
+    // `?refresh=true` stays blocking and re-probes.
+    let (status, forced) = call(&app, Method::GET, "/api/quotas?refresh=true", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let forced = forced.unwrap();
+    assert_eq!(find_provider(&forced, "openrouter")["cached"], false);
+    assert_eq!(counters.openrouter_key.load(Ordering::SeqCst), probes + 1);
+
+    // `POST /api/quotas/refresh` returns the fresh snapshot synchronously too.
+    let (status, posted) = call(&app, Method::POST, "/api/quotas/refresh", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let posted = posted.unwrap();
+    assert_no_nulls(&posted, "$");
+    assert_eq!(find_provider(&posted, "openrouter")["cached"], false);
+    assert_eq!(counters.openrouter_key.load(Ordering::SeqCst), probes + 2);
+}
+
 #[tokio::test]
 async fn quotas_aggregates_opencode_go_local_usage_and_captured_rate_limits() {
     let harness = setup_harness().await;
     let app = router(harness.state.clone());
 
-    let (status, resp) = call(&app, Method::GET, "/api/quotas", None).await;
+    // Prime the cache: `GET /api/quotas` is cache-first and never probes, so the
+    // blocking `POST /api/quotas/refresh` is the path that fills the snapshot.
+    let (status, resp) = call(&app, Method::POST, "/api/quotas/refresh", None).await;
     assert_eq!(status, StatusCode::OK, "{resp:?}");
     let body = resp.unwrap();
     assert_no_nulls(&body, "$");
@@ -984,6 +1087,146 @@ fn assert_live_provider_cards(refreshed: &Value) {
     assert_eq!(antigravity["keyLabel"], "quota-user@example.com");
     assert!(!antigravity["accounts"].as_array().unwrap().is_empty());
     assert!(!antigravity["windows"].as_array().unwrap().is_empty());
+}
+
+/// A model client that is never called: these tests only read the
+/// runtime-owned key-rotation table, never stream.
+#[derive(Debug)]
+struct NoopModel;
+
+impl oc_runtime::ModelClient for NoopModel {
+    fn stream(
+        &self,
+        _request: oc_llm::LlmRequest,
+    ) -> futures_util::future::BoxFuture<'static, Result<oc_llm::LlmStream, oc_llm::LlmError>> {
+        Box::pin(async {
+            Ok(futures_util::StreamExt::boxed(
+                futures_util::stream::empty::<oc_llm::LlmEvent>(),
+            ))
+        })
+    }
+}
+
+/// Attach a runtime so `AppState::key_pool()` has an owner, returning the router
+/// and the pool the test marks.
+fn state_with_key_pool(parts: &HarnessParts) -> (Router, Arc<oc_llm::KeyPool>) {
+    let state = state_from(parts);
+    let config = Arc::clone(&parts.config);
+    let catalog = Arc::clone(state.catalog().expect("catalog"));
+    let store = Arc::clone(state.store().expect("store"));
+    let broker = Arc::new(oc_server::PermissionBroker::from_state(&state));
+    let sink = Arc::new(oc_server::BusSink::from_state(&state));
+    let runtime = Arc::new(oc_runtime::Runtime::new_with_model_client(
+        oc_runtime::RuntimeConfig {
+            store,
+            config,
+            catalog,
+            client: Arc::new(SharedLlmClient::new(LlmClient::new().expect("client"))),
+            tools: Arc::new(oc_tools::ToolRegistry::with_defaults()),
+            sink,
+            permissions: broker.clone(),
+        },
+        Arc::new(NoopModel),
+    ));
+    let pool = Arc::clone(runtime.key_pool());
+    let state = state.with_runtime(runtime).with_permissions(broker);
+    (router(state), pool)
+}
+
+/// Per-provider `keys`: stored credentials in rotation order joined with the
+/// runtime's key cooldowns. A provider with no credential row omits `keys`, and
+/// a cooled key reports its deadline without hiding the model or the provider.
+#[tokio::test]
+async fn quotas_expose_per_provider_keys_and_key_cooldowns() {
+    let parts = harness_parts().await;
+    // A second `deepseek` key: `create_credential` deactivates its siblings, so
+    // re-activate the first one to get exactly one active row out of two.
+    parts
+        .store
+        .create_credential(NewCredential {
+            id: Some("cred_deepseek_backup".to_owned()),
+            integration_id: "deepseek".to_owned(),
+            label: Some("DeepSeek Backup".to_owned()),
+            value: json!({ "type": "key", "key": "sk-ds-backup-789" }),
+            active: Some(false),
+        })
+        .await
+        .unwrap();
+    let (app, pool) = state_with_key_pool(&parts);
+
+    let (status, body) = call(&app, Method::POST, "/api/quotas/refresh", None).await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    let body = body.unwrap();
+    assert_no_nulls(&body, "$");
+
+    let deepseek = find_provider(&body, "deepseek");
+    let keys = deepseek["keys"].as_array().expect("deepseek keys");
+    assert_eq!(keys.len(), 2, "{deepseek}");
+    assert_eq!(
+        keys.iter().filter(|k| k["active"] == true).count(),
+        1,
+        "exactly one credential is the stored selection: {deepseek}"
+    );
+    assert_eq!(keys[0]["active"], true, "active key sorts first: {keys:?}");
+    let labels: Vec<&str> = keys.iter().filter_map(|k| k["label"].as_str()).collect();
+    assert!(labels.contains(&"DeepSeek API Key"), "{labels:?}");
+    assert!(labels.contains(&"DeepSeek Backup"), "{labels:?}");
+    // No per-key usage attribution exists; it must be zero, never invented.
+    assert_eq!(keys[0]["usedCostUsd"], 0.0, "{deepseek}");
+    assert_eq!(keys[0]["usedRequests"], 0, "{deepseek}");
+    assert!(
+        keys[0].get("cooldownUntilMs").is_none(),
+        "a healthy key omits the cooldown: {keys:?}"
+    );
+
+    // A provider backed only by config/env owns no credential row: no `keys`.
+    let envonly = find_provider(&body, "envonly");
+    assert!(
+        envonly.get("keys").is_none(),
+        "`keys` is omitted without credentials: {envonly}"
+    );
+
+    // Cool one deepseek key: it reports the deadline and the failure class, and
+    // the sibling key plus an unrelated provider stay untouched.
+    let now = now_millis();
+    pool.mark(
+        "deepseek",
+        Some("cred_deepseek_backup"),
+        oc_llm::FailureKind::Quota,
+        now,
+    );
+    let (status, body) = call(&app, Method::GET, "/api/quotas", None).await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    let body = body.unwrap();
+    let deepseek = find_provider(&body, "deepseek");
+    let keys = deepseek["keys"].as_array().expect("deepseek keys");
+    let cooling = keys
+        .iter()
+        .find(|k| k["credentialID"] == "cred_deepseek_backup")
+        .expect("the marked key is listed");
+    assert_eq!(cooling["limited"], true, "{cooling}");
+    assert_eq!(cooling["kind"], "quota", "{cooling}");
+    assert_eq!(cooling["failures"], 1, "{cooling}");
+    assert!(
+        cooling["cooldownUntilMs"]
+            .as_i64()
+            .is_some_and(|until| until > now),
+        "the cooldown must be a future epoch ms: {cooling}"
+    );
+    let healthy = keys
+        .iter()
+        .find(|k| k["credentialID"] == "cred_deepseek")
+        .expect("the other key is listed");
+    assert_eq!(healthy["limited"], false, "{healthy}");
+    assert!(healthy.get("cooldownUntilMs").is_none(), "{healthy}");
+    // The provider itself is still connected and fully usable.
+    assert_eq!(deepseek["connected"], true, "{deepseek}");
+    for other in ["openrouter", "opencode-go"] {
+        let entry = find_provider(&body, other);
+        for key in entry["keys"].as_array().into_iter().flatten() {
+            assert_eq!(key["limited"], false, "{other} must be unaffected: {key}");
+        }
+    }
 }
 
 /// A captured rate-limit header snapshot for `provider_id`.

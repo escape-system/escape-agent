@@ -35,7 +35,7 @@ async fn harness() -> Harness {
                 project_id: "prj_test".to_owned(),
                 directory: directory.clone(),
                 title: Some(format!("session {id}")),
-                agent: Some("build".to_owned()),
+                agent: Some("engineer".to_owned()),
                 model: Some(json!({"providerID": "test", "id": "alpha"})),
                 metadata: None,
                 permissions: None,
@@ -483,7 +483,7 @@ async fn subagent_tree_and_peer_message() {
     assert_eq!(nodes[1]["id"], "ses_child");
     assert_eq!(nodes[1]["parentID"], "ses_root");
     assert_eq!(nodes[1]["depth"], 1);
-    assert_eq!(nodes[1]["agent"], "build");
+    assert_eq!(nodes[1]["agent"], "engineer");
     assert_eq!(nodes[1]["model"], "test/alpha");
 
     let (status, _) = call(
@@ -578,7 +578,7 @@ async fn observer_check_without_observer_is_503() {
             project_id: "prj_observer".to_owned(),
             directory: db.path().to_string_lossy().into_owned(),
             title: Some("observer check".to_owned()),
-            agent: Some("build".to_owned()),
+            agent: Some("engineer".to_owned()),
             model: Some(json!({"providerID": "test", "id": "alpha"})),
             metadata: None,
             permissions: None,

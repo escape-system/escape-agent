@@ -24,7 +24,7 @@ use crate::error::Respond;
 static CONFIG_LOCK: Mutex<()> = Mutex::new(());
 static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
-const ALLOWED: [&str; 8] = [
+const ALLOWED: [&str; 9] = [
     "shell",
     "subagents",
     "observer",
@@ -33,6 +33,10 @@ const ALLOWED: [&str; 8] = [
     "lanes",
     "lsp_install",
     "events",
+    // Parity only: `models` has its own typed, validated writer at
+    // `PUT /api/config/models` (`data::models_registry`), which deep-merges
+    // instead of replacing. Listing it here keeps the key tables consistent.
+    "models",
 ];
 
 pub async fn patch(State(_state): State<AppState>, Json(body): Json<Value>) -> Response {
@@ -122,6 +126,19 @@ pub(crate) fn global_dir() -> PathBuf {
         return PathBuf::from(home).join(".config/opencode");
     }
     PathBuf::from(".opencode")
+}
+
+/// The directory the config writers target for `state`.
+///
+/// Discovery already resolved the global directory from the *same* environment
+/// the configuration was loaded with, so prefer it: a server whose config came
+/// from an explicit env map (tests, containers) writes back to the file it
+/// read. Without an attached service the process environment decides.
+pub(crate) fn write_dir(state: &AppState) -> PathBuf {
+    state
+        .config()
+        .and_then(|config| config.global_config_dir())
+        .unwrap_or_else(global_dir)
 }
 
 fn read_document(path: &std::path::Path) -> Result<Map<String, Value>, ApiError> {

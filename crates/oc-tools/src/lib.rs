@@ -1,5 +1,5 @@
 //! Built-in tools: `read`, `write`, `edit`, `patch`, `glob`, `grep`, `shell`,
-//! `todowrite` and `webfetch`.
+//! `todowrite`, `webfetch` and `key_health`.
 //!
 //! The tool layer never performs permission checks. Paths may be absolute or
 //! relative; relative paths resolve against [`ToolContext::directory`] (the
@@ -28,6 +28,7 @@ pub mod diff;
 pub mod edit;
 pub mod glob;
 pub mod grep;
+pub mod key_health;
 pub mod patch;
 pub mod read;
 pub mod shell;
@@ -43,6 +44,7 @@ pub use code_map::CodeMapTool;
 pub use edit::EditTool;
 pub use glob::GlobTool;
 pub use grep::GrepTool;
+pub use key_health::KeyHealthTool;
 pub use patch::PatchTool;
 pub use read::ReadTool;
 pub use shell::ShellTool;
@@ -176,6 +178,7 @@ impl ToolRegistry {
         registry.register(Arc::new(EditTool));
         registry.register(Arc::new(GlobTool));
         registry.register(Arc::new(GrepTool));
+        registry.register(Arc::new(KeyHealthTool));
         registry.register(Arc::new(ReadTool));
         registry.register(Arc::new(ShellTool));
         registry.register(Arc::new(SymbolEditTool));
@@ -352,7 +355,7 @@ mod tests {
         memory.register(Arc::new(FakeTool("memory_write")));
 
         base.extend(&memory);
-        assert_eq!(base.len(), 13);
+        assert_eq!(base.len(), 14);
         assert!(base.contains("memory_write"));
         assert_eq!(
             base.names()
@@ -368,7 +371,7 @@ mod tests {
         assert_eq!(names, sorted, "registry names stay sorted");
 
         let merged = ToolRegistry::with_defaults().merged(&memory);
-        assert_eq!(merged.len(), 13);
+        assert_eq!(merged.len(), 14);
         assert!(merged.contains("memory_write"));
         assert_eq!(
             merged

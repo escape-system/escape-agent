@@ -26,7 +26,7 @@ pub(crate) async fn harness() -> Harness {
     let config_dir = tempfile::tempdir().unwrap();
     std::fs::write(
         config_dir.path().join("opencode.json"),
-        r#"{"model":"test/model","agent":{"build":{"model":"test/model"}}}"#,
+        r#"{"model":"test/model","agent":{"engineer":{"model":"test/model"}}}"#,
     )
     .unwrap();
     let skill = config_dir.path().join(".opencode/skill/demo");

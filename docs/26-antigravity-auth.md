@@ -75,6 +75,56 @@ Architecture and interface contract for `oc-antigravity`, the native Rust port o
   - Empty SSE streams / `thinking_block_order` 400 errors: retries or applies
     `close_tool_loop_for_thinking` recovery when enabled.
 
+### In-band quota frames (shipped)
+
+Cloud Code can report exhaustion *inside* an HTTP 200 SSE stream as a
+`{"error":{"message":…}}` frame, so the message decides the class, not the HTTP
+status. The decoder returns `StreamDecodeFailure::{QuotaExhausted, RateLimited}`
+and `in_band_or` maps them to `SingleAttempt::RateLimited { status: 200 }`, which
+makes the pool mark the serving account and rotate to the next one instead of
+failing the turn with raw provider text
+(`crates/oc-antigravity/src/gateway/stream.rs:122-146`). A frame without account
+attribution stays fatal with its verbatim text. Once a stream has emitted its
+first event, rotation is impossible and the mid-stream message names the
+account-level cause instead (`gateway/stream.rs:154-171`).
+
+`parse_rate_limit_reason` recognises `RESOURCE_EXHAUSTED`, `RESOURCE EXHAUSTED`,
+`RESOURCE HAS BEEN EXHAUSTED`, `QUOTA_EXHAUSTED`, `INSUFFICIENT_QUOTA`,
+`MODEL_CAPACITY_EXHAUSTED`, `DAILY LIMIT` and `CHECK QUOTA` (case-insensitive) as
+`QuotaExhausted`, ahead of the generic 429 arm — a depleted quota window needs
+the longer cooldown, not a burst ceiling (`crates/oc-antigravity/src/rotation.rs:37-73`,
+asserted by `resource_exhausted_is_quota`, `rotation.rs:513`). Consequently
+`classify_in_band_error` maps `QuotaExhausted` **and** `ModelCapacityExhausted`
+onto `StreamDecodeFailure::QuotaExhausted`, and only `RateLimitExceeded` onto
+`StreamDecodeFailure::RateLimited` (`crates/oc-antigravity/src/stream.rs:253-272`).
+
+Cooldown keys are per account, per quota bucket, and **variant-insensitive**:
+`quota_key(family, style, model)` strips the `#variant` suffix and lowercases the
+model, so `model#high` and `model#xhigh` share one bucket
+(`crates/oc-antigravity/src/accounts.rs:51-68`). A `QuotaExhausted` result on a
+model writes the model key *and* the family base key (no model), because the
+quota stop is account-wide; other reasons write only the model key
+(`accounts.rs:568-590`).
+
+When no account can serve the request the gateway returns a typed error rather
+than provider prose (`crates/oc-antigravity/src/gateway/pool.rs:126-176`), e.g.
+`all Antigravity accounts are cooling down until <untilMs> (every eligible
+account already failed this request)` and `… (next reset in Ns, exceeds the
+per-turn wait budget)`, plus
+`no usable Google Antigravity accounts configured; run "opencode auth login"`.
+Asserted by `gateway_rotates_on_in_band_quota_error`
+(`crates/oc-antigravity/src/gateway/mod.rs:369`) and
+`all_accounts_cooling_down_is_reported` (`gateway/mod.rs:470`).
+
+Background maintenance runs in the served binary: `bootstrap` calls
+`AntigravityService::spawn_background_maintenance()`
+(`crates/oc-cli/src/bootstrap.rs:238`), which spawns the tick loop for proactive
+token refresh and periodic quota/model refresh unless both
+`proactive_token_refresh` is off and `quota_refresh_interval_minutes == 0`
+(`crates/oc-antigravity/src/service/mod.rs:268-297`; the disabled path is
+asserted by `background_maintenance_is_a_noop_when_disabled`,
+`crates/oc-antigravity/src/service/tests.rs:182`).
+
 ## Request & Stream Transformation Pipeline
 
 1. **Model resolution**: Maps `antigravity-*` aliases, tier suffixes

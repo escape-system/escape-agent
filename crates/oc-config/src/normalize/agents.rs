@@ -10,6 +10,17 @@ use super::permissions::{migrate_permission_v1, migrate_tools, normalize_rules};
 // ---------------------------------------------------------------------------
 // Agents and commands
 
+/// Config-level id alias for the pre-rename builtin set.
+///
+/// `agents.build` is remapped to `agents.engineer`, and the same for
+/// `plan` -> `architect` and `reviewer` -> `review`, so an existing document
+/// updates the builtin instead of creating a ghost custom agent next to it.
+/// Keys are trimmed and matched case-insensitively; anything else is stored
+/// as written.
+fn alias(id: &str) -> &str {
+    crate::agents::normalize_agent_id(id)
+}
+
 pub(super) fn normalize_agents(
     input: &Map<String, Value>,
     out: &mut Map<String, Value>,
@@ -20,9 +31,10 @@ pub(super) fn normalize_agents(
         match value.as_object() {
             Some(entries) => {
                 for (id, item) in entries {
+                    let id = alias(id);
                     let path = jp("$.agent", id);
                     if let Some(agent) = migrate_agent_v1(item, None, ctx, &path) {
-                        agents.insert(id.clone(), agent);
+                        agents.insert(id.to_owned(), agent);
                     }
                 }
             }
@@ -33,12 +45,13 @@ pub(super) fn normalize_agents(
         match value.as_object() {
             Some(entries) => {
                 for (id, item) in entries {
+                    let id = alias(id);
                     let path = jp("$.mode", id);
                     if let Some(agent) = migrate_agent_v1(item, Some("primary"), ctx, &path) {
                         if agents.contains_key(id) {
                             ctx.conflict(&jp("$.agents", id));
                         }
-                        agents.insert(id.clone(), agent);
+                        agents.insert(id.to_owned(), agent);
                     }
                 }
             }
@@ -67,12 +80,13 @@ pub(super) fn normalize_agents(
         match value.as_object() {
             Some(entries) => {
                 for (id, item) in entries {
+                    let id = alias(id);
                     let path = jp("$.agents", id);
                     if let Some(agent) = normalize_agent_v2(item, ctx, &path) {
                         if agents.contains_key(id) {
                             ctx.conflict(&path);
                         }
-                        agents.insert(id.clone(), agent);
+                        agents.insert(id.to_owned(), agent);
                     }
                 }
             }

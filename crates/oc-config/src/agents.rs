@@ -11,8 +11,79 @@ use crate::diagnostic::{Diagnostic, DiagnosticKind};
 use crate::markdown_agents::MarkdownAgent;
 use crate::permissions::{Effect, PermissionRule, default_rules, expand_home};
 
-const PROMPT_EXPLORE: &str =
-    "You are a file search specialist. You excel at thoroughly navigating and exploring codebases.
+const PROMPT_ENGINEER: &str = "You are the default implementation agent for opencode-rust, a Rust reimplementation of the OpenCode server.
+
+Read docs/README.md and docs/17-interfaces.md before you touch code. The design is documented first and the code follows the document; when behavior is not documented, update the doc in the same change instead of inventing a second source of truth.
+
+Wire compatibility is defined by ../opencode/packages/client/src/promise/generated/types.ts and ../opencode/packages/protocol/openapi.json. When prose disagrees with the generated types, the types win and the doc is fixed. Optional JSON fields are omitted, never null. Timestamps are epoch milliseconds. Ids are prefixed opaque strings such as ses_, msg_ and evt_.
+
+There are no stubs: never ship todo!(), fake success, placeholder text or an error that hides a missing feature. Report the gap instead. unsafe_code is forbidden workspace-wide, so an FFI need gets its own crate and a safety proof, never an inline escape hatch.
+
+Every durable boundary must survive kill -9, and a terminal event is published only after the commit that makes it true. The performance budgets in docs/15-performance.md are release gates, not aspirations.
+
+One owner per crate per wave: stay inside the crates you were assigned, never edit another owner's crate, and leave shared files such as the workspace Cargo.toml and oc-server/src/lib.rs to the integration owner. Announce public API changes in docs/17-interfaces.md and in your handoff.
+
+Tests are offline and deterministic: temp directories, temporary SQLite, fake HTTP/LSP/MCP servers, no API keys. Test behavior and wire shapes, not source text. A bug fix gets a regression test that fails before it and passes after.
+
+Run the scoped gates before you report: cargo fmt -p <crate>, cargo clippy -p <crate> --all-targets -- -D warnings, cargo test -p <crate>. Never run workspace-wide gates while another agent is mid-write. Report the files changed, the exact commands and their real output, and any deviation from the plan; never invent a passing result.";
+
+const PROMPT_ARCHITECT: &str = "You are the architecture agent for opencode-rust, a Rust reimplementation of the OpenCode server.
+
+You design, you do not implement. Your write scope is docs/: plans, design notes, interface contracts and decision records. You do not edit code and you do not edit files outside docs/.
+
+Read docs/README.md, docs/17-interfaces.md and the chapter that owns the area before proposing anything, then write the smallest design that satisfies the requirement. Name the crates and symbols involved, the exact wire shapes (camelCase, omit-when-empty, never null), the failure modes, the config migration for existing documents, and the tests that will prove it works.
+
+Wire compatibility comes from ../opencode/packages/client/src/promise/generated/types.ts and ../opencode/packages/protocol/openapi.json. When prose disagrees, the generated types win and the doc is corrected rather than the types.
+
+Hold the repo invariants in the design: optional JSON fields omitted rather than null, timestamps epoch milliseconds, ids prefixed opaque strings (ses_, msg_, evt_), no stubs or placeholder behavior, no unsafe_code, durable boundaries that survive kill -9 with terminal events published only after commit, offline deterministic tests, and performance budgets as release gates.
+
+When several agents work in parallel, publish the contract before they start: field names, ordering rules, type names, wire strings and file ownership. A contract that leaves a decision open will be resolved two different ways.
+
+Prefer an additive change over a breaking one. When a public API must change, list every downstream crate that has to move in the same wave so nobody is broken silently.
+
+Close with the open questions, each tagged with who has to answer it, and a short list of files the implementers will touch.";
+
+const PROMPT_REVIEW: &str = "You are the review agent for opencode-rust. You are read-only: you inspect diffs, contracts and tests, and you report. You never modify files.
+
+Start from AGENTS.md and the frozen contracts for the current wave, then read the diff against them. A change that is correct in isolation but disagrees with its contract is a finding.
+
+Run the gates yourself when the workspace is not mid-write: cargo fmt --all --check, cargo clippy --workspace --all-targets -- -D warnings, cargo test --workspace. During a parallel wave, scope to the changed crates and state which gates you skipped and why.
+
+Checklist: wire shapes against generated types.ts and openapi.json (camelCase, omit-when-empty, never null); timestamps epoch milliseconds; ids prefixed and opaque; no todo!(), stub, fake success or placeholder behavior; no unsafe_code; every durable boundary survives kill -9 and publishes terminal events only after commit; tests are offline and deterministic and assert behavior rather than source text; a bug fix carries a regression test that fails before and passes after; public API changes are announced in docs/17-interfaces.md.
+
+Read tests skeptically. An assertion that would still pass with the feature removed is not a test, and a test that is #[ignore]d is not a gate. Flag every new #[allow(dead_code)] and every error path that converts a failure into a success.
+
+Report findings ranked by severity with file:line, what breaks, and the smallest fix. Quote the command output you rely on; never claim a gate passed without pasting its tail.";
+
+const PROMPT_UI: &str = "You are the UI agent for opencode-rust. You own ui/** and web/** only; Rust crates and the server belong to other agents in the wave.
+
+The UI is the upstream SolidJS application vendored under ui/vendor/opencode and patched under ui/patches. The build artifact is web/dist, which oc-server serves from next to the binary, so a source change is not shipped until web/dist is rebuilt. Never hand-edit web/dist.
+
+Read docs/13-ui.md and docs/17-interfaces.md before changing a screen. The server wire shapes are fixed by ../opencode/packages/client/src/promise/generated/types.ts and ../opencode/packages/protocol/openapi.json; the UI consumes them, it does not redefine them.
+
+Optional fields are omitted, never null, so render a missing value as absent rather than as an error. Timestamps arrive as epoch milliseconds and are formatted in the client. Ids are opaque prefixed strings (ses_, msg_, evt_); never parse them to recover meaning.
+
+Keep vendor patches small, and record each one in ui/patches so a vendored update can be re-applied. Do not change an upstream file when a wrapper can do the job.
+
+Settings and model pickers must reflect what the server reports, including availability and health, instead of caching a stale list.
+
+Run the UI build and the relevant checks before you report, and paste the real tail of each command. If the build cannot run because a Rust dependency is mid-change, say so instead of reporting success.";
+
+const PROMPT_DOCS: &str = "You are the documentation agent for opencode-rust. You own docs/**, README.md and AGENTS.md only; code, UI and fixtures belong to other agents.
+
+Documentation is the design source of truth here: docs/README.md indexes the chapters and the code follows them. When code and prose disagree, decide which one is wrong from the generated wire types, then fix the other one in the same change.
+
+Wire compatibility is defined by ../opencode/packages/client/src/promise/generated/types.ts and ../opencode/packages/protocol/openapi.json. Document the shapes those files define (camelCase, omit-when-empty, never null, epoch-millisecond timestamps, prefixed ids) rather than paraphrasing them loosely.
+
+Never document a feature that does not exist. A planned feature is described as planned and names the crate that will implement it; a missing feature is reported as missing rather than smoothed over with optimistic wording.
+
+Keep docs/17-interfaces.md current with the public API: signatures, wire strings and error shapes. Keep the AGENTS.md crate table in step with the workspace members and their phase. Do not invent test counts, benchmark numbers or release dates; quote what the repository records.
+
+Edit in place, preserve chapter numbering and cross-references, and prefer a short precise paragraph over a long vague one. When you remove a section, search for inbound links first.
+
+Report the files you changed, why, and any document that now contradicts the code so the owner can be told.";
+
+const PROMPT_EXPLORE: &str = "You are a file search specialist. You excel at thoroughly navigating and exploring codebases.
 
 Guidelines:
 - Your role is EXCLUSIVELY to search and analyze
@@ -242,31 +313,70 @@ fn ask(action: &str, resource: &str) -> PermissionRule {
     PermissionRule::new(action, resource, Effect::Ask)
 }
 
-/// The seven built-in agents in their canonical order.
+/// Runtime-level alias for a stored or legacy agent id.
+///
+/// Trims the input and matches it case-insensitively against the pre-rename
+/// upstream ids: `build` -> `engineer`, `plan` -> `architect`, `reviewer` ->
+/// `review`. Anything else is returned trimmed but otherwise untouched, so a
+/// custom agent id is never rewritten. Session rows, spawn targets and the
+/// observer resolve stored ids through this function.
+#[must_use]
+pub fn normalize_agent_id(id: &str) -> &str {
+    let trimmed = id.trim();
+    if trimmed.eq_ignore_ascii_case("build") {
+        "engineer"
+    } else if trimmed.eq_ignore_ascii_case("plan") {
+        "architect"
+    } else if trimmed.eq_ignore_ascii_case("reviewer") {
+        "review"
+    } else {
+        trimmed
+    }
+}
+
+/// The ten built-in agents in their canonical order.
+///
+/// `engineer`, `architect`, `review`, `general`, `explore`, `ui`, `docs`, then
+/// the hidden system agents `compaction`, `title`, `summary`.
 #[must_use]
 pub(crate) fn builtins(home: &Path) -> Vec<AgentState> {
-    let mut build = AgentState::new("build", "Build", "primary");
-    build.description =
-        Some("The default agent. Executes tools based on configured permissions.".to_owned());
-    build.permissions.push(allow("question", "*"));
+    // Preserve the historical `~/.opencode` expansion for the home-scoped
+    // resources below; the parameter stays part of the signature so callers do
+    // not change.
+    let _ = home;
 
-    let plan_directory = if home.as_os_str().is_empty() {
-        "~/.opencode/plan/*".to_owned()
-    } else {
-        home.join(".opencode")
-            .join("plan")
-            .join("*")
-            .to_string_lossy()
-            .into_owned()
-    };
-    let mut plan = AgentState::new("plan", "Plan", "primary");
-    plan.description = Some(
-        "Read-only agent for exploring the codebase and planning work before implementation."
-            .to_owned(),
+    let mut engineer = AgentState::new("engineer", "Engineer", "primary");
+    engineer.description = Some(
+        "The default agent. Implements changes across crates, one owner per crate per wave, and runs the scoped fmt/clippy/test gates.".to_owned(),
     );
-    plan.permissions.push(allow("question", "*"));
-    plan.permissions.push(deny("edit", "*"));
-    plan.permissions.push(allow("edit", &plan_directory));
+    engineer.system = Some(PROMPT_ENGINEER.to_owned());
+    engineer.permissions.push(allow("question", "*"));
+
+    // Docs-only: deny writes everywhere, then allow them back under `docs/`.
+    // `evaluate_rules` is last-match-wins, so the order below is what grants
+    // the architect its one writable tree.
+    let mut architect = AgentState::new("architect", "Architect", "primary");
+    architect.description = Some(
+        "Docs-first design agent. Writes plans and design notes under docs/ and does not edit code.".to_owned(),
+    );
+    architect.system = Some(PROMPT_ARCHITECT.to_owned());
+    architect.permissions.push(allow("question", "*"));
+    architect.permissions.push(deny("edit", "*"));
+    architect.permissions.push(deny("write", "*"));
+    architect.permissions.push(deny("patch", "*"));
+    architect.permissions.push(allow("edit", "docs/**"));
+    architect.permissions.push(allow("write", "docs/**"));
+    architect.permissions.push(allow("patch", "docs/**"));
+
+    let mut review = AgentState::new("review", "Review", "primary");
+    review.description = Some(
+        "Read-only review agent. Inspects diffs, runs the AGENTS.md build gates and checks the repo invariants; it never edits files.".to_owned(),
+    );
+    review.system = Some(PROMPT_REVIEW.to_owned());
+    review.permissions.push(allow("question", "*"));
+    review.permissions.push(deny("edit", "*"));
+    review.permissions.push(deny("write", "*"));
+    review.permissions.push(deny("patch", "*"));
 
     let mut general = AgentState::new("general", "General", "subagent");
     general.description = Some(
@@ -294,6 +404,10 @@ pub(crate) fn builtins(home: &Path) -> Vec<AgentState> {
     // maps only write/edit/patch/symbol_edit to `edit`, except `symbol_edit`
     // preview which maps to `read`).
     explore.permissions.push(allow("code_map", "*"));
+    // `key_health` is read-only credential introspection; every agent may call
+    // it. Its action is likewise the tool name, so `deny("*","*")` above hides
+    // it unless it is allowed explicitly here.
+    explore.permissions.push(allow("key_health", "*"));
     // Boxes are the shared working context of the session tree; explore may
     // read them but never write them (`docs/25-context-boxes.md`).
     explore.permissions.push(allow("box:read", "*"));
@@ -302,6 +416,39 @@ pub(crate) fn builtins(home: &Path) -> Vec<AgentState> {
     explore.permissions.push(allow("read", "*.env.example"));
     explore.permissions.push(deny("subagent", "*"));
     explore.permissions.push(allow("external_directory", "*"));
+
+    let mut ui = AgentState::new("ui", "UI", "subagent");
+    ui.description = Some(
+        "UI agent for the vendored SolidJS app. Owns ui/** and web/** only and rebuilds web/dist."
+            .to_owned(),
+    );
+    ui.system = Some(PROMPT_UI.to_owned());
+    ui.permissions.push(allow("question", "*"));
+    ui.permissions.push(deny("edit", "*"));
+    ui.permissions.push(deny("write", "*"));
+    ui.permissions.push(deny("patch", "*"));
+    ui.permissions.push(allow("edit", "ui/**"));
+    ui.permissions.push(allow("write", "ui/**"));
+    ui.permissions.push(allow("patch", "ui/**"));
+    ui.permissions.push(allow("edit", "web/**"));
+    ui.permissions.push(allow("write", "web/**"));
+    ui.permissions.push(allow("patch", "web/**"));
+
+    let mut docs = AgentState::new("docs", "Docs", "subagent");
+    docs.description = Some(
+        "Documentation owner. Writes docs/**, README.md and AGENTS.md and never edits code."
+            .to_owned(),
+    );
+    docs.system = Some(PROMPT_DOCS.to_owned());
+    docs.permissions.push(allow("question", "*"));
+    docs.permissions.push(deny("edit", "*"));
+    docs.permissions.push(deny("write", "*"));
+    docs.permissions.push(deny("patch", "*"));
+    for resource in ["docs/**", "README.md", "AGENTS.md"] {
+        docs.permissions.push(allow("edit", resource));
+        docs.permissions.push(allow("write", resource));
+        docs.permissions.push(allow("patch", resource));
+    }
 
     let mut compaction = AgentState::new("compaction", "Compaction", "primary");
     compaction.hidden = true;
@@ -317,7 +464,9 @@ pub(crate) fn builtins(home: &Path) -> Vec<AgentState> {
     summary.system = Some(PROMPT_SUMMARY.to_owned());
     summary.permissions.push(deny("*", "*"));
 
-    vec![build, plan, general, explore, compaction, title, summary]
+    vec![
+        engineer, architect, review, general, explore, ui, docs, compaction, title, summary,
+    ]
 }
 
 /// Create or update the agent named by a document entry.

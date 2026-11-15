@@ -19,7 +19,7 @@ use axum::extract::{Query, State};
 use axum::response::Response;
 use axum::routing::{get, post, put};
 use oc_llm::ProviderQuotaProbeResult;
-use oc_types::{ApiError, DataEnvelope};
+use oc_types::{ApiError, DataEnvelope, now_millis};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::RwLock;
@@ -54,12 +54,45 @@ pub(super) const CACHE_TTL_MS: i64 = 60_000;
 pub struct QuotaCache {
     pub(in crate::data::quotas) probes: BTreeMap<String, ProviderQuotaProbeResult>,
     pub(in crate::data::quotas) usage: UsageCache,
+    /// When the last full probe pass finished (epoch ms); `0` means the cache
+    /// has never been filled. Only a full pass writes it.
+    pub(in crate::data::quotas) computed_at_ms: i64,
+    /// Single-flight guard for the background refresh a GET starts.
+    pub(in crate::data::quotas) refreshing: bool,
 }
 
 impl QuotaCache {
+    /// Whether the snapshot is young enough to serve without a refresh.
+    #[must_use]
+    pub fn is_fresh(&self, now_ms: i64) -> bool {
+        self.computed_at_ms > 0 && now_ms.saturating_sub(self.computed_at_ms) < CACHE_TTL_MS
+    }
+
+    /// Whether a background refresh is running right now.
+    #[must_use]
+    pub fn is_refreshing(&self) -> bool {
+        self.refreshing
+    }
+
+    /// Claim the single background refresh slot; `false` means one is running
+    /// already and the caller must join it instead of starting another pass.
+    pub fn begin_refresh(&mut self) -> bool {
+        if self.refreshing {
+            return false;
+        }
+        self.refreshing = true;
+        true
+    }
+
+    /// Release the background refresh slot.
+    pub fn end_refresh(&mut self) {
+        self.refreshing = false;
+    }
+
     /// Remove a cached provider entry so the next read re-probes upstream.
     pub fn invalidate(&mut self, provider_id: &str) {
         self.probes.remove(provider_id);
+        self.computed_at_ms = 0;
     }
 
     /// Drop every cached probe and the usage rollup so the next read
@@ -67,6 +100,7 @@ impl QuotaCache {
     pub fn invalidate_all(&mut self) {
         self.probes.clear();
         self.usage = UsageCache::default();
+        self.computed_at_ms = 0;
     }
 }
 
@@ -94,14 +128,57 @@ pub struct ManagementKeyBody {
 }
 
 /// `GET /api/quotas?refresh=true|false`
+///
+/// Cache-first: this path never awaits a provider probe. A missing or stale
+/// snapshot is returned as it stands — a cold cache answers HTTP 200 with an
+/// empty provider list and `refreshing: true` — and exactly one background
+/// refresh is started behind it. `?refresh=true` keeps the historical blocking
+/// behavior for callers that cannot poll.
 pub async fn get_quotas(
     State(state): State<AppState>,
     params: Result<Query<QuotasQuery>, QueryRejection>,
 ) -> Result<Json<DataEnvelope<Value>>, ErrorResponse> {
     let Query(params) = params.map_err(|error| ErrorResponse::from(query_error(error)))?;
-    let payload = build_unified_quotas(&state, params.refresh.unwrap_or(false)).await?;
+    let blocking = params.refresh.unwrap_or(false);
+    let mut payload = build_unified_quotas(&state, blocking, blocking).await?;
+    if !blocking {
+        payload.refreshing = start_background_refresh(&state).await;
+    }
     let value = serde_json::to_value(payload).map_err(|err| ApiError::internal(err.to_string()))?;
     Ok(Json(DataEnvelope::new(value)))
+}
+
+/// Start one background refresh when the cached snapshot is missing or older
+/// than [`CACHE_TTL_MS`], and report whether the payload being served may be
+/// stale — which is exactly what the wire `refreshing` flag means.
+///
+/// Single-flight: the [`QuotaCache::begin_refresh`] claim makes a second
+/// request join the in-flight run instead of starting another probe pass.
+async fn start_background_refresh(state: &AppState) -> bool {
+    let now_ms = now_millis();
+    let (is_stale, in_flight) = {
+        let cache = state.quota_cache().read().await;
+        (!cache.is_fresh(now_ms), cache.is_refreshing())
+    };
+    if in_flight {
+        return true;
+    }
+    if !is_stale {
+        return false;
+    }
+    if !state.quota_cache().write().await.begin_refresh() {
+        return true;
+    }
+    let background = state.clone();
+    tokio::spawn(async move {
+        // A full pass: the cache is stale by definition here, so both the
+        // provider probes and the local-usage rollup are recomputed.
+        if build_unified_quotas(&background, true, true).await.is_err() {
+            tracing::warn!("background quota refresh failed");
+        }
+        background.quota_cache().write().await.end_refresh();
+    });
+    true
 }
 
 /// `POST /api/quotas/refresh`
@@ -109,7 +186,7 @@ pub async fn refresh_quotas(
     State(state): State<AppState>,
 ) -> Result<Json<DataEnvelope<Value>>, ErrorResponse> {
     state.quota_cache().write().await.invalidate_all();
-    let payload = build_unified_quotas(&state, true).await?;
+    let payload = build_unified_quotas(&state, true, true).await?;
     let value = serde_json::to_value(payload).map_err(|err| ApiError::internal(err.to_string()))?;
     Ok(Json(DataEnvelope::new(value)))
 }

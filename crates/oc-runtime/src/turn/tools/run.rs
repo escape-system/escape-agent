@@ -146,7 +146,10 @@ pub(super) async fn run_tool(
         }
         result = oc_tools::code_map::with_semantic_oracle(
             runtime.semantic_oracle(),
-            tool.execute(&context, input),
+            oc_tools::key_health::with_key_health_source(
+                Some(runtime.key_health_source()),
+                tool.execute(&context, input),
+            ),
         ) => result,
     };
     if tool_token.is_cancelled() && !cancel.is_cancelled() {

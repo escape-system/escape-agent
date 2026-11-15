@@ -52,7 +52,9 @@ async fn agent_model_and_move_emit_events() {
 
     let (_, body) = call(&app, Method::GET, &format!("/api/session/{sid}"), None).await;
     let session = body.unwrap()["data"].clone();
-    assert_eq!(session["agent"], "plan");
+    // `plan` is a legacy alias: the route resolves it through
+    // `normalize_agent_id`, so the canonical id is what gets persisted.
+    assert_eq!(session["agent"], "architect");
     assert_eq!(session["model"]["providerID"], "test");
     assert_eq!(session["model"]["id"], "model");
 

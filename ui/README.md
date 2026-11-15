@@ -48,6 +48,11 @@ them. An external `OC_UPSTREAM` must be patched with `git apply --check` first:
    (`settings/quotas/`), the provider quota section in the Usage dialog, and the
    `en`/`tr` strings. The settings tab polls every 60 s; the Usage dialog never
    polls and reads the cached snapshot.
+9. `0009-models-control-plane.patch` — the Models settings tab rebuilt as a
+   server-backed control plane (fallback chain, per-model quota, notes,
+   cost/usage) and search in the setup wizard's model step
+   (`settings/models/{models,api}.tsx|ts`, `providers/connect/dialog.tsx`,
+   `runtime/i18n/en.ts`).
 
 Patch scope (see `docs/13-ui.md`):
 

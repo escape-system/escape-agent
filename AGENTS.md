@@ -10,10 +10,18 @@ design is documented first; code follows the docs.
   generated types win and the doc is fixed.
 - Optional JSON fields are omitted, never `null`. Timestamps are epoch ms. IDs
   are prefixed opaque strings (`ses_`, `msg_`, `evt_`).
+- `models.chain` / `models.chains.<role>` are a routing **preference order**,
+  never a visibility filter. Chat-picker visibility is
+  `!models.hidden[ref] && providerConnected`; the chain and `models.favorites`
+  only reorder rows. `models.notes[ref]` is the only editable note.
 - No stubs, `todo!()`, fake success, or placeholder behavior. A missing feature
   is reported, not faked.
 - `unsafe_code` is forbidden workspace-wide. If FFI is ever required, it gets a
   dedicated crate and a safety proof.
+- Every provider may hold several credentials; rotation happens per key on the
+  same model and never surfaces as a model fallback. Provider key material never
+  enters the config document or a log line. The primary-key pointer is durable
+  (`credential.active`); per-key cooldowns are in-memory and reset on restart.
 - Every durable boundary must survive kill -9; terminal events are published
   only after commit.
 - Performance budgets in `docs/15-performance.md` are release gates.
@@ -37,6 +45,32 @@ design is documented first; code follows the docs.
 | `oc-cli` | 1 | `opencode serve`, service registration |
 | `oc-pty` | 3 | upstream `process-daemon` port |
 | `oc-testkit` | 1 | fixtures, harness, benches |
+
+## Agents and model policy
+
+Builtin agents (canonical ids, in canonical order): `engineer` (primary, the
+DEFAULT — implements changes across crates, one owner per crate per wave),
+`architect` (primary — docs-first design, writes design notes under `docs/`, no
+code edits), `review` (primary — read-only diff review plus running the build
+gates), `general` (subagent, the DEFAULT subagent, full tools), `explore`
+(subagent — read-only search/navigation), `ui` (subagent — owns `ui/**` and
+`web/**`), `docs` (subagent — owns `docs/**`, `README.md`, `AGENTS.md`), plus the
+hidden system agents `compaction`, `title`, `summary`.
+
+Legacy ids are aliases, normalized at config load and wherever a stored or
+requested agent id is resolved (session rows, spawn targets, observer):
+`build` → `engineer`, `plan` → `architect`, `reviewer` → `review`. `steward` is a
+project template, never a builtin.
+
+Model policy: `models.chain` / `models.chains.<agent>` is a routing **preference
+order**, never an allowlist and never a visibility filter — it does not restrict
+what a caller may ask for and it never overrides an explicit `model:` argument,
+which always wins even when it is outside the chain. Chat-picker visibility is
+`!models.hidden[ref] && providerConnected`; the chain and `models.favorites` only
+reorder rows. `FailureKind::ModelUnavailable` always
+advances the chain regardless of `models.fallback.on`; every other class must be
+retryable and listed. `PUT /api/config/models` applies to the next spawn/turn
+without a restart; only an external edit of the config file needs one.
 
 ## Build gates (run from `opencode-rust/`)
 

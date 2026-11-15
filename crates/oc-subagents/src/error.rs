@@ -1,6 +1,6 @@
 //! Typed policy errors.
 
-use crate::model::ModelCandidate;
+use crate::model::{ModelCandidate, ModelSkip};
 
 /// Why a spawn was refused. Every variant is decided before a session row is
 /// written, so a caller can fail the tool call without partial state.
@@ -53,24 +53,46 @@ pub enum WriteError {
     NotInScope { from: String, to: String },
 }
 
-/// Model resolution failure. The chain lists every candidate in priority
-/// order so the tool error can show what was tried.
+/// Model resolution failure. Both variants carry the ordered candidate chain
+/// so the tool error can show exactly what was tried.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ModelError {
-    #[error("no model candidates; supply a call/agent/default/parent model")]
-    NoCandidate,
-    #[error("model reference {reference} ({origin}) is malformed; candidates: {chain:?}")]
-    InvalidReference {
-        reference: String,
-        origin: &'static str,
+    #[error("no model candidates; supply a call/chain/agent/default/parent model")]
+    NoCandidate { chain: Vec<ModelCandidate> },
+    #[error(
+        "no usable model candidate; skipped: {}; candidates: {}",
+        skipped_display(skipped),
+        chain_display(chain)
+    )]
+    NoUsableCandidate {
         chain: Vec<ModelCandidate>,
+        skipped: Vec<ModelSkip>,
     },
-    #[error("model {reference} ({origin}) is unavailable; candidates: {chain:?}")]
-    Unavailable {
-        reference: String,
-        origin: &'static str,
-        chain: Vec<ModelCandidate>,
-    },
+}
+
+/// `reference (reason, source), ...` in skip order. Never empty for this error:
+/// a non-empty candidate list always yields at least one skip.
+fn skipped_display(skipped: &[ModelSkip]) -> String {
+    if skipped.is_empty() {
+        return "none".to_owned();
+    }
+    skipped
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// `reference (source), ...` in resolution order.
+fn chain_display(chain: &[ModelCandidate]) -> String {
+    if chain.is_empty() {
+        return "none".to_owned();
+    }
+    chain
+        .iter()
+        .map(|candidate| format!("{} ({})", candidate.reference, candidate.source))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Spawn/message rate-limit failure. Times are explicit milliseconds, so the

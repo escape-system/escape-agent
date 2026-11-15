@@ -46,6 +46,7 @@ pub use permissions::{Effect, PermissionRule, evaluate_rules, wildcard_match};
 pub use skills::{SkillInfo, SkillSource};
 
 use agents::AgentState;
+pub use agents::normalize_agent_id;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -177,4 +178,21 @@ pub struct ConfigService {
     mcp_servers: Value,
     shell: String,
     model: Option<String>,
+    /// Owned `models` control-plane section. Seeded from the merged document at
+    /// load, replaced by `PUT /api/config/models` and refreshed from disk.
+    ///
+    /// It is a cell rather than a field of the merged snapshot because a
+    /// `PUT` must be visible to the next spawn without a restart; readers clone
+    /// the value out and never hold the lock.
+    models: RwLock<ModelsCell>,
+}
+
+/// One immutable revision of the `models` section.
+///
+/// Private to the crate: callers see [`ConfigService::models_section`] and
+/// [`ConfigService::models_revision`].
+#[derive(Debug, Clone)]
+pub(crate) struct ModelsCell {
+    pub(crate) value: Value,
+    pub(crate) revision: u64,
 }

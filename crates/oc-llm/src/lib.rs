@@ -13,6 +13,8 @@ pub mod client;
 pub mod error;
 pub mod event;
 pub mod hook;
+pub mod key_pool;
+pub mod model_health;
 mod protocols;
 pub mod quota;
 pub mod retry;
@@ -21,16 +23,19 @@ pub mod token;
 
 pub use catalog::{
     Activation, Capabilities, Catalog, Compatibility, Cost, CostCache, CostTier, CostTierKind,
-    Limit, ModelInfo, ModelRef, ModelStatus, ModelTime, Ordered, Protocol, ProviderInfo,
-    ResolvedModel, Variant, calculate_cost, parse_reference, parse_release_date,
+    Limit, ModelInfo, ModelRef, ModelStatus, ModelTime, Ordered, PriceOverride, PriceOverrideMap,
+    Protocol, ProviderInfo, ResolvedModel, Variant, calculate_cost, parse_reference,
+    parse_release_date,
 };
 pub use client::{LlmClient, SharedLlmClient};
-pub use error::LlmError;
+pub use error::{FailureKind, LlmError, classify_provider_message};
 pub use event::{
     ContentPart, LlmEvent, LlmMessage, LlmOptions, LlmRequest, LlmStream, Role, Timeouts, ToolDef,
     Usage,
 };
 pub use hook::{HookStreamFuture, LlmTransportHook};
+pub use key_pool::{ENV_KEY_ID, KeyHealthEntry, KeyPool, PoolKey};
+pub use model_health::{ModelHealth, Unavailable};
 pub use quota::{
     ProviderApiSpend, ProviderBalanceSummary, ProviderQuotaProbeResult, ProviderQuotaTarget,
     ProviderRateLimit, QuotaCapability, QuotaWindow, extract_rate_limit, fetch_provider_quota,

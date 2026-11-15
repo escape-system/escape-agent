@@ -102,7 +102,7 @@ async fn session_tree_rows_and_status() {
     assert_eq!(root.role, "primary");
     assert!(root.spawn_allowed);
     assert_eq!(root.child_count, 1);
-    assert_eq!(root.agent, "build");
+    assert_eq!(root.agent, "engineer");
     assert_eq!(root.model, None);
     assert_eq!(root.status, "idle");
 

@@ -146,36 +146,53 @@ pub fn attach(
     Some(LlmScribe::new(client, model, store))
 }
 
-/// Model reference for `digest`: `subagents.digest_model`, then
-/// `observer.digest_model`, then `observer.model`.
+/// Model reference for `digest`: `models.chains.scribe` (else `models.chain`),
+/// then `subagents.digest_model`, then `observer.digest_model`, then
+/// `observer.model`.
+///
+/// The chain comes first so the Models tab owns the scribe like every other
+/// role: a `models.chains.scribe` entry is the documented way to point digest
+/// at a cheap model. It is read through the runtime's own parser
+/// ([`oc_runtime::models_policy`]) so the scribe cannot disagree with the turn
+/// loop about what the `models` section means.
 fn digest_reference(config: &ConfigService) -> Option<String> {
     let merged = config.merged();
     let observer = merged.get("observer");
+    // `chain_for("scribe")` is already `models.chains.scribe` otherwise
+    // `models.chain`; an empty chain falls through to the legacy keys below.
+    let chain = oc_runtime::models_policy(config)
+        .chain_for("scribe")
+        .iter()
+        .map(|reference| reference.trim())
+        .find(|reference| !reference.is_empty())
+        .map(str::to_owned);
     // Normalize each candidate before falling through: a present-but-null or
     // empty `subagents.digest_model` (the settings UI writes `null` when the
     // field is cleared) must not stop the chain before `observer.model`.
-    let reference = [
-        merged
-            .get("subagents")
-            .and_then(|subagents| subagents.get("digest_model")),
-        observer.and_then(|observer| observer.get("digest_model")),
-        observer.and_then(|observer| observer.get("model")),
-    ]
-    .into_iter()
-    .flatten()
-    .filter_map(Value::as_str)
-    .map(str::trim)
-    .find(|reference| !reference.is_empty())
-    .map(str::to_owned);
-    let reference = reference.as_deref();
+    let reference = chain.or_else(|| {
+        [
+            merged
+                .get("subagents")
+                .and_then(|subagents| subagents.get("digest_model")),
+            observer.and_then(|observer| observer.get("digest_model")),
+            observer.and_then(|observer| observer.get("model")),
+        ]
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .find(|reference| !reference.is_empty())
+        .map(str::to_owned)
+    });
     let Some(reference) = reference else {
         tracing::warn!(
             "memory scribe disabled: no digest model configured \
-             (subagents.digest_model, observer.digest_model, observer.model)"
+             (models.chains.scribe, models.chain, subagents.digest_model, \
+             observer.digest_model, observer.model)"
         );
         return None;
     };
-    Some(reference.to_owned())
+    Some(reference)
 }
 
 /// Stored credential for `provider`, mirroring the runtime's
@@ -330,6 +347,52 @@ mod tests {
             .resolve_model(&catalog, &reference)
             .expect("model resolves");
         Some(model.reference)
+    }
+
+    /// The Models tab owns the scribe: `models.chains.scribe` is the first
+    /// candidate and beats every legacy digest key.
+    #[test]
+    fn models_chains_scribe_beats_every_legacy_key() {
+        let root = TempDir::new().expect("tempdir");
+        let config = config_at(
+            root.path(),
+            r#"{
+              "models": {"chains": {"scribe": ["test/beta"]}},
+              "subagents": {"digest_model": "test/alpha"},
+              "observer": {"digest_model": "test/alpha", "model": "test/alpha"}
+            }"#,
+        );
+        assert_eq!(resolved_reference(&config).as_deref(), Some("test/beta"));
+    }
+
+    /// With no `models.chains.scribe`, the global `models.chain` is next.
+    #[test]
+    fn models_chain_is_used_when_the_scribe_chain_is_absent() {
+        let root = TempDir::new().expect("tempdir");
+        let config = config_at(
+            root.path(),
+            r#"{
+              "models": {"chain": ["test/beta"]},
+              "subagents": {"digest_model": "test/alpha"}
+            }"#,
+        );
+        assert_eq!(resolved_reference(&config).as_deref(), Some("test/beta"));
+    }
+
+    /// An empty scribe chain falls through to the legacy keys instead of
+    /// disabling the scribe: an absent `models` section must not change
+    /// behavior.
+    #[test]
+    fn an_empty_models_section_keeps_the_legacy_precedence() {
+        let root = TempDir::new().expect("tempdir");
+        let config = config_at(
+            root.path(),
+            r#"{
+              "models": {"chains": {"scribe": []}},
+              "subagents": {"digest_model": "test/alpha"}
+            }"#,
+        );
+        assert_eq!(resolved_reference(&config).as_deref(), Some("test/alpha"));
     }
 
     #[test]

@@ -167,7 +167,7 @@ impl Harness {
                     project_id: "prj_nested_test".to_owned(),
                     directory: path(&work),
                     title: Some("nested root".to_owned()),
-                    agent: Some("build".to_owned()),
+                    agent: Some("engineer".to_owned()),
                     model: Some(json!({"providerID": "test", "id": "alpha"})),
                     metadata: None,
                     permissions: None,

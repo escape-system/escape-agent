@@ -11,7 +11,8 @@ use futures_util::future::BoxFuture;
 use futures_util::stream::{self, StreamExt};
 use oc_config::{ConfigService, LoadOptions};
 use oc_llm::{
-    Catalog, LlmClient, LlmError, LlmEvent, LlmRequest, LlmStream, Role, SharedLlmClient, Usage,
+    Catalog, FailureKind, LlmClient, LlmError, LlmEvent, LlmRequest, LlmStream, Role,
+    SharedLlmClient, Usage,
 };
 use oc_memory::{BoxFuture as MemoryFuture, MemoryError, ScribeModel};
 use oc_observer::{
@@ -51,6 +52,22 @@ pub(crate) const CATALOG: &str = r#"{
             "sdk": {"aisdk": "@ai-sdk/openai-compatible"}
           }
         }
+      },
+      "beta": {
+        "id": "beta",
+        "type": "chat",
+        "name": "Beta",
+        "release_date": "2025-01-03",
+        "modalities": {"input": ["text"], "output": ["text"]},
+        "capabilities": {"tools": {"supported": true}, "temperature": true},
+        "limit": {"context": 100000, "output": 10000},
+        "cost": {"text": {"input": {"price": 1}, "output": {"price": 2}}},
+        "api": {
+          "chat-completions": {
+            "base_url": "http://unused.invalid",
+            "sdk": {"aisdk": "@ai-sdk/openai-compatible"}
+          }
+        }
       }
     }
   }
@@ -63,6 +80,14 @@ pub(crate) enum Script {
     Delayed {
         events: Vec<LlmEvent>,
         delay: Duration,
+    },
+    /// Fail the request with a *classifiable* provider error before any event is
+    /// streamed. `stream` returns `Err(LlmError::Failure { .. })`, which is the
+    /// only shape `turn/stream.rs` may advance `models.chain` on — an empty
+    /// event stream must not be used to emulate this.
+    Failure {
+        kind: FailureKind,
+        message: String,
     },
 }
 
@@ -110,6 +135,9 @@ impl ModelClient for ScriptedModel {
                     tokio::time::sleep(delay).await;
                     Ok(stream::iter(events).boxed())
                 }
+                // A classifiable failure, not an empty stream: `turn/stream.rs`
+                // advances `models.chain` only on `LlmError::Failure`.
+                Script::Failure { kind, message } => Err(LlmError::Failure { kind, message }),
             }
         })
     }
@@ -357,7 +385,7 @@ impl Harness {
                 project_id: "prj_runtime_test".to_owned(),
                 directory: path(&work),
                 title: Some("runtime test".to_owned()),
-                agent: Some("build".to_owned()),
+                agent: Some("engineer".to_owned()),
                 model: Some(json!({"providerID": "test", "id": "alpha"})),
                 metadata: None,
                 permissions: session_permissions,
@@ -651,7 +679,7 @@ pub(crate) async fn create_unrelated_root(harness: &Harness, id: &str) {
                 project_id: "prj_unrelated".to_owned(),
                 directory: path(&harness.work),
                 title: Some("unrelated".to_owned()),
-                agent: Some("build".to_owned()),
+                agent: Some("engineer".to_owned()),
                 model: Some(json!({"providerID": "test", "id": "alpha"})),
                 metadata: None,
                 permissions: None,

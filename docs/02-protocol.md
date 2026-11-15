@@ -83,7 +83,7 @@ and anything that answers an honest `501`/`503` says so in its row.
 | GET `/auth/connect/:code` | — | B | public; `{token}` = session token, or 302+cookie |
 | GET `/api/location` | loc | B | bare `Location.PublicInfo`; 404 `LocationNotFoundError`; upserts the `LocationRef` project row when a store is attached |
 | POST `/api/location/reload` | — | N | rescans skills only; 503 without config (no full config reload) |
-| GET `/api/agent` / `/api/agent/:id` | loc | L | `Agent.Info[]` / `Agent.Info`; 404 |
+| GET `/api/agent` / `/api/agent/:id` | loc | L | `Agent.Info[]` / `Agent.Info`; 404. The Models tab consumes `id, name, mode, hidden, model` for its agent policy editor |
 | GET `/api/session` | `limit?,order?,search?,parentID?,archived?,directory?,project?,cursor?` | D | `{data,cursor}` |
 | POST `/api/session` | `{id?,parentID?,title?,agent?,model?,location?,metadata?,permissions?}` | D | 404 `LocationNotFoundError` |
 | GET `/api/session/active` | — | D | `Record<sid,{type:"running"}>` |
@@ -184,11 +184,14 @@ files that did not exist at capture time; skipped paths stay untouched.
 | DELETE `/api/credential/:id` | — | N | unknown id is a no-op |
 | POST `/api/credential/:id/activate` | — | N | unknown id is a no-op |
 | GET `/api/websearch/provider` | loc | L | truthful empty list (no provider) |
-| GET `/api/experimental/usage/limits` | loc | L | signed out: `data` is `null` |
+| GET `/api/experimental/usage/limits` | loc | L | signed out: `data` is `null`, and it stays `null` by design: there is no Console workspace credential, so any other answer would be invented (see "Model control plane" below) |
+| GET `/api/models/registry` | `sessionID?` | D | Models tab payload: models (incl. per-model `unavailable`), chain, chains, fallback, agentNotes, quota, usage, `modelHealth`; optional fields omitted |
+| PUT `/api/config/models` | `models` config subset | D | deep-merge into the `models` key, applied to the next spawn/turn; unknown ref → 400 `InvalidRequestError` (`invalid_model: <ref>`); answers the registry body + `x-opencode-config-reloaded: models` (no restart header) |
+| GET `/api/experimental/usage/models` | `days?` 1..=90, default 7 | D | `{windowDays,models[]}` rollup over `session_message.data` |
 | GET `/api/command`, `/api/skill`, `/api/reference` | loc | L | `/api/command` appends the builtin `compress` (`{name,description}` only) when no markdown command shadows it |
 | GET `/api/config` | — | B | `Config.Entry[]`; process snapshot, ignores `location` |
 | GET `/api/config/shell` | — | B | `ConfigShell.Option[]` |
-| PATCH `/api/experimental/config` | allowlisted keys only | N | 400 unknown key; `x-opencode-restart: required` |
+| PATCH `/api/experimental/config` | allowlisted keys only (incl. `models`) | N | 400 unknown key; `x-opencode-restart: required` |
 | POST `/api/experimental/generate/{text,image,decisions}` | body | — | 503 after body validation (no generator service) |
 | POST `/api/experimental/generate` (deprecated alias) | body | — | 503 |
 
@@ -204,6 +207,131 @@ environment variables. A connect via `/api/integration/:id/connect/key` or a
 same resolution per judge call; a declared-but-unset `provider.env` no longer
 disables it, and a judge call with no usable credential fails open by
 publishing `observer.unavailable`.
+
+Several credentials per provider are legal — they are backup keys. Each
+`POST /api/integration/{id}/connect/key` appends another `cred_…` row for that
+integration and makes it active (`crates/oc-server/src/data/integration/connect.rs:52-61`:
+`NewCredential.active = None` defaults to activation,
+`crates/oc-store/src/credentials.rs:93,115`), and `POST /api/credential` takes an
+explicit `activate` flag for the same choice. Activating any row clears the
+`active` flag on its siblings in the same transaction
+(`crates/oc-store/src/credentials.rs:373-391`), so "several keys, exactly one
+primary" is a code invariant rather than a schema constraint. Rotation order is
+`active` first, then id ascending (`Store::credential_pool`); see
+[27](27-key-pool.md).
+
+Shipped, additive and omit-when-absent (never `null`): three read-only surfaces
+report rotation state. `GET /api/quotas` provider entries carry `keys[]` — one
+entry per stored credential in rotation order, `credentialID`, `label`, `active`,
+`limited`, `cooldownUntilMs?`, `kind?`, `failures?`, `usedCostUsd`,
+`usedRequests` — omitted when the provider owns no credential row
+(`crates/oc-server/src/data/quotas/types.rs:66-115`,
+`crates/oc-server/src/data/quotas/aggregate.rs:180-212`). `GET /api/models/registry`
+carries a top-level `keyHealth[]` of
+`{providerID, credentialID?, untilMs, kind, failures}`, omitted when every key is
+healthy (`crates/oc-server/src/data/models_registry.rs:88-116`). Each account on
+`GET /api/antigravity/accounts` carries `cooldownUntilMs?`, the maximum deadline
+still in the future, omitted for a healthy account
+(`crates/oc-server/src/data/antigravity.rs:151-160`). `usedCostUsd` /
+`usedRequests` are always `0` by design: the usage rollup keys on
+`model.providerID` alone, so per-key attribution does not exist yet.
+`keyHealth` is the credential axis and never hides a model; the model axis stays
+`modelHealth[]` / per-model `unavailable`. See [27](27-key-pool.md).
+
+### Model control plane
+
+Three routes back the Models tab and the cost/quota views. The config block
+they read and write is specified in [14](14-config-permissions.md); the runtime
+side (fallback + spawn quota) in [05](05-subagents.md).
+
+**`GET /api/models/registry?sessionID=`** — `D`. One call for the whole tab.
+`sessionID` is optional and only scopes usage/quota to that session tree's
+rollup; the registry itself is process-wide.
+
+```jsonc
+{"data":{
+ "models":[{"providerID":"google","id":"gemini-3-pro","name":"Gemini 3 Pro",
+   "variants":["low","medium","high","max"],
+   "cost":[{"input":1.25,"output":5.0,"cache":{"read":0.3,"write":1.5}}],
+   "limit":{"context":1000000,"output":65536},
+   "visible":true,"favorite":false,
+   "note":"flat-rate tier",
+   "unavailable":{"untilMs":1763000000000,"kind":"model_unavailable","message":"retired by provider"},
+   "usage":{"requests":12,"tokensInput":1000,"tokensOutput":200,"tokensReasoning":50,"costUsd":0.42,"windowHours":120},
+   "quota":{"maxCostUsd":5.0,"maxRequests":100,"usedCostUsd":0.42,"usedRequests":12,"remainingPercent":91.6,"limited":false}}],
+ "chain":["google/gemini-3-pro"],
+ "chains":{"coordinator":["google/gemini-3-pro"]},
+ "fallback":{"on":["empty_response","transport","rate_limit","quota"],"maxHops":2},
+ "agentNotes":{"explore":{"opencode-go/glm-5.3-flash":"read-only worker"}},
+ "quota":{"reservePercent":10,"windowHours":5,
+   "default":{"maxCostUsd":5.0,"maxRequests":100},
+   "models":{"google/gemini-3-pro":{"maxCostUsd":2.0,"maxRequests":50}}},
+ "modelHealth":[{"providerID":"anthropic","id":"claude-opus-4-6",
+   "reference":"anthropic/claude-opus-4-6","untilMs":1763000000000,
+   "kind":"quota","message":"credit balance exhausted"}],
+ "keyHealth":[{"providerID":"anthropic","credentialID":"cred_a1b2c3",
+   "untilMs":1763000000000,"kind":"quota","failures":2}],
+ "usage":{"windowHours":120,"totalCostUsd":1.2,"totalRequests":30}}}
+```
+
+Rules: `note` only when non-empty; the per-model `quota` object only when that
+model is configured; `usage` always; `visible` is "not in `hidden`";
+`favorite` is "in `favorites`". Optional fields are omitted, never `null`.
+
+Additive runtime-health fields (ours, both optional): per-model
+`unavailable: {untilMs, kind, message?}` while the runtime holds that model
+unavailable, and the top-level `modelHealth: [{providerID, id, reference,
+untilMs, kind, message?}]` list — both omitted when the table is empty, never
+`null`. `kind` is a `FailureKind` wire string (`model_unavailable`, `quota`,
+`rate_limit`, `transport`; the runtime never records the other kinds),
+`untilMs` is epoch milliseconds, and `reference` is the variant-insensitive
+`provider/id` key. The per-model badge and the list are the same table; see
+[05](05-subagents.md) for the TTLs.
+
+The third additive field is the credential axis: top-level `keyHealth:
+[{providerID, credentialID?, untilMs, kind, failures}]`, omitted when every key
+is healthy, never `null` (`crates/oc-server/src/data/models_registry.rs:88-116`).
+`credentialID` is omitted for a provider's environment key, which has no stored
+credential row. A `keyHealth` entry takes one key out of rotation for one
+provider and never hides a model; `modelHealth` stays the model axis. See
+[27](27-key-pool.md).
+
+**`PUT /api/config/models`** — `D`. Body is the subset of the `models` config
+block: `chain`, `chains`, `fallback`, `notes`, `agentNotes`, `hidden`,
+`favorites`, `pricing`, `quota`. All keys optional; supplied keys deep-merge
+(maps merge key-by-key, arrays replace wholesale). Every model ref is validated
+first: an unknown ref answers `400` with the tagged error
+`{"_tag":"InvalidRequestError","message":"invalid_model: <ref>",…}` and
+**nothing** is written.
+
+Success answers the registry body above with `Cache-Control: no-store` and the
+header `x-opencode-config-reloaded: models`. There is **no**
+`x-opencode-restart` header: the committed block is published to the live config
+cell, the runtime re-parses `models` for every spawn and turn, and the registry
+reads the same cell, so the change is live for the next spawn/turn without a
+restart. Only an **external edit** of the config file still needs a restart —
+nothing watches the file, and `ConfigService::refresh_models_from_disk()` is
+on-demand. `PATCH /api/experimental/config` keeps `x-opencode-restart: required`.
+
+The status is `400` because the server's status table ([Errors](#errors)) has no
+separate validation status; the tag distinguishes a well-formed body whose model
+refs do not resolve (`InvalidRequestError`) from a malformed body
+(`BadRequestError`/`SchemaError`).
+
+**`GET /api/experimental/usage/models?days=7`** — `D`. Model rollup straight
+from `session_message.data`; no new tables ([03](03-storage.md)). `days` is
+clamped to `1..=90`, default `7`.
+
+```jsonc
+{"data":{"windowDays":7,"models":[{"providerID":"google","id":"gemini-3-pro","requests":12,
+ "tokensInput":1000,"tokensOutput":200,"tokensReasoning":50,"costUsd":0.42}]}}
+```
+
+**`GET /api/experimental/usage/limits` stays `null`.** That row did not change:
+the upstream shape requires a Console workspace identity we do not have, so a
+populated answer would be invented. The honest model-level usage view is the
+`/usage/models` rollup above, and `/api/quotas` keeps serving live provider
+probes.
 
 ### Files, VCS, shells, terminals
 
@@ -419,8 +547,9 @@ Ephemeral extension events: `form.created` (`{form:Form.Info}`),
 
 New config is served through `GET /api/config` documents and written through
 `PATCH /api/experimental/config` (allowlisted keys: `shell`, `subagents`,
-`observer`, `goal`, `memory`, `lanes`, `lsp_install`, `events`), never through
-ad-hoc per-feature writes. See [14](14-config-permissions.md).
+`observer`, `goal`, `memory`, `lanes`, `lsp_install`, `events`, `models`), never
+through ad-hoc per-feature writes; `models` also has its own typed, validating
+write (`PUT /api/config/models`). See [14](14-config-permissions.md).
 
 ## Static web app
 

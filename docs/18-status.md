@@ -33,8 +33,8 @@ Smoke verification passes on isolated ports and databases across core surfaces: 
 | `oc-store` (context boxes) | migration `0011_context_box` adds `context_box` keyed `(root_id, key)`: create-or-update writes with in-transaction append, soft delete, `stable`/`temporary` kinds, `time_expired` audit stamp with revival, revision bumping, paging; a deleted row is recreated with `revision = 1`. Six store tests (`crates/oc-store/tests/store_ext/boxes.rs`): tree sharing, revision/append, validation, expiry/revival, delete/recreate, paging. Store suite 21/21 |
 | `oc-config` | discovery/JSONC/V1 aliases, agents, permissions, skills, commands, AGENTS.md, rescan; the `explore` subagent can read-only `code_map` (`allow("code_map","*")`, `crates/oc-config/src/agents.rs:294`; regression `explore_toolset_allows_read_only_code_map_and_still_denies_edits`, `crates/oc-config/tests/config.rs:543`); 37 tests |
 | `oc-llm` | embedded models.dev snapshot, catalog/resolve/overlay (`upsert_provider`/`upsert_provider_models`), `LlmTransportHook` on `SharedLlmClient`/`LlmClient`, OpenAI/Anthropic/Gemini streaming, retries |
-| `oc-antigravity` | Native Google Antigravity OAuth 2.0 + PKCE + loopback listener (`127.0.0.1:51121`) / manual code fallback, single-flight token refresh + rotation, Cloud Code Assist onboarding (`loadCodeAssist`/`onboardUser`), V4 `antigravity-accounts.json` + V1–V3 migration, sticky/round-robin/hybrid rotation with health score & token bucket, dual quota pool & live model discovery, 4-phase schema cleaning + `to_gemini_schema`, cross-model & Claude transforms, thinking signature cache, Cloud Code SSE gateway (`LlmTransportHook`), `GoogleSearchTool` (`google_search`); 50 tests |
-| `oc-runtime` | session actors, turn loop, tools + permissions, armed threshold compaction (`compaction.auto` defaults **false**, but the guard is armed when `auto` is true **or** `compaction.ceiling_tokens` is set and fires above `ceiling − buffer`; the internal reason is `guard` when `auto` is off and the wire reason stays `auto`; overflow recovery and manual `/compact`/`compact_context` unchanged; ceiling is `context_window − max(15%, 16k)` with `compaction.ceiling_tokens` able only to lower it; manual inbox `compaction` rows write `reason:"manual"` and a failed inbox delete stops the actor instead of re-dispatching), step budget (`session.execution.step_limit` v1 `{sessionID, steps}`, published after `session.execution.succeeded` and never as a terminal; parent metadata carries `stepLimit`/`steps`), `BoxTools` (`box_list`/`box_read`/`box_write`/`box_delete`/`compact_context`) with `box:read`/`box:write` mappings and key resources, `oc/boxes` prompt index pinned per actor epoch with tail supplements, temporary-box expiry after the `completed` row commits, mid-turn `steer` promotion at step boundaries (repost waits for idle; `switch_model` rejects a catalog-unknown target), cancellation/recovery, memory, observer strips, `ContextPressure`/`context_pressure()` with the host-side compaction adviser (`observer.advised`; the adviser lives in `oc-runtime`, not `oc-observer`), subagents (nested spawn for `general`, digest scoped to the caller's subtree with the child's full final answer and raw-answer cache honoring each caller's token budget, bounded watcher that cancels on timeout and delivers failed/timeout exactly once, parent cancellation interrupts a foreground child through `ToolContext.cancel`), `ToolProvider`, `GoalTools`/`SkillTools`/`LaneTools`, `ProcessLaneRunner`, lane events, pre-write snapshots, stored-credential key injection (active first, then any); actor `Err` finalization: a drain-loop error repairs the rows the dead turn left open and then publishes `session.idle` + `session.execution.failed` through a per-item `TerminalState` guard so a settle that already ran is not duplicated, and the actor retires from the map and respawns when durable input is already waiting (`crates/oc-runtime/src/runtime/actor.rs:185`); regressions `actor_error_publishes_one_terminal_pair_and_closes_the_rows` (`crates/oc-runtime/tests/runtime/actor_error_terminal.rs`) and `crates/oc-runtime/tests/runtime/context_boxes.rs` (5 tests: tree sharing, `compact_context` enqueue, explore read-only / write-only agent, two-compaction survival with temporary expiry, cache-stable prefix with tail supplement); 91 runtime-scenario tests + 68 lib tests |
+| `oc-antigravity` | Native Google Antigravity OAuth 2.0 + PKCE + loopback listener (`127.0.0.1:51121`) / manual code fallback, single-flight token refresh + rotation, Cloud Code Assist onboarding (`loadCodeAssist`/`onboardUser`), V4 `antigravity-accounts.json` + V1–V3 migration, sticky/round-robin/hybrid rotation with health score & token bucket, dual quota pool & live model discovery, 4-phase schema cleaning + `to_gemini_schema`, cross-model & Claude transforms, thinking signature cache, Cloud Code SSE gateway (`LlmTransportHook`: in-band `RESOURCE_EXHAUSTED`/quota SSE frames and HTTP 429s rotate to the next account instead of failing the turn, variant-insensitive per-family quota keys, typed all-cooling errors), `GoogleSearchTool` (`google_search`); 50 tests |
+| `oc-runtime` | session actors, turn loop, tools + permissions, armed threshold compaction (`compaction.auto` defaults **false**, but the guard is armed when `auto` is true **or** `compaction.ceiling_tokens` is set and fires above `ceiling − buffer`; the internal reason is `guard` when `auto` is off and the wire reason stays `auto`; overflow recovery and manual `/compact`/`compact_context` unchanged; ceiling is `context_window − max(15%, 16k)` with `compaction.ceiling_tokens` able only to lower it; manual inbox `compaction` rows write `reason:"manual"` and a failed inbox delete stops the actor instead of re-dispatching), step budget (`session.execution.step_limit` v1 `{sessionID, steps}`, published after `session.execution.succeeded` and never as a terminal; parent metadata carries `stepLimit`/`steps`), `BoxTools` (`box_list`/`box_read`/`box_write`/`box_delete`/`compact_context`) with `box:read`/`box:write` mappings and key resources, `oc/boxes` prompt index pinned per actor epoch with tail supplements, temporary-box expiry after the `completed` row commits, mid-turn `steer` promotion at step boundaries (repost waits for idle; `switch_model` rejects a catalog-unknown target), cancellation/recovery, memory, observer strips, `ContextPressure`/`context_pressure()` with the host-side compaction adviser (`observer.advised`; the adviser lives in `oc-runtime`, not `oc-observer`), subagents (nested spawn for `general`, digest scoped to the caller's subtree with the child's full final answer and raw-answer cache honoring each caller's token budget, bounded watcher that cancels on timeout and delivers failed/timeout exactly once, parent cancellation interrupts a foreground child through `ToolContext.cancel`), `ToolProvider`, `GoalTools`/`SkillTools`/`LaneTools`, `ProcessLaneRunner`, lane events, pre-write snapshots, stored-credential key injection (active first, then any; per-provider key rotation inside one model attempt — `stream_model_attempts` retries the *same* model on the next key, `MAX_KEY_ATTEMPTS = 8`, publishes no `session.model.fallback`, and advances the chain only once the pool is spent; compaction cools a key without rotating); actor `Err` finalization: a drain-loop error repairs the rows the dead turn left open and then publishes `session.idle` + `session.execution.failed` through a per-item `TerminalState` guard so a settle that already ran is not duplicated, and the actor retires from the map and respawns when durable input is already waiting (`crates/oc-runtime/src/runtime/actor.rs:185`); regressions `actor_error_publishes_one_terminal_pair_and_closes_the_rows` (`crates/oc-runtime/tests/runtime/actor_error_terminal.rs`) and `crates/oc-runtime/tests/runtime/context_boxes.rs` (5 tests: tree sharing, `compact_context` enqueue, explore read-only / write-only agent, two-compaction survival with temporary expiry, cache-stable prefix with tail supplement); 91 runtime-scenario tests + 68 lib tests |
 | `oc-tools` | `code_map`, `read`, `write`, `edit`, `patch`, `glob`, `grep`, `shell`, `todowrite`, `webfetch`, `websearch` (72 tests); registry merge, `&str` names; `ToolContext.cancel` (`CancellationToken`) lets long-running tools stop detached helpers when the execution is interrupted; `code_map` `map` delegates to ripwire whenever the binary is found (mode-dependent argv: empty query `--max-tokens`/`--top-k`, query `--for`/`--token-budget`), captures stderr into `metadata.ripwire_stderr`, enforces a 30 s timeout (`OPENCODE_RIPWIRE_TIMEOUT_MS`) as a hard error, and discovers `RIPWIRE_PATH` → `$HOME/.local/bin/ripwire` → `PATH` requiring a regular executable file (`crates/oc-tools/src/code_map.rs`); hermetic delegation tests in `crates/oc-tools/tests/code_map_ripwire.rs` |
 | `oc-observer` | registry, terse input, strict verdicts, budgets, goal state machine, repairs; judge credentials resolved per request from the credential store or provider env (declared-but-unset env no longer disables it), failures publish `observer.unavailable`; goal verdicts persist to the store before `goal.updated`; switch_model falls back to `observer.escalation_model`, repost replays the last user prompt (with a pending-input guard), restart_subagent re-enqueues the original child prompt; the context-pressure adviser is host-side in `oc-runtime` (`observer/advice.rs`), not in this crate |
 | `oc-subagents` | session-tree policy, spawn limits, sibling/coordinator scope, write policy, model chain, budgets |
@@ -44,7 +44,7 @@ Smoke verification passes on isolated ports and databases across core surfaces: 
 | `oc-lsp` | supervisor, stdio framing, sync, push/pull diagnostics, tool ops (`lsp`, `lsp_diagnostics`), eviction/shutdown, `LspToolProvider` |
 | `oc-plugin` | native registry/domains/hooks, JSON-RPC stdio sidecar, inventory/RPC |
 | `oc-pty` | in-process ConPTY/PTY, 1 MiB ring, rows/snapshot/replay |
-| `oc-server` | HTTP/SSE/WS, auth/pairing (password from `--password`/`OPENCODE_PASSWORD`/`OPENCODE_SERVER_PASSWORD`; explicit empty disables; Basic/session token/`auth_token`/same-origin cookie; static shell public so the connect screen loads), static app, sessions/messages/inbox/log, forms, fork/revert/context/diff/view/environment, export/import/stats/instructions, permissions (request + saved; `always` persists to `permission_saved`, auto-resolves covered asks, `reject` drains every pending ask of the session, saved rules use wildcard matching and answer the admission route too), builtin `compress` command + raw `/compress` prompt alias, model/provider (only available providers + dynamic `google/antigravity-*` overlay), config, fs (list can navigate outside the location for the picker; reads/finds stay confined), vcs, project, shell manager, persistent PTY, MCP/LSP/plugin/RPC, lanes, observer, goal, memory, subagent, credential/integration (catalog providers connectable via key+env + real `google`/`antigravity` PKCE OAuth flow + `/api/antigravity/*` control plane + `AntigravityToolProvider`), worktree (refresh takes the main tree from git's first porcelain record, excludes the project's own checkout and the main tree, self-heals stale rows), duplicate synthetic message ids are 409, default location resolution does not double a relative server directory, static directory paths are 404 not 503; `antigravity` + HTTP integration suites passing |
+| `oc-server` | HTTP/SSE/WS, auth/pairing (password from `--password`/`OPENCODE_PASSWORD`/`OPENCODE_SERVER_PASSWORD`; explicit empty disables; Basic/session token/`auth_token`/same-origin cookie; static shell public so the connect screen loads), static app, sessions/messages/inbox/log, forms, fork/revert/context/diff/view/environment, export/import/stats/instructions, permissions (request + saved; `always` persists to `permission_saved`, auto-resolves covered asks, `reject` drains every pending ask of the session, saved rules use wildcard matching and answer the admission route too), builtin `compress` command + raw `/compress` prompt alias, model/provider (only available providers + dynamic `google/antigravity-*` overlay; `GET /api/quotas` provider `keys[]` with per-key cooldown/kind/failures in rotation order, `GET /api/models/registry` top-level `keyHealth[]`, `GET /api/antigravity/accounts` per-account `cooldownUntilMs` — all omitted when empty, never `null`), config, fs (list can navigate outside the location for the picker; reads/finds stay confined), vcs, project, shell manager, persistent PTY, MCP/LSP/plugin/RPC, lanes, observer, goal, memory, subagent, credential/integration (catalog providers connectable via key+env + real `google`/`antigravity` PKCE OAuth flow + `/api/antigravity/*` control plane + `AntigravityToolProvider`), worktree (refresh takes the main tree from git's first porcelain record, excludes the project's own checkout and the main tree, self-heals stale rows), duplicate synthetic message ids are 409, default location resolution does not double a relative server directory, static directory paths are 404 not 503; `antigravity` + HTTP integration suites passing |
 | `oc-cli` | `serve` with store/config/catalog, password resolution (flag/env alias, empty disables, service reuses registration or generates), `service get <url|password|pid|id|version>`, `auth` (`login`/`list`/`status`/`quota`/`use`/`enable`/`disable`/`remove`/`models`) + `/antigravity` (`/ag`) chat commands, Antigravity startup bootstrap/hook/version refresh, runtime + LLM scribe attach (model chain normalizes null/empty `subagents.digest_model` so it still falls through to `observer.digest_model`/`observer.model`), memory, observer host, MCP/LSP, PTY, plugins, lanes, service registration; 27 unit + 8 e2e tests |
 | `oc-testkit` | fake provider/process harness + binary-level scenarios |
 | UI | vendored SolidJS source (`ui/vendor/opencode`, MIT) built into `web/dist`; **Escape Agent brand layer** (dark default, gold/charcoal `oc-2` theme, glass panels/composer/tabs, centered home hero, six-letter wordmark + matching pin grid, branded connect/about, favicon/PWA/brand assets); settings tabs (memory, goals, observer, subagents, lanes) and session agent panels (subagent tree, peer drawer, observer repairs/budget, goal chip, lane pill); models with `time.released = 0` stay pickable (`0003`); missing tool metadata no longer crashes the session page (`0004`); `/compress` appears in the slash menu from `GET /api/command`; connect/login screen appears on a 401 and logs in with the configured password; live Playwright readiness suite in `packages/app/e2e/escape-agent` (**6/6** on 4096 + password 4097) |
@@ -394,7 +394,10 @@ and the 4096 server were not modified except for read-only UI checks.
 6. **Full location reload** — `POST /api/location/reload` only rescans skills;
    the immutable `ConfigService` snapshot is not rebuilt, so config changes need
    a restart (`PATCH /api/experimental/config` sets
-   `x-opencode-restart: required`).
+   `x-opencode-restart: required`). `PUT /api/config/models` no longer does: it
+   publishes the committed block to the live `models` cell and answers
+   `x-opencode-config-reloaded: models`, so the model policy applies to the next
+   spawn/turn; only an external edit of the config file needs a restart.
 7. **V1 import** — no upstream/V1 importer; `GET /api/experimental/migration/v1`
    answers `501`.
 8. **Observer repair audit precedes apply** — the CLI repair channel is
@@ -492,3 +495,99 @@ Verified workspace suite for this release wave: **1,155 passed, 0 failed, 3 igno
    cargo test --workspace
    ```
 4. Record behavior tests and update this verification log accordingly.
+
+
+## Model policy, model health and the agent set (shipped)
+
+- Model resolution order: `Call` → `Chain` (`models.chains.<agent>` else
+  `models.chain`) → `Agent` (`agents.<id>.model`) → `Agent`
+  (`subagents.agents.<id>.model`) → `Default` (`subagents.default_model`) →
+  `Parent`. An explicit `model:` call argument always wins, even outside the
+  chain: the chain is a routing preference order, never a visibility filter.
+  `chain_for(role)` is the resolver for the roles that resolve a model through it —
+  the spawn target (`crates/oc-runtime/src/subagent/spawn/prepare.rs:151`), the
+  live turn's `agent_id` (`crates/oc-runtime/src/turn/stream.rs:156`), `scribe`
+  (`crates/oc-cli/src/scribe.rs:164`), `observer`
+  (`crates/oc-server/src/observer_host/mod.rs:158`) and `compaction`
+  (`crates/oc-runtime/src/turn/compaction.rs:418-430`); a role without its own
+  entry inherits `models.chain`.
+- Compaction resolves its own chain: `compaction_candidates` returns
+  `chain_for("compaction")` in order, then the turn's
+  `turn.model_ref.to_reference()`, deduplicated by exact reference with the first
+  occurrence kept (`crates/oc-runtime/src/turn/compaction.rs:418`).
+  `COMPACTION_MAX_ATTEMPTS = 2` allows exactly **one** fallback hop — not
+  `models.fallback.max_hops` — and each hop is gated by
+  `policy.fallback().allows(kind)`, which is always true for
+  `Quota`/`RateLimit`/`ModelUnavailable` (`:216,309,852`). The completed
+  compaction row and the `session.compaction.ended` payload report the model that
+  **actually produced** the summary, i.e. the chain candidate that answered,
+  which is not `turn.model_ref` once the chain advanced; `session.model` is never
+  rewritten (`:105-115,345-355`). Preserved from before: one shortened retry on a
+  context-window overflow on the same candidate, key cooling via
+  `mark_compaction_key`, `model_health().mark`, and single-row reuse — the
+  `compaction` message is appended `status:"running"` and updated to `completed`
+  in place rather than appended twice (`:124-150,349-361`). As before, no path
+  spawns the ids `compaction`, `title` or `summary`.
+- Fallback: `FallbackPolicy::allows` advances the chain unconditionally for
+  `ModelUnavailable`, `Quota` and `RateLimit`, so `models.fallback.on` can no
+  longer switch quota/rate-limit recovery off; an explicit `on` only gates the
+  opt-in classes `empty_response`/`transport`, and `disabled_by_config()` names
+  the classes a user switched off. Reason: the live config listed
+  `on = ["empty_response","transport"]`, so a quota failure killed the turn.
+  `"cooling down"` (every Antigravity account exhausted) classifies as
+  `FailureKind::Quota` in `oc_llm::classify_provider_message`, so it advances the
+  chain and records model health.
+- Chat-picker visibility is `!models.hidden[ref] && providerConnected`, ordered
+  favorites first, then chain index, then name
+  (`ui/vendor/opencode/packages/app/src/providers/models/policy.ts`).
+  `models.notes[ref]` is the only editable note (inline on the chain row and via
+  the catalog indicator); `models.agent_notes` is read-only legacy shown as a
+  badge. The Models tab never writes it, though `PUT /api/config/models` still
+  accepts and merges it (`crates/oc-server/src/data/models_registry.rs:1235`).
+- Spawn metadata: `model`, `modelSource`
+  (`call|chain|agent|default|parent`), `quota`, and
+  `rejectedModels: [{reference, source, reason}]`
+  (`malformed|not_available|denied`, omitted when empty). Nothing is `null`.
+- `FailureKind::ModelUnavailable` (`model_unavailable`) always advances the
+  chain, independently of `models.fallback.on` (whose default set still excludes
+  it); `oc_llm::classify_provider_message` supplies the kind, and
+  `oc_llm::ModelHealth` remembers the failing reference (24 h / 5 min / 60 s /
+  30 s for model-unavailable / quota / rate-limit / transport).
+- `GET /api/models/registry` reports that table as the additive, optional
+  `modelHealth[]` and per-model `unavailable` fields, omitted when healthy.
+- The credential axis is separate and shipped: top-level `keyHealth:
+  [{providerID, credentialID?, untilMs, kind, failures}]` on the same registry
+  response, omitted when every key is healthy
+  (`crates/oc-server/src/data/models_registry.rs:88-116`). A key entry only takes
+  one key out of rotation for one provider; it never hides a model.
+- Per-provider backup keys: `Store::credential_pool` orders `active DESC, id ASC`
+  and `Store::set_credential_primary` moves the durable primary pointer. An
+  in-flight turn rotates on the same model via `stream_model_attempts`
+  (`MAX_KEY_ATTEMPTS = 8`) with per-key cooldowns from `oc_llm::KeyPool`, and
+  publishes no `session.model.fallback`; the chain advances once, and only after
+  the pool is spent. Compaction cools but does not rotate. Tests:
+  `crates/oc-runtime/tests/runtime/key_pool.rs` (4),
+  `auth_failure_on_two_keys_does_not_advance_the_chain`
+  (`tests/runtime/models_policy.rs:554`). Cooldowns are in-memory (cleared on
+  restart); the primary pointer is durable.
+- `GET /api/quotas` is non-blocking: it answers the cached snapshot immediately,
+  including a cold cache, which returns HTTP 200 with an empty `providers` list.
+  While a background refresh runs it sets `refreshing: true`
+  (`skip_serializing_if = "is_false"`, so the field is omitted when false) and
+  exactly one refresh is in flight at a time (`data/quotas/mod.rs:134-161`,
+  `data/quotas/types.rs:24-25`). `?refresh=true` keeps the historical blocking
+  behavior, and `POST /api/quotas/refresh` is blocking
+  (`data/quotas/mod.rs:189`).
+- `GET /api/quotas` reports each provider's `keys[]` (rotation order, `active`,
+  `limited`, `cooldownUntilMs?`, `kind?`, `failures?`, `usedCostUsd`,
+  `usedRequests`), omitted when the provider has no credential row. `usedCostUsd`
+  / `usedRequests` are always `0` by design — the usage rollup keys on
+  `model.providerID`, so per-key attribution does not exist yet.
+- `PUT /api/config/models` is live: `ConfigService::set_models` updates the
+  `models` cell the runtime re-parses per spawn/turn, so the response carries
+  `x-opencode-config-reloaded: models` and **no** `x-opencode-restart`.
+  `PATCH /api/experimental/config` still answers `x-opencode-restart: required`.
+- Builtin agents, canonical order: `engineer` (primary, default), `architect`,
+  `review`, `general`, `explore`, `ui`, `docs`, `compaction`, `title`, `summary`
+  (the last three hidden). Aliases: `build` → `engineer`, `plan` → `architect`,
+  `reviewer` → `review`. `steward` remains a project template, not a builtin.

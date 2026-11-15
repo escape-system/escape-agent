@@ -183,7 +183,7 @@ impl Harness {
                 project_id: "prj_manual_compact".to_owned(),
                 directory: path(&work),
                 title: Some("manual compaction".to_owned()),
-                agent: Some("build".to_owned()),
+                agent: Some("engineer".to_owned()),
                 model: Some(json!({"providerID": "test", "id": "alpha"})),
                 metadata: None,
                 permissions: None,

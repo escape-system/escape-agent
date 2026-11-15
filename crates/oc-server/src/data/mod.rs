@@ -29,6 +29,7 @@ pub mod mcp_tools;
 pub mod memory;
 pub mod message;
 pub mod model;
+pub mod models_registry;
 pub mod observer;
 pub mod permission;
 pub mod plugin;
@@ -40,6 +41,7 @@ pub mod session;
 pub mod session_ext;
 pub mod shells;
 pub mod subagent;
+pub mod usage_models;
 pub mod vcs;
 pub mod worktree;
 

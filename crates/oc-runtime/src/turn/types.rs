@@ -75,6 +75,28 @@ pub(super) struct StepRun {
     pub(super) cost: f64,
 }
 
+/// A streaming attempt that ended in a *classifiable* provider failure.
+///
+/// Only `LlmError::Failure` produces this: an untyped `LlmError::Provider` has
+/// no `FailureKind`, so it can never advance `models.chain` (guessing a class
+/// from message text would silently rewrite provider semantics).
+#[derive(Debug)]
+pub(super) struct StreamFailure {
+    pub(super) error: oc_llm::LlmError,
+    pub(super) state: AssistantState,
+    pub(super) kind: oc_llm::FailureKind,
+    /// True when nothing was streamed or persisted beyond the initial row, so
+    /// the assistant row can be rewritten in place for the next model.
+    pub(super) reusable: bool,
+}
+
+/// One `stream_step` attempt.
+#[derive(Debug)]
+pub(super) enum StepAttempt {
+    Done(StepRun),
+    Retry(StreamFailure),
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct PendingToolCall {
     pub(super) index: usize,

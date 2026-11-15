@@ -151,17 +151,29 @@ fn resolve_model(
         .and_then(|subagents| subagents.get("digest_model"))
         .and_then(Value::as_str);
     let root_model = config.model();
-    let reference = [
-        observer.model.as_deref(),
-        observer.digest_model.as_deref(),
-        subagents_digest,
-        root_model.as_deref(),
-    ]
-    .into_iter()
-    .flatten()
-    .map(str::trim)
-    .find(|candidate| !candidate.is_empty())
-    .map(str::to_owned);
+    // The role chain is consulted first: `models.chains.observer` when the user
+    // set one, otherwise `models.chain`. This is the same resolver the runtime
+    // uses for every other role (`oc_runtime::models_policy`), so the Models tab
+    // is the one place the observer's model is chosen.
+    let role_chain = oc_runtime::models_policy(config)
+        .chain_for("observer")
+        .to_vec();
+    let reference = role_chain
+        .iter()
+        .map(String::as_str)
+        .chain(
+            [
+                observer.model.as_deref(),
+                observer.digest_model.as_deref(),
+                subagents_digest,
+                root_model.as_deref(),
+            ]
+            .into_iter()
+            .flatten(),
+        )
+        .map(str::trim)
+        .find(|candidate| !candidate.is_empty())
+        .map(str::to_owned);
     let Some(reference) = reference else {
         tracing::info!("observer disabled: no model");
         return None;

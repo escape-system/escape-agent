@@ -180,3 +180,144 @@ async fn credentials_crud_activation_and_ordering() {
         Err(StoreError::Invalid(_))
     ));
 }
+
+fn key_credential(id: &str, integration: &str, secret: &str, active: bool) -> NewCredential {
+    NewCredential {
+        id: Some(id.to_owned()),
+        integration_id: integration.to_owned(),
+        label: Some(format!("label-{id}")),
+        value: credential_key(secret),
+        active: Some(active),
+    }
+}
+
+#[tokio::test]
+async fn credential_pool_returns_active_first_then_id_ascending() {
+    let store = Store::open_memory().await.expect("memory store");
+    // Created in a deliberately scrambled order so the ordering cannot come
+    // from insertion order.
+    for (id, active) in [("cred_d", false), ("cred_b", true), ("cred_a", false)] {
+        store
+            .create_credential(key_credential(id, "int_keys", id, active))
+            .await
+            .expect("create credential");
+    }
+    store
+        .create_credential(key_credential("cred_x", "int_other", "x", true))
+        .await
+        .expect("create other integration");
+
+    let pool = store.credential_pool("int_keys").await.expect("pool");
+    assert_eq!(
+        pool.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+        vec!["cred_b", "cred_a", "cred_d"]
+    );
+    assert_eq!(
+        pool.iter().filter(|row| row.active).count(),
+        1,
+        "exactly one row is primary"
+    );
+    assert!(pool.iter().all(|row| row.integration_id == "int_keys"));
+    let first = &pool[0];
+    assert_eq!(first.label, "label-cred_b");
+    assert_eq!(first.value, credential_key("cred_b"));
+
+    assert!(
+        store
+            .credential_pool("int_missing")
+            .await
+            .expect("empty pool")
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn set_credential_primary_clears_siblings_and_survives_reopen() {
+    let directory = tempfile::TempDir::new().expect("temp dir");
+    let path = directory.path().join("pool.db");
+    let store = Store::open(&path).await.expect("open store");
+    for (id, active) in [("cred_a", true), ("cred_b", false), ("cred_c", false)] {
+        store
+            .create_credential(key_credential(id, "int_keys", id, active))
+            .await
+            .expect("create credential");
+    }
+
+    assert!(
+        store
+            .set_credential_primary("int_keys", "cred_c")
+            .await
+            .expect("set primary")
+    );
+    let pool = store.credential_pool("int_keys").await.expect("pool");
+    assert_eq!(
+        pool.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+        vec!["cred_c", "cred_a", "cred_b"],
+        "the new primary sorts first"
+    );
+    assert_eq!(
+        pool.iter().filter(|row| row.active).count(),
+        1,
+        "siblings were cleared in the same transaction"
+    );
+    assert_eq!(
+        store
+            .get_credential("cred_a")
+            .await
+            .expect("get")
+            .expect("row")["active"],
+        json!(false)
+    );
+
+    // Unknown ids and foreign integrations are refused without writing.
+    assert!(
+        !store
+            .set_credential_primary("int_keys", "cred_missing")
+            .await
+            .expect("unknown id")
+    );
+    store
+        .create_credential(key_credential("cred_other", "int_other", "other", true))
+        .await
+        .expect("create other integration");
+    assert!(
+        !store
+            .set_credential_primary("int_keys", "cred_other")
+            .await
+            .expect("foreign id")
+    );
+    assert_eq!(
+        store.credential_pool("int_keys").await.expect("pool")[0].id,
+        "cred_c",
+        "a refused call leaves the selection untouched"
+    );
+
+    drop(store);
+    let reopened = Store::open(&path).await.expect("reopen");
+    let pool = reopened.credential_pool("int_keys").await.expect("pool");
+    assert_eq!(
+        pool.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+        vec!["cred_c", "cred_a", "cred_b"],
+        "the rotation priority survived a restart"
+    );
+    assert!(pool[0].active);
+}
+
+#[tokio::test]
+async fn deleting_the_active_credential_leaves_the_rest_of_the_pool() {
+    let store = Store::open_memory().await.expect("memory store");
+    for (id, active) in [("cred_a", true), ("cred_b", false)] {
+        store
+            .create_credential(key_credential(id, "int_keys", id, active))
+            .await
+            .expect("create credential");
+    }
+    assert!(store.delete_credential("cred_a").await.expect("delete"));
+    let pool = store.credential_pool("int_keys").await.expect("pool");
+    assert_eq!(
+        pool.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+        vec!["cred_b"],
+        "the backup key is still usable"
+    );
+    assert_eq!(pool[0].value, credential_key("cred_b"));
+}

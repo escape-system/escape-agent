@@ -474,7 +474,118 @@ entry whose link target is missing (or is not a file/directory) is skipped.
   `/antigravity`): `status`, `quota [cached]`, `use|enable|disable <account>`,
   `models [refresh]`.
 
-## Local conventions inside `Session.Metadata`
+## Model control plane
+
+Additive only: no existing payload, route or type was renamed or narrowed; every
+change below is a new name. Wire sources stay authoritative (header of this
+file).
+
+### Event `session.model.fallback` (`oc-types`)
+
+```rust
+// crates/oc-types/src/payload/meta.rs
+pub struct SessionModelFallback { session_id, from: ModelRef, to: ModelRef,
+                                 kind: String, attempt: Option<u32> }
+impl_event_payload!(SessionModelFallback, "session.model.fallback", true, 1);
+```
+
+Payload fields: `sessionID`, `from {providerID,id,variant?}`, `to
+{providerID,id,variant?}`, `kind` (`empty_response|transport|rate_limit|quota`),
+`attempt?` (1-based hop). `variant` and `attempt` are omitted when absent —
+never `null`. `durable = true`, `version = 1`, and
+`oc-store/src/event.rs:178` becomes a projection arm writing the durable model
+for the event. It mirrors the existing `session.model.selected` payload; the
+fallback record is the event log, not a new table.
+
+### `LlmError::Failure` + `FailureKind` (`oc-llm`)
+
+```rust
+pub enum FailureKind { EmptyResponse, Transport, RateLimit, Quota, Auth, InvalidRequest, Unknown }
+pub enum LlmError { /* existing variants unchanged, */ Failure { kind: FailureKind, message: String } }
+```
+
+Additive variant: every existing `LlmError` arm keeps its name and shape, so
+matches that were exhaustive before only gain one arm. `is_retryable` truth
+table:
+
+| kind | `is_retryable()` |
+|---|---|
+| `EmptyResponse` | true |
+| `Transport` | true |
+| `RateLimit` | true |
+| `Quota` | true |
+| `Auth` | false |
+| `InvalidRequest` | false |
+| `ModelUnavailable` | false |
+| `Unknown` | false |
+
+Retryable = `EmptyResponse` | `Transport` | `RateLimit` | `Quota`; not
+retryable = `Auth` | `InvalidRequest` | `ModelUnavailable` | `Unknown`.
+
+`ModelUnavailable` (`model_unavailable`) is what always advances `models.chain`:
+a retired/decommissioned model cannot serve the request whatever
+`models.fallback.on` says, so the runtime special-cases it in
+`FallbackPolicy::allows` and never transport-retries it. Every other advancing
+class must be retryable AND listed in `models.fallback.on`; the default set is
+`[empty_response, transport, rate_limit, quota]` and excludes
+`model_unavailable` on purpose (listing it changes nothing). Config accepts all
+five spellings.
+
+`oc_llm::classify_provider_message(&str) -> FailureKind` turns an opaque provider
+message into one of these kinds (lowercase substring rules, first group wins:
+model unavailable → quota → rate limit → auth → invalid request → `unknown`), and
+the runtime raises `LlmError::Failure { kind, message }` instead of
+`LlmError::Provider` for a known kind. `Http { status: 429 }` keeps its retry.
+Before advancing, the failing reference is marked in `oc_llm::ModelHealth`
+(`Runtime::model_health()`, shared with `AppState::model_health()`); TTLs are
+24 h / 5 min / 60 s / 30 s for `model_unavailable` / `quota` / `rate_limit` /
+`transport`, and the other kinds are never marked.
+
+### `resolve_model_with` + `CandidateFilter` (`oc-subagents`)
+
+```rust
+pub struct CandidateFilter<'a> { pub chain: &'a [String], pub deny: &'a [String] }
+pub fn resolve_model_with(.., filter: Option<&CandidateFilter<'_>>) -> Result<ModelChoice, ModelError>;
+```
+
+Signature-compatible: `resolve_model` keeps its arguments and delegates with
+`None`. `chain` is a preference order inserted at position 2 (after the call
+model, before the agent rows) and `deny` removes models variant-insensitively
+(quota is per `provider/id`). Resolution never aborts on a bad candidate:
+`ModelChoice { reference, source, skipped }` carries the winner plus every
+`ModelSkip { reference, source, reason }` (`reason`:
+`malformed | not_available | denied`). An empty list is
+`ModelError::NoCandidate { chain }`; a non-empty list with nothing usable is
+`ModelError::NoUsableCandidate { chain, skipped }` (replacing
+`InvalidReference`/`Unavailable`), whose `Display` names every skip with reason
+and source. `ModelSource` values are `Call | Chain | Agent | Default | Parent`
+(`as_str()`: `call | chain | agent | default | parent`; `Fallback` was renamed to
+`Chain`), so a chain pick is
+distinguishable in the tool result (`docs/05`).
+
+### `oc_store::usage::model_usage` (`oc-store`)
+
+```rust
+// crates/oc-store/src/usage.rs (new)
+pub struct ModelUsageRow { provider_id, model_id, requests,
+                           tokens_in, tokens_out, tokens_reasoning, cost: f64 }
+pub async fn model_usage(..) -> Result<Vec<ModelUsageRow>, StoreError>;
+```
+
+Read-only rollup over `session_message.data` filtered by the `type` column; no
+table, no migration, no write path. SQL and index plan are in
+[docs/03](03-storage.md).
+
+### Server modules
+
+`GET /api/models/registry` lives in `crates/oc-server/src/data/models_registry.rs`
+and `GET /api/experimental/usage/models` in
+`crates/oc-server/src/data/usage_models.rs`; both expose `routes()` like every
+other group (`docs/17` "oc-server route modules"). `PUT /api/config/models`
+stays in `data/config_patch.rs` next to the existing allowlist, and `lib.rs`
+route registration is the integration owner's edit only.
+
+
 
 `Session.Metadata` is the only open object on the upstream wire
 (`types.ts:65`, `openapi.json:22808-22809`; `Session.Info` itself is closed at
@@ -689,13 +800,24 @@ impl ConfigService {
     pub fn mcp_servers(&self) -> Value;
     pub fn shell(&self) -> String;
     pub fn model(&self) -> Option<String>;
+    // live `models` cell: PUT /api/config/models publishes here, the runtime
+    // re-parses it per spawn/turn, and the registry reads the same cell.
+    pub fn models_section(&self) -> Value;              // owned clone, `{}` when absent
+    pub fn set_models(&self, models: Value);            // replaces + bumps revision
+    pub fn models_revision(&self) -> u64;
+    pub fn refresh_models_from_disk(&self) -> Result<(), String>;
 }
+/// Legacy agent ids -> canonical ids (build->engineer, plan->architect,
+/// reviewer->review), case-insensitive and trimmed.
+pub fn normalize_agent_id(id: &str) -> &str;
 pub struct PermissionRule { pub action: String, pub resource: String, pub effect: Effect }
 pub enum Effect { Allow, Deny, Ask }
 ```
 
 Must implement: file discovery order, JSONC parse, `{env:}`/`{file:}`, V1
-aliases, agent builtins (build/plan/general/explore/title/summary/compaction),
+aliases, agent builtins (engineer/architect/review/general/explore/ui/docs plus the
+hidden compaction/title/summary; legacy ids build/plan/reviewer normalize to
+engineer/architect/review),
 last-match-wins glob permissions, agent permission composition. Tests for each.
 No network. `ConfigService::load` must not block on well-known/Console; those
 are out of scope in phase 1.
@@ -757,8 +879,30 @@ pub struct ToolResult { pub output: Option<String>, pub content: Option<Value>, 
 pub struct ToolError { pub message: String, pub metadata: Option<Value> }  // thiserror + helpers
 ```
 
+### `key_health` (read-only)
+
+`crates/oc-tools/src/key_health.rs`, registered in `ToolRegistry::with_defaults`
+and merged into every execution by the runtime (`turn/session.rs`). The tool owns
+no state: `oc_tools::key_health::with_key_health_source` binds a
+`KeyHealthSource` in task-local storage for one call, the same pattern
+`code_map` uses for its semantic oracle (`turn/tools/run.rs`). The runtime's
+implementation (`oc-runtime/src/key_health.rs`) joins
+`Store::credential_pool` with `oc_llm::KeyPool::entries`.
+
+- Arguments: none required; optional `provider` (string, exact provider id).
+- Result: `{"summary": "<one line>", "providers": [{"providerID": "...",
+  "keys": [...]}]}`. Each key carries `credentialID?`, `label?`, `active`,
+  `limited`, and — only when `limited` — `cooldownUntilMs`, `kind`, `failures`.
+  The environment key has `source: "env"` and no `credentialID`. Every optional
+  field is omitted, never `null`. Key material is never present: the structs
+  have no field for it.
+- A provider with at least one key is always listed, even when nothing is
+  cooling, so the model can say "2 keys for opencode-go, both healthy". An
+  unknown `provider` filter yields an empty `providers` array, not an error.
+- Without a bound source the tool returns a typed `ToolError` (no fake success).
+
 Landed built-ins: `code_map`, `read`, `write`, `edit`, `symbol_edit`, `patch`,
-`glob`, `grep`, `shell`, `todowrite`, `webfetch`, `websearch`. Exact
+`glob`, `grep`, `shell`, `todowrite`, `webfetch`, `websearch`, `key_health`. Exact
 schemas/limits/error strings per `docs/12-tools.md`; tests cover edit
 three-tier matching, CRLF, atomic symbol editing, patch grammar, glob/grep
 limits, shell timeout/kill, webfetch SSRF guards. No `expectation` injection

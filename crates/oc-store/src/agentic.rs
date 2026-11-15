@@ -37,7 +37,7 @@ pub struct SessionNodeRow {
     pub spawn_allowed: bool,
     /// Number of direct children recorded by the store.
     pub child_count: u32,
-    /// Selected agent, falling back to `build`.
+    /// Selected agent, falling back to `engineer`.
     pub agent: String,
     /// Compact `provider/id#variant` model reference.
     pub model: Option<String>,
@@ -563,7 +563,7 @@ fn node_row(row: &Row<'_>) -> Result<SessionNodeRow, StoreError> {
         role: role.unwrap_or_else(|| "primary".to_owned()),
         spawn_allowed: spawn_allowed != 0,
         child_count: u32::try_from(child_count).unwrap_or_default(),
-        agent: agent.unwrap_or_else(|| "build".to_owned()),
+        agent: agent.unwrap_or_else(|| "engineer".to_owned()),
         model: model.and_then(|raw| compact_model(&raw)),
         idle_reason: idle_reason
             .filter(|reason| crate::session::keeps_idle_reason(outcome.as_deref(), reason)),

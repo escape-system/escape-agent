@@ -11,13 +11,13 @@ async fn create_list_get_patch_delete() {
 
     let created = create_session(
         &app,
-        json!({"title": "first", "metadata": {"a": 1}, "agent": "build"}),
+        json!({"title": "first", "metadata": {"a": 1}, "agent": "engineer"}),
     )
     .await;
     let id = session_id(&created);
     assert!(id.starts_with("ses_"));
     assert_eq!(created["title"], "first");
-    assert_eq!(created["agent"], "build");
+    assert_eq!(created["agent"], "engineer");
     assert!(created["projectID"].as_str().unwrap().starts_with("prj_"));
     assert!(created["location"]["directory"].is_string());
 

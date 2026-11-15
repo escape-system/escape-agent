@@ -34,6 +34,7 @@ async fn registry_definitions_are_sorted_without_expectation() {
             "edit",
             "glob",
             "grep",
+            "key_health",
             "patch",
             "read",
             "shell",

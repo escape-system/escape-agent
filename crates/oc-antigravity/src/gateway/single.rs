@@ -86,10 +86,15 @@ pub(super) async fn handle_single_attempt(
                 retry_after_ms,
             );
             excluded_indices.insert(account_index);
+            // `status == 200` means the failure arrived in-band in an SSE error frame
+            // (`{"error":{"message":…}}`), not as an HTTP status line; name it that way so
+            // diagnostics never pretend upstream answered with a 200-rate-limit.
             *last_error = Some(LlmError::Provider {
-                message: format!(
-                    "Cloud Code HTTP {status} ({reason:?}, cooldown {delay}ms): {body}"
-                ),
+                message: if status == 200 {
+                    format!("Cloud Code in-band {reason:?}: {body}")
+                } else {
+                    format!("Cloud Code HTTP {status} ({reason:?}, cooldown {delay}ms): {body}")
+                },
             });
             let switch_first = svc.config().switch_on_first_rate_limit;
             if !switch_first && svc.account_count() == 1 {

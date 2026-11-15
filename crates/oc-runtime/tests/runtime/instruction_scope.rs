@@ -53,7 +53,7 @@ async fn instructions_follow_the_session_directory_not_the_config_directory() {
             project_id: "prj_scoped".to_owned(),
             directory: path(&session_dir),
             title: Some("scoped instructions".to_owned()),
-            agent: Some("build".to_owned()),
+            agent: Some("engineer".to_owned()),
             model: Some(json!({"providerID": "test", "id": "alpha"})),
             metadata: None,
             permissions: None,

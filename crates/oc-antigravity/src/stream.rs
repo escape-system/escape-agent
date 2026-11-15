@@ -2,6 +2,7 @@
 //! chunks into `oc_llm::LlmEvent` with cumulative thinking deduplication and signature capture.
 
 use crate::accounts::ModelFamily;
+use crate::rotation::RateLimitReason;
 use crate::signature_cache::SignatureCache;
 use oc_llm::{LlmEvent, Usage};
 use serde_json::Value;
@@ -116,7 +117,7 @@ impl CloudCodeSseDecoder {
             if is_thinking_order_error(&msg) {
                 return Err(StreamDecodeFailure::ThinkingBlockOrder(msg));
             }
-            return Err(StreamDecodeFailure::Fatal(msg));
+            return Err(classify_in_band_error(msg));
         }
 
         let inner = val.get("response").unwrap_or(&val);
@@ -248,8 +249,29 @@ pub enum StreamDecodeFailure {
     EmptyStream,
     /// Upstream rejected history with thinking-block / signature ordering error.
     ThinkingBlockOrder(String),
+    /// In-band SSE error frame reporting a depleted quota window (HTTP status was 200).
+    QuotaExhausted(String),
+    /// In-band SSE error frame reporting a burst rate limit (HTTP status was 200).
+    RateLimited(String),
     /// Non-recoverable upstream stream error.
     Fatal(String),
+}
+
+/// Classify an in-band `{"error":{"message":…}}` SSE frame with the shared reason parser so
+/// quota/rate-limit frames stay attributable to the serving account instead of failing the turn.
+#[must_use]
+pub fn classify_in_band_error(message: String) -> StreamDecodeFailure {
+    match crate::rotation::parse_rate_limit_reason(200, &message) {
+        // `ModelCapacityExhausted` is an account-wide upstream quota stop, so it shares the
+        // quota cooldown; `ServerError`/`Unknown` stay fatal (no useful account attribution).
+        RateLimitReason::QuotaExhausted | RateLimitReason::ModelCapacityExhausted => {
+            StreamDecodeFailure::QuotaExhausted(message)
+        }
+        RateLimitReason::RateLimitExceeded => StreamDecodeFailure::RateLimited(message),
+        RateLimitReason::ServerError | RateLimitReason::Unknown => {
+            StreamDecodeFailure::Fatal(message)
+        }
+    }
 }
 
 /// Check if an upstream error message indicates a Claude/Gemini thinking ordering/signature rejection.

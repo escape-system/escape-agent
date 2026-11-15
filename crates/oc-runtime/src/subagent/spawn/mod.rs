@@ -217,10 +217,8 @@ impl Tool for SubagentTool {
                 child.prompt_id,
                 settings.timeout,
             );
-            return Ok(ToolResult::text(
-                json!({ "sessionID": child.session_id, "status": "running" }).to_string(),
-            )
-            .with_metadata(json!({ "sessionID": child.session_id, "status": "running" })));
+            let payload = ctx_spawn.result_metadata(&child.session_id, "running");
+            return Ok(ToolResult::text(payload.to_string()).with_metadata(payload));
         }
         let mut running_meta = serde_json::Map::new();
         running_meta.insert(
@@ -229,7 +227,7 @@ impl Tool for SubagentTool {
         );
         running_meta.insert("status".to_owned(), Value::String("running".to_owned()));
         crate::turn::report_tool_progress(running_meta);
-        finish_foreground(
+        let mut result = finish_foreground(
             runtime,
             &caller,
             &child.session_id,
@@ -239,7 +237,104 @@ impl Tool for SubagentTool {
             &settings,
             ctx.cancel.as_ref(),
         )
-        .await
+        .await?;
+        // The model-visible `<subagent …>` envelope is unchanged; the resolved
+        // model, its provenance and the quota snapshot are metadata only, so
+        // prompt caching and the documented parent view survive.
+        ctx_spawn.annotate_metadata(&mut result);
+        Ok(result)
+    }
+}
+
+impl SpawnContext {
+    /// `{sessionID, status}` plus the resolved-model report.
+    fn result_metadata(&self, child: &str, status: &str) -> Value {
+        let mut map = serde_json::Map::new();
+        map.insert("sessionID".to_owned(), Value::String(child.to_owned()));
+        map.insert("status".to_owned(), Value::String(status.to_owned()));
+        map.extend(self.report_metadata());
+        Value::Object(map)
+    }
+
+    /// The optional report fields, omitted when unknown (never `null`).
+    fn report_metadata(&self) -> serde_json::Map<String, Value> {
+        let mut map = serde_json::Map::new();
+        map.insert("model".to_owned(), self.model_value.clone());
+        map.insert(
+            "modelSource".to_owned(),
+            Value::String(self.model_source.as_str().to_owned()),
+        );
+        if let Some(quota) = &self.quota_snapshot {
+            map.insert("quota".to_owned(), quota.to_json());
+        }
+        // Only the cooling keys are reported; an all-healthy pool omits the field
+        // entirely instead of publishing an empty array.
+        if !self.key_health.is_empty() {
+            map.insert(
+                "keyHealth".to_owned(),
+                Value::Array(self.key_health.clone()),
+            );
+        }
+        if !self.rejected_models.is_empty() {
+            map.insert(
+                "rejectedModels".to_owned(),
+                Value::Array(
+                    self.rejected_models
+                        .iter()
+                        .map(|skip| {
+                            json!({
+                                "reference": skip.reference,
+                                "source": skip.source.as_str(),
+                                "reason": skip.reason.as_str(),
+                            })
+                        })
+                        .collect(),
+                ),
+            );
+        }
+        map
+    }
+
+    fn annotate_metadata(&self, result: &mut oc_tools::ToolResult) {
+        let report = self.report_metadata();
+        if report.is_empty() {
+            return;
+        }
+        let mut map = match result.metadata.take() {
+            Some(Value::Object(map)) => map,
+            _ => serde_json::Map::new(),
+        };
+        map.extend(report);
+        result.metadata = Some(Value::Object(map));
+    }
+}
+
+/// Per-model quota state at spawn time, reported in tool metadata.
+#[derive(Debug, Clone)]
+struct QuotaSnapshot {
+    provider_id: String,
+    remaining_pct: Option<f64>,
+    limited: bool,
+    spend_usd: Option<f64>,
+    window_hours: u32,
+}
+
+impl QuotaSnapshot {
+    fn to_json(&self) -> Value {
+        let mut map = serde_json::Map::new();
+        map.insert(
+            "providerID".to_owned(),
+            Value::String(self.provider_id.clone()),
+        );
+        if let Some(pct) = self.remaining_pct {
+            map.insert("remainingPercent".to_owned(), json!(pct));
+        }
+        map.insert("limited".to_owned(), Value::Bool(self.limited));
+        if let Some(spend) = self.spend_usd {
+            map.insert("spendUsd".to_owned(), json!(spend));
+        }
+        map.insert("windowHours".to_owned(), json!(self.window_hours));
+        Value::Object(map)
     }
 }
 
@@ -255,6 +350,12 @@ struct SpawnContext {
     parent_info: oc_types::SessionInfo,
     model_value: Value,
     created_model: Option<oc_types::ModelRef>,
+    model_source: oc_subagents::ModelSource,
+    quota_snapshot: Option<QuotaSnapshot>,
+    /// Cooling-down keys of the chosen model's provider at spawn time; empty
+    /// when every key is healthy.
+    key_health: Vec<Value>,
+    rejected_models: Vec<oc_subagents::ModelSkip>,
     role: oc_subagents::Role,
     lane: Option<String>,
     group: Option<String>,

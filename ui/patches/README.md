@@ -36,6 +36,29 @@ contains them, and `build.sh`/`build.ps1` do not apply them.
   `quotas.css`, `api.test.ts`), the provider quota section in the Usage dialog,
   and the `en`/`tr` strings. The dialog reads the cached query only
   (`enabled: () => false`); the settings tab is the only poller (60 s).
+- `0009-models-control-plane.patch` — the Models settings tab rebuilt as the
+  agent model-policy editor, plus a registry-driven chat model picker.
+  `settings/models/api.ts` is the typed client for `GET /api/models/registry`
+  and `PUT /api/config/models`; `chain.ts` holds the fallback-chain algebra and
+  `models.tsx` renders it: a scope selector (global vs. one agent, grouped
+  primary agents / subagents), per-agent chain editing with add/remove/reorder
+  and an "already added" filter, whole-chain model visibility, per-model quota,
+  cost and usage columns, notes, and collapse/expand-all, plus an unavailable
+  registry badge instead of a restart gate. The picker is registry-driven:
+  `providers/models/policy.ts` (pure visibility/ordering rules),
+  `select-dialog.tsx` (registry-gated visibility, chain-aware ordering,
+  favorites first) and the setup wizard's model step
+  (`providers/connect/dialog.tsx`). `settings/models/chain.test.ts`,
+  `api.test.ts` and `providers/models/picker-policy.test.ts` cover the rules;
+  `runtime/i18n/en.ts` and `tr.ts` carry the new `settings.models.*` strings.
+  Also carries the provider account/key controls this wave needed
+  (`settings/providers/accounts.ts`, `account-actions.ts`, `providers.tsx` —
+  "Add backup key" / "Make primary") and the quota client changes in
+  `settings/quotas/api.ts`, `quotas.tsx`. HEAD predates 0009, so HEAD is a true
+  "before" baseline and the `diff -ruN a b` recipe below applies unchanged:
+  20 files, 5432 patch lines. Verified with `git apply --check -p1` on a
+  pristine `ui/vendor/opencode` archive and confirmed to reconstruct the
+  working tree byte-for-byte (`diff -ru` empty).
 
 Rules:
 

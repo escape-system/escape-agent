@@ -27,7 +27,7 @@ use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
 use axum::http::{HeaderName, Method};
 use axum::middleware;
 use axum::response::Response;
-use axum::routing::{get, patch as patch_route, post};
+use axum::routing::{get, patch as patch_route, post, put};
 use oc_antigravity::AntigravityService;
 use oc_config::ConfigService;
 use oc_lanes::LaneService;
@@ -220,6 +220,28 @@ impl AppState {
     #[must_use]
     pub fn runtime(&self) -> Option<&Arc<Runtime>> {
         self.runtime.as_ref()
+    }
+
+    /// Model health owned by the runtime, when a runtime is attached.
+    ///
+    /// The runtime is the only writer (a failed turn marks its model), so the
+    /// registry reads this instead of keeping a second map that could disagree.
+    #[must_use]
+    pub fn model_health(&self) -> Option<Arc<oc_llm::ModelHealth>> {
+        self.runtime()
+            .map(|runtime| Arc::clone(runtime.model_health()))
+    }
+
+    /// Per-credential rotation state owned by the runtime, when one is attached.
+    ///
+    /// Same ownership rule as [`AppState::model_health`]: the runtime is the
+    /// only writer (a provider call marks the key that failed), so the quota and
+    /// registry routes read this table instead of keeping a second one that
+    /// could disagree. `None` means no runtime, which is also "no key is
+    /// cooling down".
+    #[must_use]
+    pub fn key_pool(&self) -> Option<Arc<oc_llm::KeyPool>> {
+        self.runtime().map(|runtime| Arc::clone(runtime.key_pool()))
     }
 
     /// Attach the memory service used by the experimental memory routes.
@@ -551,6 +573,12 @@ pub fn router(state: AppState) -> Router {
         .route("/api/agent/{id}", get(data::config::agent))
         .route("/api/model", get(data::model::models))
         .route("/api/model/default", get(data::model::default_model))
+        .route("/api/models/registry", get(data::models_registry::registry))
+        .route("/api/config/models", put(data::models_registry::put_models))
+        .route(
+            "/api/experimental/usage/models",
+            get(data::usage_models::usage_models),
+        )
         .route("/api/provider", get(data::model::providers))
         .route("/api/provider/{id}", get(data::model::provider))
         .route("/api/project", get(data::project::list))

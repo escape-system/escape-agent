@@ -260,7 +260,7 @@ async fn create_root(store: &Store, directory: &str, id: &str) {
             project_id: "prj_observer_repair".to_owned(),
             directory: directory.to_owned(),
             title: Some("observer repair test".to_owned()),
-            agent: Some("build".to_owned()),
+            agent: Some("engineer".to_owned()),
             model: Some(json!({"providerID": "test", "id": "alpha"})),
             metadata: None,
             permissions: None,

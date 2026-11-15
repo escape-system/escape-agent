@@ -90,8 +90,36 @@ export interface AntigravityAccountStatus {
   projectId?: string
   tier?: string
   quota?: AntigravityCachedQuota
+  /**
+   * The latest still-future rate-limit deadline across this account's quota
+   * keys. The server omits it for a healthy account, never `null`.
+   */
+  cooldownUntilMs?: number
   addedAt: number
   lastUsed: number
+}
+
+/**
+ * One stored credential of a provider, joined with its runtime rotation state.
+ *
+ * `active` is the stored selection; a request tries `keys[0]` first. The
+ * server keeps a cooling key in rotation order rather than hiding it, so the
+ * list always shows every key the provider owns.
+ *
+ * `usedCostUsd` / `usedRequests` are always `0` by design: the usage rollup
+ * keys on the model's provider alone, so per-key attribution does not exist.
+ * They stay on the wire for a future column and are deliberately NOT rendered.
+ */
+export interface ProviderKeyEntry {
+  credentialID: string
+  label: string
+  active: boolean
+  limited: boolean
+  cooldownUntilMs?: number
+  kind?: string
+  failures?: number
+  usedCostUsd?: number
+  usedRequests?: number
 }
 
 export interface UsageWindowTotals {
@@ -140,6 +168,8 @@ export interface ProviderQuotaEntry {
   spendSummary?: ProviderApiSpend
   rateLimit?: ProviderRateLimit
   accounts?: AntigravityAccountStatus[]
+  /** Stored credentials in rotation order; omitted when the provider owns none. */
+  keys?: ProviderKeyEntry[]
   localUsage?: ProviderLocalUsage
   warnings?: string[]
   error?: string
@@ -149,6 +179,14 @@ export interface UnifiedQuotasResponse {
   fetchedAtMs: number
   summary: UnifiedQuotaSummary
   providers: ProviderQuotaEntry[]
+  /**
+   * The server served the cache and is re-probing providers in the background.
+   *
+   * Optional on the wire: the server omits it when nothing is refreshing, and
+   * older servers never sent it. `parseQuotasResponse` normalizes it to a
+   * boolean, so a payload object literal may omit it too.
+   */
+  refreshing?: boolean
 }
 
 /** The server answers `503` when it runs without the quota service. */
@@ -158,6 +196,113 @@ export interface QuotasUnavailable {
 }
 
 export type QuotasSnapshot = UnifiedQuotasResponse | QuotasUnavailable
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  !!value && typeof value === "object" && !Array.isArray(value)
+
+const optionalNumber = (value: unknown): number | undefined =>
+  typeof value === "number" && Number.isFinite(value) ? value : undefined
+
+/**
+ * Parses `provider.keys`. The field is optional and absent for a provider with
+ * no stored credentials, so an absent or malformed list yields `[]` rather than
+ * a placeholder key. An entry without a `credentialID` cannot be acted on and is
+ * dropped instead of being shown with an invented id.
+ */
+export function parseProviderKeys(value: unknown): ProviderKeyEntry[] {
+  if (!Array.isArray(value)) return []
+
+  return value.flatMap((item): ProviderKeyEntry[] => {
+    if (!isRecord(item)) return []
+    const credentialID = typeof item.credentialID === "string" ? item.credentialID : undefined
+
+    if (!credentialID) return []
+    const key: ProviderKeyEntry = {
+      credentialID,
+      label: typeof item.label === "string" && item.label.length > 0 ? item.label : credentialID,
+      active: item.active === true,
+      limited: item.limited === true,
+    }
+    const cooldownUntilMs = optionalNumber(item.cooldownUntilMs)
+    const kind = typeof item.kind === "string" ? item.kind : undefined
+    const failures = optionalNumber(item.failures)
+    const usedCostUsd = optionalNumber(item.usedCostUsd)
+    const usedRequests = optionalNumber(item.usedRequests)
+
+    if (cooldownUntilMs !== undefined) key.cooldownUntilMs = cooldownUntilMs
+    if (kind) key.kind = kind
+    if (failures !== undefined) key.failures = failures
+    // Kept verbatim, never rendered: the server publishes 0 because per-key
+    // attribution does not exist, so showing it would report a fake spend.
+    if (usedCostUsd !== undefined) key.usedCostUsd = usedCostUsd
+    if (usedRequests !== undefined) key.usedRequests = usedRequests
+
+    return [key]
+  })
+}
+
+/**
+ * Parses the optional per-account `cooldownUntilMs`. The server omits it for a
+ * healthy account, and a cooling deadline is only meaningful while it is in the
+ * future, so a past deadline is dropped instead of being shown as "resetting".
+ */
+function parseAccountCooldown(value: unknown, nowMs: number): number | undefined {
+  const until = optionalNumber(value)
+
+  return until !== undefined && until > nowMs ? until : undefined
+}
+
+/**
+ * Normalizes a quota response body. Only the fields this client must not trust
+ * blindly are parsed: `keys` (optional per provider) and the antigravity
+ * `cooldownUntilMs` (optional per account). Everything else keeps the server's
+ * shape, because the panel renders it verbatim.
+ */
+export function parseQuotasResponse(value: unknown, nowMs = Date.now()): UnifiedQuotasResponse | undefined {
+  if (!isRecord(value)) return undefined
+  if (!Array.isArray(value.providers)) return undefined
+  if (!isRecord(value.summary)) return undefined
+
+  const providers = value.providers.flatMap((item): ProviderQuotaEntry[] => {
+    if (!isRecord(item)) return []
+    const providerID = typeof item.providerID === "string" ? item.providerID : undefined
+
+    if (!providerID) return []
+    const keys = parseProviderKeys(item.keys)
+    const accounts = Array.isArray(item.accounts)
+      ? item.accounts.flatMap((account): AntigravityAccountStatus[] => {
+          if (!isRecord(account)) return []
+          const cooldownUntilMs = parseAccountCooldown(account.cooldownUntilMs, nowMs)
+          const parsed = { ...account, cooldownUntilMs } as unknown as AntigravityAccountStatus
+
+          if (cooldownUntilMs === undefined) delete parsed.cooldownUntilMs
+
+          return [parsed]
+        })
+      : undefined
+    const provider = { ...item, providerID } as unknown as ProviderQuotaEntry
+
+    if (keys.length > 0) provider.keys = keys
+    else delete provider.keys
+    if (accounts) provider.accounts = accounts
+
+    return [provider]
+  })
+
+  return {
+    ...(value as unknown as UnifiedQuotasResponse),
+    fetchedAtMs: optionalNumber(value.fetchedAtMs) ?? nowMs,
+    providers,
+    // A cache-first payload says so; an older server that omits the field is
+    // not refreshing as far as this client can tell.
+    refreshing: value.refreshing === true,
+  }
+}
+
+/** True while the server is re-probing providers behind a cached payload. */
+export function quotasRefreshing(value: QuotasSnapshot | undefined): boolean {
+  return quotasData(value)?.refreshing === true
+}
 
 /** The unified payload, or `undefined` while pending or when the service is detached. */
 export function quotasData(value: QuotasSnapshot | undefined): UnifiedQuotasResponse | undefined {
@@ -235,6 +380,31 @@ export function statusLabelKey(status: string): QuotaStatusLabelKey {
 
 const QUOTAS_QUERY_KEY = ["quotas", "unified"] as const
 
+/** The failure classes a cooling key can report, in the server's wire vocabulary. */
+export type KeyKindLabelKey =
+  | "settings.quotas.keys.kind.quota"
+  | "settings.quotas.keys.kind.rate_limit"
+  | "settings.quotas.keys.kind.auth"
+
+/**
+ * Maps a key's failure `kind` to a localized badge label. The server may report
+ * classes this panel has no badge for (transport, unknown, …); those fall back
+ * to the generic "limited" wording rather than leaking a raw token.
+ */
+export function keyKindLabelKey(kind: string | undefined): KeyKindLabelKey | undefined {
+  switch (kind) {
+    case "quota":
+    case "quota_exhausted":
+      return "settings.quotas.keys.kind.quota"
+    case "rate_limit":
+      return "settings.quotas.keys.kind.rate_limit"
+    case "auth":
+      return "settings.quotas.keys.kind.auth"
+    default:
+      return undefined
+  }
+}
+
 export interface UseQuotasDataOptions {
   /** Reads reactively; a detached dialog passes `() => false` until it needs the data. */
   enabled?: () => boolean
@@ -276,9 +446,12 @@ export function useQuotasData(options: UseQuotasDataOptions = {}) {
         return { unavailable: true, message: await serverMessage(response) }
       }
       if (!response.ok) throw await requestError(response)
-      const payload = (await response.json()) as { data?: UnifiedQuotasResponse }
-      if (!payload.data) throw new Error("Missing quotas response data")
-      return payload.data
+      const payload = (await response.json()) as { data?: unknown }
+      const data = parseQuotasResponse(payload.data)
+
+      if (!data) throw new Error("Missing quotas response data")
+
+      return data
     },
     staleTime: 30_000,
     enabled: options.enabled?.() ?? true,
@@ -289,13 +462,15 @@ export function useQuotasData(options: UseQuotasDataOptions = {}) {
   const refreshLive = async () => {
     const response = await request("/api/quotas/refresh", { method: "POST" })
     if (!response.ok) throw await requestError(response)
-    const payload = (await response.json()) as { data?: UnifiedQuotasResponse }
-    if (payload.data) {
-      client.setQueryData([sdk.scope, ...QUOTAS_QUERY_KEY], payload.data)
+    const payload = (await response.json()) as { data?: unknown }
+    const data = parseQuotasResponse(payload.data)
+
+    if (data) {
+      client.setQueryData([sdk.scope, ...QUOTAS_QUERY_KEY], data)
     } else {
       await client.invalidateQueries({ queryKey: [sdk.scope, ...QUOTAS_QUERY_KEY] })
     }
-    return payload.data
+    return data
   }
 
   const invalidate = () => client.invalidateQueries({ queryKey: [sdk.scope, ...QUOTAS_QUERY_KEY] })

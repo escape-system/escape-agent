@@ -3,14 +3,15 @@ use std::sync::Arc;
 use futures_util::StreamExt;
 use oc_llm::{LlmMessage, LlmOptions, LlmRequest};
 use oc_store::NewMessage;
-use oc_types::MessageId;
 use oc_types::message::StructuredError;
 use oc_types::payload::{
     SessionCompactionEnded, SessionCompactionFailed, SessionCompactionStarted,
 };
+use oc_types::{MessageId, ModelRef};
 use serde_json::{Value, json};
 
 use crate::runtime::{CancelToken, Runtime, RuntimeError};
+use crate::subagent::settings::models_policy;
 
 use super::types::ResolvedTurn;
 
@@ -101,6 +102,16 @@ impl Runtime {
             .await
     }
 
+    /// Summarize `context` and persist the compaction.
+    ///
+    /// Model reporting: the completed compaction row and the
+    /// `session.compaction.ended` payload both name the model that ACTUALLY
+    /// produced the summary — the chain candidate that answered, which is not
+    /// `turn.model_ref` when the chain advanced. That field is telemetry about
+    /// what happened; it never means "the session's configured model". A
+    /// compaction does not rewrite `session.model`, so the observer/repair path
+    /// must read the configured model from the session row and use the
+    /// compaction's `model` only to describe the summary's author.
     #[allow(clippy::too_many_lines)]
     pub(super) async fn compact(
         &self,
@@ -190,108 +201,58 @@ impl Runtime {
         };
         let mut messages = context.to_vec();
         messages.push(LlmMessage::user(summary_instruction.clone()));
-        let api_key = self.credential_key(&turn.model.provider.id).await;
-        let request = LlmRequest {
-            model: turn.model.clone(),
-            system: system.clone(),
-            messages,
-            tools: turn.tools.clone(),
-            options: LlmOptions {
-                api_key: api_key.clone(),
-                tool_choice: Some("none".to_owned()),
-                cache_key: Some(session.to_owned()),
-                ..LlmOptions::default()
-            },
-        };
-
-        let stream_result = tokio::select! {
-            biased;
-            () = cancel.cancelled() => None,
-            result = self.inner.model.stream(request) => Some(result),
-        };
-        let Some(stream_result) = stream_result else {
-            self.fail_compaction(
+        // Compaction resolves its model through the chain like every other role:
+        // `models.chains.compaction` (else `models.chain`) first, the turn's
+        // current model last. It allows exactly ONE fallback hop — unlike a turn
+        // step it reuses one shortened request, so this is a single switch, not a
+        // loop — and a key-level failure still marks that key
+        // ([`Runtime::mark_compaction_key`]), so the *next* turn picks another
+        // one instead of paying for the same dead key again.
+        let policy = models_policy(&self.inner.config.config);
+        let candidates = self.compaction_candidates(turn);
+        let mut attempted = 0_usize;
+        let mut produced = None;
+        for reference in &candidates {
+            if attempted >= COMPACTION_MAX_ATTEMPTS {
+                break;
+            }
+            // A reference the catalog cannot run is skipped without spending one
+            // of the two attempts, exactly like the turn loop's chain walk, so a
+            // retired entry falls through instead of stalling every compaction.
+            let Ok(model) = self
+                .inner
+                .config
+                .client
+                .resolve_model(&self.inner.config.catalog, reference)
+            else {
+                tracing::debug!(
+                    session = %session,
+                    reference = %reference,
+                    "skipping an unusable compaction model candidate"
+                );
+                continue;
+            };
+            attempted = attempted.saturating_add(1);
+            let model_ref = ModelRef {
+                id: model.model.model_id.clone(),
+                provider_id: model.model.provider_id.clone(),
+                variant: model.variant.as_ref().map(|variant| variant.id.clone()),
+            };
+            let attempt = CompactionAttempt {
                 session,
-                &turn.directory,
-                &id,
-                created,
-                reason,
-                "compaction was cancelled",
-            )
-            .await?;
-            return Err(RuntimeError::Cancelled);
-        };
-        let mut stream = match stream_result {
-            Ok(stream) => stream,
-            Err(error) if is_context_overflow_message(&error.to_string()) => {
-                let mut shortened = shorten_messages_for_compaction(context);
-                shortened.push(LlmMessage::user(crate::compaction::summary_prompt(None)));
-                let fallback = LlmRequest {
-                    model: turn.model.clone(),
-                    system,
-                    messages: shortened,
-                    tools: turn.tools.clone(),
-                    options: LlmOptions {
-                        api_key,
-                        tool_choice: Some("none".to_owned()),
-                        cache_key: Some(session.to_owned()),
-                        ..LlmOptions::default()
-                    },
-                };
-                let retry_result = tokio::select! {
-                    biased;
-                    () = cancel.cancelled() => None,
-                    result = self.inner.model.stream(fallback) => Some(result),
-                };
-                match retry_result {
-                    Some(Ok(stream)) => stream,
-                    Some(Err(retry_err)) => {
-                        self.fail_compaction(
-                            session,
-                            &turn.directory,
-                            &id,
-                            created,
-                            reason,
-                            &retry_err.to_string(),
-                        )
-                        .await?;
-                        return Err(RuntimeError::Llm(retry_err));
-                    }
-                    None => {
-                        self.fail_compaction(
-                            session,
-                            &turn.directory,
-                            &id,
-                            created,
-                            reason,
-                            "compaction was cancelled",
-                        )
-                        .await?;
-                        return Err(RuntimeError::Cancelled);
-                    }
+                turn,
+                model: &model,
+                context,
+                messages: &messages,
+                system: &system,
+                cancel,
+            };
+            match self.compaction_attempt(&attempt).await {
+                CompactionOutcome::Produced { summary, usage } => {
+                    produced = Some((summary, usage, model_ref));
+                    break;
                 }
-            }
-            Err(error) => {
-                self.fail_compaction(
-                    session,
-                    &turn.directory,
-                    &id,
-                    created,
-                    reason,
-                    &error.to_string(),
-                )
-                .await?;
-                return Err(RuntimeError::Llm(error));
-            }
-        };
-
-        let mut summary = String::new();
-        let mut usage = None;
-        let mut failure = None;
-        loop {
-            let event = tokio::select! {
-                biased;
-                () = cancel.cancelled() => {
+                CompactionOutcome::Cancelled => {
                     self.fail_compaction(
                         session,
                         &turn.directory,
@@ -303,46 +264,94 @@ impl Runtime {
                     .await?;
                     return Err(RuntimeError::Cancelled);
                 }
-                event = stream.next() => event,
-            };
-            let Some(event) = event else {
-                break;
-            };
-            match event {
-                oc_llm::LlmEvent::TextDelta { delta } => summary.push_str(&delta),
-                oc_llm::LlmEvent::TextEnd { text } => summary = text,
-                oc_llm::LlmEvent::Finish { usage: finish, .. } => usage = Some(finish),
-                oc_llm::LlmEvent::ProviderError { message } => {
-                    failure = Some(message);
-                    break;
+                CompactionOutcome::Empty => {
+                    self.fail_compaction(
+                        session,
+                        &turn.directory,
+                        &id,
+                        created,
+                        reason,
+                        "the summary was empty",
+                    )
+                    .await?;
+                    return Err(RuntimeError::Config(
+                        "compaction returned an empty summary".to_owned(),
+                    ));
                 }
-                _ => {}
+                CompactionOutcome::Failed(failure) => {
+                    // Record against the model and key that actually failed, so
+                    // the next spawn skips the model and the next turn rotates
+                    // away from a dead key. Neither is a model switch.
+                    match failure.record {
+                        RecordPolicy::ModelAndKey => {
+                            if let oc_llm::LlmError::Failure { .. } = &failure.error {
+                                self.model_health().mark(
+                                    &model_ref.to_reference(),
+                                    failure.kind,
+                                    oc_types::now_millis(),
+                                    None,
+                                );
+                            }
+                            self.mark_compaction_key(
+                                &model.provider.id,
+                                failure.credential.as_ref(),
+                                &failure.error,
+                            );
+                        }
+                        RecordPolicy::KeyOnly => {
+                            self.mark_compaction_key(
+                                &model.provider.id,
+                                failure.credential.as_ref(),
+                                &failure.error,
+                            );
+                        }
+                    }
+                    let last = attempted >= COMPACTION_MAX_ATTEMPTS;
+                    if last || !policy.fallback().allows(failure.kind) {
+                        self.fail_compaction(
+                            session,
+                            &turn.directory,
+                            &id,
+                            created,
+                            reason,
+                            &failure.message,
+                        )
+                        .await?;
+                        return Err(RuntimeError::Llm(failure.error));
+                    }
+                    tracing::debug!(
+                        session = %session,
+                        model = %model_ref.to_reference(),
+                        kind = failure.kind.as_str(),
+                        "compaction advanced to the next model candidate"
+                    );
+                }
             }
         }
-        if let Some(message) = failure {
-            self.fail_compaction(session, &turn.directory, &id, created, reason, &message)
-                .await?;
-            return Err(RuntimeError::Llm(oc_llm::LlmError::Provider { message }));
-        }
-        if summary.trim().is_empty() {
+        let Some((summary, usage, model_ref)) = produced else {
             self.fail_compaction(
                 session,
                 &turn.directory,
                 &id,
                 created,
                 reason,
-                "the summary was empty",
+                "no compaction model candidate could be attempted",
             )
             .await?;
             return Err(RuntimeError::Config(
-                "compaction returned an empty summary".to_owned(),
+                "no compaction model candidate could be attempted".to_owned(),
             ));
-        }
+        };
+        // `model` is the model that ACTUALLY produced this summary, which is not
+        // necessarily `turn.model_ref` when the chain advanced. It describes what
+        // happened; `session.model` stays untouched by a compaction, so the
+        // session's configured model is read from the session row, never from
+        // this compaction field.
         let mut completed = json!({
             "time": {"created": created},
             "status": "completed",
             "reason": event_reason(reason),
-            "model": turn.model_ref.clone(),
+            "model": model_ref,
             "summary": summary
         });
         if let Some(keep_id) = &keep_id {
@@ -381,7 +390,7 @@ impl Runtime {
             SessionCompactionEnded {
                 session_id: Runtime::session_id(session),
                 reason: event_reason(reason).to_owned(),
-                model: Some(turn.model_ref.clone()),
+                model: Some(model_ref.clone()),
                 native: None,
                 text: summary,
                 cost: usage.as_ref().and_then(|usage| usage.cost),
@@ -390,6 +399,185 @@ impl Runtime {
         )
         .await?;
         Ok(())
+    }
+
+    /// Ordered model references for one compaction.
+    ///
+    /// `models.chains.compaction` (else `models.chain`) keeps its configured
+    /// order, and the turn's current model is appended last so a document without
+    /// a compaction chain compacts on exactly the model the session already uses.
+    /// The list is deduplicated by reference string, preserving the FIRST
+    /// occurrence: a chain that names the session's own model keeps it at its
+    /// chain position and the appended turn model is dropped instead.
+    ///
+    /// Nothing is filtered by resolvability here. Resolving is the attempt loop's
+    /// job, exactly as in the turn loop's chain walk: a retired entry is skipped
+    /// there without spending one of the two attempts, and letting the stream
+    /// call itself fail is what makes an unusable reference reportable instead of
+    /// silently shrinking the candidate list to nothing.
+    fn compaction_candidates(&self, turn: &ResolvedTurn) -> Vec<String> {
+        let policy = models_policy(&self.inner.config.config);
+        let mut candidates: Vec<String> = Vec::new();
+        let push = |reference: &str, candidates: &mut Vec<String>| {
+            if !candidates.iter().any(|known| known == reference) {
+                candidates.push(reference.to_owned());
+            }
+        };
+        for reference in policy.chain_for("compaction") {
+            push(reference, &mut candidates);
+        }
+        push(&turn.model_ref.to_reference(), &mut candidates);
+        candidates
+    }
+
+    /// One compaction attempt against a single model candidate.
+    ///
+    /// Preserves the historical request shape: one summary request with
+    /// `tool_choice: none`, one selected key (compaction does not rotate keys
+    /// mid-attempt), and a single shortened retry when the request itself
+    /// overflows the context window. The shortened retry stays on the SAME
+    /// candidate: the model did not fail, the prompt was too large.
+    async fn compaction_attempt(&self, attempt: &CompactionAttempt<'_>) -> CompactionOutcome {
+        let (stream, credential) = match self.open_compaction_stream(attempt).await {
+            Ok(opened) => opened,
+            Err(outcome) => return *outcome,
+        };
+        read_compaction_summary(stream, attempt.cancel, credential).await
+    }
+
+    /// Open the summary stream for one candidate, selecting exactly one key.
+    ///
+    /// A request that overflows the provider's context window is retried once on
+    /// the SAME candidate with masked tool output and inline media: the model did
+    /// not fail, the prompt was too large. Any other open failure is classified
+    /// here and reported against the model AND the key, because it says the model
+    /// could not serve the request at all. The selected key is returned on
+    /// success so an in-band failure can still be recorded against it.
+    async fn open_compaction_stream(
+        &self,
+        attempt: &CompactionAttempt<'_>,
+    ) -> Result<(oc_llm::LlmStream, Option<oc_llm::PoolKey>), Box<CompactionOutcome>> {
+        let CompactionAttempt {
+            session,
+            turn,
+            model,
+            context,
+            messages,
+            system,
+            cancel,
+        } = *attempt;
+        let pool = self
+            .credential_pool(&model.provider.id, oc_types::now_millis())
+            .await;
+        let credential = pool.into_iter().next();
+        let api_key = credential.as_ref().map(|entry| entry.key.clone());
+        let request = LlmRequest {
+            model: model.clone(),
+            system: system.to_vec(),
+            messages: messages.to_vec(),
+            tools: turn.tools.clone(),
+            options: LlmOptions {
+                api_key: api_key.clone(),
+                tool_choice: Some("none".to_owned()),
+                cache_key: Some(session.to_owned()),
+                ..LlmOptions::default()
+            },
+        };
+        let stream_result = tokio::select! {
+            biased;
+            () = cancel.cancelled() => None,
+            result = self.inner.model.stream(request) => Some(result),
+        };
+        let Some(stream_result) = stream_result else {
+            return Err(Box::new(CompactionOutcome::Cancelled));
+        };
+        match stream_result {
+            Ok(stream) => Ok((stream, credential)),
+            Err(error) if is_context_overflow_message(&error.to_string()) => {
+                let mut shortened = shorten_messages_for_compaction(context);
+                shortened.push(LlmMessage::user(crate::compaction::summary_prompt(None)));
+                let retry = LlmRequest {
+                    model: model.clone(),
+                    system: system.to_vec(),
+                    messages: shortened,
+                    tools: turn.tools.clone(),
+                    options: LlmOptions {
+                        api_key,
+                        tool_choice: Some("none".to_owned()),
+                        cache_key: Some(session.to_owned()),
+                        ..LlmOptions::default()
+                    },
+                };
+                let retry_result = tokio::select! {
+                    biased;
+                    () = cancel.cancelled() => None,
+                    result = self.inner.model.stream(retry) => Some(result),
+                };
+                match retry_result {
+                    Some(Ok(stream)) => Ok((stream, credential)),
+                    Some(Err(error)) => Err(Box::new(CompactionOutcome::Failed(
+                        compaction_failure(error, credential, RecordPolicy::ModelAndKey),
+                    ))),
+                    None => Err(Box::new(CompactionOutcome::Cancelled)),
+                }
+            }
+            Err(error) => {
+                // An untyped provider error on the stream-open path is
+                // classified like an in-band `ProviderError`, so the caller
+                // sees a typed `Failure` instead of a bare `Provider`. The raw
+                // provider text stays inside the error.
+                let classified = match &error {
+                    oc_llm::LlmError::Provider { message } => {
+                        super::stream::classified_provider_error(message)
+                    }
+                    oc_llm::LlmError::Failure { kind, message } => oc_llm::LlmError::Failure {
+                        kind: *kind,
+                        message: message.clone(),
+                    },
+                    other => oc_llm::LlmError::Provider {
+                        message: other.to_string(),
+                    },
+                };
+                Err(Box::new(CompactionOutcome::Failed(compaction_failure(
+                    classified,
+                    credential,
+                    RecordPolicy::ModelAndKey,
+                ))))
+            }
+        }
+    }
+
+    /// Record a key-level compaction failure so the next turn skips that key.
+    /// Compaction keeps the single-request shape (it reuses one shortened
+    /// prompt), so it never rotates mid-attempt: a `Quota`/`Auth`/`RateLimit`
+    /// failure only cools the key inside [`oc_llm::KeyPool`]. The durable primary
+    /// pointer is left alone here — a turn step owns that decision
+    /// (`Runtime::mark_key_failure`) so a compaction never rewrites credential
+    /// order on its own.
+    fn mark_compaction_key(
+        &self,
+        provider: &str,
+        credential: Option<&oc_llm::PoolKey>,
+        error: &oc_llm::LlmError,
+    ) {
+        let Some(credential) = credential else {
+            return;
+        };
+        let kind = match error {
+            oc_llm::LlmError::Failure { kind, .. } => *kind,
+            oc_llm::LlmError::Http { status, .. } => match status {
+                401..=403 => oc_llm::FailureKind::Auth,
+                429 => oc_llm::FailureKind::RateLimit,
+                _ => return,
+            },
+            _ => return,
+        };
+        self.key_pool().mark(
+            provider,
+            credential.credential_id.as_deref(),
+            kind,
+            oc_types::now_millis(),
+        );
     }
 
     /// Recent-context budget preserved across a compaction (`compaction.keep.tokens`).
@@ -563,6 +751,170 @@ impl Runtime {
         )
         .await?;
         Ok(())
+    }
+}
+
+/// Read one summary stream to completion.
+///
+/// A stream that ends without text is [`CompactionOutcome::Empty`]; an in-band
+/// provider frame is classified and recorded against the KEY only, because the
+/// request was accepted and the model itself may still be fine.
+async fn read_compaction_summary(
+    mut stream: oc_llm::LlmStream,
+    cancel: &Arc<CancelToken>,
+    credential: Option<oc_llm::PoolKey>,
+) -> CompactionOutcome {
+    let mut summary = String::new();
+    let mut usage = None;
+    let mut failure = None;
+    loop {
+        let event = tokio::select! {
+            biased;
+            () = cancel.cancelled() => return CompactionOutcome::Cancelled,
+            event = stream.next() => event,
+        };
+        let Some(event) = event else {
+            break;
+        };
+        match event {
+            oc_llm::LlmEvent::TextDelta { delta } => summary.push_str(&delta),
+            oc_llm::LlmEvent::TextEnd { text } => summary = text,
+            oc_llm::LlmEvent::Finish { usage: finish, .. } => usage = Some(finish),
+            oc_llm::LlmEvent::ProviderError { message } => {
+                failure = Some(message);
+                break;
+            }
+            _ => {}
+        }
+    }
+    if let Some(message) = failure {
+        let error = super::stream::classified_provider_error(&message);
+        // An in-band quota/auth frame on the summary request still costs the
+        // key: record it so the next turn rotates away from it.
+        return CompactionOutcome::Failed(compaction_failure(
+            error,
+            credential,
+            RecordPolicy::KeyOnly,
+        ));
+    }
+    if summary.trim().is_empty() {
+        return CompactionOutcome::Empty;
+    }
+    CompactionOutcome::Produced { summary, usage }
+}
+
+/// Classify one failed attempt and keep the provider text verbatim for the row.
+fn compaction_failure(
+    error: oc_llm::LlmError,
+    credential: Option<oc_llm::PoolKey>,
+    record: RecordPolicy,
+) -> CompactionFailure {
+    let message = match &error {
+        oc_llm::LlmError::Failure { message, .. } => message.clone(),
+        other => other.to_string(),
+    };
+    CompactionFailure {
+        kind: failure_kind(&error),
+        message,
+        error,
+        credential,
+        record,
+    }
+}
+
+/// Everything one compaction attempt needs.
+///
+/// Grouped because the attempt is one request/response exchange over a fixed
+/// context; carrying seven positional parameters made every call site and
+/// signature change a risk.
+struct CompactionAttempt<'a> {
+    /// Session being compacted (used for the key's `cache_key` and event ids).
+    session: &'a str,
+    /// Resolved turn: supplies the tool list and the event directory.
+    turn: &'a ResolvedTurn,
+    /// Candidate model for this attempt.
+    model: &'a oc_llm::ResolvedModel,
+    /// Unshortened conversation, replayed once more if the request overflows.
+    context: &'a [LlmMessage],
+    /// Conversation plus the summary instruction.
+    messages: &'a [LlmMessage],
+    /// System prompt parts.
+    system: &'a [String],
+    /// Cancellation for the stream open and every read.
+    cancel: &'a Arc<CancelToken>,
+}
+
+/// Maximum model candidates one compaction may attempt.
+///
+/// Compaction allows exactly ONE fallback hop (two attempts), not the turn
+/// loop's `models.fallback.max_hops` budget: it reuses one shortened request, so
+/// a longer walk would pay a full round trip per candidate for a single summary.
+const COMPACTION_MAX_ATTEMPTS: usize = 2;
+
+/// What a compaction failure is recorded against.
+///
+/// A failure on the stream-open path says the model could not serve at all, so
+/// it is recorded against the model AND the key; an in-band frame arrives after
+/// the request was accepted and only costs the key. `Nothing` exists so the
+/// caller's intent is explicit rather than implied by an absent field.
+enum RecordPolicy {
+    /// Mark the model unhealthy and cool the key.
+    ModelAndKey,
+    /// Cool the key only; the model may still be fine.
+    KeyOnly,
+}
+
+/// One compaction attempt's classified failure.
+struct CompactionFailure {
+    /// Class the fallback policy decides on.
+    kind: oc_llm::FailureKind,
+    /// Provider text, preserved verbatim for the failed row.
+    message: String,
+    /// Original error, surfaced unchanged when the attempt is the last one.
+    error: oc_llm::LlmError,
+    /// Key the request used, if any; cooled by [`Runtime::mark_compaction_key`].
+    credential: Option<oc_llm::PoolKey>,
+    /// What to record this failure against.
+    record: RecordPolicy,
+}
+
+/// Result of one compaction attempt against one model candidate.
+enum CompactionOutcome {
+    /// The model produced a non-empty summary.
+    Produced {
+        summary: String,
+        usage: Option<oc_llm::Usage>,
+    },
+    /// The execution was cancelled before or during the stream.
+    Cancelled,
+    /// The stream completed without any text.
+    Empty,
+    /// The request failed in a classifiable way.
+    Failed(CompactionFailure),
+}
+
+/// Classify an [`oc_llm::LlmError`] into the class the fallback policy reads.
+///
+/// [`oc_llm::LlmError::Failure`] is already classified. The remaining variants
+/// map onto their closest class so an untyped transport error can still advance
+/// a chain entry that a `Failure` would have advanced; anything with no
+/// provider meaning stays `Unknown`, which no policy advances.
+fn failure_kind(error: &oc_llm::LlmError) -> oc_llm::FailureKind {
+    use oc_llm::FailureKind;
+    match error {
+        oc_llm::LlmError::Failure { kind, .. } => *kind,
+        oc_llm::LlmError::Http { status, .. } => match status {
+            401..=403 => FailureKind::Auth,
+            429 => FailureKind::RateLimit,
+            408 | 500..=599 => FailureKind::Transport,
+            _ => FailureKind::Unknown,
+        },
+        oc_llm::LlmError::Timeout { .. } | oc_llm::LlmError::Transport { .. } => {
+            FailureKind::Transport
+        }
+        oc_llm::LlmError::Provider { message } => oc_llm::classify_provider_message(message),
+        oc_llm::LlmError::InvalidRequest { .. } => FailureKind::InvalidRequest,
+        _ => FailureKind::Unknown,
     }
 }
 

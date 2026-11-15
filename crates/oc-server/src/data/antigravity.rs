@@ -16,7 +16,7 @@ use axum::extract::{Path, Query, State};
 use axum::response::Response;
 use axum::routing::{delete, get, post};
 use oc_antigravity::{AccountStatusSummary, AntigravityError, AntigravityService};
-use oc_types::{ApiError, DataEnvelope};
+use oc_types::{ApiError, DataEnvelope, now_millis};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use std::sync::Arc;
@@ -119,11 +119,48 @@ pub async fn list_accounts(
         .list_accounts_status()
         .map_err(|e| map_antigravity_error(&e))?;
     Ok(Json(DataEnvelope::new(json!({
-        "accounts": accounts,
+        "accounts": account_wire_list(&accounts, now_millis()),
         "count": accounts.len(),
         "usableCount": svc.usable_account_count(),
         "version": svc.version().current(),
     }))))
+}
+
+/// Serialize account summaries for the wire, adding the derived
+/// `cooldownUntilMs` field.
+///
+/// `AccountStatusSummary` lives in `oc-antigravity` and carries the raw
+/// per-quota-key `rateLimits` map. Clients need one deadline to grey out a
+/// cooling account, so this maps the pool summary onto JSON and adds the
+/// maximum deadline that is still in the future. The field is omitted (never
+/// `null`) for an account with no future deadline.
+fn account_wire_list(accounts: &[AccountStatusSummary], now_ms: i64) -> Vec<Value> {
+    accounts
+        .iter()
+        .map(|account| {
+            let mut value = match serde_json::to_value(account) {
+                Ok(value) => value,
+                // `AccountStatusSummary` is a plain derive-Serialize struct with
+                // no fallible field, so this cannot fail; if it ever does, the
+                // account is skipped rather than reported with invented data.
+                Err(error) => {
+                    tracing::warn!(%error, "could not serialize antigravity account");
+                    return Value::Null;
+                }
+            };
+            let cooldown = account
+                .rate_limits
+                .values()
+                .copied()
+                .filter(|until| *until > now_ms)
+                .max();
+            if let (Some(until), Some(map)) = (cooldown, value.as_object_mut()) {
+                map.insert("cooldownUntilMs".to_owned(), json!(until));
+            }
+            value
+        })
+        .filter(|value| !value.is_null())
+        .collect()
 }
 
 /// `POST /api/antigravity/accounts/{id}/select`

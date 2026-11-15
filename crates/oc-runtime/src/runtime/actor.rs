@@ -172,7 +172,7 @@ impl Runtime {
         let session = session_id.to_owned();
         let actor = Arc::clone(&handle);
         let join = tokio::spawn(async move {
-            runtime.actor_loop(session, actor).await;
+            Box::pin(runtime.actor_loop(session, actor)).await;
         });
         *handle.join.lock().expect("join slot") = Some(join);
     }
@@ -183,7 +183,7 @@ impl Runtime {
                 break;
             }
             handle.running.store(true, Ordering::SeqCst);
-            let result = self.drain(&session, &handle).await;
+            let result = Box::pin(self.drain(&session, &handle)).await;
             handle.running.store(false, Ordering::SeqCst);
             handle.idle.notify_waiters();
             self.inner.idle.notify_waiters();
@@ -237,7 +237,7 @@ impl Runtime {
             let result = if item.get("type").and_then(Value::as_str) == Some("compaction") {
                 self.run_manual_compaction(session, &item, &token).await
             } else {
-                self.run_execution(session, &item, &token, handle).await
+                Box::pin(self.run_execution(session, &item, &token, handle)).await
             };
             *handle.cancel.lock().expect("cancel slot") = None;
             result?;

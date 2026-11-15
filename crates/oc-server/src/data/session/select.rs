@@ -34,13 +34,16 @@ pub async fn select_agent(
         .await?
         .ok_or_else(|| session_not_found(&session_id))?;
     let config = require_config(&state)?;
-    if config.agent(&body.agent).is_none() {
-        return Err(ApiError::not_found(
-            "AgentNotFoundError",
-            format!("Agent not found: {}", body.agent),
-        )
-        .with("agentID", json!(&body.agent))
-        .into());
+    // A client (or a stored row) may still name a pre-rename agent id such as
+    // `build`, `plan` or `reviewer`. Resolve it through the alias so the
+    // canonical id is what gets validated, persisted and published.
+    let agent = oc_config::normalize_agent_id(body.agent.trim()).to_owned();
+    if config.agent(&agent).is_none() {
+        return Err(
+            ApiError::not_found("AgentNotFoundError", format!("Agent not found: {agent}"))
+                .with("agentID", json!(&agent))
+                .into(),
+        );
     }
     let previous = existing
         .get("agent")
@@ -51,7 +54,7 @@ pub async fn select_agent(
         .patch_session(
             &session_id,
             SessionPatch {
-                agent: Some(body.agent.clone()),
+                agent: Some(agent.clone()),
                 ..SessionPatch::default()
             },
         )
@@ -59,7 +62,7 @@ pub async fn select_agent(
 
     let payload = SessionAgentSelected {
         session_id: SessionId::from_wire(session_id.as_str()),
-        agent: body.agent,
+        agent,
         previous,
     };
     publish_durable(

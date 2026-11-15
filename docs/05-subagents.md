@@ -22,17 +22,175 @@ spawn_allowed, child_count, agent, model, status, title, location, project_id
 
 ## Model selection
 
-Resolution order (first hit wins):
+Resolution order, highest first (first usable hit wins):
 
-1. `subagent` tool call `model` (`provider/id[#variant]`).
-2. The target agent's `model` (config `agent.<id>.model`).
-3. `subagents.agents.<agent>.model`.
-4. `subagents.default_model`.
-5. Parent session's current model.
+1. `Call` — the `subagent` tool call's `model` (`provider/id[#variant]`). An
+   explicit call model always wins, even when it is outside `models.chain`: the
+   chain is a routing preference order, never a visibility filter and not a gate.
+   Chat-picker visibility comes from `models.hidden` plus provider connectivity
+   ([13](13-ui.md)), not from chain membership.
+2. `Chain` — `models.chains.<agent>`, else `models.chain`, in declared order
+   ([14](14-config-permissions.md)).
+3. `Agent` — `agents.<id>.model`.
+4. `Agent` — `subagents.agents.<id>.model`.
+5. `Default` — `subagents.default_model`.
+6. `Parent` — the parent session's current model.
 
-Every resolved model must be chat-capable and available; unknown variants are
-rejected before the child session is created. The child's model is visible in
-`Session.Info.model` and in the subagent bar.
+`chain_for(role)` — the `Chain` step — also serves the standalone roles
+`scribe`, `observer` and `compaction`, so a `models.chains.<role>` entry applies
+to them too. `compaction` walks `models.chains.compaction` (else `models.chain`)
+in declared order and only then the turn's current model, with **exactly one**
+fallback hop (`COMPACTION_MAX_ATTEMPTS = 2`), not the turn loop's
+`models.fallback.max_hops`; the model it reports on the completed compaction row
+and in `session.compaction.ended` is the one that actually produced the summary
+(`crates/oc-runtime/src/turn/compaction.rs:418-430`).
+
+The merged list is deduplicated by exact reference (the first occurrence wins, so
+a chain entry that repeats the call reference cannot shadow it), then
+`CandidateFilter.deny` removes matching models variant-insensitively (quota is
+tracked per `provider/id`, so denying a model denies every variant of it).
+
+Selection never aborts on the first bad candidate: a malformed or catalog-absent
+entry is recorded as a skip and the next candidate is tried, so a typo in
+`models.chain` degrades to the next entry instead of failing the spawn.
+
+Resolution is `oc_subagents::resolve_model_with(.., filter:
+Option<&CandidateFilter<'_>>)`; `CandidateFilter { chain, deny }` lets the runtime
+express the preference order and hard denials without changing the signature used
+by existing callers (`resolve_model` is the unfiltered entry point).
+`ModelChoice { reference, source, skipped }` carries the provenance and the
+rejects:
+
+- `ModelSource` / `modelSource`: `call | chain | agent | default | parent`
+  (the chain variant is `ModelSource::Chain`).
+- `ModelSkip { reference, source, reason }`, with `SkipReason` /
+  `rejectedModels[].reason`: `malformed | not_available | denied`.
+
+An empty merged list is `ModelError::NoCandidate { chain }`. A non-empty list with
+nothing usable is `ModelError::NoUsableCandidate { chain, skipped }`, whose
+`Display` names every skipped reference with its reason and source
+(`reference (reason, source), …`) plus the full ordered chain — no silent
+downgrade and no spawn without a model.
+
+The resolved coordinates are written to the session row at spawn time, and the
+child's model is visible in `Session.Info.model` and in the subagent bar.
+
+### Model selection and quota
+
+The candidate list above is filtered by quota before anything is created:
+
+- `models.quota.reserve_percent` keeps that share of a model's window in
+  reserve; a model whose remaining budget is at or below the reserve is treated
+  as exhausted for selection.
+- `models.quota.window_hours` fixes the rolling window (default 5 h) the usage
+  rollup (`GET /api/experimental/usage/models`) is compared against.
+- `models.quota.default` applies `max_cost_usd`/`max_requests` to every model
+  without an explicit `models.quota.models` entry; the per-model entry wins.
+- Deny-on-exhaustion: an exhausted model is removed from the candidate list and
+  recorded in `rejectedModels` with reason `denied`. The quota arithmetic that
+  produced the denial stays in the tool error text (`quota_cost <used>/<limit>`,
+  `quota_requests <used>/<limit>`).
+
+### Spawn metadata
+
+The `subagent` tool result metadata carries these fields (each omitted when
+unknown — never `null`):
+
+```jsonc
+{ "sessionID": "ses_…", "status": "completed",
+  "model": { "providerID": "google", "id": "gemini-3-pro" },  // + "variant" when the reference carried one
+  "modelSource": "call|chain|agent|default|parent",
+  "quota": { "providerID": "google", "remainingPercent": 91.6,
+             "limited": false, "spendUsd": 0.42, "windowHours": 5 },
+  "rejectedModels": [ { "reference": "anthropic/claude-opus-4-6",
+                        "source": "chain", "reason": "not_available" } ] }
+```
+
+`model` is the resolved reference as an object: `providerID`, `id`, and
+`variant` only when the configured reference carried a `#variant`. `modelSource`
+is the winning `ModelSource` (`call | chain | agent | default | parent`).
+`quota.providerID`, `quota.windowHours` and `quota.limited` are always present;
+`quota.remainingPercent`/`quota.spendUsd` are omitted when the provider gives no
+budget figure.
+
+`rejectedModels` is present only when at least one candidate was skipped. Each
+entry is `{ "reference", "source", "reason" }`: `reference` is the candidate
+reference exactly as it appeared (`provider/id`, or `provider/id#variant`),
+`source` is its `ModelSource`, and `reason` is
+
+- `malformed` — not `provider/id[#variant]`;
+- `not_available` — well-formed but absent from the catalog;
+- `denied` — removed for this spawn: quota exhaustion, or a model the runtime
+  currently holds unhealthy (`ModelHealth`).
+
+Entries keep resolution order and are deduplicated by reference. The same shape
+appears in the `NoUsableCandidate` tool error, per skip, plus the whole ordered
+chain.
+
+### Model health and the runtime fallback
+
+- `oc_llm::classify_provider_message(&str) -> FailureKind` classifies a raw
+  provider message (lowercase substring rules, first group wins: model
+  unavailable, quota, rate limit, auth, invalid request, else `unknown`).
+- When that classification is known, the runtime raises
+  `LlmError::Failure { kind, message }` instead of the opaque
+  `LlmError::Provider`, both in-band (`LlmEvent::ProviderError`) and on a
+  pre-stream (stream-open) error, in `turn/stream.rs` and `turn/compaction.rs`.
+  `Http { status: 429 }` keeps its existing retry-after behavior.
+- `FailureKind::ModelUnavailable` (`model_unavailable`) ALWAYS advances the
+  chain, regardless of `models.fallback.on`. The default `on` set is
+  `[empty_response, transport, rate_limit, quota]` and deliberately excludes it,
+  yet an unlisted `model_unavailable` still advances. Every other class keeps the
+  historical gate: it must be retryable AND listed in `on`.
+- Before advancing, the runtime marks the failing reference in
+  `oc_llm::ModelHealth`; the next turn and the next spawn skip it.
+
+`ModelHealth` is owned by `Runtime` (`Runtime::model_health()`), shared with
+`AppState::model_health()` for the registry.
+
+| Kind | Remembered for |
+|---|---|
+| `model_unavailable` | 24 h |
+| `quota` | 5 min |
+| `rate_limit` | 60 s |
+| `transport` | 30 s |
+| `auth`, `invalid_request`, `empty_response`, `unknown` | never marked |
+
+Keys are variant-insensitive `provider/id` (lowercased, `.` folded to `-`), so
+marking `Anthropic/Claude.Opus#high` also hides `anthropic/claude-opus`. An entry
+expires at exactly `until_ms`, and reads prune expired rows. The resolver skips
+unhealthy references (the runtime removes them from the available set and records
+a `denied` skip), and `GET /api/models/registry` reports the same table via
+`modelHealth` / per-model `unavailable` ([02](02-protocol.md)).
+
+### Key rotation vs model fallback
+
+Two independent axes, and they must not be confused:
+
+- **Key rotation** happens on the *same* model. A provider may hold several
+  credentials ([27](27-key-pool.md)); when one is exhausted (`auth`, `quota`,
+  `rate_limit`, `transport`) the runtime retries the same model with the next
+  key and reuses the same assistant row. It MUST NOT emit
+  `session.model.fallback`: that event means the model changed
+  (`crates/oc-types/src/payload/meta.rs:55`), and the runtime publishes it only
+  on a chain advance (`crates/oc-runtime/src/turn/stream.rs`).
+- **Model fallback** happens only when every key — and, for Antigravity, every
+  account — of the current model is exhausted. Then `models.fallback` may
+  advance to the next chain entry exactly as described above.
+
+Classification is the same for both paths: `Resource has been exhausted (e.g.
+check quota).` classifies as `FailureKind::Quota`, never `RateLimit`
+(`crates/oc-llm/src/error.rs:87-98`, asserted at `:439`). Antigravity adds the
+in-band rule: Cloud Code can report exhaustion inside a 200 SSE stream as
+`{"error":{"message":…}}`, so the message, not the HTTP status, decides the
+class. Such a frame is no longer fatal — `classify_in_band_error` maps it to
+`StreamDecodeFailure::QuotaExhausted` (or `RateLimited`) and `in_band_or` turns
+that into `SingleAttempt::RateLimited { status: 200 }`, which marks the serving
+account and rotates to the next account on the *same* model
+(`crates/oc-antigravity/src/stream.rs:253-272`,
+`crates/oc-antigravity/src/gateway/stream.rs:122-146`; see
+[26](26-antigravity-auth.md)). Only a frame with no account attribution stays
+`StreamDecodeFailure::Fatal` with its verbatim provider text.
 
 ## Configuration
 
@@ -141,9 +299,9 @@ envelope and the metadata carries `sessionID`/`status`. A deleted child reports
 `state="failed"` with metadata `status: "failed"`.
 
 The parent sees **only** this text plus the tool metadata (`sessionID`,
-`status`, and `stepLimit`/`steps` when the child hit its budget; background
-delivery uses `childID`, `agent`, `state` and the same optional
-`stepLimit`/`steps`). Everything else
+`status`, the `model`/`modelSource`/`quota`/`rejectedModels` fields above, and
+`stepLimit`/`steps` when the child hit its budget; background delivery uses
+`childID`, `agent`, `state` and the same optional fields). Everything else
 (tool calls, intermediate reasoning, costs) is retrieved on demand through
 `digest`:
 
@@ -311,8 +469,8 @@ file stem). The `opencode.json` entry is therefore load-bearing: drop it and
 the template loads with default permissions. `mode: subagent` is required for
 `subagent {agent:"steward"}` to resolve, because only `subagent`/`all` agents
 are advertised as spawnable. No lane coordinator is a built-in, and none ever
-was: the builtin set stays `build`, `plan`, `general`, `explore`, `compaction`,
-`title`, `summary`.
+was: the builtin set stays `engineer`, `architect`, `review`, `general`,
+`explore`, `ui`, `docs`, `compaction`, `title`, `summary`.
 
 ## Failure modes
 
@@ -322,7 +480,8 @@ was: the builtin set stays `build`, `plan`, `general`, `explore`, `compaction`,
 | Parent dies | Children are interrupted (`reason:"shutdown"`); on boot each repaired child is settled to the parent as failed exactly once (no automatic resume; observers may `restart_subagent`) |
 | Sibling message to a deleted session | Tool error `SessionNotFoundError`; sender is notified |
 | Depth/child limit hit | Tool error before session creation; no partial state |
-| Model unavailable | Resolution fails before spawn; error lists the resolved candidate chain |
+| Model unavailable | Resolution skips the entry (or the runtime marks it and advances the chain mid-turn); if nothing is usable, `NoUsableCandidate` names every skip with reason and source |
+| Every chain model denied by quota | Spawn fails with a tool error naming each denied model and its reason; no child session is created |
 | Sibling storm | `max_messages_per_min` per sender, after `can_message`; exhaustion is a tool **error** (`BudgetError: rate limit reached …`), not a queued warning |
 | Write storm | `max_writes_per_min` per sender, consumed after `can_write` and before any enqueue/interrupt; exhaustion is the same structured `BudgetError` and no inbox row is written |
 | Lane runner interrupted | On boot a `running` ticket becomes `failed` (`exit: -1`, restart reason); queued tickets replay, ids are never reused |

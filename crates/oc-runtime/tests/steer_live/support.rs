@@ -227,7 +227,7 @@ impl Harness {
                     project_id: "prj_steer_test".to_owned(),
                     directory: path(&work),
                     title: Some("steer test".to_owned()),
-                    agent: Some("build".to_owned()),
+                    agent: Some("engineer".to_owned()),
                     model: Some(json!({"providerID": "test", "id": "alpha"})),
                     metadata: None,
                     permissions: None,

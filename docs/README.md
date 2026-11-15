@@ -40,6 +40,7 @@ scope; the TUI must keep working against our server.
 | 24 | [UI performance](24-ui-performance.md) | Served web client audit, budgets, measured hot paths |
 | 25 | [context boxes](25-context-boxes.md) | Durable root-shared context, tool surface, expiry |
 | 26 | [Antigravity auth](26-antigravity-auth.md) | Native Google Antigravity OAuth, multi-account pool, Cloud Code gateway |
+| 27 | [key pool](27-key-pool.md) | Backup keys per provider, pool ordering, cooldowns, rotation seam |
 
 ## Rules that apply to every doc
 

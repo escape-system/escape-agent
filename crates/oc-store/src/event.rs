@@ -176,6 +176,9 @@ fn project(
         "session.renamed" => update_text(transaction, data, created, "title", "title"),
         "session.agent.selected" => update_text(transaction, data, created, "agent", "agent"),
         "session.model.selected" => update_json(transaction, data, created, "model", "model"),
+        // A fallback rewrites the session's model to the model that actually
+        // served the turn, mirroring `session.model.selected`.
+        "session.model.fallback" => update_json(transaction, data, created, "model", "to"),
         "session.metadata.updated" => {
             update_json(transaction, data, created, "metadata", "metadata")
         }
@@ -577,4 +580,55 @@ fn project_content_updated(
 
 fn message_id_from_event(event_id: &str) -> String {
     format!("msg_{}", event_id.strip_prefix("evt_").unwrap_or(event_id))
+}
+
+#[cfg(test)]
+mod fallback_projection_tests {
+    use serde_json::json;
+
+    use crate::{NewEvent, NewSession, Store};
+
+    #[tokio::test]
+    async fn model_fallback_event_rewrites_the_session_model() {
+        let store = Store::open_memory().await.expect("memory store");
+        store
+            .create_session(NewSession {
+                id: "ses_fallback".to_owned(),
+                parent_id: None,
+                project_id: "prj_1".to_owned(),
+                directory: "/tmp/fallback".to_owned(),
+                title: None,
+                agent: None,
+                model: Some(json!({"providerID": "google", "id": "gemini-3-pro"})),
+                metadata: None,
+                permissions: None,
+                time_created: 1_000,
+            })
+            .await
+            .expect("session");
+        store
+            .append_event(NewEvent {
+                id: "evt_fallback".to_owned(),
+                aggregate_id: "ses_fallback".to_owned(),
+                kind: "session.model.fallback".to_owned(),
+                data: json!({
+                    "sessionID": "ses_fallback",
+                    "from": {"providerID": "google", "id": "gemini-3-pro"},
+                    "to": {"providerID": "opencode-go", "id": "glm-5.3-flash"},
+                    "kind": "empty_response"
+                }),
+                durable: true,
+                version: 1,
+                created: 2_000,
+            })
+            .await
+            .expect("event");
+        let session = store
+            .get_session("ses_fallback")
+            .await
+            .expect("get")
+            .expect("present");
+        assert_eq!(session["model"]["providerID"], "opencode-go");
+        assert_eq!(session["model"]["id"], "glm-5.3-flash");
+    }
 }

@@ -96,8 +96,8 @@ pub use message::{
     SessionTextEnded, SessionTextStarted,
 };
 pub use meta::{
-    SessionAgentSelected, SessionMetadataUpdated, SessionModelSelected, SessionPermissions,
-    SessionSynthetic,
+    SessionAgentSelected, SessionMetadataUpdated, SessionModelFallback, SessionModelSelected,
+    SessionPermissions, SessionSynthetic,
 };
 pub use step::{
     SessionIdle, SessionStatusUpdated, SessionStepEnded, SessionStepFailed, SessionStepStarted,
@@ -226,6 +226,7 @@ mod tests {
         );
         check!(SessionAgentSelected, "session.agent.selected", true);
         check!(SessionModelSelected, "session.model.selected", true);
+        check!(SessionModelFallback, "session.model.fallback", true);
         check!(SessionMetadataUpdated, "session.metadata.updated", true);
         check!(SessionPermissions, "session.permissions", true);
         check!(SessionArchived, "session.archived", true);
@@ -253,6 +254,46 @@ mod tests {
         check!(SessionStatusUpdated, "session.status", false);
         check!(SessionIdle, "session.idle", false);
         check!(SessionUsageUpdated, "session.usage.updated", false);
+    }
+
+    #[test]
+    fn model_fallback_payload_matches_the_wire_shape() {
+        use crate::session::ModelRef;
+
+        let payload = SessionModelFallback {
+            session_id: SessionId::from_wire("ses_0123456789abABCDEFGHIJKLMN"),
+            from: ModelRef::new("google", "gemini-3-pro"),
+            to: ModelRef::new("opencode-go", "glm-5.3-flash"),
+            kind: "empty_response".to_owned(),
+            attempt: None,
+        };
+        let data = payload.data();
+        assert_eq!(
+            data,
+            serde_json::json!({
+                "sessionID": "ses_0123456789abABCDEFGHIJKLMN",
+                "from": {"providerID": "google", "id": "gemini-3-pro"},
+                "to": {"providerID": "opencode-go", "id": "glm-5.3-flash"},
+                "kind": "empty_response"
+            }),
+            "an unknown attempt is omitted, not null"
+        );
+        assert!(!data.to_string().contains("null"));
+        assert_eq!(
+            <SessionModelFallback as EventPayload>::TYPE,
+            "session.model.fallback"
+        );
+        assert_eq!(<SessionModelFallback as EventPayload>::VERSION, 1);
+        const { assert!(<SessionModelFallback as EventPayload>::DURABLE) };
+
+        let with_attempt = SessionModelFallback {
+            attempt: Some(2),
+            ..payload
+        };
+        assert_eq!(with_attempt.data()["attempt"], 2);
+        let round_trip: SessionModelFallback =
+            serde_json::from_value(with_attempt.data()).expect("decodes");
+        assert_eq!(round_trip, with_attempt);
     }
 
     #[test]

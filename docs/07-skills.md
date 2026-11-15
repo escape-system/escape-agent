@@ -117,7 +117,7 @@ Same discovery roots, `command/` and `commands/`:
 ```markdown
 ---
 description: Run the focused Rust test lane
-agent: build
+agent: engineer
 model: anthropic/claude-sonnet-4-5
 subtask: true
 ---

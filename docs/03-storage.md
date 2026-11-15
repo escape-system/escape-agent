@@ -436,7 +436,34 @@ On boot, per session with a claim:
   not boot-critical).
 - Suspended sessions resume with concurrency ≤ 8, queued FIFO.
 
-## Retention
+## Model usage rollup (no new tables)
+
+The model-level usage view
+(`GET /api/experimental/usage/models`, `docs/02-protocol.md`) is a rollup over
+the existing `session_message` table, so no `edges` (or any other) table is
+required. `data` already carries the wire keys
+`$.model.providerID`, `$.model.id`, `$.tokens.{input,output,reasoning}` and
+`$.cost`, so the query is `SELECT json_extract(...) … FROM session_message WHERE
+type='assistant' AND time_created >= ? GROUP BY 1,2 ORDER BY cost DESC` and the
+store exposes it as `oc_store::usage::model_usage(&UsageQuery) ->
+Vec<ModelUsageRow>` (`ModelUsageRow { provider_id, model_id, requests,
+tokens_in, tokens_out, tokens_reasoning, cost }`). Filter on the **`type`
+column**, not on `json_extract(data,'$.type')`: `id`/`sessionID`/`type` are
+injected at read time by `oc-store/src/message.rs:335-354` and are not stored in
+`data`. No backfill and no write path change are involved, and cost is whatever
+the turn already recorded (a zero catalog price stays zero unless
+`models.pricing` overrides it, `docs/14-config-permissions.md`).
+
+The only optional schema change is an index for that scan, proposed as the
+optional migration `0013_message_time` (not frozen; the last shipped migration
+is `0012_session_idle_reason`, and the rollup is correct without it):
+`CREATE INDEX message_time ON session_message(time_created) WHERE
+type='assistant';`. Existing indices do not help a cross-session time filter
+(`message_session_time` leads with `session_id`). `session_part` is unused by
+readers and writers today (`crates/oc-store/src/schema.rs:95,104` only) and
+stays that way; all conversation content, including the usage fields above,
+lives in `session_message.data`.
+
 
 Design target, **not implemented yet**: the store exposes no sweep/list API and
 no maintenance task runs on boot or on a timer. Until that task exists, rows

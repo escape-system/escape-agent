@@ -5,17 +5,74 @@ use oc_llm::{LlmMessage, LlmOptions, LlmRequest};
 use oc_store::NewMessage;
 use oc_types::message::{AssistantPart, FinishReason, StructuredError, ToolState};
 use oc_types::payload::{
-    SessionStepEnded, SessionStepFailed, SessionStepStarted, SessionStepStreamed, SessionTextDelta,
-    SessionTextEnded, SessionTextStarted, SessionToolCalled, SessionToolInputDelta,
-    SessionToolInputEnded, SessionToolInputStarted, SessionUsageUpdated,
+    SessionModelFallback, SessionStepEnded, SessionStepFailed, SessionStepStarted,
+    SessionStepStreamed, SessionTextDelta, SessionTextEnded, SessionTextStarted, SessionToolCalled,
+    SessionToolInputDelta, SessionToolInputEnded, SessionToolInputStarted, SessionUsageUpdated,
 };
-use oc_types::{MessageId, Tokens};
+use oc_types::{MessageId, ModelRef, Tokens};
 
 use crate::runtime::{CancelToken, Runtime, RuntimeError};
+use crate::subagent::settings::{model_key, models_policy};
 
 use super::assistant::{AssistantState, ordinal_u32};
 use super::tools::strip_expectation;
-use super::types::{PendingToolCall, ResolvedTurn, StepRun, finish_reason, tokens_from_usage};
+use super::types::{
+    PendingToolCall, ResolvedTurn, StepAttempt, StepRun, StreamFailure, finish_reason,
+    tokens_from_usage,
+};
+
+/// Turn a raw provider message into a typed failure when the text names a known
+/// class.
+///
+/// Provider streams report some failures only as opaque text. Classifying it
+/// here means a retired model, an exhausted quota or a rate limit is recorded
+/// against the model (and can be acted on) instead of surfacing as an
+/// unclassifiable `Provider` error. Unrecognized text keeps the historical
+/// `Provider` shape byte for byte.
+pub(super) fn classified_provider_error(message: &str) -> oc_llm::LlmError {
+    let kind = oc_llm::classify_provider_message(message);
+    if kind == oc_llm::FailureKind::Unknown {
+        oc_llm::LlmError::Provider {
+            message: message.to_owned(),
+        }
+    } else {
+        oc_llm::LlmError::Failure {
+            kind,
+            message: message.to_owned(),
+        }
+    }
+}
+
+/// Upper bound on credential attempts for one model candidate.
+///
+/// A pool larger than this is a configuration accident; the cap keeps one step
+/// from turning into an unbounded provider loop while still covering every
+/// realistic backup-key count (contract §3).
+const MAX_KEY_ATTEMPTS: usize = 8;
+
+/// The failure class that justifies rotating to another credential, if any.
+///
+/// Only key-level classes rotate: `Auth`, `Quota` and `RateLimit` say the
+/// credential cannot serve now, while `ModelUnavailable` / `InvalidRequest` /
+/// `EmptyResponse` / `Unknown` say nothing about the key (a different key would
+/// repeat the same answer), so those keep today's model-chain behavior.
+/// `Http` statuses are mapped as a defensive fallback for transports that report
+/// the status before it is classified.
+fn key_failure_kind(failure: &StreamFailure) -> Option<oc_llm::FailureKind> {
+    match &failure.error {
+        oc_llm::LlmError::Failure { kind, .. } => matches!(
+            kind,
+            oc_llm::FailureKind::Auth | oc_llm::FailureKind::Quota | oc_llm::FailureKind::RateLimit
+        )
+        .then_some(*kind),
+        oc_llm::LlmError::Http { status, .. } => match status {
+            401..=403 => Some(oc_llm::FailureKind::Auth),
+            429 => Some(oc_llm::FailureKind::RateLimit),
+            _ => None,
+        },
+        _ => None,
+    }
+}
 
 impl Runtime {
     pub(super) async fn persist_assistant(
@@ -66,6 +123,26 @@ impl Runtime {
         Ok(())
     }
 
+    /// Stream one step, advancing `models.chain` on classifiable provider
+    /// failures before giving up.
+    ///
+    /// Only a classified [`oc_llm::LlmError::Failure`] can advance the chain:
+    /// [`oc_llm::FailureKind`] is the single place provider semantics are
+    /// classified, and an unclassifiable error keeps the historical
+    /// fail-then-error behavior. An in-band [`oc_llm::LlmEvent::ProviderError`]
+    /// is classified too ([`classified_provider_error`]), so a provider that
+    /// reports "model no longer available" mid-stream switches models instead of
+    /// killing the turn.
+    ///
+    /// [`crate::subagent::settings::FallbackPolicy::allows`] decides per class:
+    /// `model_unavailable` always advances (the model is gone; retrying it is
+    /// pointless), while the transport-ish classes additionally require
+    /// `is_retryable()` and an entry in `models.fallback.on`.
+    ///
+    /// The chain is the ordered candidate list, models already tried in this
+    /// step are skipped, and `models.fallback.max_hops` caps the number of
+    /// switches. When the chain is exhausted the ORIGINAL error is surfaced
+    /// unchanged.
     #[allow(clippy::too_many_lines)]
     pub(super) async fn stream_step(
         &self,
@@ -75,47 +152,334 @@ impl Runtime {
         final_call: bool,
         cancel: &Arc<CancelToken>,
     ) -> Result<StepRun, RuntimeError> {
-        let created = oc_types::now_millis();
-        let id = MessageId::new();
-        let mut state = AssistantState::new(
-            id.clone(),
-            turn.agent_id.clone(),
-            turn.model_ref.clone(),
-            created,
-        );
-        self.inner
+        let policy = models_policy(&self.inner.config.config);
+        let chain = policy.chain_for(&turn.agent_id);
+        let mut model = turn.model.clone();
+        let mut model_ref = turn.model_ref.clone();
+        let mut tried = vec![model_key(&model_ref.to_reference())];
+        let mut hops: u32 = 0;
+        let mut reuse: Option<AssistantState> = None;
+
+        loop {
+            // Credential rotation is strictly *inside* one model candidate: an
+            // exhausted or revoked key says nothing about whether the next key
+            // can serve the same model, so every usable key is tried before the
+            // chain is consulted (`docs/27-key-pool.md`, contract §3).
+            let attempt = self
+                .stream_model_attempts(
+                    session, turn, &model, &model_ref, messages, final_call, cancel, &mut reuse,
+                )
+                .await?;
+            let failure = match attempt {
+                StepAttempt::Done(run) => return Ok(run),
+                StepAttempt::Retry(failure) => failure,
+            };
+            let StreamFailure {
+                error,
+                state,
+                kind,
+                reusable,
+            } = failure;
+            // Remember the class against the model that just failed: the next
+            // spawn removes it from `available` instead of paying the same
+            // failed round trip (`ModelHealth` owns the per-class TTL and
+            // ignores request-scoped kinds). The raw provider text is kept, not
+            // the `Display` form, so the registry badge shows what the provider
+            // actually said.
+            let message = match &error {
+                oc_llm::LlmError::Failure { message, .. } => message.clone(),
+                other => other.to_string(),
+            };
+            self.model_health().mark(
+                &model_ref.to_reference(),
+                kind,
+                oc_types::now_millis(),
+                Some(message),
+            );
+            let original = RuntimeError::Llm(error);
+
+            let mut advanced = false;
+            if policy.fallback.allows(kind) && hops < policy.fallback.max_hops {
+                while let Some(next) = chain
+                    .iter()
+                    .find(|reference| !tried.contains(&model_key(reference.as_str())))
+                    .cloned()
+                {
+                    tried.push(model_key(&next));
+                    let Ok(resolved) = self
+                        .inner
+                        .config
+                        .client
+                        .resolve_model(&self.inner.config.catalog, &next)
+                    else {
+                        // A chain entry the catalog cannot run is skipped rather
+                        // than fatal: it must not stall every later turn.
+                        continue;
+                    };
+                    let next_ref = ModelRef {
+                        id: resolved.model.model_id.clone(),
+                        provider_id: resolved.model.provider_id.clone(),
+                        variant: resolved.variant.as_ref().map(|variant| variant.id.clone()),
+                    };
+                    // One switch implementation: catalog guard + `patch_session`
+                    // + `session.model.selected` (`observer/repair_worker.rs`).
+                    self.observer_switch_model(session, &next).await?;
+                    hops = hops.saturating_add(1);
+                    self.emit(
+                        session,
+                        &turn.directory,
+                        SessionModelFallback {
+                            session_id: Runtime::session_id(session),
+                            from: model_ref.clone(),
+                            to: next_ref.clone(),
+                            kind: kind.as_str().to_owned(),
+                            attempt: Some(hops),
+                        },
+                    )
+                    .await?;
+                    model = resolved;
+                    model_ref = next_ref;
+                    reuse = reusable.then(|| state.clone());
+                    advanced = true;
+                    break;
+                }
+            }
+            if !advanced {
+                let tokens = state.tokens.clone();
+                let cost = state.cost.unwrap_or(0.0);
+                let structured = original.structured();
+                self.fail_step(session, turn, state, structured, tokens, cost)
+                    .await?;
+                return Err(original);
+            }
+            if !reusable {
+                // Mid-stream output cannot be replayed into the next model, so
+                // the partial attempt stays durable as a failed row.
+                let tokens = state.tokens.clone();
+                let cost = state.cost.unwrap_or(0.0);
+                let structured = original.structured();
+                self.fail_step(session, turn, state, structured, tokens, cost)
+                    .await?;
+            }
+        }
+    }
+
+    /// One model candidate with credential rotation.
+    ///
+    /// The pool is ordered by [`oc_llm::KeyPool::select`] (active key first,
+    /// cooling keys removed). Each key gets one attempt on the SAME model and the
+    /// SAME assistant row: a key-level failure marks the key, moves the durable
+    /// primary pointer when the dead key was primary, and retries immediately.
+    ///
+    /// A key rotation is not a model fallback: no `session.model.fallback` event
+    /// is published here, and `models.chain` is untouched. Only when every key is
+    /// exhausted is the last failure returned to [`Runtime::stream_step`], which
+    /// then runs the chain advance exactly once. `MAX_KEY_ATTEMPTS` bounds the
+    /// work even if a pool somehow reports more keys than that.
+    #[allow(clippy::too_many_arguments)]
+    async fn stream_model_attempts(
+        &self,
+        session: &str,
+        turn: &ResolvedTurn,
+        model: &oc_llm::ResolvedModel,
+        model_ref: &ModelRef,
+        messages: &[LlmMessage],
+        final_call: bool,
+        cancel: &Arc<CancelToken>,
+        reuse: &mut Option<AssistantState>,
+    ) -> Result<StepAttempt, RuntimeError> {
+        let provider = model.provider.id.clone();
+        let now_ms = oc_types::now_millis();
+        let pool = self.credential_pool(&provider, now_ms).await;
+        // An empty pool means "no stored credential and no environment key": the
+        // client resolves the provider's environment on its own, so the request
+        // is attempted exactly once with `api_key: None` — today's behavior.
+        let attempts: Vec<Option<oc_llm::PoolKey>> = if pool.is_empty() {
+            vec![None]
+        } else {
+            pool.into_iter().take(MAX_KEY_ATTEMPTS).map(Some).collect()
+        };
+        let total = attempts.len();
+        let mut last: Option<StreamFailure> = None;
+        for (index, candidate) in attempts.into_iter().enumerate() {
+            let api_key = candidate.as_ref().map(|entry| entry.key.clone());
+            let attempt = self
+                .stream_once(
+                    session,
+                    turn,
+                    model,
+                    model_ref,
+                    messages,
+                    final_call,
+                    cancel,
+                    reuse.take(),
+                    api_key,
+                )
+                .await?;
+            let failure = match attempt {
+                StepAttempt::Done(run) => return Ok(StepAttempt::Done(run)),
+                StepAttempt::Retry(failure) => failure,
+            };
+            let Some(credential) = candidate.as_ref() else {
+                // No key to rotate away from: keep the historical behavior.
+                return Ok(StepAttempt::Retry(failure));
+            };
+            let rotated = key_failure_kind(&failure).is_some();
+            if !rotated {
+                return Ok(StepAttempt::Retry(failure));
+            }
+            let kind = failure.kind;
+            self.mark_key_failure(&provider, credential.credential_id.as_deref(), kind, now_ms)
+                .await;
+            let last_attempt = index + 1 >= total;
+            // The row is reusable only while nothing reached the provider
+            // surface; once a key did stream output the row is durable as a
+            // failed attempt (`reusable == false`) and the next key starts a new
+            // one. Either way the *step* stays the same and no model switch is
+            // announced.
+            if !failure.reusable {
+                if last_attempt {
+                    last = Some(failure);
+                    break;
+                }
+                let original = RuntimeError::Llm(failure.error);
+                let tokens = failure.state.tokens.clone();
+                let cost = failure.state.cost.unwrap_or(0.0);
+                let structured = original.structured();
+                self.fail_step(session, turn, failure.state, structured, tokens, cost)
+                    .await?;
+                *reuse = None;
+                continue;
+            }
+            if last_attempt {
+                last = Some(failure);
+                break;
+            }
+            *reuse = Some(failure.state);
+        }
+        Ok(StepAttempt::Retry(last.expect(
+            "a pool with at least one usable key yields a failure or a success",
+        )))
+    }
+
+    /// Record a key-level failure and keep the durable primary pointer healthy.
+    ///
+    /// The store's pool is the source of truth for order, so the pointer only
+    /// moves when the failing key *was* primary: a restart would otherwise pick
+    /// the dead key first again. `set_credential_primary` reuses
+    /// `activate_credential`'s transaction, so kill -9 safety is unchanged.
+    async fn mark_key_failure(
+        &self,
+        provider: &str,
+        credential_id: Option<&str>,
+        kind: oc_llm::FailureKind,
+        now_ms: i64,
+    ) {
+        self.key_pool().mark(provider, credential_id, kind, now_ms);
+        let Some(failed) = credential_id else {
+            return;
+        };
+        let Ok(rows) = self.inner.config.store.credential_pool(provider).await else {
+            return;
+        };
+        let Some(primary) = rows.first() else {
+            return;
+        };
+        if primary.id != failed {
+            return;
+        }
+        let Some(next) = rows.iter().find(|row| row.id != failed) else {
+            return;
+        };
+        match self
+            .inner
             .config
             .store
-            .append_message(NewMessage {
-                id: id.as_str().to_owned(),
-                session_id: session.to_owned(),
-                kind: "assistant".to_owned(),
-                data: state.data(),
-                time_created: created,
-            })
+            .set_credential_primary(provider, &next.id)
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => tracing::debug!(
+                provider,
+                credential = %next.id,
+                "rotation could not move the primary credential"
+            ),
+            Err(error) => tracing::warn!(
+                %error,
+                provider,
+                credential = %next.id,
+                "rotation could not move the primary credential"
+            ),
+        }
+    }
+
+    /// One request attempt. A classifiable failure is returned to the caller
+    /// instead of being recorded, so [`Runtime::stream_step`] can decide whether
+    /// the chain advances; every other failure keeps the historical
+    /// fail-then-error behavior.
+    #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+    async fn stream_once(
+        &self,
+        session: &str,
+        turn: &ResolvedTurn,
+        model: &oc_llm::ResolvedModel,
+        model_ref: &ModelRef,
+        messages: &[LlmMessage],
+        final_call: bool,
+        cancel: &Arc<CancelToken>,
+        reuse: Option<AssistantState>,
+        api_key: Option<String>,
+    ) -> Result<StepAttempt, RuntimeError> {
+        let created = oc_types::now_millis();
+        // Nothing streamed on the previous attempt: the row is rewritten for
+        // the new model instead of appending a second assistant message.
+        let mut state = if let Some(mut state) = reuse {
+            state.model = model_ref.clone();
+            self.persist_assistant(session, &state).await?;
+            state
+        } else {
+            let state = AssistantState::new(
+                MessageId::new(),
+                turn.agent_id.clone(),
+                model_ref.clone(),
+                created,
+            );
+            self.inner
+                .config
+                .store
+                .append_message(NewMessage {
+                    id: state.id.as_str().to_owned(),
+                    session_id: session.to_owned(),
+                    kind: "assistant".to_owned(),
+                    data: state.data(),
+                    time_created: created,
+                })
+                .await?;
+            self.emit(
+                session,
+                &turn.directory,
+                SessionStepStarted {
+                    session_id: Runtime::session_id(session),
+                    assistant_message_id: state.id.clone(),
+                    agent: turn.agent_id.clone(),
+                    model: model_ref.clone(),
+                    snapshot: None,
+                    started: created,
+                },
+            )
             .await?;
-        self.emit(
-            session,
-            &turn.directory,
-            SessionStepStarted {
-                session_id: Runtime::session_id(session),
-                assistant_message_id: id.clone(),
-                agent: turn.agent_id.clone(),
-                model: turn.model_ref.clone(),
-                snapshot: None,
-                started: created,
-            },
-        )
-        .await?;
+            state
+        };
+        let id = state.id.clone();
 
         let options = LlmOptions {
-            api_key: self.credential_key(&turn.model.provider.id).await,
+            api_key,
             tool_choice: final_call.then(|| "none".to_owned()),
             cache_key: Some(session.to_owned()),
             ..LlmOptions::default()
         };
         let request = LlmRequest {
-            model: turn.model.clone(),
+            model: model.clone(),
             system: turn.system.clone(),
             messages: messages.to_vec(),
             tools: turn.tools.clone(),
@@ -135,13 +499,32 @@ impl Runtime {
         let mut stream = match stream_result {
             Ok(stream) => stream,
             Err(error) => {
+                // A pre-stream provider message carries the same classes as an
+                // in-band `ProviderError`; normalizing it keeps one
+                // classification path for both (`Unknown` stays `Provider`).
+                let error = match error {
+                    oc_llm::LlmError::Provider { message } => classified_provider_error(&message),
+                    other => other,
+                };
+                // Copy the class out before moving `error`: `FailureKind` is
+                // `Copy`, so the borrow ends with the `if let` arm.
+                if let oc_llm::LlmError::Failure { kind, .. } = &error {
+                    let kind = *kind;
+                    // Nothing reached the provider surface yet, so the row is
+                    // still reusable for the next candidate.
+                    return Ok(StepAttempt::Retry(StreamFailure {
+                        error,
+                        state,
+                        kind,
+                        reusable: true,
+                    }));
+                }
                 let runtime_error = RuntimeError::Llm(error);
                 self.fail_step(session, turn, state, runtime_error.structured(), None, 0.0)
                     .await?;
                 return Err(runtime_error);
             }
         };
-
         let mut calls = Vec::new();
         let mut provider_error = None;
         loop {
@@ -345,7 +728,7 @@ impl Runtime {
                     state.raw_finish = Some(reason);
                     let tokens = tokens_from_usage(&usage);
                     state.tokens = Some(tokens.clone());
-                    let cost = oc_llm::model_cost(&turn.model.model, &usage);
+                    let cost = oc_llm::model_cost(&model.model, &usage);
                     state.cost = Some(cost);
                     self.inner
                         .config
@@ -382,12 +765,27 @@ impl Runtime {
         self.close_reasoning(session, turn, &mut state).await?;
         self.close_text(session, turn, &mut state).await?;
         if let Some(message) = provider_error {
+            // A classifiable in-band provider error advances the model chain
+            // instead of killing the step: another candidate may serve the
+            // request. The partial output already streamed, so the assistant row
+            // is NOT reusable — it stays durable as a failed attempt
+            // (`stream_step` records it and switches models).
+            let error = classified_provider_error(&message);
+            if let oc_llm::LlmError::Failure { kind, .. } = &error {
+                let kind = *kind;
+                return Ok(StepAttempt::Retry(StreamFailure {
+                    error,
+                    state,
+                    kind,
+                    reusable: false,
+                }));
+            }
             let error = StructuredError::new("ProviderError", message.clone());
             let tokens = state.tokens.clone().unwrap_or_default();
             let cost = state.cost.unwrap_or(0.0);
             self.fail_step(session, turn, state, error, Some(tokens), cost)
                 .await?;
-            return Err(RuntimeError::Llm(oc_llm::LlmError::Provider { message }));
+            return Err(RuntimeError::Llm(classified_provider_error(&message)));
         }
         if cancel.is_cancelled() {
             self.schedule_finalizer(session.to_owned(), turn.directory.clone(), state)
@@ -401,15 +799,15 @@ impl Runtime {
             let cost = state.cost.unwrap_or(0.0);
             self.fail_step(session, turn, state, error, Some(tokens), cost)
                 .await?;
-            return Err(RuntimeError::Llm(oc_llm::LlmError::Provider { message }));
+            return Err(RuntimeError::Llm(classified_provider_error(&message)));
         }
         self.persist_assistant(session, &state).await?;
-        Ok(StepRun {
+        Ok(StepAttempt::Done(StepRun {
             tokens: state.tokens.clone().unwrap_or_default(),
             cost: state.cost.unwrap_or(0.0),
             state,
             calls,
-        })
+        }))
     }
 
     async fn mark_streamed(

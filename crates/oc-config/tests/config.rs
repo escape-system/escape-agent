@@ -12,6 +12,20 @@ struct Fixture {
     root: tempfile::TempDir,
 }
 
+/// The contract order of the builtin agents (`contract-agents`).
+const CONTRACT_ORDER: [&str; 10] = [
+    "engineer",
+    "architect",
+    "review",
+    "general",
+    "explore",
+    "ui",
+    "docs",
+    "compaction",
+    "title",
+    "summary",
+];
+
 impl Fixture {
     fn new() -> Self {
         Self {
@@ -397,19 +411,19 @@ fn permissions_compose_and_last_match_wins() {
 
     // Document rules apply, then the agent's own rules.
     assert_eq!(
-        service.evaluate(Some("build"), "read", "src/main.rs"),
+        service.evaluate(Some("engineer"), "read", "src/main.rs"),
         Effect::Allow
     );
     assert_eq!(
-        service.evaluate(Some("build"), "read", "src/secret/key"),
+        service.evaluate(Some("engineer"), "read", "src/secret/key"),
         Effect::Deny
     );
     assert_eq!(
-        service.evaluate(Some("build"), "read", "config.env.example"),
+        service.evaluate(Some("engineer"), "read", "config.env.example"),
         Effect::Allow
     );
     assert_eq!(
-        service.evaluate(Some("build"), "read", "config.env"),
+        service.evaluate(Some("engineer"), "read", "config.env"),
         Effect::Deny
     );
     // Without an agent, only document rules apply.
@@ -442,23 +456,71 @@ fn wildcard_matching_uses_star_and_question() {
     );
 }
 
+/// One long, table-like assertion over the whole contract agent set: modes,
+/// order, prompts and permissions in one place beats ten fragmented tests.
 #[test]
-fn builtin_agents_have_upstream_modes_permissions_and_prompts() {
+#[allow(clippy::too_many_lines)]
+fn builtin_agents_have_contract_modes_permissions_and_prompts() {
     let fixture = Fixture::new();
     let project = fixture.project();
-    fixture.write("project/opencode.json", r#"{"default_agent": "plan"}"#);
+    fixture.write("project/opencode.json", r#"{"default_agent": "architect"}"#);
     let service = fixture.load(&project);
 
     let agents = service.agents();
-    assert_eq!(agents.len(), 7);
-    assert_eq!(agents[0]["id"], "plan");
+    assert_eq!(agents.len(), 10, "the contract builtin set");
+    assert_eq!(
+        agents[0]["id"], "architect",
+        "the configured default agent is listed first"
+    );
+    // The configured default agent is listed first; the remaining agents keep
+    // the contract order. `service.agents()` returns an owned `Vec<Value>`, so
+    // it must be bound before iterating it (E0716 otherwise).
+    let listed: Vec<String> = agents
+        .iter()
+        .filter_map(|agent| agent["id"].as_str().map(str::to_owned))
+        .collect();
+    let mut canonical = listed.clone();
+    canonical.sort_by_key(|id| {
+        CONTRACT_ORDER
+            .iter()
+            .position(|known| known == id)
+            .unwrap_or(usize::MAX)
+    });
+    assert_eq!(
+        canonical, CONTRACT_ORDER,
+        "the ten builtins are exactly the contract set"
+    );
+    // `agents()` lists the configured default first, then the remaining
+    // builtins in contract order, so the tail is the contract order minus the
+    // default itself.
+    let mut expected_rest: Vec<&str> = CONTRACT_ORDER.to_vec();
+    expected_rest.retain(|id| *id != "architect");
+    let listed_rest: Vec<&str> = listed[1..].iter().map(String::as_str).collect();
+    assert_eq!(
+        listed_rest, expected_rest,
+        "everything after the configured default keeps the contract order"
+    );
 
-    let build = service.agent("build").expect("build");
-    assert_eq!(build["mode"], "primary");
-    assert_eq!(build["hidden"], false);
-    assert!(build.get("model").is_none());
-    assert!(build.get("system").is_none());
-    assert_eq!(build["request"]["settings"], serde_json::json!({}));
+    let engineer = service.agent("engineer").expect("engineer");
+    assert_eq!(engineer["mode"], "primary");
+    assert_eq!(engineer["hidden"], false);
+    assert!(engineer.get("model").is_none());
+    assert!(
+        engineer["system"]
+            .as_str()
+            .expect("engineer has a real prompt")
+            .contains("docs/17-interfaces.md"),
+        "the engineer prompt encodes the docs-first invariant"
+    );
+    assert_eq!(engineer["request"]["settings"], serde_json::json!({}));
+
+    // The configured `default_agent` wins; the builtin default is `engineer`
+    // only when no document sets one.
+    assert_eq!(
+        service.default_agent(),
+        "architect",
+        "the configured default agent wins"
+    );
 
     let general = service.agent("general").expect("general");
     assert_eq!(general["mode"], "subagent");
@@ -517,20 +579,63 @@ fn builtin_agents_have_upstream_modes_permissions_and_prompts() {
         );
     }
 
-    let plan = service.agent("plan").expect("plan");
-    let rules = plan["permissions"].as_array().expect("rules");
+    // architect: docs-only writes, deny-then-allow under `docs/`.
+    let architect = service.agent("architect").expect("architect");
     assert!(
-        rules
-            .iter()
-            .any(|rule| rule["action"] == "edit" && rule["effect"] == "deny")
+        architect["system"]
+            .as_str()
+            .expect("architect prompt")
+            .contains("docs/"),
+        "the architect prompt is a real design prompt"
     );
-    assert!(rules.iter().any(|rule| {
-        rule["action"] == "edit"
-            && rule["effect"] == "allow"
-            && rule["resource"]
-                .as_str()
-                .is_some_and(|resource| resource.contains(".opencode") && resource.ends_with('*'))
-    }));
+    assert_eq!(
+        service.evaluate(Some("architect"), "edit", "crates/oc-config/src/lib.rs"),
+        Effect::Deny,
+        "architect must not edit code"
+    );
+    assert_eq!(
+        service.evaluate(Some("architect"), "edit", "docs/17-interfaces.md"),
+        Effect::Allow,
+        "architect owns docs/"
+    );
+
+    // review: read-only everywhere.
+    let review = service.agent("review").expect("review");
+    assert!(!review["system"].as_str().expect("review prompt").is_empty());
+    for action in ["edit", "write", "patch"] {
+        assert_eq!(
+            service.evaluate(Some("review"), action, "docs/17-interfaces.md"),
+            Effect::Deny,
+            "review is read-only: {action}"
+        );
+    }
+
+    // docs: docs/, README.md and AGENTS.md only.
+    for (resource, expected) in [
+        ("docs/14-config-permissions.md", Effect::Allow),
+        ("README.md", Effect::Allow),
+        ("AGENTS.md", Effect::Allow),
+        ("crates/oc-config/src/lib.rs", Effect::Deny),
+    ] {
+        assert_eq!(
+            service.evaluate(Some("docs"), "edit", resource),
+            expected,
+            "docs scope for {resource}"
+        );
+    }
+
+    // ui: ui/** and web/** only.
+    for (resource, expected) in [
+        ("ui/vendor/opencode/packages/app/src/app.tsx", Effect::Allow),
+        ("web/dist/index.html", Effect::Allow),
+        ("crates/oc-server/src/lib.rs", Effect::Deny),
+    ] {
+        assert_eq!(
+            service.evaluate(Some("ui"), "edit", resource),
+            expected,
+            "ui scope for {resource}"
+        );
+    }
 }
 
 /// `code_map` is a read-only search tool; the explore subagent must be able to
@@ -552,7 +657,7 @@ fn explore_toolset_allows_read_only_code_map_and_still_denies_edits() {
     );
     // `build` composes the default `* * allow`, so code_map stays visible.
     assert_eq!(
-        service.evaluate(Some("build"), "code_map", "*"),
+        service.evaluate(Some("engineer"), "code_map", "*"),
         Effect::Allow
     );
     for action in ["read", "grep", "glob", "webfetch", "websearch", "shell"] {
@@ -609,7 +714,7 @@ fn configured_agent_overrides_and_custom_agents() {
         r#"{
   "permissions": [{"action": "shell", "resource": "*", "effect": "allow"}],
   "agents": {
-    "build": {"description": "custom build", "steps": 5, "model": "openai/gpt-5#high"},
+    "engineer": {"description": "custom engineer", "steps": 5, "model": "openai/gpt-5#high"},
     "helper": {"description": "custom helper", "mode": "subagent", "hidden": true}
   }
 }
@@ -617,19 +722,19 @@ fn configured_agent_overrides_and_custom_agents() {
     );
     let service = fixture.load(&project);
 
-    let build = service.agent("build").expect("build");
-    assert_eq!(build["description"], "custom build");
-    assert_eq!(build["steps"], 5);
-    assert_eq!(build["model"]["id"], "gpt-5");
-    assert_eq!(build["model"]["providerID"], "openai");
-    assert_eq!(build["model"]["variant"], "high");
+    let engineer = service.agent("engineer").expect("engineer");
+    assert_eq!(engineer["description"], "custom engineer");
+    assert_eq!(engineer["steps"], 5);
+    assert_eq!(engineer["model"]["id"], "gpt-5");
+    assert_eq!(engineer["model"]["providerID"], "openai");
+    assert_eq!(engineer["model"]["variant"], "high");
     // Config documents keep the selection shape.
     assert_eq!(
-        service.merged()["agents"]["build"]["model"]["model"],
+        service.merged()["agents"]["engineer"]["model"]["model"],
         "gpt-5"
     );
     assert_eq!(
-        service.evaluate(Some("build"), "shell", "cargo test"),
+        service.evaluate(Some("engineer"), "shell", "cargo test"),
         Effect::Allow
     );
 
@@ -637,9 +742,69 @@ fn configured_agent_overrides_and_custom_agents() {
     assert_eq!(helper["mode"], "subagent");
     assert_eq!(helper["hidden"], true);
     assert_eq!(helper["name"], "helper");
-    // Custom agents are not selectable defaults, and build remains first.
-    assert_eq!(service.agents()[0]["id"], "build");
-    assert_eq!(service.default_agent(), "build");
+    // Custom agents are not selectable defaults, and engineer remains first.
+    assert_eq!(service.agents()[0]["id"], "engineer");
+    assert_eq!(service.default_agent(), "engineer");
+}
+
+/// The degenerate config where every builtin primary is disabled still resolves
+/// the default to the post-rename agent id. Regression: the last-resort literal
+/// was the pre-rename `build`, an id no builtin carries, so the reported default
+/// pointed at an agent that cannot exist.
+#[test]
+fn default_agent_fallback_uses_the_post_rename_engineer_id() {
+    let fixture = Fixture::new();
+    let project = fixture.project();
+    fixture.write(
+        "project/opencode.json",
+        r#"{
+  "agents": {
+    "engineer": {"disabled": true},
+    "architect": {"disabled": true},
+    "review": {"disabled": true}
+  }
+}
+"#,
+    );
+    let service = fixture.load(&project);
+
+    // No selectable primary survives, so the last-resort literal decides.
+    assert!(
+        !service
+            .agents()
+            .iter()
+            .any(|agent| agent["mode"] == "primary" && agent["hidden"] == false),
+        "the fixture must leave no selectable primary"
+    );
+    assert_eq!(
+        service.default_agent(),
+        "engineer",
+        "the fallback is the post-rename id, not the removed `build`"
+    );
+}
+
+/// A selectable primary is always reported as the default, so callers never get
+/// an id that is missing from `agents()`.
+#[test]
+fn default_agent_names_an_agent_that_exists() {
+    let fixture = Fixture::new();
+    let project = fixture.project();
+    fixture.write(
+        "project/opencode.json",
+        r#"{"agents": {"engineer": {"disabled": true}}}"#,
+    );
+    let service = fixture.load(&project);
+
+    let default = service.default_agent();
+    assert_ne!(default, "build", "the pre-rename id is never the default");
+    assert_eq!(
+        default, "architect",
+        "the next selectable primary takes over"
+    );
+    assert!(
+        service.agent(default).is_some(),
+        "the default must name an agent that exists: {default}"
+    );
 }
 
 #[test]
@@ -657,7 +822,7 @@ fn symbol_edit_permission_alias_normalizes_to_edit() {
     );
     let service = fixture.load(&project);
     assert_eq!(
-        service.evaluate(Some("build"), "edit", "src/lib.rs"),
+        service.evaluate(Some("engineer"), "edit", "src/lib.rs"),
         Effect::Deny
     );
     assert_eq!(

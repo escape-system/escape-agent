@@ -34,6 +34,7 @@ import { useProviders } from "@/providers/catalog/providers"
 import { consoleProviderGroup, consoleProviderName } from "@/providers/catalog/console"
 import { useIntegrations } from "@/providers/catalog/integrations"
 import { ProviderModelGroup, ProviderModelIcon } from "@/providers/models/provider-group"
+import { matchesModelSearch } from "@/providers/models/search"
 import type { ModelSelection } from "@/providers/models/selection"
 import { decode64 } from "@/runtime/persistence/base64"
 import { SettingsList } from "@/settings/list"
@@ -520,6 +521,7 @@ function ProviderConnection(props: {
     noModels: boolean
     catalogPending: boolean
     selectedModel: string
+    search: string
     collapsed: Record<string, boolean>
     adding: boolean
     direct: boolean
@@ -537,6 +539,7 @@ function ProviderConnection(props: {
     // The workspace providers had not loaded when the wait ran out.
     catalogPending: false,
     selectedModel: "",
+    search: "",
     collapsed: {},
   })
 
@@ -622,6 +625,10 @@ function ProviderConnection(props: {
       .map((provider) => ({ provider, models: models.filter((model) => model.providerID === provider.id) }))
       .filter((group) => group.models.length > 0)
   })
+
+  // The catalog keeps one cost band per tier; the untiered entry is the per-1M base price.
+  const connectionModelCost = (model: ReturnType<typeof connectionModels>[number]) =>
+    model.cost.find((item) => item.tier === undefined) ?? model.cost[0]
 
   const managedProviders = createMemo(() => (isConsole ? consoleProviderGroup(connectionProviders()) : undefined))
 
@@ -1617,11 +1624,25 @@ function ProviderConnection(props: {
   }
 
   function ConnectionModelList(listProps: { items: ReturnType<typeof connectionModels> }) {
+    const money = (value: number) =>
+      new Intl.NumberFormat(language.intl(), {
+        style: "currency",
+        currency: "USD",
+        maximumFractionDigits: 4,
+      }).format(value)
+
     return (
       <SettingsList>
         <For each={listProps.items}>
           {(model) => {
             const selected = () => state.selectedModel === modelKey(model)
+            const band = () => connectionModelCost(model)
+            const cost = () => {
+              const input = band()?.input ?? 0
+              const output = band()?.output ?? 0
+
+              return input > 0 || output > 0 ? `${money(input)} / ${money(output)}` : "—"
+            }
 
             return (
               <div data-component="connected-model-row-shell" class="connected-model-row-shell">
@@ -1640,10 +1661,22 @@ function ProviderConnection(props: {
                       <span class="min-w-0 truncate">{model.name}</span>
                     </div>
                   </div>
-                  <div data-slot="settings-row-control" class="size-4">
-                    <Show when={selected()}>
-                      <Icon name="check" size="small" class="shrink-0 text-v2-icon-icon-base" />
-                    </Show>
+                  <div class="flex min-w-0 shrink-0 items-center gap-2">
+                    <span
+                      data-slot="connected-model-cost"
+                      class="max-w-32 truncate text-[11px] tabular-nums text-v2-text-text-muted"
+                      title={language.t("provider.connect.models.cost", {
+                        input: money(band()?.input ?? 0),
+                        output: money(band()?.output ?? 0),
+                      })}
+                    >
+                      {cost()}
+                    </span>
+                    <span data-slot="settings-row-control" class="flex size-4 items-center justify-center">
+                      <Show when={selected()}>
+                        <Icon name="check" size="small" class="shrink-0 text-v2-icon-icon-base" />
+                      </Show>
+                    </span>
                   </div>
                 </button>
               </div>
@@ -1655,12 +1688,86 @@ function ProviderConnection(props: {
   }
 
   function FirstConnectionModels() {
+    let searchRef: HTMLInputElement | undefined
+    let scrollRef: HTMLDivElement | undefined
+    let scrollMemory = 0
+
+    const searching = () => state.search.trim().length > 0
+
+    // `variants` on the catalog list is an array of `{ id, ... }`, not the normalized record.
+    const filteredGroups = createMemo(() =>
+      connectionGroups()
+        .map((group) => ({
+          ...group,
+          models: group.models.filter(
+            (model) =>
+              !searching() ||
+              matchesModelSearch(state.search, [
+                group.provider.name,
+                connectionGroupName(group.provider.name),
+                model.name,
+                model.id,
+                model.providerID,
+                ...model.variants.map((variant) => variant.id),
+              ]),
+          ),
+        }))
+        .filter((group) => group.models.length > 0),
+    )
+
+    const totalMatches = createMemo(() => filteredGroups().reduce((sum, group) => sum + group.models.length, 0))
+    const expanded = (providerID: string) => searching() || !state.collapsed[providerID]
+
+    // Filtering shrinks the list; keep the scroll offset the user had, clamped to the new height.
+    createEffect(() => {
+      state.search
+      const element = scrollRef
+
+      if (!element) return
+      const top = Math.min(scrollMemory, Math.max(0, element.scrollHeight - element.clientHeight))
+      element.scrollTo({ top })
+    })
+
+    onMount(() => searchRef?.focus({ preventScroll: true }))
+
     return (
       <div data-component="first-provider-models" class="flex min-h-0 flex-1 flex-col px-3">
         <p class="shrink-0 pb-5 text-[13px] leading-5 text-v2-text-text-muted">
           {language.t("provider.connect.models.description")}
         </p>
+        <div class="shrink-0 pb-3">
+          <TextInput
+            ref={(element) => (searchRef = element)}
+            type="search"
+            appearance="base"
+            class="!w-full self-stretch"
+            placeholder={language.t("provider.connect.models.search.placeholder")}
+            value={state.search}
+            autofocus
+            spellcheck={false}
+            autocomplete="off"
+            aria-label={language.t("provider.connect.models.search.placeholder")}
+            showClearButton={searching()}
+            clearIcon="circle-xmark"
+            clearLabel={language.t("common.clear")}
+            onInput={(event) => {
+              scrollMemory = scrollRef?.scrollTop ?? 0
+              setState("search", event.currentTarget.value)
+            }}
+            onClearClick={() => {
+              scrollMemory = scrollRef?.scrollTop ?? 0
+              setState("search", "")
+              searchRef?.focus()
+            }}
+            onKeyDown={(event) => {
+              if (event.key !== "ArrowDown") return
+              event.preventDefault()
+              scrollRef?.querySelector<HTMLElement>(".connected-model-row")?.focus()
+            }}
+          />
+        </div>
         <div
+          ref={(element) => (scrollRef = element)}
           data-component="first-provider-model-scroll"
           class="settings-panel settings-models min-h-0 flex-1 overflow-y-auto pb-4"
         >
@@ -1670,62 +1777,80 @@ function ProviderConnection(props: {
             </span>
             <Show when={managedProviders()}>{(managed) => <Badge>{managed().workspace}</Badge>}</Show>
           </div>
-          <div role="radiogroup" aria-label={language.t("provider.connect.models.list", { provider: provider().name })}>
-            <Show
-              when={managedProviders()}
-              fallback={
-                <Show
-                  when={connectionGroups().length > 1}
-                  fallback={<ConnectionModelList items={connectionGroups()[0]?.models ?? []} />}
-                >
-                  <For each={connectionGroups()}>
-                    {(group) => {
-                      const expanded = () => !state.collapsed[group.provider.id]
-
-                      return (
-                        <section class="settings-section" data-expanded={expanded() ? "" : undefined}>
-                          <h3 class="settings-models-group-header sticky top-0 z-[1] box-content bg-v2-background-bg-base">
-                            <button
-                              type="button"
-                              class="settings-models-group-trigger"
-                              aria-expanded={expanded()}
-                              onClick={() => setState("collapsed", group.provider.id, expanded())}
-                            >
-                              <span class="settings-models-group-chevron">
-                                <Icon name="chevron-down" size="small" classList={{ collapsed: !expanded() }} />
-                              </span>
-                              <span class="settings-models-group-label">
-                                <ProviderModelIcon provider={group.provider} class="shrink-0" />
-                                <span class="settings-section-title">{group.provider.name}</span>
-                              </span>
-                            </button>
-                          </h3>
-                          <Show when={expanded()}>
-                            <ConnectionModelList items={group.models} />
-                          </Show>
-                        </section>
-                      )
-                    }}
-                  </For>
+          <Show
+            when={totalMatches() > 0}
+            fallback={
+              <div role="status" data-component="first-provider-models-empty" class="settings-models-status">
+                <Show when={searching()} fallback={<span>{language.t("dialog.model.empty")}</span>}>
+                  {language.t("provider.connect.models.empty", { query: state.search.trim() })}
                 </Show>
-              }
-            >
-              <div class="provider-model-groups provider-model-groups--dialog">
-                <For each={connectionGroups()}>
-                  {(group) => (
-                    <ProviderModelGroup
-                      provider={group.provider}
-                      name={connectionGroupName(group.provider.name)}
-                      expanded={!state.collapsed[group.provider.id]}
-                      onExpandedChange={(value) => setState("collapsed", group.provider.id, !value)}
-                    >
-                      <ConnectionModelList items={group.models} />
-                    </ProviderModelGroup>
-                  )}
-                </For>
               </div>
-            </Show>
-          </div>
+            }
+          >
+            <div role="radiogroup" aria-label={language.t("provider.connect.models.list", { provider: provider().name })}>
+              <Show
+                when={managedProviders()}
+                fallback={
+                  <Show
+                    when={filteredGroups().length > 1}
+                    fallback={<ConnectionModelList items={filteredGroups()[0]?.models ?? []} />}
+                  >
+                    <For each={filteredGroups()}>
+                      {(group) => {
+                        return (
+                          <section
+                            class="settings-section"
+                            data-expanded={expanded(group.provider.id) ? "" : undefined}
+                          >
+                            <h3 class="settings-models-group-header sticky top-0 z-[1] box-content bg-v2-background-bg-base">
+                              <button
+                                type="button"
+                                class="settings-models-group-trigger"
+                                aria-expanded={expanded(group.provider.id)}
+                                disabled={searching()}
+                                onClick={() => setState("collapsed", group.provider.id, expanded(group.provider.id))}
+                              >
+                                <span class="settings-models-group-chevron">
+                                  <Icon
+                                    name="chevron-down"
+                                    size="small"
+                                    classList={{ collapsed: !expanded(group.provider.id) }}
+                                  />
+                                </span>
+                                <span class="settings-models-group-label">
+                                  <ProviderModelIcon provider={group.provider} class="shrink-0" />
+                                  <span class="settings-section-title">{group.provider.name}</span>
+                                </span>
+                              </button>
+                            </h3>
+                            <Show when={expanded(group.provider.id)}>
+                              <ConnectionModelList items={group.models} />
+                            </Show>
+                          </section>
+                        )
+                      }}
+                    </For>
+                  </Show>
+                }
+              >
+                <div class="provider-model-groups provider-model-groups--dialog">
+                  <For each={filteredGroups()}>
+                    {(group) => (
+                      <ProviderModelGroup
+                        provider={group.provider}
+                        name={connectionGroupName(group.provider.name)}
+                        expanded={expanded(group.provider.id)}
+                        disabled={searching()}
+                        onExpandedChange={(value) => setState("collapsed", group.provider.id, !value)}
+                      >
+                        <ConnectionModelList items={group.models} />
+                      </ProviderModelGroup>
+                    )}
+                  </For>
+                </div>
+              </Show>
+            </div>
+          </Show>
         </div>
         <div
           data-component="first-provider-model-footer"

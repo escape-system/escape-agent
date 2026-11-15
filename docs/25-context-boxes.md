@@ -151,10 +151,10 @@ Built-in defaults:
 
 | Agent | `box:read` | `box:write` |
 |---|---|---|
-| `build` (and other primaries) | allow | allow |
+| `engineer` (and other primaries) | allow | allow |
 | `general` | allow | allow |
 | `explore` | allow | deny (`deny("*","*")`) |
-| `plan` | allow | allow |
+| `architect`, `review`, `ui`, `docs` | allow | allow |
 
 A write-only reporter is a custom agent with `box:write` allowed and
 `box:read` denied; it can call `box_write` but not `box_read`/`box_list`. The

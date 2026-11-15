@@ -58,10 +58,13 @@ pub fn quota_key(family: ModelFamily, style: HeaderStyle, model: Option<&str>) -
             HeaderStyle::GeminiCli => "gemini-cli".to_owned(),
         },
     };
-    if let Some(m) = model
-        && !m.trim().is_empty()
-    {
-        return format!("{base}:{}", m.trim().to_ascii_lowercase());
+    if let Some(m) = model {
+        // Variant-insensitive: `model#high` and `model#xhigh` are the same upstream quota
+        // bucket, so a cooldown recorded for one must apply to the other.
+        let trimmed = m.trim().split('#').next().unwrap_or_default().trim();
+        if !trimmed.is_empty() {
+            return format!("{base}:{}", trimmed.to_ascii_lowercase());
+        }
     }
     base
 }

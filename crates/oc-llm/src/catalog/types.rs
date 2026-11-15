@@ -129,6 +129,42 @@ pub struct CostCache {
     pub write: f64,
 }
 
+/// User price override for one model, in USD per million tokens.
+///
+/// Every field is optional: an unset field keeps the catalog price, so a user
+/// can correct the input price of a flat-rate model without erasing the rest.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PriceOverride {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write: Option<f64>,
+}
+
+impl PriceOverride {
+    /// Overlay the set fields onto one catalog band.
+    #[must_use]
+    pub fn apply(&self, band: &Cost) -> Cost {
+        Cost {
+            tier: band.tier,
+            input: self.input.unwrap_or(band.input),
+            output: self.output.unwrap_or(band.output),
+            cache: CostCache {
+                read: self.cache_read.unwrap_or(band.cache.read),
+                write: self.cache_write.unwrap_or(band.cache.write),
+            },
+        }
+    }
+}
+
+/// Price overrides keyed by `provider/model[#variant]`.
+pub type PriceOverrideMap = BTreeMap<String, PriceOverride>;
+
 /// Request overrides attached to a variant.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

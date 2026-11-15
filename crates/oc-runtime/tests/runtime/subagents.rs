@@ -1128,7 +1128,11 @@ async fn subagent_model_override_resolves_and_unavailable_models_fail_before_spa
     assert_eq!(session["model"]["providerID"], "test");
     assert_eq!(session["model"]["id"], "alpha");
 
-    let error = tool
+    // An unknown call model is not fatal: the resolver falls through to the
+    // agent's model and reports the rejected reference. (The contract used to
+    // fail loudly here, which turned one bad chain entry into a total spawn
+    // lockout.)
+    let result = tool
         .execute(
             &tool_context(&harness, &harness.session),
             json!({
@@ -1139,13 +1143,23 @@ async fn subagent_model_override_resolves_and_unavailable_models_fail_before_spa
             }),
         )
         .await
-        .expect_err("unavailable model");
-    assert!(error.message.contains("unavailable"), "{}", error.message);
-    assert!(error.message.contains("test/missing"), "{}", error.message);
+        .expect("an unavailable call model falls through to the agent model");
+    let metadata = result.metadata.expect("metadata");
+    assert_eq!(metadata["model"]["id"], "alpha");
+    assert_eq!(metadata["modelSource"], "agent");
+    let rejected = metadata["rejectedModels"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the bad call reference is reported: {metadata}"));
+    assert!(
+        rejected
+            .iter()
+            .any(|skip| skip["reference"] == "test/missing"),
+        "{metadata}"
+    );
     assert_eq!(
         child_sessions(&harness.store, &harness.session).await.len(),
-        1,
-        "no session is created for an unavailable model"
+        2,
+        "the fall-through still spawns"
     );
 }
 

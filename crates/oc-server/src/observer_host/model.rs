@@ -30,49 +30,39 @@ impl LlmObserverModel {
     }
 }
 
-/// Stored credential for `provider`, mirroring the runtime's private
-/// `credential_key` (`oc-runtime/src/turn.rs`): the integration's active row
-/// wins, otherwise the first non-empty key; OAuth values use `access_token`,
-/// other types `key`. Store failures are logged and leave the provider's
-/// environment variables to the LLM client.
+/// Stored credential for `provider` in store rotation order.
+///
+/// The order comes from [`Store::credential_pool`] — the single source of truth
+/// (active row first, then ids ascending) that `oc-runtime` and `KeyPool` rotate
+/// over — instead of a second private copy of the selection rule. Store failures
+/// are logged and leave the provider's environment variables to the LLM client.
 async fn stored_credential_key(store: &Store, provider: &str) -> Option<String> {
-    let credentials = match store.list_credentials().await {
-        Ok(credentials) => credentials,
+    let pool = match store.credential_pool(provider).await {
+        Ok(pool) => pool,
         Err(error) => {
             tracing::warn!(%error, provider, "could not read stored credentials");
             return None;
         }
     };
+    pool.into_iter().find_map(|row| credential_key(&row.value))
+}
 
-    let mut fallback = None;
-    for entry in credentials {
-        if entry.get("integrationID").and_then(Value::as_str) != Some(provider) {
-            continue;
-        }
-        let Some(value) = entry.get("value") else {
-            continue;
-        };
-        let key = match value.get("type").and_then(Value::as_str) {
-            Some("oauth") => value
-                .get("access")
-                .or_else(|| value.get("access_token"))
-                .or_else(|| value.get("key")),
-            _ => value
-                .get("key")
-                .or_else(|| value.get("access"))
-                .or_else(|| value.get("access_token")),
-        }
-        .and_then(Value::as_str)
-        .filter(|key| !key.is_empty());
-        let Some(key) = key else {
-            continue;
-        };
-        if entry.get("active").and_then(Value::as_bool) == Some(true) {
-            return Some(key.to_owned());
-        }
-        fallback.get_or_insert_with(|| key.to_owned());
+/// The usable key inside a tagged credential value: OAuth values use
+/// `access_token`, other types `key`.
+fn credential_key(value: &Value) -> Option<String> {
+    let key = match value.get("type").and_then(Value::as_str) {
+        Some("oauth") => value
+            .get("access")
+            .or_else(|| value.get("access_token"))
+            .or_else(|| value.get("key")),
+        _ => value
+            .get("key")
+            .or_else(|| value.get("access"))
+            .or_else(|| value.get("access_token")),
     }
-    fallback
+    .and_then(Value::as_str)
+    .filter(|key| !key.is_empty())?;
+    Some(key.to_owned())
 }
 
 impl ObserverModel for LlmObserverModel {

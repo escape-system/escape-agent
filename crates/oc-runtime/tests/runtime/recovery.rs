@@ -60,7 +60,7 @@ async fn recovery_does_not_add_a_terminal_to_an_already_terminal_session() {
             kind: "assistant".to_owned(),
             data: json!({
                 "time": {"created": now},
-                "agent": "build",
+                "agent": "engineer",
                 "model": {"providerID": "test", "id": "alpha"},
                 "content": [{"type": "text", "text": "half an answer"}]
             }),
@@ -79,7 +79,7 @@ async fn recovery_does_not_add_a_terminal_to_an_already_terminal_session() {
             kind: "assistant".to_owned(),
             data: json!({
                 "time": {"created": now},
-                "agent": "build",
+                "agent": "engineer",
                 "model": {"providerID": "test", "id": "alpha"},
                 "content": [{"type": "text", "text": "unfinished"}]
             }),
@@ -150,7 +150,7 @@ async fn recovery_reports_a_settled_childs_real_outcome() {
             kind: "assistant".to_owned(),
             data: json!({
                 "time": {"created": now},
-                "agent": "build",
+                "agent": "engineer",
                 "model": {"providerID": "test", "id": "alpha"},
                 "content": [{
                     "type": "tool",
@@ -255,7 +255,7 @@ async fn crash_recovery_settles_an_interrupted_background_child_once() {
             kind: "assistant".to_owned(),
             data: json!({
                 "time": {"created": now, "streamed": now, "completed": now},
-                "agent": "build",
+                "agent": "engineer",
                 "model": {"providerID": "test", "id": "alpha"},
                 "finish": "stop",
                 "content": [{
@@ -401,7 +401,7 @@ async fn recovered_child_report_is_capped_in_the_repaired_tool_part() {
             kind: "assistant".to_owned(),
             data: json!({
                 "time": {"created": now},
-                "agent": "build",
+                "agent": "engineer",
                 "model": {"providerID": "test", "id": "alpha"},
                 "content": [{
                     "type": "tool",

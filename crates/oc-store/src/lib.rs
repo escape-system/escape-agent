@@ -61,11 +61,12 @@ mod schema;
 mod session;
 mod session_ext;
 mod snapshot;
+mod usage;
 mod worktrees;
 
 pub use agentic::{GoalPatch, NewGoal, NewObservation, NewRepair, SessionNodeRow};
 pub use boxes::{BOX_KINDS, BoxPage, BoxQuery, MAX_BOX_CHARS, MAX_BOX_KEY_CHARS, NewBox};
-pub use credentials::{CredentialPatch, NewCredential};
+pub use credentials::{CredentialPatch, CredentialRow, NewCredential};
 pub use cursor::{Cursor, Order};
 pub use db::Store;
 pub use error::StoreError;
@@ -81,4 +82,5 @@ pub use schedule::{
 };
 pub use session::{NewSession, NewSessionTree, SessionPage, SessionPatch, SessionQuery};
 pub use snapshot::{NewSnapshot, SnapshotRow};
+pub use usage::{MAX_USAGE_ROWS, ModelUsageRow, model_usage};
 pub use worktrees::NewWorktree;

@@ -1,4 +1,4 @@
-import { createEffect, on, onMount } from "solid-js"
+import { createEffect, on, onMount, type JSX } from "solid-js"
 import { createStore } from "solid-js/store"
 import { makeEventListener } from "@solid-primitives/event-listener"
 import { createResizeObserver } from "@solid-primitives/resize-observer"
@@ -6,11 +6,27 @@ import { Icon } from "@opencode/ui/icon"
 import { TextInput } from "@opencode/ui/text-input"
 import "@/settings/search.css"
 
+/**
+ * Elements that own their keys. The typed-to-search shortcut only exists for a
+ * page that has no input of its own in reach, so it must never take a key from
+ * anything focusable, anything that announces itself as a control, or any
+ * region that opted out with `data-settings-key-capture="off"` (the Models tab,
+ * whose two search surfaces each handle their own keys).
+ */
+const INTERACTIVE =
+  "input, textarea, select, [contenteditable], [contenteditable='true'], [role='combobox'], [role='listbox'], [role='option'], [role='button'], [role='menuitem'], [role='tab'], [role='switch'], [role='slider'], [role='progressbar'], button, a, summary, [data-settings-key-capture='off']"
+
+const ownsKeys = (target: EventTarget | null) => target instanceof Element && !!target.closest(INTERACTIVE)
+
 export function SettingsSearchField(props: {
   value: string
   placeholder: string
+  /** The field's accessible name, when the placeholder names what it searches instead. */
+  label?: string
   active: boolean
   onInput: (value: string) => void
+  /** A live line under the field, such as the result count. */
+  status?: JSX.Element
 }) {
   const [state, setState] = createStore({ overflow: { start: false, end: false } })
   let root: HTMLDivElement | undefined
@@ -45,7 +61,7 @@ export function SettingsSearchField(props: {
         event.altKey ||
         event.key.length !== 1 ||
         !event.key.trim() ||
-        (event.target instanceof Element && event.target.closest("input, textarea, select, [contenteditable=true]"))
+        ownsKeys(event.target)
       )
         return
       event.preventDefault()

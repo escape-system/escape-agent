@@ -13,8 +13,8 @@ use crate::free::{
 use crate::loader::Loader;
 use crate::merge::merge_documents;
 use crate::{
-    ConfigEntry, ConfigError, ConfigService, LoadOptions, commands, instructions, markdown_agents,
-    normalize, permissions, skills,
+    ConfigEntry, ConfigError, ConfigService, LoadOptions, ModelsCell, commands, instructions,
+    markdown_agents, normalize, permissions, skills,
 };
 
 impl ConfigService {
@@ -76,6 +76,11 @@ impl ConfigService {
             .and_then(Value::as_str)
             .map_or_else(default_shell, str::to_owned);
         let model = merged.get("model").and_then(normalize::model_string);
+        let models = merged
+            .get("models")
+            .filter(|value| value.is_object())
+            .cloned()
+            .unwrap_or_else(|| Value::Object(Map::new()));
 
         Ok(Self {
             entries,
@@ -95,6 +100,10 @@ impl ConfigService {
             mcp_servers,
             shell,
             model,
+            models: RwLock::new(ModelsCell {
+                value: models,
+                revision: 0,
+            }),
         })
     }
 

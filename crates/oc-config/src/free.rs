@@ -78,14 +78,14 @@ pub(super) fn build_agents(
     };
     let default_agent = configured
         .and_then(select)
-        .or_else(|| select("build"))
+        .or_else(|| select("engineer"))
         .or_else(|| {
             agents
                 .iter()
                 .find(|agent| agent.is_selectable())
                 .map(|agent| agent.id.clone())
         })
-        .unwrap_or_else(|| "build".to_owned());
+        .unwrap_or_else(|| "engineer".to_owned());
 
     (agents, default_agent)
 }

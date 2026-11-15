@@ -1,6 +1,8 @@
 import { createSignal, For, Show, type Component } from "solid-js"
 import { Badge } from "@opencode/ui/badge"
 import { Button } from "@opencode/ui/button"
+import { Collapsible } from "@opencode/ui/collapsible"
+import { Icon } from "@opencode/ui/icon"
 import { Loader } from "@opencode/ui/loader"
 import { ProviderIcon } from "@opencode/ui/provider-icon"
 import { TextInput } from "@opencode/ui/text-input"
@@ -12,12 +14,15 @@ import {
   formatCountdownDuration,
   formatCurrencyValue,
   formatQuotaWindowValue,
+  keyKindLabelKey,
   QuotaRequestError,
   quotasData,
+  quotasRefreshing,
   quotasUnavailable,
   statusLabelKey,
   useQuotasData,
   type AntigravityAccountStatus,
+  type ProviderKeyEntry,
   type ProviderLocalUsage,
   type ProviderQuotaEntry,
   type ProviderRateLimit,
@@ -210,6 +215,12 @@ const AntigravityAccountsSection: Component<{
       resetAtMs: snap.resetTimeMs,
     }))
   }
+  // The server omits the deadline for a healthy account; a past one is already
+  // reset and reads as healthy, so both render nothing.
+  const accCooldown = (account: AntigravityAccountStatus) =>
+    typeof account.cooldownUntilMs === "number"
+      ? formatCountdownDuration(account.cooldownUntilMs)
+      : undefined
 
   return (
     <div class="flex flex-col gap-2">
@@ -241,6 +252,17 @@ const AntigravityAccountsSection: Component<{
                   </Show>
                   <Show when={acc.verificationRequired}>
                     <Badge variant="neutral">{language.t("settings.quotas.antigravity.verify")}</Badge>
+                  </Show>
+                  <Show when={accCooldown(acc)}>
+                    {(text) => (
+                      <Badge
+                        variant="neutral"
+                        data-testid={`settings-quotas-ag-cooldown-${acc.index}`}
+                        data-state="cooldown"
+                      >
+                        {text()}
+                      </Badge>
+                    )}
                   </Show>
                 </div>
                 <div class="flex items-center gap-1.5">
@@ -415,9 +437,73 @@ const LocalUsageSection: Component<{ usage: ProviderLocalUsage }> = (props) => {
   )
 }
 
-const ProviderQuotaCard: Component<{
+const ProviderKeysSection: Component<{ keys: ProviderKeyEntry[] }> = (props) => {
+  const language = useLanguage()
+
+  return (
+    <div class="flex flex-col gap-2" data-testid="settings-quotas-keys">
+      <div class="text-12-medium text-v2-text-text-base">{language.t("settings.quotas.keys.title")}</div>
+      <div class="flex flex-col gap-1.5">
+        <For each={props.keys}>
+          {(key) => {
+            // The server reports a cooling key with the failure class that caused it.
+            const kindLabel = () => {
+              const labelKey = keyKindLabelKey(key.kind)
+
+              return labelKey ? language.t(labelKey) : undefined
+            }
+            const resetsIn = () =>
+              typeof key.cooldownUntilMs === "number" ? formatCountdownDuration(key.cooldownUntilMs) : undefined
+
+            return (
+              <div
+                data-testid={`settings-quotas-key-${key.credentialID}`}
+                data-limited={key.limited ? "true" : "false"}
+                data-active={key.active ? "true" : "false"}
+                class="flex flex-wrap items-center justify-between gap-2 rounded-md border border-v2-border-border-base bg-v2-background-bg-base px-3 py-1.5"
+              >
+                <div class="flex min-w-0 flex-wrap items-center gap-1.5">
+                  <bdi class="min-w-0 truncate text-12-regular text-v2-text-text-base" title={key.credentialID}>
+                    {key.label}
+                  </bdi>
+                  <Show when={key.active}>
+                    <Badge variant="accent">{language.t("settings.quotas.keys.primary")}</Badge>
+                  </Show>
+                </div>
+                <div class="flex shrink-0 flex-wrap items-center gap-2 text-11-regular text-v2-text-text-muted">
+                  <Show when={key.limited}>
+                    <Badge variant="neutral">
+                      {kindLabel()
+                        ? language.t("settings.quotas.keys.limitedWithKind", { kind: kindLabel()! })
+                        : language.t("settings.quotas.keys.limited")}
+                    </Badge>
+                  </Show>
+                  <Show when={resetsIn()}>
+                    {(duration) => <span>{language.t("settings.quotas.keys.resetsIn", { duration: duration() })}</span>}
+                  </Show>
+                </div>
+              </div>
+            )
+          }}
+        </For>
+      </div>
+      {/*
+        `usedCostUsd`/`usedRequests` are always 0 on the wire: per-key attribution
+        does not exist yet, so a spend column here would report a fake zero.
+      */}
+    </div>
+  )
+}
+
+/**
+ * Per-provider compact row: requests, cost and remaining quota, expandable to
+ * the per-key rotation rows and the rest of the provider's detail.
+ *
+ * The spend/request numbers come from `localUsage.day` (the honest 24h bucket);
+ * `summary` totals are not repeated here because the block header owns them.
+ */
+const ProviderQuotaRow: Component<{
   entry: ProviderQuotaEntry
-  /** The server refused a key change because an env var owns the key. */
   envManaged: boolean
   busyAccountId: string | undefined
   savingMgmt: boolean
@@ -426,166 +512,209 @@ const ProviderQuotaCard: Component<{
   onClearMgmtKey: () => Promise<void>
 }> = (props) => {
   const language = useLanguage()
+  const [open, setOpen] = createSignal(false)
   const e = () => props.entry
-  // A 409 names the owner; a fresh payload may name it directly.
-  const envOwned = () => props.envManaged || e().managementKeySource === "env"
+  const day = () => e().localUsage?.day
+  const remaining = () => {
+    const values = (e().windows ?? []).flatMap((window) => {
+      const fill = windowFillPercent(window)
+
+      return fill === undefined ? [] : [fill]
+    })
+
+    return values.length > 0 ? Math.min(...values) : undefined
+  }
+  const limited = () => (e().windows ?? []).some((window) => window.limited === true)
 
   return (
-    <div data-testid={`settings-quotas-provider-${e().providerID}`} class="quotas-provider-card">
-      <div class="flex flex-wrap items-start justify-between gap-2">
-        <div class="flex items-center gap-2.5">
-          <ProviderIcon id={e().providerID} class="size-4 shrink-0 text-v2-text-text-base" />
-          <div class="flex flex-col">
-            <div class="flex flex-wrap items-center gap-1.5">
-              <span class="text-14-medium text-v2-text-text-base">{e().name}</span>
-              <Badge variant="subtle">{e().providerID}</Badge>
-              <Show when={e().keyLabel}>{(label) => <Badge variant="subtle">{label()}</Badge>}</Show>
-            </div>
-            <div class="flex flex-wrap items-center gap-2 text-11-regular text-v2-text-text-muted">
-              <span>{language.t(sourceLabelKey(e().connectionSource))}</span>
-              <Show when={e().rateLimitRule}>{(rule) => <span>· {rule()}</span>}</Show>
-              <Show when={typeof e().fetchedAtMs === "number"}>
-                <span>
-                  · {new Intl.DateTimeFormat(language.intl(), { timeStyle: "short" }).format(e().fetchedAtMs!)}
-                </span>
-              </Show>
-              <Show when={e().cached}>
-                <span>({language.t("settings.quotas.cached")})</span>
-              </Show>
-            </div>
+    <div data-testid={`settings-quotas-provider-${e().providerID}`} class="flex flex-col">
+      <button
+        type="button"
+        class="flex w-full flex-wrap items-center gap-x-3 gap-y-1 rounded-md border border-v2-border-border-base bg-v2-background-bg-base px-3 py-2 text-start hover:bg-v2-overlay-simple-overlay-hover focus-visible:outline focus-visible:outline-2 focus-visible:outline-v2-border-border-focus"
+        aria-expanded={open()}
+        aria-label={language.t("settings.quotas.usage.expand", { provider: e().name })}
+        onClick={() => setOpen((value) => !value)}
+      >
+        <span class={`shrink-0 text-v2-icon-icon-muted transition-transform ${open() ? "rotate-90" : ""}`}>
+          <Icon name="chevron-right" size="small" />
+        </span>
+        <ProviderIcon id={e().providerID} class="size-4 shrink-0 text-v2-text-text-base" />
+        <span class="min-w-0 flex-1 truncate text-13-regular text-v2-text-text-base">{e().name}</span>
+        <Show when={limited()}>
+          <Badge variant="neutral">{language.t("settings.quotas.window.limited")}</Badge>
+        </Show>
+        <Show when={e().keys && e().keys!.length > 1}>
+          <Badge variant="subtle">{language.t("settings.quotas.usage.keys", { count: e().keys!.length })}</Badge>
+        </Show>
+        <span class="shrink-0 text-11-regular text-v2-text-text-muted">
+          {language.t("settings.quotas.usage.requests", {
+            requests: formatCompactNumber(day()?.steps ?? 0, language.intl()),
+          })}
+        </span>
+        <span class="w-20 shrink-0 text-end text-11-regular text-v2-text-text-base">
+          {formatCurrencyValue(day()?.costUsd ?? 0, "USD", language.intl())}
+        </span>
+        <span class="w-24 shrink-0 text-end text-11-regular text-v2-text-text-muted">
+          <Show
+            when={remaining() !== undefined}
+            fallback={<span class="text-v2-text-text-faint">{language.t("settings.quotas.usage.noWindow")}</span>}
+          >
+            {language.t("settings.quotas.usage.remaining", { percent: Math.round(remaining()!) })}
+          </Show>
+        </span>
+      </button>
+
+      <Show when={open()}>
+        <div class="mt-1 flex flex-col gap-3 rounded-md border border-v2-border-border-base bg-v2-background-bg-layer-01 px-3 py-2">
+          <div class="flex flex-wrap items-center gap-2 text-11-regular text-v2-text-text-muted">
+            <span>{language.t(sourceLabelKey(e().connectionSource))}</span>
+            <Show when={e().rateLimitRule}>{(rule) => <span>· {rule()}</span>}</Show>
+            <Show when={typeof e().fetchedAtMs === "number"}>
+              <span>
+                · {new Intl.DateTimeFormat(language.intl(), { timeStyle: "short" }).format(e().fetchedAtMs!)}
+              </span>
+            </Show>
+            <Show when={e().cached}>
+              <span>({language.t("settings.quotas.cached")})</span>
+            </Show>
+            <Badge variant={e().capability === "live_api" ? "accent" : "subtle"}>
+              {e().capability === "live_api"
+                ? language.t("settings.quotas.capability.live")
+                : language.t("settings.quotas.capability.headers")}
+            </Badge>
+            <Badge variant={e().status === "error" ? "neutral" : "subtle"}>
+              {language.t(statusLabelKey(e().status))}
+            </Badge>
           </div>
-        </div>
-        <div class="flex items-center gap-1.5">
-          <Badge variant={e().capability === "live_api" ? "accent" : "subtle"}>
-            {e().capability === "live_api"
-              ? language.t("settings.quotas.capability.live")
-              : language.t("settings.quotas.capability.headers")}
-          </Badge>
-          <Badge variant={e().status === "error" ? "neutral" : "subtle"}>
-            {language.t(statusLabelKey(e().status))}
-          </Badge>
-        </div>
-      </div>
 
-      <Show when={e().error}>
-        {(err) => (
-          <div class="rounded-md border border-v2-border-border-base bg-v2-background-bg-base px-3 py-2 text-12-regular text-v2-state-fg-danger">
-            {err()}
-          </div>
-        )}
-      </Show>
+          <Show when={e().error}>
+            {(err) => (
+              <div class="rounded-md border border-v2-border-border-base bg-v2-background-bg-base px-3 py-2 text-12-regular text-v2-state-fg-danger">
+                {err()}
+              </div>
+            )}
+          </Show>
 
-      <Show when={e().warnings && e().warnings!.length > 0}>
-        <div class="flex flex-col gap-1 rounded-md border border-v2-border-border-base bg-v2-background-bg-base px-3 py-2 text-11-regular text-v2-text-text-muted">
-          <For each={e().warnings}>{(w) => <span>{w}</span>}</For>
-        </div>
-      </Show>
+          <Show when={e().warnings && e().warnings!.length > 0}>
+            <div class="flex flex-col gap-1 rounded-md border border-v2-border-border-base bg-v2-background-bg-base px-3 py-2 text-11-regular text-v2-text-text-muted">
+              <For each={e().warnings}>{(w) => <span>{w}</span>}</For>
+            </div>
+          </Show>
 
-      <Show when={e().balances && e().balances!.length > 0}>
-        <div class="flex flex-wrap gap-2">
-          <For each={e().balances}>
-            {(bal) => (
-              <div class="flex flex-wrap items-center gap-2 rounded-md border border-v2-border-border-base bg-v2-background-bg-base px-3 py-1.5 text-12-regular">
-                <span class="text-v2-text-text-muted">{language.t("settings.quotas.balance")}</span>
-                <Show when={typeof bal.remaining === "number"}>
-                  <strong class="font-medium text-v2-text-text-base">
-                    {formatCurrencyValue(bal.remaining!, bal.currency, language.intl())}
-                  </strong>
-                </Show>
-                <Show when={typeof bal.total === "number"}>
-                  <span class="text-11-regular text-v2-text-text-muted">
-                    ({language.t("settings.quotas.balanceTotal")}:{" "}
-                    {formatCurrencyValue(bal.total!, bal.currency, language.intl())})
+          <Show when={e().balances && e().balances!.length > 0}>
+            <div class="flex flex-wrap gap-2">
+              <For each={e().balances}>
+                {(bal) => (
+                  <div class="flex flex-wrap items-center gap-2 rounded-md border border-v2-border-border-base bg-v2-background-bg-base px-3 py-1.5 text-12-regular">
+                    <span class="text-v2-text-text-muted">{language.t("settings.quotas.balance")}</span>
+                    <Show when={typeof bal.remaining === "number"}>
+                      <strong class="font-medium text-v2-text-text-base">
+                        {formatCurrencyValue(bal.remaining!, bal.currency, language.intl())}
+                      </strong>
+                    </Show>
+                    <Show when={typeof bal.total === "number"}>
+                      <span class="text-11-regular text-v2-text-text-muted">
+                        ({language.t("settings.quotas.balanceTotal")}:{" "}
+                        {formatCurrencyValue(bal.total!, bal.currency, language.intl())})
+                      </span>
+                    </Show>
+                    <Show when={typeof bal.toppedUp === "number" || typeof bal.granted === "number"}>
+                      <span class="text-11-regular text-v2-text-text-muted">
+                        {[
+                          typeof bal.toppedUp === "number"
+                            ? `${language.t("settings.quotas.toppedUp")} ${formatCurrencyValue(bal.toppedUp, bal.currency, language.intl())}`
+                            : undefined,
+                          typeof bal.granted === "number"
+                            ? `${language.t("settings.quotas.granted")} ${formatCurrencyValue(bal.granted, bal.currency, language.intl())}`
+                            : undefined,
+                        ]
+                          .filter(Boolean)
+                          .join(" · ")}
+                      </span>
+                    </Show>
+                  </div>
+                )}
+              </For>
+            </div>
+          </Show>
+
+          <Show when={e().spendSummary}>
+            {(spend) => (
+              <div class="flex flex-wrap gap-3 text-11-regular text-v2-text-text-muted">
+                <Show when={typeof spend().daily === "number"}>
+                  <span>
+                    {language.t("settings.quotas.apiSpend.daily")}:{" "}
+                    <strong class="text-v2-text-text-base">
+                      {formatCurrencyValue(spend().daily!, spend().currency, language.intl())}
+                    </strong>
                   </span>
                 </Show>
-                <Show when={typeof bal.toppedUp === "number" || typeof bal.granted === "number"}>
-                  <span class="text-11-regular text-v2-text-text-muted">
-                    {[
-                      typeof bal.toppedUp === "number"
-                        ? `${language.t("settings.quotas.toppedUp")} ${formatCurrencyValue(bal.toppedUp, bal.currency, language.intl())}`
-                        : undefined,
-                      typeof bal.granted === "number"
-                        ? `${language.t("settings.quotas.granted")} ${formatCurrencyValue(bal.granted, bal.currency, language.intl())}`
-                        : undefined,
-                    ]
-                      .filter(Boolean)
-                      .join(" · ")}
+                <Show when={typeof spend().weekly === "number"}>
+                  <span>
+                    {language.t("settings.quotas.apiSpend.weekly")}:{" "}
+                    <strong class="text-v2-text-text-base">
+                      {formatCurrencyValue(spend().weekly!, spend().currency, language.intl())}
+                    </strong>
+                  </span>
+                </Show>
+                <Show when={typeof spend().monthly === "number"}>
+                  <span>
+                    {language.t("settings.quotas.apiSpend.monthly")}:{" "}
+                    <strong class="text-v2-text-text-base">
+                      {formatCurrencyValue(spend().monthly!, spend().currency, language.intl())}
+                    </strong>
+                  </span>
+                </Show>
+                <Show when={typeof spend().total === "number"}>
+                  <span>
+                    {language.t("settings.quotas.apiSpend.total")}:{" "}
+                    <strong class="text-v2-text-text-base">
+                      {formatCurrencyValue(spend().total!, spend().currency, language.intl())}
+                    </strong>
                   </span>
                 </Show>
               </div>
             )}
-          </For>
+          </Show>
+
+          <Show when={e().windows && e().windows!.length > 0}>
+            <div class="flex flex-col gap-2.5">
+              <For each={e().windows}>{(w) => <WindowRow window={w} />}</For>
+            </div>
+          </Show>
+
+          <Show when={e().providerID === "openrouter"}>
+            <OpenRouterManagementSection
+              configured={Boolean(e().hasManagementKey)}
+              envManaged={props.envManaged || e().managementKeySource === "env"}
+              saving={props.savingMgmt}
+              onSave={props.onSaveMgmtKey}
+              onClear={props.onClearMgmtKey}
+            />
+          </Show>
+
+          <Show when={e().accounts && e().accounts!.length > 0}>
+            <AntigravityAccountsSection
+              accounts={e().accounts!}
+              busyId={props.busyAccountId}
+              onAction={props.onAccountAction}
+            />
+          </Show>
+
+          <Show when={e().rateLimit}>{(rl) => <RateLimitSection rateLimit={rl()} />}</Show>
+
+          {/* Per-key rotation rows: the credential axis, never the model axis. */}
+          <Show when={e().keys && e().keys!.length > 0}>
+            <ProviderKeysSection keys={e().keys!} />
+          </Show>
+
+          <Show when={e().localUsage}>{(usage) => <LocalUsageSection usage={usage()} />}</Show>
+
+          <Show when={e().capabilityNote}>
+            {(note) => <div class="text-11-regular text-v2-text-text-muted">{note()}</div>}
+          </Show>
         </div>
       </Show>
-
-      <Show when={e().spendSummary}>
-        {(spend) => (
-          <div class="flex flex-wrap gap-3 text-11-regular text-v2-text-text-muted">
-            <Show when={typeof spend().daily === "number"}>
-              <span>
-                {language.t("settings.quotas.apiSpend.daily")}:{" "}
-                <strong class="text-v2-text-text-base">
-                  {formatCurrencyValue(spend().daily!, spend().currency, language.intl())}
-                </strong>
-              </span>
-            </Show>
-            <Show when={typeof spend().weekly === "number"}>
-              <span>
-                {language.t("settings.quotas.apiSpend.weekly")}:{" "}
-                <strong class="text-v2-text-text-base">
-                  {formatCurrencyValue(spend().weekly!, spend().currency, language.intl())}
-                </strong>
-              </span>
-            </Show>
-            <Show when={typeof spend().monthly === "number"}>
-              <span>
-                {language.t("settings.quotas.apiSpend.monthly")}:{" "}
-                <strong class="text-v2-text-text-base">
-                  {formatCurrencyValue(spend().monthly!, spend().currency, language.intl())}
-                </strong>
-              </span>
-            </Show>
-            <Show when={typeof spend().total === "number"}>
-              <span>
-                {language.t("settings.quotas.apiSpend.total")}:{" "}
-                <strong class="text-v2-text-text-base">
-                  {formatCurrencyValue(spend().total!, spend().currency, language.intl())}
-                </strong>
-              </span>
-            </Show>
-          </div>
-        )}
-      </Show>
-
-      <Show when={e().windows && e().windows!.length > 0}>
-        <div class="flex flex-col gap-2.5">
-          <For each={e().windows}>{(w) => <WindowRow window={w} />}</For>
-        </div>
-      </Show>
-
-      <Show when={e().providerID === "openrouter"}>
-        <OpenRouterManagementSection
-          configured={Boolean(e().hasManagementKey)}
-          envManaged={envOwned()}
-          saving={props.savingMgmt}
-          onSave={props.onSaveMgmtKey}
-          onClear={props.onClearMgmtKey}
-        />
-      </Show>
-
-      <Show when={e().accounts && e().accounts!.length > 0}>
-        <AntigravityAccountsSection
-          accounts={e().accounts!}
-          busyId={props.busyAccountId}
-          onAction={props.onAccountAction}
-        />
-      </Show>
-
-      <Show when={e().rateLimit}>{(rl) => <RateLimitSection rateLimit={rl()} />}</Show>
-
-      <Show when={e().localUsage}>{(usage) => <LocalUsageSection usage={usage()} />}</Show>
-
-      <Show when={e().capabilityNote}>{(note) => <div class="text-11-regular text-v2-text-text-muted">{note()}</div>}</Show>
     </div>
   )
 }
@@ -736,73 +865,65 @@ export const SettingsQuotas: Component = () => {
         <Show when={data()}>
           {(snapshot) => (
             <div class="flex flex-col gap-4">
-              <div class="quotas-summary-grid" data-testid="settings-quotas-summary">
-                <div class="quotas-summary-card">
-                  <span class="text-11-regular text-v2-text-text-muted">
-                    {language.t("settings.quotas.summary.liveApis")}
-                  </span>
-                  <span class="text-14-medium text-v2-text-text-base">
-                    {snapshot().summary.liveQuotaCount} / {snapshot().summary.providerCount}
-                  </span>
-                </div>
-                <div class="quotas-summary-card">
-                  <span class="text-11-regular text-v2-text-text-muted">
-                    {language.t("settings.quotas.summary.spend5h")}
-                  </span>
-                  <span class="text-14-medium text-v2-text-text-base">
-                    {formatCurrencyValue(snapshot().summary.spend5hUsd, "USD", language.intl())}
-                  </span>
-                </div>
-                <div class="quotas-summary-card">
-                  <span class="text-11-regular text-v2-text-text-muted">
-                    {language.t("settings.quotas.summary.spend24h")}
-                  </span>
-                  <span class="text-14-medium text-v2-text-text-base">
-                    {formatCurrencyValue(snapshot().summary.spend24hUsd, "USD", language.intl())}
-                  </span>
-                </div>
-                <div class="quotas-summary-card">
-                  <span class="text-11-regular text-v2-text-text-muted">
-                    {language.t("settings.quotas.summary.spend7d")}
-                  </span>
-                  <span class="text-14-medium text-v2-text-text-base">
-                    {formatCurrencyValue(snapshot().summary.spend7dUsd, "USD", language.intl())}
-                  </span>
-                </div>
-                <div class="quotas-summary-card">
-                  <span class="text-11-regular text-v2-text-text-muted">
-                    {language.t("settings.quotas.summary.spend30d")}
-                  </span>
-                  <span class="text-14-medium text-v2-text-text-base">
-                    {formatCurrencyValue(snapshot().summary.spend30dUsd, "USD", language.intl())}
-                  </span>
-                </div>
-              </div>
+              <Collapsible variant="ghost" defaultOpen>
+                <Collapsible.Trigger>
+                  <span>{language.t("settings.quotas.usage.title")}</span>
+                  <Show when={quotasRefreshing(quotas.query.data)}>
+                    <span data-testid="settings-quotas-refreshing" class="flex items-center gap-1.5 text-11-regular text-v2-text-text-faint">
+                      <Icon name="outline-rotate-clockwise" size="small" />
+                      {language.t("settings.quotas.refreshing")}
+                    </span>
+                  </Show>
+                  <Collapsible.Arrow />
+                </Collapsible.Trigger>
+                <Collapsible.Content>
+                  <div class="flex flex-col gap-3 pt-2">
+                    {/*
+                      One row per provider; the compact row owns its own numbers
+                      and expands to the key rotation list. Totals live once, in
+                      this header row.
+                    */}
+                    <div class="flex flex-wrap items-center gap-x-3 text-11-regular text-v2-text-text-muted">
+                      <span class="flex-1">
+                        {language.t("settings.quotas.usage.providers", {
+                          count: snapshot().summary.liveQuotaCount,
+                          total: snapshot().summary.providerCount,
+                        })}
+                      </span>
+                      <span class="w-24 text-end">
+                        {language.t("settings.quotas.usage.spend", {
+                          amount: formatCurrencyValue(snapshot().summary.spend24hUsd, "USD", language.intl()),
+                        })}
+                      </span>
+                    </div>
 
-              <Show
-                when={snapshot().providers.length > 0}
-                fallback={
-                  <div class="rounded-md border border-v2-border-border-base bg-v2-background-bg-layer-01 p-4 text-13-regular text-v2-text-text-muted">
-                    {language.t("settings.quotas.empty")}
+                    <Show
+                      when={snapshot().providers.length > 0}
+                      fallback={
+                        <div class="rounded-md border border-v2-border-border-base bg-v2-background-bg-layer-01 p-4 text-13-regular text-v2-text-text-muted">
+                          {language.t("settings.quotas.empty")}
+                        </div>
+                      }
+                    >
+                      <div class="flex flex-col gap-1.5">
+                        <For each={snapshot().providers}>
+                          {(entry) => (
+                            <ProviderQuotaRow
+                              entry={entry}
+                              envManaged={envManaged()}
+                              busyAccountId={busyAccountId()}
+                              savingMgmt={savingMgmt()}
+                              onAccountAction={(id, action) => void onAccountAction(id, action)}
+                              onSaveMgmtKey={onSaveMgmt}
+                              onClearMgmtKey={onClearMgmt}
+                            />
+                          )}
+                        </For>
+                      </div>
+                    </Show>
                   </div>
-                }
-              >
-                <div class="flex flex-col gap-3">
-                  <For each={snapshot().providers}>
-                    {(entry) => (
-                      <ProviderQuotaCard
-                        entry={entry}
-                        envManaged={envManaged()}
-                        busyAccountId={busyAccountId()}
-                        savingMgmt={savingMgmt()}
-                        onAccountAction={(id, action) => void onAccountAction(id, action)}
-                        onSaveMgmtKey={onSaveMgmt}
-                        onClearMgmtKey={onClearMgmt}
-                      />
-                    )}
-                  </For>
-                </div>
-              </Show>
+                </Collapsible.Content>
+              </Collapsible>
             </div>
           )}
         </Show>

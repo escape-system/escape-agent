@@ -7,7 +7,7 @@
 //! exactly as stored.
 
 use rusqlite::types::Value as SqlValue;
-use rusqlite::{OptionalExtension, Row, params, params_from_iter};
+use rusqlite::{OptionalExtension, Row, Transaction, params, params_from_iter};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
@@ -45,6 +45,26 @@ pub struct CredentialPatch {
     pub value: Option<Value>,
     /// Select or deselect the credential for its integration.
     pub active: Option<bool>,
+}
+
+/// One stored credential row, decoded for callers that need identity and
+/// secret material rather than the wire shape.
+///
+/// Ordered pools ([`Store::credential_pool`]) return these so key rotation sees
+/// stable ids and the activation flag without re-parsing wire JSON.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialRow {
+    /// Credential id (`cred_…`).
+    pub id: String,
+    /// Integration that owns the credential.
+    pub integration_id: String,
+    /// Human label; `default` when the row never had one.
+    pub label: String,
+    /// Tagged secret value (`{ "type": "oauth" | "key" | "external", … }`).
+    pub value: Value,
+    /// Whether this is the integration's current selection.
+    pub active: bool,
 }
 
 impl Store {
@@ -267,23 +287,11 @@ impl Store {
         let id_for_read = id.clone();
         self.write(move |connection| {
             in_tx(connection, |transaction| {
-                let integration: Option<String> = transaction
-                    .query_row(
-                        "SELECT integration_id FROM credential
-                         WHERE id = ?1 AND integration_id IS NOT NULL",
-                        [&id],
-                        |row| row.get(0),
-                    )
-                    .optional()?;
-                let Some(integration) = integration else {
-                    return Err(StoreError::NotFound(format!("credential {id}")));
-                };
-                transaction.execute(
-                    "UPDATE credential SET active = 0 WHERE integration_id = ?1",
-                    [&integration],
-                )?;
-                transaction.execute("UPDATE credential SET active = 1 WHERE id = ?1", [&id])?;
-                Ok(())
+                if activate_in_tx(transaction, &id)? {
+                    Ok(())
+                } else {
+                    Err(StoreError::NotFound(format!("credential {id}")))
+                }
             })
         })
         .await?;
@@ -291,6 +299,95 @@ impl Store {
             .await?
             .ok_or_else(|| StoreError::NotFound(format!("credential {id_for_read}")))
     }
+
+    /// Every credential of one integration ordered by rotation priority: the
+    /// active one first, then the remaining ids ascending.
+    ///
+    /// This is the single source of truth for backup-key order. Ids encode
+    /// creation time, so the order is stable across restarts without any extra
+    /// column.
+    pub async fn credential_pool(
+        &self,
+        integration_id: &str,
+    ) -> Result<Vec<CredentialRow>, StoreError> {
+        let integration_id = integration_id.to_owned();
+        self.read(move |connection| {
+            let sql = format!(
+                "SELECT {CREDENTIAL_COLUMNS} FROM credential
+                 WHERE integration_id = ?1
+                 ORDER BY active DESC, id ASC"
+            );
+            let mut statement = connection.prepare(&sql)?;
+            let mut rows = statement.query([&integration_id])?;
+            let mut items = Vec::new();
+            while let Some(row) = rows.next()? {
+                if let Some(entry) = credential_row(row)? {
+                    items.push(entry);
+                }
+            }
+            Ok(items)
+        })
+        .await
+    }
+
+    /// Makes `credential_id` the active credential of `integration_id` and
+    /// clears the flag on its siblings, in one transaction.
+    ///
+    /// Returns `false` when the id is unknown or belongs to a different
+    /// integration; the stored selection is then untouched. Rotation calls this
+    /// after a key starts cooling down so a restart does not pick the dead key
+    /// first; it shares [`activate_credential`](Self::activate_credential)'s
+    /// transaction body, so kill -9 safety is identical.
+    pub async fn set_credential_primary(
+        &self,
+        integration_id: &str,
+        credential_id: &str,
+    ) -> Result<bool, StoreError> {
+        let integration_id = integration_id.to_owned();
+        let credential_id = credential_id.to_owned();
+        self.write(move |connection| {
+            in_tx(connection, |transaction| {
+                let owner: Option<Option<String>> = transaction
+                    .query_row(
+                        "SELECT integration_id FROM credential WHERE id = ?1",
+                        [&credential_id],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                match owner {
+                    Some(Some(owner)) if owner == integration_id => {
+                        activate_in_tx(transaction, &credential_id)
+                    }
+                    _ => Ok(false),
+                }
+            })
+        })
+        .await
+    }
+}
+
+/// Shared body of [`Store::activate_credential`] and
+/// [`Store::set_credential_primary`]: resolve the owning integration, clear
+/// every sibling flag, then set exactly one row. `Ok(false)` means the id is
+/// unknown; nothing was written.
+fn activate_in_tx(transaction: &Transaction<'_>, id: &str) -> Result<bool, StoreError> {
+    let integration: Option<String> = transaction
+        .query_row(
+            "SELECT integration_id FROM credential
+             WHERE id = ?1 AND integration_id IS NOT NULL",
+            [id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(integration) = integration else {
+        return Ok(false);
+    };
+    transaction.execute(
+        "UPDATE credential SET active = 0 WHERE integration_id = ?1",
+        [&integration],
+    )?;
+    transaction.execute("UPDATE credential SET active = 1 WHERE id = ?1", [id])?;
+    Ok(true)
 }
 
 fn validate_value(value: &Value) -> Result<(), StoreError> {
@@ -305,6 +402,30 @@ fn validate_value(value: &Value) -> Result<(), StoreError> {
         )));
     }
     Ok(())
+}
+
+/// Decodes one row into [`CredentialRow`]. `Ok(None)` means the row has no
+/// integration id, which no pool query can return but legacy rows can.
+fn credential_row(row: &Row<'_>) -> Result<Option<CredentialRow>, StoreError> {
+    let id: String = row.get(0)?;
+    let integration_id: Option<String> = row.get(1)?;
+    let Some(integration_id) = integration_id else {
+        return Ok(None);
+    };
+    let label: Option<String> = row.get(2)?;
+    let encoded: Option<String> = row.get(3)?;
+    let active: Option<i64> = row.get(4)?;
+    let encoded =
+        encoded.ok_or_else(|| StoreError::Corrupt(format!("credential {id} has no value")))?;
+    let value: Value = serde_json::from_str(&encoded)
+        .map_err(|error| StoreError::Corrupt(format!("credential {id} value: {error}")))?;
+    Ok(Some(CredentialRow {
+        id,
+        integration_id,
+        label: label.unwrap_or_else(|| "default".to_owned()),
+        value,
+        active: active.is_some_and(|flag| flag != 0),
+    }))
 }
 
 /// Decodes one row. `Ok(None)` means the row has no integration id, which the

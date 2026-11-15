@@ -39,9 +39,13 @@ const {
   formatCurrencyValue,
   formatQuotaWindowValue,
   quotasData,
+  quotasRefreshing,
   quotasUnavailable,
   statusLabelKey,
   useQuotasData,
+  keyKindLabelKey,
+  parseProviderKeys,
+  parseQuotasResponse,
 } = await import("./api")
 
 const { dict: english } = await import("@/runtime/i18n/en")
@@ -211,5 +215,214 @@ describe("useQuotasData", () => {
 
     expect(lastOptions?.enabled).toBe(true)
     expect(lastOptions?.refetchInterval).toBe(60_000)
+  })
+})
+
+describe("parseProviderKeys", () => {
+  test("an absent or non-array list yields no keys rather than a placeholder", () => {
+    expect(parseProviderKeys(undefined)).toEqual([])
+    expect(parseProviderKeys(null)).toEqual([])
+    expect(parseProviderKeys({})).toEqual([])
+    expect(parseProviderKeys([])).toEqual([])
+  })
+
+  test("drops an entry without a credentialID and defaults the label to it", () => {
+    expect(parseProviderKeys([{ label: "orphan", active: true }])).toEqual([])
+    expect(parseProviderKeys([{ credentialID: "cred_1", label: "" }])).toEqual([
+      { credentialID: "cred_1", label: "cred_1", active: false, limited: false },
+    ])
+    expect(parseProviderKeys([{ credentialID: "cred_1", label: "Work" }])[0].label).toBe("Work")
+  })
+
+  test("keeps a cooldown, kind and failure count and omits the absent ones", () => {
+    const [limited] = parseProviderKeys([
+      {
+        credentialID: "cred_1",
+        label: "Work",
+        active: true,
+        limited: true,
+        cooldownUntilMs: 1_700_000_060_000,
+        kind: "quota",
+        failures: 3,
+        usedCostUsd: 0,
+        usedRequests: 0,
+      },
+    ])
+
+    expect(limited).toEqual({
+      credentialID: "cred_1",
+      label: "Work",
+      active: true,
+      limited: true,
+      cooldownUntilMs: 1_700_000_060_000,
+      kind: "quota",
+      failures: 3,
+      usedCostUsd: 0,
+      usedRequests: 0,
+    })
+    // A healthy key carries none of the cooldown fields at all.
+    const [healthy] = parseProviderKeys([{ credentialID: "cred_2", label: "Home" }])
+
+    expect(healthy.cooldownUntilMs).toBeUndefined()
+    expect(healthy.kind).toBeUndefined()
+    expect(healthy.failures).toBeUndefined()
+  })
+})
+
+describe("parseQuotasResponse", () => {
+  const now = 1_700_000_000_000
+  const summary = {
+    providerCount: 1,
+    liveQuotaCount: 0,
+    spend5hUsd: 0,
+    spend24hUsd: 0,
+    spend7dUsd: 0,
+    spend30dUsd: 0,
+  }
+
+  test("rejects a body it cannot trust instead of inventing a payload", () => {
+    expect(parseQuotasResponse(undefined)).toBeUndefined()
+    expect(parseQuotasResponse("nope")).toBeUndefined()
+    expect(parseQuotasResponse({ summary })).toBeUndefined()
+    expect(parseQuotasResponse({ providers: [] })).toBeUndefined()
+  })
+
+  test("leaves a provider without credentials without a keys field", () => {
+    const data = parseQuotasResponse({ fetchedAtMs: now, summary, providers: [{ providerID: "google", name: "Google" }] })
+
+    expect(data?.providers[0].keys).toBeUndefined()
+    expect("keys" in (data!.providers[0] as object)).toBe(false)
+    expect(data?.fetchedAtMs).toBe(now)
+  })
+
+  test("parses provider keys and keeps the server's rotation order", () => {
+    const data = parseQuotasResponse({
+      fetchedAtMs: now,
+      summary: { ...summary, providerCount: 2 },
+      providers: [
+        { providerID: "google", name: "Google", keys: [{ credentialID: "cred_2", active: true }, { credentialID: "cred_1" }] },
+        { providerID: "anthropic", name: "Anthropic", keys: "nonsense" },
+        { name: "no id" },
+      ],
+    })
+
+    expect(data?.providers.map((p) => p.providerID)).toEqual(["google", "anthropic"])
+    expect(data?.providers[0].keys?.map((key) => key.credentialID)).toEqual(["cred_2", "cred_1"])
+    expect(data?.providers[1].keys).toBeUndefined()
+  })
+
+  test("keeps only a still-future antigravity account cooldown", () => {
+    const data = parseQuotasResponse(
+      {
+        fetchedAtMs: now,
+        summary,
+        providers: [
+          {
+            providerID: "antigravity",
+            name: "Antigravity",
+            accounts: [
+              { index: 0, id: "a0", cooldownUntilMs: now + 60_000 },
+              { index: 1, id: "a1", cooldownUntilMs: now - 1 },
+              { index: 2, id: "a2" },
+            ],
+          },
+        ],
+      },
+      now,
+    )
+    const accounts = data!.providers[0].accounts!
+
+    expect(accounts[0].cooldownUntilMs).toBe(now + 60_000)
+    // A past deadline already reset: it must not render as a countdown.
+    expect(accounts[1].cooldownUntilMs).toBeUndefined()
+    expect("cooldownUntilMs" in accounts[1]).toBe(false)
+    expect(accounts[2].cooldownUntilMs).toBeUndefined()
+  })
+})
+
+describe("refreshing", () => {
+  const summary = {
+    providerCount: 1,
+    liveQuotaCount: 0,
+    spend5hUsd: 0,
+    spend24hUsd: 0,
+    spend7dUsd: 0,
+    spend30dUsd: 0,
+  }
+  const now = 1_700_000_000_000
+
+  test("a cache-first payload reports refreshing and the flag survives parsing", () => {
+    const data = parseQuotasResponse({
+      fetchedAtMs: now,
+      refreshing: true,
+      summary,
+      providers: [{ providerID: "google", name: "Google" }],
+    })
+
+    expect(data?.refreshing).toBe(true)
+    expect(quotasRefreshing(data)).toBe(true)
+  })
+
+  test("an older server that omits the field is normalized to false, never undefined", () => {
+    const data = parseQuotasResponse({
+      fetchedAtMs: now,
+      summary,
+      providers: [{ providerID: "google", name: "Google" }],
+    })
+
+    expect(data?.refreshing).toBe(false)
+    expect(quotasRefreshing(data)).toBe(false)
+    expect(quotasRefreshing({ unavailable: true })).toBe(false)
+    expect(quotasRefreshing(undefined)).toBe(false)
+  })
+
+  test("a non-boolean refreshing value cannot turn the indicator on", () => {
+    const data = parseQuotasResponse({
+      fetchedAtMs: now,
+      refreshing: "yes",
+      summary,
+      providers: [{ providerID: "google", name: "Google" }],
+    })
+
+    expect(data?.refreshing).toBe(false)
+  })
+
+  // The field is optional on the wire, so a payload object literal may omit it.
+  // These two assertions guard that: a required field here would break every
+  // fixture that models the shipped server, which omits `refreshing` when idle.
+  test("reads the flag straight off an unparsed payload, present or absent", () => {
+    const base = { fetchedAtMs: now, summary, providers: [] }
+
+    expect(quotasRefreshing({ ...base, refreshing: true })).toBe(true)
+    expect(quotasRefreshing(base)).toBe(false)
+  })
+})
+
+describe("keyKindLabelKey", () => {
+  test("maps the failure classes the server publishes and hides unknown tokens", () => {
+    expect(keyKindLabelKey("quota")).toBe("settings.quotas.keys.kind.quota")
+    expect(keyKindLabelKey("quota_exhausted")).toBe("settings.quotas.keys.kind.quota")
+    expect(keyKindLabelKey("rate_limit")).toBe("settings.quotas.keys.kind.rate_limit")
+    expect(keyKindLabelKey("auth")).toBe("settings.quotas.keys.kind.auth")
+    expect(keyKindLabelKey("transport")).toBeUndefined()
+    expect(keyKindLabelKey(undefined)).toBeUndefined()
+  })
+
+  test("every key badge and key string exists in both shipped locales", () => {
+    const keys = [
+      "settings.quotas.keys.title",
+      "settings.quotas.keys.primary",
+      "settings.quotas.keys.limited",
+      "settings.quotas.keys.limitedWithKind",
+      "settings.quotas.keys.resetsIn",
+      "settings.quotas.keys.kind.quota",
+      "settings.quotas.keys.kind.rate_limit",
+      "settings.quotas.keys.kind.auth",
+    ] as const
+
+    for (const key of keys) {
+      expect((english[key] ?? "").trim().length).toBeGreaterThan(0)
+      expect((turkish[key] ?? "").trim().length).toBeGreaterThan(0)
+    }
   })
 })

@@ -18,7 +18,7 @@ import { CONSOLE_INTEGRATION } from "@/providers/connect/controller"
 import { DialogConnectProvider, useProviderConnectController } from "@/providers/connect/dialog"
 import { ProviderModelIcon } from "@/providers/models/provider-group"
 import { SettingsList } from "@/settings/list"
-import { activeProviderAccount, providerAccounts, type ProviderAccount } from "./accounts"
+import { activeProviderAccount, accountRoles, providerAccounts, type ProviderAccount } from "./accounts"
 import { AccountNameInput } from "./account-name"
 import { useProviderAccountActions } from "./account-actions"
 import "@/settings/settings.css"
@@ -49,7 +49,8 @@ export const SettingsProviders: Component<{
   const providers = useProviders(() => props.directory)
   const integrations = useIntegrations(() => props.directory)
   const providerConnect = useProviderConnectController()
-  const accountActions = useProviderAccountActions(() => props.directory)
+  // Backup keys open this same `connect` entry point, so there is no second connect flow.
+  const accountActions = useProviderAccountActions(() => props.directory, { connect: (providerID) => connect(providerID) })
 
   const [state, setState] = createStore<{
     disconnecting: Record<string, "removing" | "removed" | "absent" | undefined>
@@ -317,6 +318,7 @@ export const SettingsProviders: Component<{
     const accounts = () => menuProps.accounts
     const active = () => menuProps.active
     const name = () => menuProps.name
+    const roles = () => accountRoles(accounts(), active()?.id)
 
     return (
       <div class="settings-provider-account-actions">
@@ -337,7 +339,7 @@ export const SettingsProviders: Component<{
                 <Menu.GroupLabel>{language.t("settings.providers.account.group")}</Menu.GroupLabel>
                 <Menu.RadioGroup
                   class="settings-provider-account-list"
-                  value={active()?.id}
+                  value={roles().primary?.id}
                   onChange={(credentialID) => {
                     const account = accounts().find((item) => item.id === credentialID)
 
@@ -346,17 +348,51 @@ export const SettingsProviders: Component<{
                 >
                   <For each={accounts()}>
                     {(account) => (
-                      <Menu.RadioItem value={account.id} closeOnSelect disabled={state.credentialID !== undefined}>
+                      <Menu.RadioItem
+                        value={account.id}
+                        closeOnSelect
+                        disabled={state.credentialID !== undefined}
+                        badge={
+                          account.id === roles().primary?.id ? undefined : (
+                            <Badge variant="subtle">{language.t("settings.providers.account.backup")}</Badge>
+                          )
+                        }
+                      >
                         <span class="settings-provider-account-label">{account.label}</span>
                       </Menu.RadioItem>
                     )}
                   </For>
                 </Menu.RadioGroup>
               </Menu.Group>
+              <Show when={roles().backups.length > 0}>
+                <Menu.Separator />
+                <Menu.Group>
+                  <Menu.GroupLabel>{language.t("settings.providers.account.backup")}</Menu.GroupLabel>
+                  <For each={roles().backups}>
+                    {(account) => (
+                      <Menu.Item
+                        disabled={state.credentialID !== undefined}
+                        badge={account.label}
+                        onSelect={() => void accountActions.makePrimary(account.id)}
+                      >
+                        <Icon name="arrow-up" size="small" class="shrink-0" />
+                        {language.t("settings.providers.account.makePrimary")}
+                      </Menu.Item>
+                    )}
+                  </For>
+                </Menu.Group>
+              </Show>
               <Menu.Separator />
               <Menu.Item disabled={state.credentialID !== undefined} onSelect={() => connect(menuProps.provider.id)}>
                 <Icon name="plus" size="small" class="shrink-0" />
                 {language.t("settings.providers.account.add")}
+              </Menu.Item>
+              <Menu.Item
+                disabled={state.credentialID !== undefined}
+                onSelect={() => accountActions.addBackupKey(menuProps.provider.id)}
+              >
+                <Icon name="plus" size="small" class="shrink-0" />
+                {language.t("settings.providers.account.addBackup")}
               </Menu.Item>
             </Menu.Content>
           </Menu.Portal>

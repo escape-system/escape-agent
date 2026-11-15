@@ -11,10 +11,14 @@ mod actor_error_terminal;
 mod context_boxes;
 #[path = "runtime/instruction_scope.rs"]
 mod instruction_scope;
+#[path = "runtime/key_pool.rs"]
+mod key_pool;
 #[path = "runtime/lane_subscriber.rs"]
 mod lane_subscriber;
 #[path = "runtime/memory.rs"]
 mod memory;
+#[path = "runtime/models_policy.rs"]
+mod models_policy;
 #[path = "runtime/observer.rs"]
 mod observer;
 #[path = "runtime/observer_advice.rs"]

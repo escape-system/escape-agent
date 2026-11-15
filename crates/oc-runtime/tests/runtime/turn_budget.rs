@@ -47,7 +47,7 @@ async fn small_cap_is_never_extended() {
     let harness = Harness::new(
         reads(&["hello.txt"; 3]),
         Arc::new(AllowAll),
-        json!({"agents": {"build": {"steps": 2}}}),
+        json!({"agents": {"engineer": {"steps": 2}}}),
         None,
     )
     .await;
@@ -110,7 +110,7 @@ async fn progress_extensions_continue_the_turn() {
     let harness = Harness::new(
         scripts,
         Arc::new(AllowAll),
-        json!({"agents": {"build": {"steps": 10}}}),
+        json!({"agents": {"engineer": {"steps": 10}}}),
         None,
     )
     .await;
@@ -215,7 +215,7 @@ async fn thrashing_is_not_extended() {
     let harness = Harness::new(
         scripts,
         Arc::new(AllowAll),
-        json!({"agents": {"build": {"steps": 10}}}),
+        json!({"agents": {"engineer": {"steps": 10}}}),
         None,
     )
     .await;
@@ -279,7 +279,7 @@ async fn extension_is_bounded() {
     let harness = Harness::new(
         reads(&["hello.txt"; 80]),
         Arc::new(AllowAll),
-        json!({"agents": {"build": {"steps": 10}}}),
+        json!({"agents": {"engineer": {"steps": 10}}}),
         None,
     )
     .await;

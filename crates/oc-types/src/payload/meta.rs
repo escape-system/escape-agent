@@ -35,6 +35,25 @@ pub struct SessionModelSelected {
 
 impl_event_payload!(SessionModelSelected, "session.model.selected", true, 1);
 
+/// `session.model.fallback`.
+///
+/// `kind` is the failure class as a `snake_case` string (`empty_response`,
+/// `transport`, `rate_limit`, `quota`); `attempt` is the 1-based fallback hop
+/// and is omitted when unknown.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionModelFallback {
+    #[serde(rename = "sessionID")]
+    pub session_id: SessionId,
+    pub from: ModelRef,
+    pub to: ModelRef,
+    pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<u32>,
+}
+
+impl_event_payload!(SessionModelFallback, "session.model.fallback", true, 1);
+
 /// `session.metadata.updated`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

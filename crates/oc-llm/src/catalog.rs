@@ -33,7 +33,8 @@ pub use resolved::ResolvedModel;
 pub use time::parse_release_date;
 pub use types::{
     Activation, Capabilities, Compatibility, Cost, CostCache, CostTier, CostTierKind, Limit,
-    ModelInfo, ModelStatus, ModelTime, Protocol, ProviderInfo, Variant,
+    ModelInfo, ModelStatus, ModelTime, PriceOverride, PriceOverrideMap, Protocol, ProviderInfo,
+    Variant,
 };
 
 /// Bundled models.dev v2 snapshot (7.9 MB).

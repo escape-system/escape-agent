@@ -19,6 +19,7 @@ import {
 import { createStore, reconcile } from "solid-js/store"
 import { Dynamic, insert } from "solid-js/web"
 import { DialogProvider } from "@opencode/ui/context/dialog"
+import { QueryClient, QueryClientProvider } from "@tanstack/solid-query"
 import { useTheme } from "@opencode/ui/theme"
 import { motionGlobals, motionTuning } from "@opencode/ui/motion-tuning"
 import { choice, defineControls, matchesCombo, toolbar, type Field } from "knobs"
@@ -306,10 +307,27 @@ export default function ComponentsLab() {
   })
 
   return (
-    <SessionRouteFrame padded>
-      <div ref={element} data-component="components-lab" class="min-h-0 flex-1" />
-    </SessionRouteFrame>
+    <QueryProvider>
+      <SessionRouteFrame padded>
+        <div ref={element} data-component="components-lab" class="min-h-0 flex-1" />
+      </SessionRouteFrame>
+    </QueryProvider>
   )
+}
+
+/** The same client defaults as the app, so a story querying the API behaves as it does in the app. */
+function QueryProvider(props: { children: JSX.Element }) {
+  const client = new QueryClient({
+    defaultOptions: {
+      queries: {
+        refetchOnReconnect: false,
+        refetchOnWindowFocus: false,
+        refetchOnMount: false,
+      },
+    },
+  })
+
+  return <QueryClientProvider client={client}>{props.children}</QueryClientProvider>
 }
 
 /** One story on the app's background, with its args and states as a knobs panel in the inspector. */

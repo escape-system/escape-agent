@@ -6,7 +6,14 @@ use crate::{Limits, SpawnError};
 /// Built-in agents whose config mode is `primary` (or hidden). They cannot be
 /// spawned; custom primary agents are filtered by the caller's
 /// `available_agents` list, which should contain spawnable ids only.
-pub const PRIMARY_ONLY_AGENTS: &[&str] = &["build", "plan", "compaction", "title", "summary"];
+pub const PRIMARY_ONLY_AGENTS: &[&str] = &[
+    "engineer",
+    "architect",
+    "review",
+    "compaction",
+    "title",
+    "summary",
+];
 
 /// The policy-approved shape of a child session. The runtime still has to
 /// create the row; this is the only path that may do so for a subagent.

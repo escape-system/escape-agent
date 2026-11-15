@@ -135,7 +135,7 @@ async fn overdue_strip_nudges_a_synthetic_message() {
         id: oc_types::ObservationId::new().into_inner(),
         root_id: harness.session.clone(),
         session_id: harness.session.clone(),
-        agent: "build".to_owned(),
+        agent: "engineer".to_owned(),
         tool_call_id: "call_overdue".to_owned(),
         tool: "shell".to_owned(),
         why: "run a command and return its result".to_owned(),

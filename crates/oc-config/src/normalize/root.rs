@@ -90,7 +90,15 @@ pub(crate) fn normalize(source: Option<&str>, input: Value) -> (Option<Value>, V
     normalize_providers(&input, &mut out, &mut ctx);
     normalize_experimental(&input, &mut out, &mut ctx);
 
-    for key in ["subagents", "observer", "goal", "memory", "lanes", "events"] {
+    for key in [
+        "subagents",
+        "observer",
+        "goal",
+        "memory",
+        "lanes",
+        "events",
+        "models",
+    ] {
         copy_object(&input, key, &mut out, &mut ctx);
     }
     copy_bool(&input, "lsp_install", &mut out, &mut ctx);

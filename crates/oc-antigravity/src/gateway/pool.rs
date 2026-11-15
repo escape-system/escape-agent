@@ -5,7 +5,7 @@ use crate::accounts::ModelFamily;
 use crate::config::SchedulingMode;
 use crate::constants::HeaderStyle;
 use crate::error::AntigravityError;
-use crate::service::AntigravityService;
+use crate::service::{AntigravityService, now_ms};
 use oc_llm::{LlmError, LlmRequest};
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
@@ -141,13 +141,22 @@ async fn wait_when_pool_exhausted(
         }));
     };
 
+    // Pool-state diagnostics stay in the log; the surfaced message must not leak the raw
+    // per-account provider sentence when the real cause is "every account is cooling".
+    if let Some(err) = last_error.as_ref() {
+        tracing::debug!(error = %err, family = family.as_str(), "antigravity: pool exhausted");
+    }
+
     if wait_ms <= 0 && !excluded_indices.is_empty() {
         if quota_fallback && family == ModelFamily::Gemini {
             return Ok(PoolExhaustedAction::TryFallbackPool);
         }
-        return Err(last_error.take().unwrap_or_else(|| LlmError::Provider {
-            message: "all eligible Antigravity accounts failed for this request".to_owned(),
-        }));
+        return Err(LlmError::Provider {
+            message: format!(
+                "all Antigravity accounts are cooling down until {} (every eligible account already failed this request)",
+                now_ms()
+            ),
+        });
     }
 
     let wait_dur = Duration::from_millis(u64::try_from(wait_ms.max(0)).unwrap_or(0));
@@ -155,12 +164,13 @@ async fn wait_when_pool_exhausted(
         if quota_fallback && family == ModelFamily::Gemini {
             return Ok(PoolExhaustedAction::TryFallbackPool);
         }
-        return Err(last_error.take().unwrap_or_else(|| LlmError::Provider {
+        let until_ms = now_ms().saturating_add(wait_ms.max(0));
+        return Err(LlmError::Provider {
             message: format!(
-                "all Antigravity accounts rate-limited (next reset in {}s)",
+                "all Antigravity accounts are cooling down until {until_ms} (next reset in {}s, exceeds the per-turn wait budget)",
                 wait_dur.as_secs()
             ),
-        }));
+        });
     }
 
     tokio::time::sleep(wait_dur).await;

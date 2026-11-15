@@ -233,6 +233,9 @@ pub(crate) async fn attach_extensions(
 
     if let Some(antigravity) = services.antigravity.clone() {
         antigravity.spawn_background_version_check();
+        // Keeps cached quota fresh so the soft-quota gate is live at request time, and
+        // refreshes tokens ahead of expiry. Returns false and spawns nothing when disabled.
+        antigravity.spawn_background_maintenance();
         state = state.with_antigravity(Arc::clone(&antigravity));
         let provider: Arc<dyn oc_runtime::ToolProvider> =
             Arc::new(oc_server::data::antigravity_tools::AntigravityToolProvider::new(antigravity));

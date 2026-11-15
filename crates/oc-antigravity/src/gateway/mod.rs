@@ -321,4 +321,211 @@ mod tests {
                 .any(|m| m.id == "antigravity-gemini-4-hydrogen")
         );
     }
+
+    /// Serve `app` on an ephemeral port and point mock endpoints at it.
+    async fn mock_endpoints(app: Router) -> AntigravityEndpoints {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        AntigravityEndpoints::mock(&format!("http://127.0.0.1:{port}"))
+    }
+
+    /// Seed the two accounts both in-band tests rotate between.
+    async fn add_two_accounts(svc: &AntigravityService) {
+        let future_exp = now_ms() + 3_600_000;
+        for (idx, email) in ["one@ex.com", "two@ex.com"].into_iter().enumerate() {
+            svc.upsert_exchange_result(
+                AntigravityTokenExchange {
+                    refresh: format!("1//tok_{idx}|proj_{idx}"),
+                    refresh_token: format!("1//tok_{idx}"),
+                    access: format!("ya29.tok_{idx}"),
+                    expires: future_exp,
+                    email: Some(email.to_owned()),
+                    project_id: format!("proj_{idx}"),
+                    explicit_project_id: Some(format!("proj_{idx}")),
+                    managed_project_id: None,
+                },
+                None,
+            )
+            .await
+            .expect("add account");
+        }
+    }
+
+    /// Resolve the shared test model against a catalog overlaid by `svc`.
+    fn resolve_pro(svc: &AntigravityService) -> oc_llm::ResolvedModel {
+        let mut catalog = Catalog::from_snapshot("{}").expect("empty");
+        svc.overlay_catalog(&mut catalog);
+        catalog
+            .resolve("google/antigravity-gemini-3.1-pro#low")
+            .expect("resolve")
+    }
+
+    /// An in-band SSE error frame on an HTTP 200 stream must attribute the failure to the
+    /// serving account and rotate to the next one instead of killing the turn.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn gateway_rotates_on_in_band_quota_error() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let app = Router::new().route(
+            "/v1internal:streamGenerateContent",
+            post({
+                let hits = hits.clone();
+                move || {
+                    let hits = hits.clone();
+                    async move {
+                        let n = hits.fetch_add(1, Ordering::SeqCst);
+                        if n == 0 {
+                            // HTTP 200 carrying an in-band quota frame, then EOF.
+                            return Response::builder()
+                                .status(StatusCode::OK)
+                                .header("content-type", "text/event-stream")
+                                .body(axum::body::Body::from(
+                                    "data: {\"error\":{\"message\":\"Resource has been exhausted (e.g. check quota).\"}}\n\n",
+                                ))
+                                .expect("resp");
+                        }
+                        let sse = concat!(
+                            "data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Antigravity OK\"}]},\"finishReason\":\"STOP\"}]}}\n\n",
+                            "data: [DONE]\n\n"
+                        );
+                        Response::builder()
+                            .status(StatusCode::OK)
+                            .header("content-type", "text/event-stream")
+                            .body(axum::body::Body::from(sse))
+                            .expect("sse")
+                    }
+                }
+            }),
+        );
+
+        let endpoints = mock_endpoints(app).await;
+        let svc =
+            AntigravityService::in_memory_for_test(None, AntigravityConfig::default(), endpoints)
+                .await
+                .expect("svc");
+        add_two_accounts(&svc).await;
+
+        let resolved = resolve_pro(&svc);
+
+        let client = LlmClient::new().expect("client");
+        client.set_hook(Some(Arc::new(svc.clone())));
+
+        let mut req = LlmRequest::new(resolved);
+        req.messages = vec![LlmMessage::user("hi")];
+        let mut stream = client
+            .stream(req)
+            .await
+            .expect("stream rotates to account 2");
+        let mut text = String::new();
+        while let Some(ev) = stream.next().await {
+            if let LlmEvent::TextDelta { delta } = ev {
+                text.push_str(&delta);
+            }
+        }
+
+        assert_eq!(text, "Antigravity OK");
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            2,
+            "second account must be tried"
+        );
+
+        let status = svc.list_accounts_status().expect("status");
+        // `select_for_request` starts at the Gemini sticky cursor, so the account the mock
+        // exhausted is not necessarily index 0: identify it by its cooldown, not by position.
+        let cooling: Vec<&_> = status
+            .iter()
+            .filter(|acct| !acct.rate_limits.is_empty())
+            .collect();
+        assert_eq!(
+            cooling.len(),
+            1,
+            "exactly one account must carry the in-band cooldown, got {status:#?}"
+        );
+        assert!(
+            cooling[0]
+                .rate_limits
+                .keys()
+                .any(|k| k.starts_with("gemini-antigravity")),
+            "cooldown must be recorded under the Gemini family key: {:?}",
+            cooling[0].rate_limits
+        );
+
+        let served: Vec<&_> = status
+            .iter()
+            .filter(|acct| acct.rate_limits.is_empty())
+            .collect();
+        assert_eq!(served.len(), 1, "one account must be left untouched");
+        assert!(
+            served[0].last_used > 0,
+            "the untouched account must be the one that served the request"
+        );
+    }
+
+    /// When every account is exhausted in-band the surfaced error must be a pool-level
+    /// cooling-down message naming a reset time, never the raw provider sentence.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn all_accounts_cooling_down_is_reported() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let app = Router::new().route(
+            "/v1internal:streamGenerateContent",
+            post({
+                let hits = hits.clone();
+                move || {
+                    let hits = hits.clone();
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        Response::builder()
+                            .status(StatusCode::OK)
+                            .header("content-type", "text/event-stream")
+                            .body(axum::body::Body::from(
+                                "data: {\"error\":{\"message\":\"Resource has been exhausted (e.g. check quota).\"}}\n\n",
+                            ))
+                            .expect("resp")
+                    }
+                }
+            }),
+        );
+
+        let endpoints = mock_endpoints(app).await;
+        let cfg = AntigravityConfig {
+            // No per-turn wait budget: the pool must report instead of sleeping.
+            max_rate_limit_wait_seconds: 0,
+            ..AntigravityConfig::default()
+        };
+        let svc = AntigravityService::in_memory_for_test(None, cfg, endpoints)
+            .await
+            .expect("svc");
+        add_two_accounts(&svc).await;
+
+        let resolved = resolve_pro(&svc);
+
+        let client = LlmClient::new().expect("client");
+        client.set_hook(Some(Arc::new(svc)));
+
+        let mut req = LlmRequest::new(resolved);
+        req.messages = vec![LlmMessage::user("hi")];
+        let err = client
+            .stream(req)
+            .await
+            .err()
+            .expect("both accounts exhausted must error");
+        let message = err.to_string();
+
+        assert!(
+            message.contains("cooling down"),
+            "expected a cooling-down message, got: {message}"
+        );
+        assert!(
+            message.contains("until"),
+            "expected a reset time in the message, got: {message}"
+        );
+        assert!(
+            !message.contains("Resource has been exhausted"),
+            "raw provider text must not surface: {message}"
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 2, "each account tried once");
+    }
 }

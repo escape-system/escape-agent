@@ -10,7 +10,16 @@ import { formatServerError } from "@/runtime/server/errors"
 import { activeProviderAccount, type ProviderAccount } from "./accounts"
 
 // Shared by the connect dialog and Settings so both switch, rename and remove accounts the same way.
-export function useProviderAccountActions(directory: () => string | undefined) {
+export function useProviderAccountActions(
+  directory: () => string | undefined,
+  options?: {
+    /**
+     * The caller's existing "connect" entry point. Settings passes the same function its "Add account"
+     * item opens, so adding a backup key is that dialog again, not a second connect flow.
+     */
+    connect?: (providerID: string) => void
+  },
+) {
   const language = useLanguage()
   const sdk = useServerSDK()
   const data = useData()
@@ -69,6 +78,18 @@ export function useProviderAccountActions(directory: () => string | undefined) {
       )
       .catch((error) => fail(formatServerError(error, language.t)))
 
+  // `activate` already clears every sibling's marker in one transaction, so a switch is a single
+  // durable call plus the catalog refresh; no settling is needed because no workspace reloads.
+  const makePrimary = (credentialID: string) =>
+    sdk.api.credential
+      .activate({ credentialID })
+      .then(refresh)
+      .catch((error) => fail(formatServerError(error, language.t)))
+
+  // A backup key is an ordinary connection: the caller's existing connect dialog, opened for this
+  // provider. Nothing is duplicated here, so a second key lands through the same code path as the first.
+  const addBackupKey = (providerID: string) => options?.connect?.(providerID)
+
   const remove = (input: { integrationID: string; provider: string; account: ProviderAccount; final: boolean }) =>
     sdk.api.credential
       .remove({ credentialID: input.account.id })
@@ -99,5 +120,5 @@ export function useProviderAccountActions(directory: () => string | undefined) {
         return false
       })
 
-  return { refresh, activate, remove, rename }
+  return { refresh, activate, makePrimary, addBackupKey, remove, rename }
 }

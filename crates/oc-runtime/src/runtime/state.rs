@@ -136,6 +136,6 @@ impl Runtime {
         cancel: &Arc<CancelToken>,
         handle: &Arc<ActorHandle>,
     ) -> Result<(), RuntimeError> {
-        turn::run_execution(self, session, item, cancel, handle).await
+        Box::pin(turn::run_execution(self, session, item, cancel, handle)).await
     }
 }

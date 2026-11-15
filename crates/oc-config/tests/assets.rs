@@ -436,7 +436,10 @@ fn markdown_agents_merge_after_json_and_inherit_permissions() {
         service.agent("retired").is_none(),
         "disabled removes the agent"
     );
-    assert!(service.agent("build").is_some(), "built-ins survive");
+    // `build` is a legacy alias for `engineer`: the builtin survives under its
+    // canonical id and the alias never becomes a ghost custom agent.
+    assert!(service.agent("build").is_none(), "the alias is remapped");
+    assert!(service.agent("engineer").is_some(), "built-ins survive");
 }
 
 #[test]

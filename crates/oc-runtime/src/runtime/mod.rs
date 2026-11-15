@@ -96,6 +96,13 @@ pub(crate) struct Inner {
     pub(crate) semantic_oracle: Mutex<Option<Arc<dyn SemanticPrecisionOracle>>>,
     pub(crate) lanes: Mutex<Option<Arc<oc_lanes::LaneService>>>,
     pub(crate) subagents: Mutex<crate::subagent::SubagentState>,
+    /// Recent model-level provider failures, shared by the spawn chooser (skips)
+    /// and the turn fallback (`docs/05-subagents.md`, contract §4).
+    pub(crate) model_health: Arc<oc_llm::ModelHealth>,
+    /// Per-credential rotation state: which keys are cooling down for which
+    /// provider. The turn loop retries the SAME model on the next key before
+    /// `models.chain` is consulted (`turn/stream.rs`).
+    pub(crate) key_pool: Arc<oc_llm::KeyPool>,
     pub(crate) tool_cancels: Mutex<HashMap<String, ToolCancelEntry>>,
     pub(crate) pending_permissions: Mutex<HashMap<String, usize>>,
     /// Last `observer.advised` enqueue time per session (`observer/advice.rs`).
@@ -131,6 +138,8 @@ impl Runtime {
                 semantic_oracle: Mutex::new(None),
                 lanes: Mutex::new(None),
                 subagents: Mutex::new(crate::subagent::SubagentState::default()),
+                model_health: oc_llm::ModelHealth::new(),
+                key_pool: oc_llm::KeyPool::new(),
                 tool_cancels: Mutex::new(HashMap::new()),
                 pending_permissions: Mutex::new(HashMap::new()),
                 observer_advised: Mutex::new(HashMap::new()),
@@ -167,6 +176,29 @@ impl Runtime {
 
     pub(crate) fn scribe_model(&self) -> Option<Arc<dyn ScribeModel>> {
         self.inner.scribe.lock().expect("scribe slot").clone()
+    }
+
+    /// Recent model-level provider failures recorded by the turn fallback.
+    ///
+    /// The spawn chooser removes unhealthy references from its candidate list
+    /// (as `Denied` skips) and the registry reports them; the table lives on
+    /// the runtime so every session of one process shares it, and it needs no
+    /// `RuntimeConfig` field (`docs/05-subagents.md`).
+    #[must_use]
+    pub fn model_health(&self) -> &Arc<oc_llm::ModelHealth> {
+        &self.inner.model_health
+    }
+
+    /// Per-credential rotation state ([`oc_llm::KeyPool`]).
+    ///
+    /// One table per process, shared by every session: a key that ran out of
+    /// quota for one turn is out of rotation for the next one too (until its
+    /// cooldown expires). The turn loop consults it through
+    /// [`Runtime::credential_pool`](crate::turn) and marks failures there; the
+    /// spawn report and the quota surface read [`oc_llm::KeyPool::entries`].
+    #[must_use]
+    pub fn key_pool(&self) -> &Arc<oc_llm::KeyPool> {
+        &self.inner.key_pool
     }
 
     /// Attach a host tool provider (MCP, LSP, plugins, …). Providers are

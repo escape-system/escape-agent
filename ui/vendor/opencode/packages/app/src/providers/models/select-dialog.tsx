@@ -37,6 +37,16 @@ import { createSafeTriangle } from "@/shell/commands/safe-triangle"
 import { formatKeybindParts, matchKeybind, parseKeybind } from "@/shell/commands/command"
 import { createEventListener } from "@solid-primitives/event-listener"
 import { matchesModelSearch } from "./search"
+import { useModelsRegistry } from "@/settings/models/api"
+import {
+  chainIndexOf,
+  comparePickerModels,
+  effectiveAgentChain,
+  favoriteRefs,
+  modelReference,
+  normalizeModelRef,
+  pickerVisible,
+} from "./policy"
 import { SettingsList } from "@/settings/list"
 import {
   CONSOLE_GROUP_KEY,
@@ -456,17 +466,51 @@ function createModelSelectorController(input: {
   model?: ModelState
   onSelect: () => void
 }) {
-  const model = input.model ?? useLocal().model
+  const local = useLocal()
+  const model = input.model ?? local.model
+  const registry = useModelsRegistry()
+
+  // The registry is served by the config API; without it the picker keeps its local visibility rules.
+  const registryData = createMemo(() => {
+    const data = registry.query.data
+
+    return data?.available ? data.registry : undefined
+  })
+  const agentName = () => local.agent.current()?.name
+  const registryIndex = createMemo(
+    () => new Map((registryData()?.models ?? []).map((item) => [normalizeModelRef(modelReference(item)), item] as const)),
+  )
+  const registryChain = createMemo(() => {
+    const data = registryData()
+
+    return data ? effectiveAgentChain(data.chains, agentName(), data.chain) : undefined
+  })
+  const favoriteSet = createMemo(() => favoriteRefs(registryData()?.models ?? []))
+  // Hiding is already applied by the local model state (`legacyVisible`), so no hidden refs are added here.
+  const hiddenSet: ReadonlySet<string> = new Set()
+  const reference = (item: ModelItem) => modelReference({ providerID: item.provider.id, id: item.id })
+  const allowed = (item: ModelItem) => (input.provider() ? item.provider.id === input.provider() : true)
 
   const allModels = createMemo(() =>
     model
       .list()
-      .filter((item) => model.visible({ modelID: item.id, providerID: item.provider.id }))
-      .filter((item) => (input.provider() ? item.provider.id === input.provider() : true)),
+      .filter((item) => allowed(item))
+      .filter((item) =>
+        // Visibility is `!hidden && providerConnected`. The agent chain below is
+        // ordering only: an explicit `model:` or a one-entry chain must never
+        // shrink the list to the models the chain happens to name.
+        pickerVisible({
+          modelRef: reference(item),
+          registryModel: registryIndex().get(normalizeModelRef(reference(item))),
+          hiddenSet: hiddenSet,
+          providerConnected: true,
+          legacyVisible: model.visible({ modelID: item.id, providerID: item.provider.id }),
+        }),
+      ),
   )
 
   return {
-    all: () => model.list().filter((item) => (input.provider() ? item.provider.id === input.provider() : true)),
+    all: () => model.list().filter((item) => allowed(item)),
     models: (search: string) => {
       const query = search.trim()
 
@@ -474,7 +518,20 @@ function createModelSelectorController(input: {
         ? allModels().filter((item) => matchesModelSearch(query, [item.name, item.id, item.provider.name]))
         : allModels()
 
-      return [...filtered].sort((a, b) => a.name.localeCompare(b.name))
+      const chain = registryChain()
+      const favorites = favoriteSet()
+      const order = (item: ModelItem) => {
+        const ref = reference(item)
+
+        return {
+          name: item.name,
+          ref,
+          favorite: favorites.has(normalizeModelRef(ref)),
+          chainIndex: chain ? chainIndexOf(chain, ref) : -1,
+        }
+      }
+
+      return [...filtered].sort((a, b) => comparePickerModels(order(a), order(b)))
     },
     groups: (models: ModelItem[]) => {
       const byProvider = new Map<string, ModelItem[]>()
@@ -497,7 +554,11 @@ function createModelSelectorController(input: {
       input.onSelect()
     },
     variant: (item: ModelItem) => model.variant.current({ providerID: item.provider.id, modelID: item.id }),
-    favorites: () => model.favorite.list().filter((item) => !input.provider() || item.provider.id === input.provider()),
+    favorites: () => {
+      if (registryData()) return allModels().filter((item) => favoriteSet().has(normalizeModelRef(reference(item))))
+
+      return model.favorite.list().filter((item) => !input.provider() || item.provider.id === input.provider())
+    },
     recent: () =>
       model
         .recent()

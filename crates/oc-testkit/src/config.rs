@@ -22,7 +22,7 @@ impl TestConfig {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            default_agent: Some("build".to_owned()),
+            default_agent: Some("engineer".to_owned()),
             ..Self::default()
         }
     }

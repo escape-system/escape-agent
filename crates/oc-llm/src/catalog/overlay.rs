@@ -8,8 +8,11 @@ use crate::error::LlmError;
 
 use super::Catalog;
 use super::convert::{compatibility_from_value, cost_from_config, protocol_for};
+use super::reference::parse_reference;
 use super::time::parse_release_date;
-use super::types::{Activation, Compatibility, ModelInfo, Protocol, ProviderInfo, Variant};
+use super::types::{
+    Activation, Compatibility, Cost, ModelInfo, PriceOverrideMap, Protocol, ProviderInfo, Variant,
+};
 use super::util::{merge_map, strings};
 use super::variants::{reasoning_support_from_config, variants_for};
 
@@ -292,6 +295,36 @@ impl Catalog {
         Ok(())
     }
 
+    /// Overlay user price overrides (`models.pricing`) onto the catalog.
+    ///
+    /// Keys are `provider/model[#variant]`; the variant is ignored because a
+    /// price belongs to the model, not to a request variant. Each band is
+    /// rewritten field by field, so an override that sets only `input` keeps
+    /// the catalog `output` and cache prices. The hardcoded Antigravity zeros
+    /// stay the default: nothing changes until an override names that model.
+    /// A model with no band at all (`cost: []`) gets one so the override is not
+    /// silently dropped. Unknown references and malformed keys are skipped.
+    pub fn apply_price_overrides(&mut self, overrides: &PriceOverrideMap) {
+        if overrides.is_empty() {
+            return;
+        }
+        for (reference, price) in overrides {
+            let Ok(parsed) = parse_reference(reference) else {
+                continue;
+            };
+            let Some(index) = self.model_index.get(&(parsed.provider, parsed.id)).copied() else {
+                continue;
+            };
+            let model = &mut self.models[index];
+            if model.cost.is_empty() {
+                model.cost.push(Cost::default());
+            }
+            for band in &mut model.cost {
+                *band = price.apply(band);
+            }
+        }
+    }
+
     pub(super) fn reindex(&mut self) {
         self.provider_index.clear();
         for (index, provider) in self.providers.iter().enumerate() {
@@ -306,5 +339,123 @@ impl Catalog {
         self.models.shrink_to_fit();
         self.provider_index.shrink_to_fit();
         self.model_index.shrink_to_fit();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+    use crate::catalog::types::PriceOverride;
+
+    /// Same shape as the Antigravity built-ins: a model whose prices are all 0.
+    const ZERO_PRICED: &str = r#"{
+      "google": {
+        "id": "google",
+        "name": "Google",
+        "env": ["GEMINI_API_KEY"],
+        "models": {
+          "gemini-3-pro": {
+            "id": "gemini-3-pro",
+            "type": "chat",
+            "name": "Gemini 3 Pro",
+            "modalities": {"input": ["text"], "output": ["text"]},
+            "capabilities": {"tools": {"supported": true}, "temperature": true},
+            "limit": {"context": 1000000, "output": 65536},
+            "cost": {"text": {"input": {"price": 0}, "output": {"price": 0}}},
+            "api": {
+              "generate-content": {
+                "base_url": "http://unused.invalid",
+                "sdk": {"aisdk": "@ai-sdk/google"}
+              }
+            }
+          }
+        }
+      }
+    }"#;
+
+    fn assert_close(actual: f64, expected: f64) {
+        assert!(
+            (actual - expected).abs() < 1e-9,
+            "expected {expected}, got {actual}"
+        );
+    }
+
+    fn override_map() -> PriceOverrideMap {
+        let mut map = PriceOverrideMap::new();
+        map.insert(
+            "google/gemini-3-pro".to_owned(),
+            PriceOverride {
+                input: Some(1.25),
+                output: None,
+                cache_read: Some(0.3),
+                cache_write: None,
+            },
+        );
+        map
+    }
+
+    #[test]
+    fn override_replaces_zero_prices_and_keeps_unset_fields() {
+        let mut catalog = Catalog::from_snapshot(ZERO_PRICED).expect("snapshot parses");
+        catalog.apply_price_overrides(&override_map());
+        let model = catalog
+            .model("google", "gemini-3-pro")
+            .expect("model present");
+        assert_eq!(model.cost.len(), 1);
+        assert_close(model.cost[0].input, 1.25);
+        assert_close(model.cost[0].output, 0.0);
+        assert_close(model.cost[0].cache.read, 0.3);
+        assert_close(model.cost[0].cache.write, 0.0);
+    }
+
+    #[test]
+    fn override_gives_a_band_to_a_model_that_had_no_cost() {
+        let mut catalog = Catalog::default();
+        catalog.upsert_provider_models(vec![ModelInfo::default_for("google", "gemini-3-pro")]);
+        assert!(
+            catalog
+                .model("google", "gemini-3-pro")
+                .expect("model")
+                .cost
+                .is_empty()
+        );
+        catalog.apply_price_overrides(&override_map());
+        let model = catalog.model("google", "gemini-3-pro").expect("model");
+        assert_eq!(model.cost.len(), 1);
+        assert_close(model.cost[0].input, 1.25);
+    }
+
+    #[test]
+    fn unknown_references_are_skipped() {
+        let mut catalog = Catalog::from_snapshot(ZERO_PRICED).expect("snapshot parses");
+        let mut overrides = PriceOverrideMap::new();
+        for reference in ["missing/model", "not-a-reference"] {
+            overrides.insert(
+                reference.to_owned(),
+                PriceOverride {
+                    input: Some(9.0),
+                    ..PriceOverride::default()
+                },
+            );
+        }
+        catalog.apply_price_overrides(&overrides);
+        let model = catalog.model("google", "gemini-3-pro").expect("model");
+        assert_close(model.cost[0].input, 0.0);
+    }
+
+    #[test]
+    fn price_override_wire_shape_is_camel_case_and_omits_unset() {
+        let parsed: PriceOverride =
+            serde_json::from_value(json!({"input": 1.25, "cacheRead": 0.3}))
+                .expect("parse override");
+        assert_eq!(parsed.input, Some(1.25));
+        assert_eq!(parsed.cache_read, Some(0.3));
+        assert_eq!(parsed.cache_write, None);
+        assert_eq!(
+            serde_json::to_value(parsed).expect("serialize"),
+            json!({"input": 1.25, "cacheRead": 0.3})
+        );
     }
 }

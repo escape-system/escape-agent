@@ -69,7 +69,7 @@ impl ObserverEngine {
             agent: context
                 .agent
                 .or_else(|| root_row.map(|row| row.agent.clone()))
-                .unwrap_or_else(|| "build".to_owned()),
+                .unwrap_or_else(|| "engineer".to_owned()),
             model: context.model,
             step: context.step,
             state: context

@@ -71,7 +71,11 @@ impl Runtime {
         self.notify_local(session).await
     }
 
-    async fn observer_switch_model(&self, session: &str, model: &str) -> Result<(), RuntimeError> {
+    pub(crate) async fn observer_switch_model(
+        &self,
+        session: &str,
+        model: &str,
+    ) -> Result<(), RuntimeError> {
         let value = self
             .inner
             .config

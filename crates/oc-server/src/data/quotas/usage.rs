@@ -52,6 +52,20 @@ pub(super) async fn usage_for(
     Ok(providers)
 }
 
+/// Local usage from a fresh cache only: a stale or empty cache yields an empty
+/// map, so a cache-first GET never scans the store either.
+pub(super) async fn usage_cached(
+    state: &AppState,
+    now_ms: i64,
+) -> BTreeMap<String, ProviderLocalUsage> {
+    let cache = state.quota_cache().read().await;
+    if cache.usage.is_fresh(now_ms) {
+        cache.usage.providers.clone()
+    } else {
+        BTreeMap::new()
+    }
+}
+
 async fn scan_local_usage(
     store: Option<&Arc<Store>>,
     now_ms: i64,

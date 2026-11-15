@@ -11,7 +11,7 @@ pub(super) const DROPPED_EXPERIMENTAL: [&str; 5] = [
 
 pub(super) const CONSUMED_EXPERIMENTAL: [&str; 3] = ["policies", "mcp_timeout", "subagent_depth"];
 
-pub(super) const HANDLED: [&str; 52] = [
+pub(super) const HANDLED: [&str; 53] = [
     "$schema",
     "shell",
     "model",
@@ -64,4 +64,5 @@ pub(super) const HANDLED: [&str; 52] = [
     "lsp_install",
     "lanes",
     "events",
+    "models",
 ];

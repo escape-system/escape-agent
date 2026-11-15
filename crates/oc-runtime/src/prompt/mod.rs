@@ -173,10 +173,24 @@ pub fn system_prefix(
     has_memory: bool,
     instructions: &str,
 ) -> Vec<String> {
-    let base = agent_system.map_or_else(
-        || default_system_prompt_with_memory(tool_names, directory, has_memory),
-        str::to_owned,
-    );
+    // An agent with its own system prompt bypasses
+    // `default_system_prompt_with_memory`, so the memory note must still be
+    // appended here: the `<memory>` instruction source exists for every agent,
+    // not only for the built-in default prompt.
+    let base = match agent_system {
+        Some(agent) => {
+            if has_memory {
+                format!(
+                    "{agent}\n- Durable notes relevant to this session are included in the \
+                     `<memory>` instruction source; use them before re-deriving facts, and do \
+                     not write memory for things the repository already records.\n"
+                )
+            } else {
+                agent.to_owned()
+            }
+        }
+        None => default_system_prompt_with_memory(tool_names, directory, has_memory),
+    };
     if instructions.trim().is_empty() {
         vec![base]
     } else {

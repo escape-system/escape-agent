@@ -606,6 +606,84 @@ async fn antigravity_http_oauth_models_accounts_quotas_and_search_work_end_to_en
     verify_google_search_and_cleanup(&harness, &app, sid).await;
 }
 
+/// A rate-limited account exposes one derived `cooldownUntilMs`: the maximum of
+/// its still-future `rateLimits` deadlines. An account that is not cooling omits
+/// the field entirely (never null).
+///
+/// The cooldown is produced the real way — the mock upstream answers the first
+/// `streamGenerateContent` with `429`, the gateway marks that account, and the
+/// request fails over to the second account.
+#[tokio::test]
+async fn antigravity_accounts_expose_the_max_rate_limit_deadline_as_a_cooldown() {
+    let harness = setup_harness().await;
+    seed_account(&harness.service, "primary@example.com", "proj-primary").await;
+    seed_account(&harness.service, "backup@example.com", "proj-backup").await;
+
+    let mut catalog = Catalog::from_snapshot("{}").unwrap();
+    overlay_catalog_models(&mut catalog, None);
+    let llm = LlmClient::new().unwrap();
+    llm.set_hook(Some(Arc::clone(&harness.service) as _));
+    let shared_llm = oc_llm::SharedLlmClient::new(llm.clone());
+    let resolved = shared_llm
+        .resolve_model(&catalog, "google/antigravity-gemini-3.1-pro#low")
+        .unwrap();
+    let mut req = LlmRequest::new(resolved);
+    req.messages = vec![LlmMessage::user("hello")];
+    let mut stream = llm.stream(req).await.unwrap();
+    let mut collected = String::new();
+    while let Some(ev) = stream.next().await {
+        if let LlmEvent::TextDelta { delta } = ev {
+            collected.push_str(&delta);
+        }
+    }
+    assert_eq!(
+        collected, "Hello from Antigravity HTTP!",
+        "failover succeeded"
+    );
+
+    let app = router(harness.state.clone());
+    let (status, body) = call(&app, Method::GET, "/api/antigravity/accounts", None).await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    let accounts = body.unwrap()["data"]["accounts"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert_eq!(accounts.len(), 2, "{accounts:?}");
+
+    let cooling: Vec<&Value> = accounts
+        .iter()
+        .filter(|account| account.get("cooldownUntilMs").is_some())
+        .collect();
+    assert_eq!(
+        cooling.len(),
+        1,
+        "exactly the rate-limited account carries a cooldown: {accounts:?}"
+    );
+    let now = oc_types::now_millis();
+    let deadline = cooling[0]["cooldownUntilMs"].as_i64().expect("epoch ms");
+    assert!(
+        deadline > now,
+        "the cooldown is a future deadline: {deadline} vs {now}"
+    );
+    // It equals the maximum still-future entry of the raw per-key map, which is
+    // also on the wire: the derived field invents nothing.
+    let raw_max = cooling[0]["rateLimits"]
+        .as_object()
+        .expect("rateLimits")
+        .values()
+        .filter_map(Value::as_i64)
+        .filter(|until| *until > now)
+        .max()
+        .expect("at least one future deadline");
+    assert_eq!(deadline, raw_max, "{}", cooling[0]);
+    // The healthy account omits the field.
+    let healthy = accounts
+        .iter()
+        .find(|account| account.get("cooldownUntilMs").is_none())
+        .expect("one account is not cooling");
+    assert_eq!(healthy["enabled"], true, "{healthy}");
+}
+
 async fn seed_account(service: &AntigravityService, email: &str, project: &str) {
     service
         .upsert_exchange_result(

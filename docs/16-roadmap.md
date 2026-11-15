@@ -41,8 +41,11 @@ Scope: `oc-llm`, `oc-runtime`, `oc-tools` (core tools).
   crash recovery.
 - Tools: read/write/edit/patch/glob/grep/shell/todowrite/question/webfetch/
   websearch; input repair; truncation; permissions ask/allow/deny flow.
-- Agents: built-ins (build/plan/general/explore/title/summary/compaction),
-  config agents, mode filters, model selection, system prompt replacement.
+- Agents: built-ins `engineer` (default primary agent), `architect`, `review`,
+  `general` (default subagent), `explore`, `ui`, `docs`, plus the hidden system
+  agents `compaction`, `title`, `summary`; aliases `build`→`engineer`,
+  `plan`→`architect`, `reviewer`→`review`; config agents, mode filters, model
+  selection, system prompt replacement.
 
 Exit: a real prompt runs end-to-end with a tool loop; the transcript and tool
 cards render; interrupt leaves no half-committed state; permission modal round

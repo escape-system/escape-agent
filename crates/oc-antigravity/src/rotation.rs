@@ -41,22 +41,30 @@ pub fn parse_rate_limit_reason(status: u16, body: &str) -> RateLimitReason {
         return RateLimitReason::ServerError;
     }
     let upper = body.to_ascii_uppercase();
-    if upper.contains("MODEL_CAPACITY_EXHAUSTED")
-        || upper.contains("CAPACITY_EXHAUSTED")
-        || upper.contains("OVERLOADED")
-    {
-        return RateLimitReason::ModelCapacityExhausted;
-    }
-    if upper.contains("QUOTA_EXHAUSTED")
+    // Quota-family reasons win over the generic rate-limit arm: a 429 whose body says
+    // `Resource has been exhausted (e.g. check quota)` is a depleted quota window, which
+    // needs the longer cooldown plus a family-wide base-key cooldown, not a burst ceiling.
+    // `MODEL_CAPACITY_EXHAUSTED` is treated the same way (it is an account-wide quota stop
+    // upstream, not a per-model RPM ceiling).
+    if upper.contains("RESOURCE_EXHAUSTED")
+        || upper.contains("RESOURCE EXHAUSTED")
+        || upper.contains("RESOURCE HAS BEEN EXHAUSTED")
+        || upper.contains("QUOTA_EXHAUSTED")
         || upper.contains("QUOTA EXHAUSTED")
         || upper.contains("INSUFFICIENT_QUOTA")
+        || upper.contains("MODEL_CAPACITY_EXHAUSTED")
         || upper.contains("DAILY LIMIT")
+        || upper.contains("CHECK QUOTA")
     {
         return RateLimitReason::QuotaExhausted;
+    }
+    if upper.contains("CAPACITY_EXHAUSTED") || upper.contains("OVERLOADED") {
+        return RateLimitReason::ModelCapacityExhausted;
     }
     if upper.contains("RATE_LIMIT_EXCEEDED")
         || upper.contains("RATE LIMIT")
         || upper.contains("TOO_MANY_REQUESTS")
+        || upper.contains("TOO MANY REQUESTS")
         || status == 429
     {
         return RateLimitReason::RateLimitExceeded;
@@ -497,7 +505,38 @@ mod tests {
         assert_eq!(extract_retry_info_from_body(body, None, None), Some(42_000));
         assert_eq!(
             parse_rate_limit_reason(429, "MODEL_CAPACITY_EXHAUSTED"),
-            RateLimitReason::ModelCapacityExhausted
+            RateLimitReason::QuotaExhausted
+        );
+    }
+
+    #[test]
+    fn resource_exhausted_is_quota() {
+        // The exact in-band sentence Antigravity returns inside an HTTP 200 stream.
+        assert_eq!(
+            parse_rate_limit_reason(429, "Resource has been exhausted (e.g. check quota)."),
+            RateLimitReason::QuotaExhausted
+        );
+        assert_eq!(
+            parse_rate_limit_reason(429, "RESOURCE_EXHAUSTED"),
+            RateLimitReason::QuotaExhausted
+        );
+        assert_eq!(
+            parse_rate_limit_reason(429, "MODEL_CAPACITY_EXHAUSTED"),
+            RateLimitReason::QuotaExhausted
+        );
+        // Status 200 keeps working: in-band frames arrive on OK responses.
+        assert_eq!(
+            parse_rate_limit_reason(200, "Resource has been exhausted (e.g. check quota)."),
+            RateLimitReason::QuotaExhausted
+        );
+        // Burst ceilings are NOT demoted to quota.
+        assert_eq!(
+            parse_rate_limit_reason(429, "too many requests"),
+            RateLimitReason::RateLimitExceeded
+        );
+        assert_eq!(
+            parse_rate_limit_reason(429, "RATE_LIMIT_EXCEEDED"),
+            RateLimitReason::RateLimitExceeded
         );
     }
 

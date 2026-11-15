@@ -14,13 +14,20 @@ use crate::error::ErrorResponse;
 
 use super::antigravity::refresh_antigravity_if_needed;
 use super::openrouter::resolve_openrouter_management_key;
-use super::providers::{ProviderEntryInput, build_provider_entry, probe_live_providers};
+use super::providers::{ProbePass, ProviderEntryInput, build_provider_entry, probe_live_providers};
 use super::types::{ProviderQuotaEntry, UnifiedQuotaSummary, UnifiedQuotasResponse};
-use super::usage::usage_for;
+use super::usage::{usage_cached, usage_for};
 
+/// Assemble the report.
+///
+/// `force_refresh` ignores the 60 s TTL. `allow_probe` is the cache-first
+/// switch: when it is false nothing here touches the network — only cached
+/// probes and a fresh local-usage cache are used, so a GET can never block on a
+/// provider probe.
 pub(super) async fn build_unified_quotas(
     state: &AppState,
     force_refresh: bool,
+    allow_probe: bool,
 ) -> Result<UnifiedQuotasResponse, ErrorResponse> {
     let now_ms = now_millis().max(now_epoch_ms());
     let credentials = match state.store() {
@@ -41,7 +48,11 @@ pub(super) async fn build_unified_quotas(
         None => BTreeSet::new(),
     };
 
-    let usage_map = usage_for(state, now_ms, force_refresh).await?;
+    let usage_map = if allow_probe {
+        usage_for(state, now_ms, force_refresh).await?
+    } else {
+        usage_cached(state, now_ms).await
+    };
     let mut rate_limit_map = collect_rate_limits(state);
 
     // Active providers only; local usage is attached to those that appear.
@@ -50,12 +61,15 @@ pub(super) async fn build_unified_quotas(
     let ag_refresh = refresh_antigravity_if_needed(state, force_refresh).await;
     let probe_results = probe_live_providers(
         state,
-        &active_ids,
-        catalog,
-        config,
-        &credentials,
-        force_refresh,
-        now_ms,
+        ProbePass {
+            available_ids: &active_ids,
+            catalog,
+            config,
+            credentials: &credentials,
+            force_refresh,
+            allow_probe,
+            now_ms,
+        },
     )
     .await;
 
@@ -86,6 +100,8 @@ pub(super) async fn build_unified_quotas(
         providers.push(entry);
     }
 
+    attach_provider_keys(state, now_ms, &mut providers).await;
+
     providers.sort_by(|a, b| {
         provider_sort_rank(a)
             .cmp(&provider_sort_rank(b))
@@ -94,10 +110,16 @@ pub(super) async fn build_unified_quotas(
     });
 
     let summary = summarize_providers(&providers);
+    // Only a full pass makes the snapshot fresh; the cache-first GET reads this
+    // stamp and never writes it.
+    if allow_probe {
+        state.quota_cache().write().await.computed_at_ms = now_ms;
+    }
     Ok(UnifiedQuotasResponse {
         fetched_at_ms: now_ms,
         summary,
         providers,
+        refreshing: false,
     })
 }
 
@@ -151,4 +173,60 @@ fn collect_rate_limits(state: &AppState) -> BTreeMap<String, ProviderRateLimit> 
         }
     }
     map
+}
+
+/// Join every provider's stored credentials with its per-key rotation state.
+///
+/// Order is the store's rotation order (active first, then ids ascending), so
+/// `keys[0]` is the key a request would try first. Providers that own no
+/// credential row keep an empty list, which the wire omits entirely.
+///
+/// `usedCostUsd` / `usedRequests` stay `0.0`/`0`: the usage rollup keys on
+/// `model.providerID` only (`quotas/usage.rs`), so a per-key split does not
+/// exist. Reporting a share of the provider total here would be invented data.
+async fn attach_provider_keys(
+    state: &AppState,
+    now_ms: i64,
+    providers: &mut [super::types::ProviderQuotaEntry],
+) {
+    let Some(store) = state.store() else {
+        return;
+    };
+    // `KeyPool` normalizes provider ids (trim + lowercase); compare the same way.
+    let health = state
+        .key_pool()
+        .map(|pool| pool.entries(now_ms))
+        .unwrap_or_default();
+    for entry in providers.iter_mut() {
+        let provider_key = entry.provider_id.trim().to_ascii_lowercase();
+        let rows = match store.credential_pool(&entry.provider_id).await {
+            Ok(rows) => rows,
+            Err(error) => {
+                tracing::warn!(%error, provider = %entry.provider_id, "could not read credential pool");
+                continue;
+            }
+        };
+        entry.keys = rows
+            .into_iter()
+            .map(|row| {
+                let cooling = health.iter().find(|item| {
+                    item.provider == provider_key
+                        && item.credential_id.as_deref() == Some(row.id.as_str())
+                });
+                super::types::ProviderKeyEntry {
+                    credential_id: row.id,
+                    label: row.label,
+                    active: row.active,
+                    limited: cooling.is_some(),
+                    cooldown_until_ms: cooling.map(|item| item.until_ms),
+                    kind: cooling.map(|item| item.kind.as_str().to_owned()),
+                    failures: cooling.map(|item| item.failures),
+                    // No per-key usage attribution exists yet: the rollup is
+                    // keyed by provider only. Zero, not a guessed split.
+                    used_cost_usd: 0.0,
+                    used_requests: 0,
+                }
+            })
+            .collect();
+    }
 }

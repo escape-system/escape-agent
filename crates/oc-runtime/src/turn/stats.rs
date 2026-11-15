@@ -182,7 +182,7 @@ mod tests {
         input.insert("command".to_owned(), json!(command));
         let mut state = AssistantState::new(
             MessageId::from_wire("msg_1"),
-            "build".to_owned(),
+            "engineer".to_owned(),
             ModelRef {
                 provider_id: "test".to_owned(),
                 id: "alpha".to_owned(),

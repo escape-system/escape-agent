@@ -91,7 +91,7 @@ Input (hard cap `max_input_tokens`, default 600):
 {
   // `done` is 0 until the goal is accepted `done`, then it equals `total`.
   "goal": {"id":"gol_…","objective":"…","status":"active","criteria":["…"],"done":0,"total":3},
-  "root": {"id":"ses_…","agent":"build","model":"…","step":7,"state":"busy"},
+  "root": {"id":"ses_…","agent":"engineer","model":"…","step":7,"state":"busy"},
   "active": [
     {"sid":"ses_…","agent":"general","tool":"subagent","why":"20 workers; pass/fail list",
      "age_s":95,"expect_s":90,"intervene_s":150,"state":"running"}

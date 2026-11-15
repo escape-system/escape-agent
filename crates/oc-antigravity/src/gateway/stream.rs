@@ -3,6 +3,7 @@
 
 use crate::accounts::ModelFamily;
 use crate::constants::{HeaderStyle, headers_for_style};
+use crate::rotation::RateLimitReason;
 use crate::service::{ActiveCredentials, AntigravityService, now_ms};
 use crate::stream::{CloudCodeSseDecoder, StreamDecodeFailure};
 use crate::transform::build_cloud_code_request;
@@ -95,15 +96,7 @@ pub(super) async fn prime_decoder_stream(
         match byte_stream.next().await {
             Some(Ok(chunk)) => match decoder.push_bytes(&chunk) {
                 Ok(evts) => initial_events.extend(evts),
-                Err(StreamDecodeFailure::ThinkingBlockOrder(_)) => {
-                    return SingleAttempt::RetryStripThinking;
-                }
-                Err(StreamDecodeFailure::Fatal(msg)) => {
-                    return SingleAttempt::Fatal(LlmError::Provider { message: msg });
-                }
-                Err(StreamDecodeFailure::EmptyStream) => {
-                    return SingleAttempt::RetryEmptyResponse;
-                }
+                Err(failure) => return in_band_or(failure),
             },
             Some(Err(err)) => {
                 return SingleAttempt::RetryableFailure {
@@ -115,15 +108,7 @@ pub(super) async fn prime_decoder_stream(
                 eof = true;
                 match decoder.finish() {
                     Ok(evts) => initial_events.extend(evts),
-                    Err(StreamDecodeFailure::EmptyStream) => {
-                        return SingleAttempt::RetryEmptyResponse;
-                    }
-                    Err(StreamDecodeFailure::ThinkingBlockOrder(_)) => {
-                        return SingleAttempt::RetryStripThinking;
-                    }
-                    Err(StreamDecodeFailure::Fatal(msg)) => {
-                        return SingleAttempt::Fatal(LlmError::Provider { message: msg });
-                    }
+                    Err(failure) => return in_band_or(failure),
                 }
                 break;
             }
@@ -133,10 +118,57 @@ pub(super) async fn prime_decoder_stream(
     SingleAttempt::Ready(build_llm_stream(initial_events, eof, byte_stream, decoder))
 }
 
+/// In-band quota/rate-limit SSE frames arrive on an HTTP 200 stream, so they are reported as
+/// `RateLimited { status: 200 }`: the pool then marks the serving account and rotates to the
+/// next one instead of failing the turn with raw provider text. Frames without account
+/// attribution stay fatal with their verbatim provider text.
+fn in_band_or(failure: StreamDecodeFailure) -> SingleAttempt {
+    match failure {
+        StreamDecodeFailure::QuotaExhausted(msg) => SingleAttempt::RateLimited {
+            reason: RateLimitReason::QuotaExhausted,
+            retry_after_ms: None,
+            status: 200,
+            body: msg,
+        },
+        StreamDecodeFailure::RateLimited(msg) => SingleAttempt::RateLimited {
+            reason: RateLimitReason::RateLimitExceeded,
+            retry_after_ms: None,
+            status: 200,
+            body: msg,
+        },
+        StreamDecodeFailure::ThinkingBlockOrder(_) => SingleAttempt::RetryStripThinking,
+        StreamDecodeFailure::EmptyStream => SingleAttempt::RetryEmptyResponse,
+        StreamDecodeFailure::Fatal(msg) => {
+            SingleAttempt::Fatal(LlmError::Provider { message: msg })
+        }
+    }
+}
+
 struct TailState {
     bytes: ByteStream,
     decoder: CloudCodeSseDecoder,
     finished: bool,
+}
+
+/// Provider-facing text for a decoder failure observed *after* the first event was emitted.
+///
+/// Rotation is no longer possible at that point (the caller already owns a stream), so the
+/// message must explain the account-level cause instead of echoing raw provider prose.
+fn mid_stream_error_message(failure: StreamDecodeFailure) -> String {
+    match failure {
+        StreamDecodeFailure::EmptyStream => "upstream stream ended unexpectedly".to_owned(),
+        StreamDecodeFailure::QuotaExhausted(m) => {
+            format!("Antigravity account quota exhausted mid-stream (reason: quota_exhausted): {m}")
+        }
+        StreamDecodeFailure::RateLimited(m) => {
+            format!(
+                "Antigravity account rate limited mid-stream (reason: rate_limit_exceeded): {m}"
+            )
+        }
+        // History/thinking rejections and non-recoverable frames already carry provider text
+        // that the caller must see verbatim.
+        StreamDecodeFailure::ThinkingBlockOrder(m) | StreamDecodeFailure::Fatal(m) => m,
+    }
 }
 
 fn build_llm_stream(
@@ -167,13 +199,7 @@ fn build_llm_stream(
                         Ok(evts) => return Some((stream::iter(evts), st)),
                         Err(err) => {
                             st.finished = true;
-                            let msg = match err {
-                                StreamDecodeFailure::EmptyStream => {
-                                    "upstream stream ended unexpectedly".to_owned()
-                                }
-                                StreamDecodeFailure::ThinkingBlockOrder(m)
-                                | StreamDecodeFailure::Fatal(m) => m,
-                            };
+                            let msg = mid_stream_error_message(err);
                             return Some((
                                 stream::iter(vec![LlmEvent::ProviderError { message: msg }]),
                                 st,
@@ -194,11 +220,10 @@ fn build_llm_stream(
                         let final_evts = match st.decoder.finish() {
                             Ok(evts) => evts,
                             Err(StreamDecodeFailure::EmptyStream) => Vec::new(),
-                            Err(
-                                StreamDecodeFailure::ThinkingBlockOrder(m)
-                                | StreamDecodeFailure::Fatal(m),
-                            ) => {
-                                vec![LlmEvent::ProviderError { message: m }]
+                            Err(err) => {
+                                vec![LlmEvent::ProviderError {
+                                    message: mid_stream_error_message(err),
+                                }]
                             }
                         };
                         return Some((stream::iter(final_evts), st));
