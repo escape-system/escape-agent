@@ -91,15 +91,24 @@ jobs:
             echo "::error::binary reports '$GOT', expected 'opencode $VER'"
             exit 1
           fi
-      - name: Verify release binary is portable (no AVX-512)
+      - name: Verify release binary is portable (no unconditional AVX-512)
         run: |
           set -euo pipefail
           BIN=target/x86_64-unknown-linux-gnu/release/opencode
-          if objdump -d "$BIN" | grep -qE '%zmm[0-9]+'; then
-            echo "::error::$BIN contains AVX-512 instructions; it will SIGILL on CPUs without AVX-512. Build with -C target-cpu=x86-64-v2 (see .cargo/config.toml)."
+          # AVX-512 is fine only inside functions that are runtime-dispatched
+          # via is_x86_feature_detected! (crc32fast names them *avx512*).
+          # Anything else means the binary was built with native/AVX-512 codegen
+          # and will SIGILL on pre-AVX-512 CPUs (v0.3.10 regression).
+          OFFENDERS=$(objdump -d "$BIN" | awk '
+            /^[0-9a-f]+ <.*>:$/ { fn=$2 }
+            /%zmm[0-9]+/ { if (fn !~ /avx512/) print fn }
+          ' | sort -u)
+          if [ -n "$OFFENDERS" ]; then
+            echo "::error::$BIN contains AVX-512 instructions outside runtime-dispatched functions; it will SIGILL on CPUs without AVX-512. Build with -C target-cpu=x86-64-v2 (see .cargo/config.toml)."
+            echo "$OFFENDERS" | head -20
             exit 1
           fi
-          echo "no AVX-512 instructions found in $BIN"
+          echo "no unconditional AVX-512 instructions found in $BIN"
 
       - name: Package
         run: |
