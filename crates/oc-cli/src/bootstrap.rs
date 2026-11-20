@@ -37,7 +37,7 @@ pub(crate) async fn shutdown_services(
 pub(crate) struct Services {
     pub(crate) store: std::sync::Arc<oc_store::Store>,
     pub(crate) config: std::sync::Arc<oc_config::ConfigService>,
-    pub(crate) catalog: std::sync::Arc<oc_llm::Catalog>,
+    pub(crate) catalog: std::sync::Arc<oc_llm::CatalogCell>,
     pub(crate) antigravity: Option<Arc<oc_antigravity::AntigravityService>>,
 }
 
@@ -98,7 +98,18 @@ pub(crate) async fn open_services(
             None
         }
     };
-    let catalog = std::sync::Arc::new(catalog);
+    // A catalog fetched by a previous run is the first offline update source:
+    // the embedded snapshot is the floor, the cache widens it without network.
+    match oc_llm::catalog::refresh::read_cache(&oc_llm::catalog::refresh::cache_path()) {
+        Some(Ok(body)) => {
+            if let Err(error) = oc_llm::catalog::refresh::merge_live(&mut catalog, &body) {
+                tracing::warn!(%error, "cached model catalog ignored");
+            }
+        }
+        Some(Err(error)) => tracing::warn!(%error, "cached model catalog unreadable"),
+        None => {}
+    }
+    let catalog = std::sync::Arc::new(oc_llm::CatalogCell::new(catalog));
     Ok(Services {
         store,
         config,
@@ -154,9 +165,10 @@ pub(crate) async fn attach_runtime(
     runtime = runtime.with_memory(Arc::clone(&memory));
     // One scribe serves both `digest` and the turn-end memory extraction.
     // `memory.auto_scribe` gates only the latter, inside the runtime.
+    let catalog_generation = services.catalog.current();
     if let Some(scribe) = scribe::attach(
         services.config.as_ref(),
-        services.catalog.as_ref(),
+        catalog_generation.as_ref(),
         Arc::clone(&client),
         Arc::clone(&services.store),
     ) {
@@ -168,7 +180,7 @@ pub(crate) async fn attach_runtime(
         &state,
         Arc::clone(&services.store),
         services.config.as_ref(),
-        services.catalog.as_ref(),
+        catalog_generation.as_ref(),
         Arc::clone(&client),
     ) {
         let engine = Arc::clone(&handle.engine);
@@ -302,6 +314,11 @@ pub(crate) fn start_background_tasks(
         let path = path.to_path_buf();
         let id = id.to_owned();
         tokio::spawn(async move { service::watch(path, id, shutdown).await });
+    }
+    if let Some(cell) = state.catalog_cell() {
+        // The loop lives for the process; dropping the handle detaches it, and
+        // shutdown ends the process. No caller ever awaits a refresh.
+        let _refresh = oc_llm::catalog::refresh::spawn_refresh_loop(std::sync::Arc::clone(cell));
     }
     spawn_schedule_runner(state.clone(), shutdown.clone())
 }

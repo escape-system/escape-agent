@@ -147,7 +147,10 @@ pub(super) async fn prepare_spawn_context(
         // session row is written, naming the offending field.
         return Err(ToolError::new(format!("ModelsConfigError: {error}")));
     }
-    let available = available_models(&runtime.inner.config.catalog, &runtime.inner.config.client);
+    let available = available_models(
+        &runtime.inner.config.catalog.current(),
+        &runtime.inner.config.client,
+    );
     let chain = models.chain_for(agent);
     let call_model = optional_str(input, "model");
 
@@ -359,7 +362,7 @@ pub(super) async fn prepare_spawn_context(
     }
     let model_value = model_value(
         &choice.reference,
-        &runtime.inner.config.catalog,
+        &runtime.inner.config.catalog.current(),
         &runtime.inner.config.client,
     )?;
     let created_model: Option<oc_types::ModelRef> =

@@ -1112,7 +1112,7 @@ impl oc_runtime::ModelClient for NoopModel {
 fn state_with_key_pool(parts: &HarnessParts) -> (Router, Arc<oc_llm::KeyPool>) {
     let state = state_from(parts);
     let config = Arc::clone(&parts.config);
-    let catalog = Arc::clone(state.catalog().expect("catalog"));
+    let catalog = state.catalog().expect("catalog");
     let store = Arc::clone(state.store().expect("store"));
     let broker = Arc::new(oc_server::PermissionBroker::from_state(&state));
     let sink = Arc::new(oc_server::BusSink::from_state(&state));
@@ -1120,7 +1120,7 @@ fn state_with_key_pool(parts: &HarnessParts) -> (Router, Arc<oc_llm::KeyPool>) {
         oc_runtime::RuntimeConfig {
             store,
             config,
-            catalog,
+            catalog: Arc::new(oc_llm::CatalogCell::from_arc(catalog)),
             client: Arc::new(SharedLlmClient::new(LlmClient::new().expect("client"))),
             tools: Arc::new(oc_tools::ToolRegistry::with_defaults()),
             sink,

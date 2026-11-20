@@ -34,9 +34,23 @@ pub(super) fn to_v2(providers: Vec<(String, SourceProvider)>) -> Vec<(String, So
                         .provider
                         .as_ref()
                         .and_then(|provider| provider.shape.clone());
-                    let api_name = if shape.as_deref() == Some("responses")
-                        || (shape.is_none() && responses_by_default(&model_npm))
-                    {
+                    // v1 gives one provider-level `npm`, optionally overridden per
+                    // model. Pick the wire protocol from the effective SDK so an
+                    // Anthropic- or Google-routed model is not flattened onto
+                    // `chat-completions` (which would send the wrong payload
+                    // shape and fail at the provider).
+                    let api_name = if let Some(shape) = shape.as_deref() {
+                        match shape {
+                            "responses" => "responses",
+                            "messages" => "messages",
+                            "generate-content" => "generate-content",
+                            _ => "chat-completions",
+                        }
+                    } else if sdk_is_anthropic(&model_npm) {
+                        "messages"
+                    } else if sdk_is_google(&model_npm) {
+                        "generate-content"
+                    } else if responses_by_default(&model_npm) {
                         "responses"
                     } else {
                         "chat-completions"
@@ -120,6 +134,16 @@ fn interleaved_field(model: &SourceModel) -> Option<String> {
 
 fn responses_by_default(npm: &str) -> bool {
     matches!(npm, "@ai-sdk/openai" | "@ai-sdk/azure" | "@ai-sdk/xai")
+}
+
+/// SDKs that speak the Anthropic Messages wire protocol.
+fn sdk_is_anthropic(npm: &str) -> bool {
+    npm.contains("anthropic")
+}
+
+/// SDKs that speak the Gemini `generateContent` wire protocol.
+fn sdk_is_google(npm: &str) -> bool {
+    npm.contains("google") || npm.contains("gemini")
 }
 
 fn reasoning_from_v1(model: &SourceModel) -> SourceReasoning {

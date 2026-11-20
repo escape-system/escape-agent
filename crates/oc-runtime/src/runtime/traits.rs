@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use futures_util::future::BoxFuture;
 use oc_config::ConfigService;
-use oc_llm::{Catalog, LlmError, LlmRequest, LlmStream, SharedLlmClient};
+use oc_llm::{CatalogCell, LlmError, LlmRequest, LlmStream, SharedLlmClient};
 use oc_store::Store;
 use oc_tools::ToolRegistry;
 use oc_types::{EventEnvelope, SessionInfo, StructuredError};
@@ -104,7 +104,9 @@ pub trait EditDiagnosticsHook: Send + Sync {
 pub struct RuntimeConfig {
     pub store: Arc<Store>,
     pub config: Arc<ConfigService>,
-    pub catalog: Arc<Catalog>,
+    /// Swappable catalog. A live refresh replaces it without a restart, so
+    /// the picker and the turn loop can never disagree about a model.
+    pub catalog: Arc<CatalogCell>,
     pub client: Arc<SharedLlmClient>,
     pub tools: Arc<ToolRegistry>,
     pub sink: Arc<dyn EventSink>,

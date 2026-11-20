@@ -22,10 +22,10 @@ pub mod sse;
 pub mod token;
 
 pub use catalog::{
-    Activation, Capabilities, Catalog, Compatibility, Cost, CostCache, CostTier, CostTierKind,
-    Limit, ModelInfo, ModelRef, ModelStatus, ModelTime, Ordered, PriceOverride, PriceOverrideMap,
-    Protocol, ProviderInfo, ResolvedModel, Variant, calculate_cost, parse_reference,
-    parse_release_date,
+    Activation, Capabilities, Catalog, CatalogCell, Compatibility, Cost, CostCache, CostTier,
+    CostTierKind, Limit, ModelInfo, ModelRef, ModelStatus, ModelTime, Ordered, PriceOverride,
+    PriceOverrideMap, Protocol, ProviderInfo, ResolvedModel, Variant, calculate_cost,
+    parse_reference, parse_release_date,
 };
 pub use client::{LlmClient, SharedLlmClient};
 pub use error::{FailureKind, LlmError, classify_provider_message};

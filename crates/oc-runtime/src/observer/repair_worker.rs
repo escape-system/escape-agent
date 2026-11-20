@@ -93,7 +93,7 @@ impl Runtime {
             .inner
             .config
             .client
-            .resolve_model(&self.inner.config.catalog, model)
+            .resolve_model(&self.inner.config.catalog.current(), model)
         {
             return Err(RuntimeError::Config(format!(
                 "repair model {model:?} is not in the catalog: {error}"

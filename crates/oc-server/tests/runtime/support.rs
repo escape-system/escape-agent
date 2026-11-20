@@ -297,7 +297,7 @@ impl Harness {
             RuntimeConfig {
                 store: Arc::clone(&store),
                 config: Arc::clone(&config),
-                catalog: Arc::clone(&catalog),
+                catalog: Arc::new(oc_llm::CatalogCell::from_arc(Arc::clone(&catalog))),
                 client: Arc::new(SharedLlmClient::new(LlmClient::new().expect("client"))),
                 tools: Arc::new(ToolRegistry::with_defaults()),
                 sink,

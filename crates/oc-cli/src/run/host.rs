@@ -34,7 +34,7 @@ pub(super) async fn boot_terminal_host(
     let state = AppState::new(info, None, directory.to_path_buf())
         .with_store(services.store.clone())
         .with_config(services.config.clone())
-        .with_catalog(services.catalog.clone());
+        .with_catalog_cell(services.catalog.clone());
     let (state, extensions) = attach_extensions(state, &services, directory).await?;
     let (state, runtime, broker) = attach_runtime(state, &services, &extensions).await?;
     Ok(TerminalHost {
@@ -81,9 +81,10 @@ pub(super) fn parse_and_validate_model(
         .with_context(|| format!("invalid model reference `{reference}` (expected provider/id)"))?;
     // Primary path: the shared client, which also asks the attached transport
     // hook (Antigravity) for models discovered after the startup snapshot.
+    let catalog = services.catalog.current();
     let resolved = match host.state.llm() {
-        Some(client) => client.resolve_model(&services.catalog, reference).ok(),
-        None => services.catalog.resolve(reference).ok(),
+        Some(client) => client.resolve_model(&catalog, reference).ok(),
+        None => catalog.resolve(reference).ok(),
     };
     // Fallback: the Antigravity service's own merged built-in + discovered
     // catalog. It also understands `#tier` shorthands and un-prefixed ids.
@@ -91,14 +92,16 @@ pub(super) fn parse_and_validate_model(
         services
             .antigravity
             .as_ref()
-            .and_then(|ag| ag.resolve_catalog_model(&services.catalog, reference))
+            .and_then(|ag| ag.resolve_catalog_model(&catalog, reference))
     });
     let Some(resolved) = resolved else {
-        let error = services.catalog.resolve(reference).err().unwrap_or(
-            oc_llm::LlmError::InvalidReference {
-                reference: reference.to_owned(),
-            },
-        );
+        let error =
+            catalog
+                .resolve(reference)
+                .err()
+                .unwrap_or(oc_llm::LlmError::InvalidReference {
+                    reference: reference.to_owned(),
+                });
         return Err(anyhow::Error::new(error))
             .with_context(|| format!("resolve model `{reference}`"));
     };

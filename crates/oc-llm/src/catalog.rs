@@ -4,10 +4,12 @@
 //! performs network or file I/O. Configuration is supplied as an already-merged
 //! `providers` JSON object.
 
+mod cell;
 mod convert;
 mod cost;
 mod overlay;
 mod reference;
+pub mod refresh;
 mod resolve;
 mod resolved;
 mod snapshot;
@@ -27,6 +29,7 @@ use std::sync::LazyLock;
 use serde::de::{MapAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 
+pub use cell::CatalogCell;
 pub use cost::calculate_cost;
 pub use reference::{ModelRef, parse_reference};
 pub use resolved::ResolvedModel;

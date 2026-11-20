@@ -210,7 +210,7 @@ impl Runtime {
                         .inner
                         .config
                         .client
-                        .resolve_model(&self.inner.config.catalog, &next)
+                        .resolve_model(&self.inner.config.catalog.current(), &next)
                     else {
                         // A chain entry the catalog cannot run is skipped rather
                         // than fatal: it must not stall every later turn.

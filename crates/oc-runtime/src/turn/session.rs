@@ -138,7 +138,7 @@ impl Runtime {
             .ok_or_else(|| RuntimeError::ModelUnavailable("no model configured".to_owned()))?;
         let resolved = config
             .client
-            .resolve_model(&config.catalog, &model_ref.to_reference())?;
+            .resolve_model(&config.catalog.current(), &model_ref.to_reference())?;
         let context_window = resolved.model.limit.context;
         let session_rules = session_rules(info);
 

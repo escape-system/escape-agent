@@ -280,6 +280,35 @@ fn embedded_snapshot_parses_within_a_second() {
     assert_eq!(catalog.provider("google").unwrap().name, "Google");
 }
 
+/// Regression: newer `opencode-go` catalog entries must reach the picker.
+///
+/// `hy4-flash-free` was missing from the embedded snapshot, so the chat picker
+/// could not offer it even though the live models.dev catalog published it.
+/// The entry also has to keep the OpenAI-compatible wire route: a free tier is
+/// only usable if `LlmClient` talks `chat-completions` to it.
+#[test]
+fn embedded_snapshot_exposes_hy4_flash_free() {
+    let catalog = Catalog::from_snapshot(oc_llm::catalog::EMBEDDED_SNAPSHOT).unwrap();
+    let model = catalog.resolve("opencode-go/hy4-flash-free").unwrap();
+    assert_eq!(model.protocol, Protocol::OpenAiChat);
+    assert_eq!(model.base_url, "https://opencode.ai/inference/go/openai/v1");
+    assert_eq!(model.model.name, "Hy4 flash Free");
+    assert!(model.model.capabilities.tools);
+    assert_eq!(model.model.limit.context, 1_048_576);
+    // A zero-priced model is the whole point of a free tier.
+    assert_eq!(model.model.cost[0].input, 0.0);
+    assert_eq!(model.model.cost[0].output, 0.0);
+
+    // The sibling entries shipped in the same refresh stay resolvable, and the
+    // Anthropic-routed one keeps its Messages protocol.
+    assert!(catalog.resolve("opencode-go/hy4").is_ok());
+    assert!(catalog.resolve("opencode-go/longcat-2.5-free").is_ok());
+    assert_eq!(
+        catalog.resolve("opencode-go/qwen4-max").unwrap().protocol,
+        Protocol::AnthropicMessages
+    );
+}
+
 #[test]
 fn errors_have_no_candidate_panic_on_empty() {
     let catalog = Catalog::from_snapshot(FIXTURE).unwrap();

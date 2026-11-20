@@ -394,7 +394,9 @@ impl Harness {
             .await
             .expect("session created");
 
-        let catalog = Arc::new(Catalog::from_snapshot(CATALOG).expect("catalog"));
+        let catalog = Arc::new(oc_llm::CatalogCell::from_arc(Arc::new(
+            Catalog::from_snapshot(CATALOG).expect("catalog"),
+        )));
         let client = Arc::new(SharedLlmClient::new(LlmClient::new().expect("client")));
         let sink = TestSink::default();
         let model = ScriptedModel::new(scripts);

@@ -773,7 +773,7 @@ fn attach_runtime(
     state: &AppState,
 ) -> (axum::Router, Arc<oc_llm::ModelHealth>, Arc<oc_llm::KeyPool>) {
     let config = Arc::clone(state.config().expect("config"));
-    let catalog = Arc::clone(state.catalog().expect("catalog"));
+    let catalog = state.catalog().expect("catalog");
     let store = Arc::clone(state.store().expect("store"));
     let broker = Arc::new(oc_server::PermissionBroker::from_state(state));
     let sink = Arc::new(oc_server::BusSink::from_state(state));
@@ -781,7 +781,7 @@ fn attach_runtime(
         oc_runtime::RuntimeConfig {
             store,
             config,
-            catalog,
+            catalog: Arc::new(oc_llm::CatalogCell::from_arc(catalog)),
             client: Arc::new(oc_llm::SharedLlmClient::new(
                 oc_llm::LlmClient::new().expect("client"),
             )),

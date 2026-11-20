@@ -31,7 +31,7 @@ use axum::routing::{get, patch as patch_route, post, put};
 use oc_antigravity::AntigravityService;
 use oc_config::ConfigService;
 use oc_lanes::LaneService;
-use oc_llm::{Catalog, LlmError, SharedLlmClient};
+use oc_llm::{Catalog, CatalogCell, LlmError, SharedLlmClient};
 use oc_lsp::LspSupervisor;
 use oc_memory::MemoryService;
 use oc_observer::ObserverEngine;
@@ -69,7 +69,7 @@ pub struct AppState {
     cors_origins: Arc<Vec<String>>,
     store: Option<Arc<Store>>,
     config: Option<Arc<ConfigService>>,
-    catalog: Option<Arc<Catalog>>,
+    catalog: Option<Arc<CatalogCell>>,
     runtime: Option<Arc<Runtime>>,
     memory: Option<Arc<MemoryService>>,
     observer: Option<Arc<ObserverEngine>>,
@@ -187,9 +187,20 @@ impl AppState {
     /// Attach the model catalog used by the model/provider routes.
     ///
     /// Build it once at startup with [`catalog_from_config`]; re-parsing the
-    /// embedded snapshot per request would be wasteful.
+    /// embedded snapshot per request would be wasteful. This wraps a fixed
+    /// catalog for tests; a live refresh needs [`Self::with_catalog_cell`].
     #[must_use]
     pub fn with_catalog(mut self, catalog: Arc<Catalog>) -> Self {
+        self.catalog = Some(Arc::new(CatalogCell::from_arc(catalog)));
+        self
+    }
+
+    /// Attach the swappable catalog handle shared with the runtime.
+    ///
+    /// One cell is the single source of truth: a refresh replaces it in place,
+    /// so the picker and the turn loop cannot disagree about which models exist.
+    #[must_use]
+    pub fn with_catalog_cell(mut self, catalog: Arc<CatalogCell>) -> Self {
         self.catalog = Some(catalog);
         self
     }
@@ -204,8 +215,18 @@ impl AppState {
         self.config.as_ref()
     }
 
+    /// The catalog generation to use for this request.
+    ///
+    /// A live refresh swaps the cell, so the returned `Arc` pins one generation
+    /// for the whole request instead of mixing two.
     #[must_use]
-    pub fn catalog(&self) -> Option<&Arc<Catalog>> {
+    pub fn catalog(&self) -> Option<Arc<Catalog>> {
+        self.catalog.as_ref().map(|cell| cell.current())
+    }
+
+    /// The swappable catalog handle, for the background refresh task.
+    #[must_use]
+    pub fn catalog_cell(&self) -> Option<&Arc<CatalogCell>> {
         self.catalog.as_ref()
     }
 

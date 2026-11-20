@@ -72,7 +72,7 @@ pub(crate) async fn serve(options: ServeOptions) -> anyhow::Result<()> {
         .with_cors_origins(cors)
         .with_store(services.store.clone())
         .with_config(services.config.clone())
-        .with_catalog(services.catalog.clone());
+        .with_catalog_cell(services.catalog.clone());
     let mut state = state;
     if let Some(web_dist) = web_dist.or_else(crate::paths::discover_web_dist) {
         state = state.with_web_dist(web_dist);

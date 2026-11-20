@@ -223,7 +223,7 @@ impl Runtime {
                 .inner
                 .config
                 .client
-                .resolve_model(&self.inner.config.catalog, reference)
+                .resolve_model(&self.inner.config.catalog.current(), reference)
             else {
                 tracing::debug!(
                     session = %session,

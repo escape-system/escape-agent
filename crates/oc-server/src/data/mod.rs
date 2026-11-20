@@ -131,8 +131,11 @@ pub(crate) fn require_config(state: &AppState) -> Result<&Arc<ConfigService>, Ap
         .ok_or_else(|| ApiError::service_unavailable("configuration service not available"))
 }
 
-/// The model catalog, or the documented 503.
-pub(crate) fn require_catalog(state: &AppState) -> Result<&Arc<Catalog>, ApiError> {
+/// The model catalog generation for this request, or the documented 503.
+///
+/// The returned `Arc` pins one generation even if a live refresh swaps the cell
+/// mid-request.
+pub(crate) fn require_catalog(state: &AppState) -> Result<Arc<Catalog>, ApiError> {
     state
         .catalog()
         .ok_or_else(|| ApiError::service_unavailable("model catalog not loaded"))

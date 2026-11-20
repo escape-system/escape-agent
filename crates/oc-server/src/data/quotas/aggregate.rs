@@ -34,7 +34,8 @@ pub(super) async fn build_unified_quotas(
         Some(store) => store.list_credentials().await?,
         None => Vec::new(),
     };
-    let catalog = state.catalog().map(Arc::as_ref);
+    let catalog_generation = state.catalog();
+    let catalog = catalog_generation.as_deref();
     let config = state.config().map(Arc::as_ref);
 
     // Only providers with a genuinely active credential (or a usable

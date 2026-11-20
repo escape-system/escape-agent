@@ -252,7 +252,9 @@ impl Harness {
         let runtime_config = RuntimeConfig {
             store: Arc::clone(&store),
             config: Arc::new(config),
-            catalog: Arc::new(Catalog::from_snapshot(CATALOG).expect("catalog")),
+            catalog: Arc::new(oc_llm::CatalogCell::from_arc(Arc::new(
+                Catalog::from_snapshot(CATALOG).expect("catalog"),
+            ))),
             client: Arc::new(SharedLlmClient::new(LlmClient::new().expect("client"))),
             tools: Arc::new(registry),
             sink: Arc::new(sink.clone()),

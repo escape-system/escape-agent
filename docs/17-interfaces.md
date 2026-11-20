@@ -851,10 +851,53 @@ pub enum LlmEvent { StepStart, TextStart, TextDelta{delta:String}, TextEnd{text:
 pub type LlmStream = futures_util::stream::BoxStream<'static, LlmEvent>;
 ```
 
-Catalog: the embedded models.dev snapshot (7.9 MB) is the source; `apply_config`
-overlays the merged `providers` object. OpenAI-compatible chat, Anthropic
-messages and Gemini streams, SSE parser, retry/timeout policy. Tests use a local
-axum fake server; no real API keys.
+Catalog: the embedded models.dev snapshot (7.9 MB) is the **floor**, not the
+source of truth. `catalog::refresh` fetches the published catalog
+(`https://models.dev/api.json`, overridable with `OPENCODE_MODELS_URL`), caches
+the raw body atomically, and merges only models the catalog does not have yet, so
+a refresh can widen the picker but never reroute or drop a shipped model. A
+background loop refreshes 30 s after boot and every 6 h; the cached body is
+merged at startup, so an offline start still serves the last fetched catalog.
+
+```rust
+pub struct CatalogCell { /* RwLock<Arc<Catalog>> + revision */ }
+impl CatalogCell {
+    pub fn new(catalog: Catalog) -> Self;
+    pub fn from_arc(catalog: Arc<Catalog>) -> Self;
+    pub fn current(&self) -> Arc<Catalog>;      // pins one generation per turn
+    pub fn replace(&self, catalog: Catalog);
+    pub fn update(&self, apply: impl FnOnce(&mut Catalog));
+    pub fn revision(&self) -> u64;
+    pub fn provider(&self, id: &str) -> Option<ProviderInfo>;
+    pub fn model(&self, provider_id: &str, id: &str) -> Option<ModelInfo>;
+    pub fn models(&self) -> Vec<ModelInfo>;
+    pub fn providers(&self) -> Vec<ProviderInfo>;
+}
+pub mod catalog::refresh {
+    pub async fn fetch_live(client: &reqwest::Client, url: &str) -> Result<String, LlmError>;
+    pub fn merge_live(base: &mut Catalog, live_json: &str) -> Result<usize, LlmError>;
+    pub fn apply_live(cell: &CatalogCell, body: &str) -> Result<usize, LlmError>;
+    pub async fn refresh_once(cell: &CatalogCell, client: &reqwest::Client, url: &str,
+                              cache: &std::path::Path) -> Result<usize, LlmError>;
+    pub fn spawn_refresh_loop(cell: Arc<CatalogCell>) -> tokio::task::JoinHandle<()>;
+    pub fn models_url() -> String;
+    pub fn cache_path() -> std::path::PathBuf;
+    pub fn read_cache(path: &std::path::Path) -> Option<Result<String, String>>;
+    pub fn write_cache(path: &std::path::Path, body: &str) -> Result<(), String>;
+}
+```
+
+`AppState::catalog()` now returns `Option<Arc<Catalog>>` (one pinned generation);
+`AppState::with_catalog` still accepts a fixed `Arc<Catalog>` for tests and
+`AppState::with_catalog_cell` takes the shared cell a live refresh swaps.
+`RuntimeConfig::catalog` is an `Arc<CatalogCell>`, so the picker and the turn
+loop cannot disagree about which models exist. The cache path is
+`OPENCODE_MODELS_CACHE`, else `<data dir>/models-cache.json`.
+
+OpenAI-compatible chat, Anthropic messages and Gemini streams, SSE parser,
+retry/timeout policy. Tests use a local axum fake server; no real API keys, and
+the live fetch is never exercised — merge and cache are covered by fixtures.
+
 
 ## `oc-tools`
 
