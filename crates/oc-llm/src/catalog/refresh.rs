@@ -1,26 +1,25 @@
-//! Live models.dev refresh: fetch the published catalog, cache it, merge it.
+//! Live models.dev refresh: fetch the published catalog, cache it, make it the
+//! catalog the server serves.
 //!
-//! The embedded snapshot is a build-time floor, never the source of truth. A
-//! running server fetches the published catalog, parses it through the same
-//! [`Catalog::from_snapshot`] path the snapshot uses, and merges entries the
-//! snapshot does not know yet. Existing entries are never replaced, so a live
-//! refresh can add a model but cannot silently reroute or drop one that shipped
-//! in the binary.
+//! Upstream treats models.dev as a **dynamic** source, not a build artifact: the
+//! published catalog is authoritative, it is cached on disk, and a refresh
+//! announces itself with `models-dev.refreshed`. The embedded snapshot is only
+//! the cold-start floor for a machine that has never fetched (this repo keeps
+//! startup offline-first, `docs/15-performance.md`), so the first successful
+//! fetch replaces it.
 //!
-//! The publisher answers in the models.dev **v1** schema (provider-level `npm`,
-//! flat `cost`, no per-model `api` map). [`super::v1`] converts it, including
-//! the per-model SDK to wire-protocol mapping, so a newly published Anthropic
-//! model is not silently routed to `chat-completions`.
-//!
-//! Only models this client can actually run are merged: a v1 provider whose SDK
-//! maps to [`Protocol::Unsupported`] would otherwise show up in the picker as a
-//! row that fails on send.
+//! Replacing rather than merging is deliberate: an additive merge would keep a
+//! model upstream renamed, repriced or withdrew forever, which is exactly the
+//! staleness the live feed exists to remove. The cost of replacement is that a
+//! broken publish could empty the picker, so callers gate the swap on
+//! [`is_plausible`]; a publish that loses almost everything is a bad response,
+//! not an upstream decision.
 
 use std::path::{Path, PathBuf};
 
 use reqwest::Client;
 
-use super::{Catalog, Protocol};
+use super::Catalog;
 use crate::error::LlmError;
 
 /// Public catalog endpoint, matching upstream's default.
@@ -41,6 +40,13 @@ pub const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30
 
 /// Interval between background refreshes.
 pub const REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
+
+/// Delay before the first background fetch so startup stays offline.
+pub const BOOT_DELAY: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// A published catalog below this many models is a broken response, not an
+/// upstream decision; the live catalog has thousands.
+pub const MIN_PLAUSIBLE_MODELS: usize = 100;
 
 /// The catalog URL this process should use.
 #[must_use]
@@ -81,9 +87,8 @@ pub fn cache_path() -> PathBuf {
 
 /// Read the cached catalog body, if any.
 ///
-/// A missing or unreadable file is not an error: the caller falls back to the
-/// embedded snapshot. Only a body that exists and cannot be parsed fails, so a
-/// truncated cache is reported rather than silently ignored.
+/// A missing file is not an error: the caller falls back to the embedded
+/// snapshot. An unreadable or unparseable cache is reported, not ignored.
 pub fn read_cache(path: &Path) -> Option<Result<String, String>> {
     match std::fs::read_to_string(path) {
         Ok(body) => Some(Ok(body)),
@@ -127,87 +132,43 @@ pub async fn fetch_live(client: &Client, url: &str) -> Result<String, LlmError> 
     Ok(response.text().await?)
 }
 
-/// Parse a published catalog and merge it into `base`.
+/// Parse a published body (models.dev v1 or v2) into a standalone catalog.
 ///
-/// Returns the number of models added. A body that does not parse is an error
-/// and leaves `base` untouched, so a bad publish can never empty the picker.
-pub fn merge_live(base: &mut Catalog, live_json: &str) -> Result<usize, LlmError> {
-    let live = Catalog::from_snapshot(live_json)?;
-    Ok(merge_catalog(base, &live))
+/// A body that does not parse is an error; the caller keeps the current
+/// catalog, so a bad publish can never empty the picker.
+pub fn parse_live(body: &str) -> Result<Catalog, LlmError> {
+    Catalog::from_snapshot(body)
 }
 
-/// Merge an already-fetched body into the live cell.
-///
-/// The body is parsed before the cell is touched, so a malformed publish leaves
-/// the running catalog exactly as it was. The revision bumps only when models
-/// were actually added.
-pub fn apply_live(cell: &super::CatalogCell, body: &str) -> Result<usize, LlmError> {
-    let live = Catalog::from_snapshot(body)?;
-    let mut added = 0;
-    cell.update(|catalog| {
-        added = merge_catalog(catalog, &live);
-    });
-    Ok(added)
-}
-
-/// One refresh cycle: fetch the published catalog, cache it, merge it.
-///
-/// The body is cached exactly as parsed, so an offline start reuses precisely
-/// the catalog this run serves. A cache write failure is logged, never fatal:
-/// a successful refresh must not be discarded because the disk is read-only.
-pub async fn refresh_once(
-    cell: &super::CatalogCell,
-    client: &Client,
-    url: &str,
-    cache: &Path,
-) -> Result<usize, LlmError> {
-    let body = fetch_live(client, url).await?;
-    if let Err(error) = write_cache(cache, &body) {
-        tracing::warn!(%error, "model catalog cache write failed");
-    }
-    apply_live(cell, &body)
-}
-
-/// Merge `live` into `base`, adding only runnable entries `base` lacks.
-///
-/// `base` wins on every collision: a model already shipped keeps its snapshot
-/// route and pricing, so a refresh can only widen the catalog.
+/// Whether a catalog is complete enough to replace the one being served.
 #[must_use]
-pub fn merge_catalog(base: &mut Catalog, live: &Catalog) -> usize {
-    let mut added = 0;
-    for provider in live.providers() {
-        let provider_known = base.provider(&provider.id).is_some();
-        let models: Vec<_> = live
-            .models()
-            .into_iter()
-            .filter(|model| model.provider_id == provider.id)
-            // Only protocols this client can stream; no dead picker rows.
-            .filter(|model| model.protocol != Protocol::Unsupported)
-            .filter(|model| base.model(&model.provider_id, &model.id).is_none())
-            .collect();
-        if models.is_empty() {
-            continue;
-        }
-        if !provider_known {
-            base.upsert_provider(provider.clone());
-        }
-        added += models.len();
-        base.upsert_provider_models(models);
-    }
-    if added > 0 {
-        base.reindex();
-    }
-    added
+pub fn is_plausible(catalog: &Catalog) -> bool {
+    catalog.models().len() >= MIN_PLAUSIBLE_MODELS
 }
 
-/// Spawn the background refresh loop.
+/// Replace the cell's catalog with a parsed published body.
 ///
-/// The first fetch waits [`BOOT_DELAY`] so startup never blocks on the network
-/// (`docs/15-performance.md` keeps npm/network out of the critical path), then
-/// the loop refreshes every [`REFRESH_INTERVAL`]. It lives for the process; a
-/// server shutdown ends the process, and a test host simply drops the handle.
+/// Returns the model count of the new generation. Callers that need overlays
+/// (config providers, Antigravity discovery) build the final [`Catalog`] first
+/// and call [`super::CatalogCell::replace`] directly.
+pub fn replace_live(cell: &super::CatalogCell, body: &str) -> Result<usize, LlmError> {
+    let live = parse_live(body)?;
+    let count = live.models().len();
+    cell.replace(live);
+    Ok(count)
+}
+
+/// Spawn the background refresh loop: fetch, cache, apply.
+///
+/// `apply` owns the interpretation of a fetched body (parse, re-apply overlays,
+/// swap the cell, publish `models-dev.refreshed`) and returns an error when the
+/// body was rejected, so the loop can log without knowing any of that layering.
+/// The loop lives for the process; shutdown ends the process.
 #[must_use]
-pub fn spawn_refresh_loop(cell: std::sync::Arc<super::CatalogCell>) -> tokio::task::JoinHandle<()> {
+pub fn spawn_refresh_loop<F>(apply: F) -> tokio::task::JoinHandle<()>
+where
+    F: Fn(&str) -> Result<(), String> + Send + 'static,
+{
     tokio::spawn(async move {
         let Ok(client) = Client::builder().build() else {
             return;
@@ -219,19 +180,21 @@ pub fn spawn_refresh_loop(cell: std::sync::Arc<super::CatalogCell>) -> tokio::ta
             let delay = if first { BOOT_DELAY } else { REFRESH_INTERVAL };
             first = false;
             tokio::time::sleep(delay).await;
-            match refresh_once(&cell, &client, &url, &cache).await {
-                Ok(added) if added > 0 => {
-                    tracing::info!(added, "model catalog refreshed from {url}");
+            match fetch_live(&client, &url).await {
+                Ok(body) => {
+                    if let Err(error) = write_cache(&cache, &body) {
+                        tracing::warn!(%error, "model catalog cache write failed");
+                    }
+                    match apply(&body) {
+                        Ok(()) => tracing::info!("model catalog refreshed from {url}"),
+                        Err(error) => tracing::warn!(%error, "model catalog publish rejected"),
+                    }
                 }
-                Ok(_) => {}
                 Err(error) => tracing::debug!(%error, "model catalog refresh failed"),
             }
         }
     })
 }
-
-/// Delay before the first background fetch so startup stays offline.
-pub const BOOT_DELAY: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[cfg(test)]
 mod tests {
@@ -259,7 +222,6 @@ mod tests {
       }
     }"#;
 
-    /// A v1 publisher body: provider-level npm, per-model provider npm override.
     const LIVE: &str = r#"{
       "known": {
         "id": "known",
@@ -268,11 +230,6 @@ mod tests {
         "npm": "@ai-sdk/openai-compatible",
         "api": "http://known.invalid/v1",
         "models": {
-          "existing": {
-            "id": "existing",
-            "name": "Existing Republished",
-            "cost": {"input": 99, "output": 99}
-          },
           "fresh": {
             "id": "fresh",
             "name": "Fresh",
@@ -281,113 +238,47 @@ mod tests {
             "temperature": true,
             "cost": {"input": 0, "output": 0},
             "limit": {"context": 1048576, "output": 65536}
-          },
-          "fresh-anthropic": {
-            "id": "fresh-anthropic",
-            "name": "Fresh Anthropic-routed",
-            "tool_call": true,
-            "provider": {"npm": "@ai-sdk/anthropic", "api": "http://known.invalid/anthropic"}
           }
-        }
-      },
-      "brand-new": {
-        "id": "brand-new",
-        "name": "Brand New",
-        "env": [],
-        "npm": "@ai-sdk/openai-compatible",
-        "api": "http://new.invalid/v1",
-        "models": {
-          "solo": {
-            "id": "solo",
-            "name": "Solo",
-            "tool_call": true
-          }
-        }
-      },
-      "unsupported-only": {
-        "id": "unsupported-only",
-        "name": "Unsupported Only",
-        "env": [],
-        "npm": "@openrouter/ai-sdk-provider",
-        "models": {
-          "weird": {"id": "weird", "name": "Weird"}
         }
       }
     }"#;
 
     #[test]
-    fn merge_adds_new_models_and_keeps_shipped_routes() {
-        let mut base = Catalog::from_snapshot(BASE).unwrap();
-        let added = merge_live(&mut base, LIVE).unwrap();
-        // A v1 publisher body gives every model one of the three protocols this
-        // client speaks, so all four new models are runnable and merged.
-        assert_eq!(added, 4, "fresh, fresh-anthropic, solo, weird");
+    fn replace_is_authoritative() {
+        let cell = super::super::CatalogCell::new(Catalog::from_snapshot(BASE).unwrap());
+        assert!(cell.current().resolve("known/existing").is_ok());
 
-        // A shipped model keeps its snapshot pricing (base wins).
-        let existing = base.resolve("known/existing").unwrap();
-        assert_eq!(existing.model.cost[0].input, 1.0);
+        let count = replace_live(&cell, LIVE).unwrap();
+        assert_eq!(count, 1);
 
-        // A new model on a known provider is added with its wire route.
-        let fresh = base.resolve("known/fresh").unwrap();
-        assert_eq!(fresh.protocol, Protocol::OpenAiChat);
-        assert_eq!(fresh.model.name, "Fresh");
-
-        // The per-model Anthropic SDK must not be flattened to chat-completions.
-        let anthropic = base.resolve("known/fresh-anthropic").unwrap();
-        assert_eq!(anthropic.protocol, Protocol::AnthropicMessages);
-        assert_eq!(anthropic.base_url, "http://known.invalid/anthropic");
-
-        // A provider unknown to the snapshot is added when it can run.
-        assert_eq!(base.provider("brand-new").unwrap().name, "Brand New");
-        assert!(base.resolve("brand-new/solo").is_ok());
-    }
-
-    /// A v2-schema live body (no provider-level `npm` anywhere) keeps its route
-    /// map, so an unsupported protocol must not reach the picker.
-    #[test]
-    fn unsupported_protocols_are_not_merged() {
-        const V2_LIVE: &str = r#"{
-          "odd": {
-            "id": "odd",
-            "name": "Odd",
-            "env": [],
-            "models": {
-              "dead": {
-                "id": "dead",
-                "type": "chat",
-                "name": "Dead",
-                "api": {
-                  "systemone": {
-                    "base_url": "http://odd.invalid",
-                    "sdk": {"aisdk": "@vendor/unknown-transport"}
-                  }
-                }
-              }
-            }
-          }
-        }"#;
-        let mut base = Catalog::from_snapshot(BASE).unwrap();
-        let added = merge_live(&mut base, V2_LIVE).unwrap();
-        assert_eq!(added, 0);
-        assert!(base.provider("odd").is_none());
+        // The withdrawn entry is gone and the published one is served: the live
+        // catalog replaces the old generation instead of merging into it.
+        assert!(cell.current().resolve("known/existing").is_err());
+        assert!(cell.current().resolve("known/fresh").is_ok());
     }
 
     #[test]
     fn a_bad_body_leaves_the_catalog_untouched() {
-        let mut base = Catalog::from_snapshot(BASE).unwrap();
-        let before = base.models().len();
-        assert!(merge_live(&mut base, "not json").is_err());
-        assert_eq!(base.models().len(), before);
+        let cell = super::super::CatalogCell::new(Catalog::from_snapshot(BASE).unwrap());
+        let before = cell.models().len();
+        assert!(replace_live(&cell, "not json").is_err());
+        assert_eq!(cell.models().len(), before);
+        assert!(cell.current().resolve("known/existing").is_ok());
+    }
+
+    #[test]
+    fn a_tiny_publish_is_not_plausible() {
+        let tiny = Catalog::from_snapshot(BASE).unwrap();
+        assert!(!is_plausible(&tiny));
     }
 
     #[test]
     fn cache_round_trips_and_missing_is_none() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("models-cache.json");
+        let path = dir.path().join(CACHE_FILE);
         assert!(read_cache(&path).is_none());
         write_cache(&path, LIVE).unwrap();
-        let body = read_cache(&path).unwrap().unwrap();
-        assert_eq!(body, LIVE);
+        assert_eq!(read_cache(&path).unwrap().unwrap(), LIVE);
         // No temp file left behind after the rename.
         assert!(!path.with_extension("json.tmp").exists());
     }

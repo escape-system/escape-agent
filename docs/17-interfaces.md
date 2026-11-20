@@ -851,13 +851,25 @@ pub enum LlmEvent { StepStart, TextStart, TextDelta{delta:String}, TextEnd{text:
 pub type LlmStream = futures_util::stream::BoxStream<'static, LlmEvent>;
 ```
 
-Catalog: the embedded models.dev snapshot (7.9 MB) is the **floor**, not the
-source of truth. `catalog::refresh` fetches the published catalog
+Catalog: models.dev is a **dynamic source**, matching upstream, not a build
+artifact. `catalog::refresh` fetches the published catalog
 (`https://models.dev/api.json`, overridable with `OPENCODE_MODELS_URL`), caches
-the raw body atomically, and merges only models the catalog does not have yet, so
-a refresh can widen the picker but never reroute or drop a shipped model. A
-background loop refreshes 30 s after boot and every 6 h; the cached body is
-merged at startup, so an offline start still serves the last fetched catalog.
+the raw body atomically, and **replaces** the served catalog: an additive merge
+would keep a model upstream renamed, repriced or withdrew forever. The embedded
+7.9 MB snapshot is only the cold-start floor for a machine that has never
+fetched.
+
+Replacement is gated on [`is_plausible`] (at least
+`MIN_PLAUSIBLE_MODELS = 100` models), so a truncated response is a rejected
+publish rather than an empty picker; a body that does not parse is also
+rejected. A successful swap re-applies the same overlays the boot path uses
+(config `providers`, Antigravity discovery) and then publishes
+`models-dev.refreshed` so clients re-read the catalog.
+
+A background loop refreshes 30 s after boot (startup stays offline, per
+`docs/15-performance.md`) and every 6 h. At startup the cached body replaces the
+embedded floor under the same plausibility gate, so an offline start serves the
+last fetched catalog.
 
 ```rust
 pub struct CatalogCell { /* RwLock<Arc<Catalog>> + revision */ }
@@ -875,11 +887,11 @@ impl CatalogCell {
 }
 pub mod catalog::refresh {
     pub async fn fetch_live(client: &reqwest::Client, url: &str) -> Result<String, LlmError>;
-    pub fn merge_live(base: &mut Catalog, live_json: &str) -> Result<usize, LlmError>;
-    pub fn apply_live(cell: &CatalogCell, body: &str) -> Result<usize, LlmError>;
-    pub async fn refresh_once(cell: &CatalogCell, client: &reqwest::Client, url: &str,
-                              cache: &std::path::Path) -> Result<usize, LlmError>;
-    pub fn spawn_refresh_loop(cell: Arc<CatalogCell>) -> tokio::task::JoinHandle<()>;
+    pub fn parse_live(body: &str) -> Result<Catalog, LlmError>;
+    pub fn is_plausible(catalog: &Catalog) -> bool;
+    pub fn replace_live(cell: &CatalogCell, body: &str) -> Result<usize, LlmError>;
+    pub fn spawn_refresh_loop<F>(apply: F) -> tokio::task::JoinHandle<()>
+        where F: Fn(&str) -> Result<(), String> + Send + 'static;
     pub fn models_url() -> String;
     pub fn cache_path() -> std::path::PathBuf;
     pub fn read_cache(path: &std::path::Path) -> Option<Result<String, String>>;
@@ -896,7 +908,9 @@ loop cannot disagree about which models exist. The cache path is
 
 OpenAI-compatible chat, Anthropic messages and Gemini streams, SSE parser,
 retry/timeout policy. Tests use a local axum fake server; no real API keys, and
-the live fetch is never exercised — merge and cache are covered by fixtures.
+the live fetch is never exercised — replacement, the plausibility gate and the
+cache are covered by fixtures.
+
 
 
 ## `oc-tools`

@@ -98,14 +98,26 @@ pub(crate) async fn open_services(
             None
         }
     };
-    // A catalog fetched by a previous run is the first offline update source:
-    // the embedded snapshot is the floor, the cache widens it without network.
+    // models.dev is a dynamic source, not a build artifact: a catalog fetched by
+    // a previous run *replaces* the embedded floor, then the same overlays the
+    // embedded path uses are re-applied. An implausible or unparseable cache is
+    // ignored, never served, so a truncated file cannot empty the picker.
     match oc_llm::catalog::refresh::read_cache(&oc_llm::catalog::refresh::cache_path()) {
-        Some(Ok(body)) => {
-            if let Err(error) = oc_llm::catalog::refresh::merge_live(&mut catalog, &body) {
-                tracing::warn!(%error, "cached model catalog ignored");
+        Some(Ok(body)) => match oc_llm::catalog::refresh::parse_live(&body) {
+            Ok(live) if oc_llm::catalog::refresh::is_plausible(&live) => {
+                catalog = live;
+                if let Some(providers) = config.merged().get("providers") {
+                    catalog
+                        .apply_config(providers)
+                        .context("apply providers to the cached catalog")?;
+                }
             }
-        }
+            Ok(live) => tracing::warn!(
+                models = live.models().len(),
+                "cached model catalog too small; using the embedded snapshot"
+            ),
+            Err(error) => tracing::warn!(%error, "cached model catalog unparseable"),
+        },
         Some(Err(error)) => tracing::warn!(%error, "cached model catalog unreadable"),
         None => {}
     }
@@ -316,9 +328,35 @@ pub(crate) fn start_background_tasks(
         tokio::spawn(async move { service::watch(path, id, shutdown).await });
     }
     if let Some(cell) = state.catalog_cell() {
-        // The loop lives for the process; dropping the handle detaches it, and
-        // shutdown ends the process. No caller ever awaits a refresh.
-        let _refresh = oc_llm::catalog::refresh::spawn_refresh_loop(std::sync::Arc::clone(cell));
+        // A published catalog is authoritative, so the swap rebuilds the whole
+        // generation: parse, gate on plausibility, re-apply the same overlays the
+        // boot path applies, then replace and announce. Dropping the handle
+        // detaches the loop; shutdown ends the process.
+        let cell = std::sync::Arc::clone(cell);
+        let state = state.clone();
+        let _refresh = oc_llm::catalog::refresh::spawn_refresh_loop(move |body| {
+            let mut live = oc_llm::catalog::refresh::parse_live(body).map_err(|e| e.to_string())?;
+            if !oc_llm::catalog::refresh::is_plausible(&live) {
+                return Err(format!(
+                    "published catalog has only {} models",
+                    live.models().len()
+                ));
+            }
+            if let Some(config) = state.config()
+                && let Some(providers) = config.merged().get("providers")
+            {
+                live.apply_config(providers).map_err(|e| e.to_string())?;
+            }
+            if let Some(antigravity) = state.antigravity() {
+                antigravity.overlay_catalog(&mut live);
+            }
+            cell.replace(live);
+            state.publish(oc_types::EventEnvelope::now(
+                "models-dev.refreshed",
+                serde_json::json!({}),
+            ));
+            Ok(())
+        });
     }
     spawn_schedule_runner(state.clone(), shutdown.clone())
 }

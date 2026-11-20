@@ -172,8 +172,12 @@ mod tests {
         let before = cell.current();
         assert!(before.resolve("p/b").is_err());
 
+        // An in-place widening (the shape a config overlay takes) keeps one
+        // generation: readers before the write see the old catalog, readers
+        // after see the merged one, and there is no window without a catalog.
         cell.update(|catalog| {
-            crate::catalog::refresh::merge_live(catalog, EXTRA).expect("merge");
+            let extra = Catalog::from_snapshot(EXTRA).expect("extra");
+            catalog.upsert_provider_models(extra.models());
         });
 
         assert_eq!(cell.revision(), 1);
