@@ -370,7 +370,8 @@ export namespace Timeline {
       !(detail?.commentary.placement === "hidden" && commentary.has(content)) &&
       isRenderable(content, showReasoning, detail)
 
-    const visibleNotice = (message: Notice) => !detail || timelineNoticePlacement(message, detail) !== "hidden"
+    const visibleNotice = (message: Notice) =>
+      !isNoopModelSwitch(message) && (!detail || timelineNoticePlacement(message, detail) !== "hidden")
 
     const visibleTurns = detail
       ? turns.filter((turn) => {
@@ -614,6 +615,7 @@ export namespace Timeline {
 
           return
         case "notice":
+          if (isNoopModelSwitch(entry.message)) return
           if (detail && timelineNoticePlacement(entry.message, detail) === "hidden") return
           appendAssistantSegment(assistantSegment)
           assistantSegment = []
@@ -789,6 +791,27 @@ export function reuseTimelineRows(previous: TimelineRow.TimelineRow[] | undefine
   if (previous.length === next.length && previous.every((row, index) => row === next[index])) return previous
 
   return next
+}
+
+/** `""`, `"default"` (any case) and an absent variant are the same selection: the Default variant. */
+function effectiveVariant(variant: string | undefined) {
+  const value = variant?.trim().toLowerCase()
+
+  return value && value !== "default" ? value : undefined
+}
+
+/**
+ * A `model-switched` notice that leaves the effective model and variant unchanged. Older servers wrote one for
+ * every prompt that re-sent the Default variant, which rendered as an endless "Switched variant to Default".
+ */
+function isNoopModelSwitch(message: SessionMessageInfo) {
+  return (
+    message.type === "model-switched" &&
+    !!message.previous &&
+    message.previous.providerID === message.model.providerID &&
+    message.previous.id === message.model.id &&
+    effectiveVariant(message.previous.variant) === effectiveVariant(message.model.variant)
+  )
 }
 
 function indexUserContext(messages: SessionMessageInfo[]) {

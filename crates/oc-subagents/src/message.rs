@@ -148,9 +148,17 @@ pub(crate) fn message_decision(
         };
     }
     // Coordinator scope: siblings, their descendants, and the parent (handled
-    // above, where `allow_parent` still applies).
+    // above, where `allow_parent` still applies), symmetrically when either
+    // sender or recipient is the coordinator.
     if from.role == Role::Coordinator && in_coordinator_scope(tree, &from.id, &to.id, true) {
         return Ok(());
+    }
+    if to.role == Role::Coordinator && in_coordinator_scope(tree, &to.id, &from.id, false) {
+        return if limits.siblings_enabled {
+            Ok(())
+        } else {
+            Err(MessageError::SiblingsDisabled)
+        };
     }
     // Siblings share a non-null parent.
     let from_parent = tree.parent_id(&from.id);
@@ -222,5 +230,57 @@ mod tests {
         assert!(has_ancestor(&tree, "child", "root"));
         assert!(!has_ancestor(&tree, "root", "root"));
         assert!(!has_ancestor(&tree, "root", "child"));
+    }
+
+    /// A sibling `session_write` must not just say "not a descendant" — the
+    /// error has to point the agent at `talk`, the tool that actually works for
+    /// sibling and parent messages. Deterministic: no store, no async, no model.
+    #[test]
+    fn sibling_write_error_names_talk() {
+        let root = SessionNode::primary("root", "engineer");
+        let a = SessionNode::child("a", &root, Role::Subagent, "general");
+        let b = SessionNode::child("b", &root, Role::Subagent, "general");
+        let tree = SessionTree::from_nodes([&root, &a, &b]);
+
+        let sibling = write_decision(&a, &b, &tree).expect_err("siblings are not writable");
+        let text = sibling.to_string();
+        assert!(
+            text.contains(
+                "session_write targets descendants only; use talk to message a sibling or parent."
+            ),
+            "sibling write error must name `talk`: {text}"
+        );
+
+        // An upward write also fails with the same guidance: `talk` reaches a
+        // parent when `limits.allow_parent` is on, `session_write` never does.
+        let upward = write_decision(&a, &root, &tree).expect_err("parents are not writable");
+        assert!(
+            upward
+                .to_string()
+                .contains("use talk to message a sibling or parent."),
+            "upward write error must name `talk`: {upward}"
+        );
+    }
+
+    #[test]
+    fn worker_in_subtree_can_message_coordinator_symmetrically() {
+        let root = SessionNode::primary("root", "engineer");
+        let coord = SessionNode::child("coord", &root, Role::Coordinator, "general");
+        let other = SessionNode::child("other", &root, Role::Subagent, "general");
+        let worker = SessionNode::child("worker", &other, Role::Subagent, "general");
+        let tree = SessionTree::from_nodes([&root, &coord, &other, &worker]);
+
+        let mut limits = Limits {
+            siblings_enabled: true,
+            ..Limits::default()
+        };
+        assert!(message_decision(&limits, &coord, &worker, &tree).is_ok());
+        assert!(message_decision(&limits, &worker, &coord, &tree).is_ok());
+
+        limits.siblings_enabled = false;
+        assert_eq!(
+            message_decision(&limits, &worker, &coord, &tree),
+            Err(MessageError::SiblingsDisabled)
+        );
     }
 }

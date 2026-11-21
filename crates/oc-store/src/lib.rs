@@ -65,7 +65,10 @@ mod usage;
 mod worktrees;
 
 pub use agentic::{GoalPatch, NewGoal, NewObservation, NewRepair, SessionNodeRow};
-pub use boxes::{BOX_KINDS, BoxPage, BoxQuery, MAX_BOX_CHARS, MAX_BOX_KEY_CHARS, NewBox};
+pub use boxes::{
+    BOX_KINDS, BOX_SCOPES, BoxMetaPatch, BoxPage, BoxQuery, BoxSearchQuery, EditBox, MAX_BOX_CHARS,
+    MAX_BOX_KEY_CHARS, NewBox, WriteBox,
+};
 pub use credentials::{CredentialPatch, CredentialRow, NewCredential};
 pub use cursor::{Cursor, Order};
 pub use db::Store;

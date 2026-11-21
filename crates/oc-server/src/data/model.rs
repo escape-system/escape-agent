@@ -18,8 +18,9 @@ use axum::Json;
 use axum::extract::{Path, RawQuery, State};
 use axum::http::HeaderMap;
 use oc_antigravity::ANTIGRAVITY_PROVIDER_ID;
+use oc_llm::catalog::refresh;
 use oc_llm::{Activation, Catalog, LlmError, ModelInfo, ProviderInfo};
-use oc_types::{ApiError, LocationEnvelope};
+use oc_types::{ApiError, DataEnvelope, EventEnvelope, LocationEnvelope};
 use serde_json::{Value, json};
 
 use crate::AppState;
@@ -254,6 +255,43 @@ pub(crate) async fn active_provider_ids(state: &AppState, catalog: &Catalog) -> 
     active
 }
 
+/// True when `"google"` is configured via a direct (non-OAuth) credential,
+/// `providers.google` config entry, or a Google API key environment variable.
+/// When false and Antigravity is attached, `"google"` is served exclusively by
+/// Antigravity OAuth, so raw `models.dev` AI Studio entries are omitted.
+pub(crate) async fn has_direct_google_access(state: &AppState, catalog: &Catalog) -> bool {
+    if state.antigravity().is_none() {
+        return true;
+    }
+    if let Some(config) = state.config()
+        && config
+            .merged()
+            .get("providers")
+            .and_then(Value::as_object)
+            .is_some_and(|p| p.contains_key(ANTIGRAVITY_PROVIDER_ID))
+    {
+        return true;
+    }
+    if let Some(store) = state.store()
+        && let Ok(entries) = store.list_credentials().await
+        && entries.iter().any(|entry| {
+            entry.get("integrationID").and_then(Value::as_str) == Some(ANTIGRAVITY_PROVIDER_ID)
+                && entry.get("active").and_then(Value::as_bool) == Some(true)
+                && entry.pointer("/value/type").and_then(Value::as_str) != Some("oauth")
+        })
+    {
+        return true;
+    }
+    catalog
+        .provider(ANTIGRAVITY_PROVIDER_ID)
+        .is_some_and(|provider| {
+            provider
+                .env
+                .iter()
+                .any(|name| std::env::var_os(name).is_some())
+        })
+}
+
 /// `GET /api/model?types=`
 pub async fn models(
     State(state): State<AppState>,
@@ -265,12 +303,16 @@ pub async fn models(
     let resolved = location::resolve(&state, &headers, None, params.first("location[directory]"));
 
     let available = available_provider_ids(&state, catalog.as_ref()).await;
+    let direct_google = has_direct_google_access(&state, catalog.as_ref()).await;
     let types = params.list("types");
     let mut models = catalog.models();
     models.retain(|model| available.contains(&model.provider_id));
     if available.contains("google")
         && let Some(ag) = state.antigravity()
     {
+        if !direct_google {
+            models.retain(|m| m.provider_id != "google");
+        }
         for extra in ag.antigravity_model_infos() {
             if let Some(pos) = models
                 .iter()
@@ -292,6 +334,63 @@ pub async fn models(
     }
 
     Ok(Json(LocationEnvelope::new(resolved.reference(), models)))
+}
+
+/// `POST /api/model/refresh`
+///
+/// Fetch the published catalog on demand, replace the served generation under
+/// the same plausibility gate and overlays as the background loop, and announce
+/// the swap. Failures are reported honestly: no event and no cell swap happens
+/// until the whole body has been accepted.
+pub async fn refresh_models(
+    State(state): State<AppState>,
+) -> Result<Json<DataEnvelope<Value>>, ErrorResponse> {
+    let Some(cell) = state.catalog_cell().cloned() else {
+        return Err(ApiError::service_unavailable("model catalog not loaded").into());
+    };
+    let url = refresh::models_url();
+    let cache = refresh::cache_path();
+    let client = refresh::client();
+    let opencode_go_models = match refresh::fetch_opencode_go_models_now(&client).await {
+        Ok(models) => Some(models),
+        Err(error) => {
+            tracing::debug!(%error, "live opencode-go model list refresh skipped");
+            None
+        }
+    };
+    // AtomicUsize keeps the captured counter Send so this handler can be routed.
+    let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0_usize));
+    let apply = |body: &str| -> Result<(), String> {
+        let mut live = refresh::parse_live(body).map_err(|e| e.to_string())?;
+        if !refresh::is_plausible(&live) {
+            return Err(format!(
+                "published catalog has only {} models",
+                live.models().len()
+            ));
+        }
+        if let Some(models) = &opencode_go_models {
+            live.upsert_provider_models(models.clone());
+        }
+        if let Some(config) = state.config()
+            && let Some(providers) = config.merged().get("providers")
+        {
+            live.apply_config(providers).map_err(|e| e.to_string())?;
+        }
+        if let Some(antigravity) = state.antigravity() {
+            antigravity.overlay_catalog(&mut live);
+        }
+        count.store(live.models().len(), std::sync::atomic::Ordering::SeqCst);
+        cell.replace(live);
+        state.publish(EventEnvelope::now("models-dev.refreshed", json!({})));
+        Ok(())
+    };
+    refresh::refresh_now(&client, &url, &cache, apply)
+        .await
+        .map_err(|error| ApiError::new(502, "ProviderError", error))?;
+    Ok(Json(DataEnvelope::new(json!({
+        "modelCount": count.load(std::sync::atomic::Ordering::SeqCst),
+        "refreshed": true,
+    }))))
 }
 
 /// `GET /api/model/default`

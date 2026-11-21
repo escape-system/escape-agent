@@ -586,6 +586,114 @@ async fn static_serving_uses_spa_and_cache_rules() {
     assert_eq!(missing.status(), StatusCode::NOT_FOUND);
 }
 
+/// Variant-only selection changes must not emit duplicate durable events.
+#[tokio::test]
+async fn model_variant_selection_dedups_unchanged_effective_selection() {
+    use std::sync::Arc;
+
+    use axum::http::Method;
+    use oc_store::{NewSession, Store};
+    use oc_types::now_millis;
+
+    async fn post_model(app: &axum::Router, sid: &str, body: Value) -> StatusCode {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/api/session/{sid}/model"))
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        response.status()
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(Store::open(dir.path().join("data.sqlite")).await.unwrap());
+    let state = state(None).with_store(store.clone());
+    let app = router(state);
+
+    let sid = format!("ses_dedup_{}", now_millis());
+    store
+        .create_session(NewSession {
+            id: sid.clone(),
+            parent_id: None,
+            project_id: "prj_test".to_owned(),
+            directory: dir.path().to_string_lossy().into_owned(),
+            title: None,
+            agent: None,
+            model: Some(json!({"id": "x", "providerID": "p", "variant": "high"})),
+            metadata: None,
+            permissions: None,
+            time_created: now_millis(),
+        })
+        .await
+        .unwrap();
+
+    // Real switches: high -> max and max -> default each emit one event.
+    for body in [
+        json!({"model": {"id": "x", "providerID": "p", "variant": "max"}}),
+        json!({"model": {"id": "x", "providerID": "p", "variant": "default"}}),
+    ] {
+        assert_eq!(post_model(&app, &sid, body).await, StatusCode::NO_CONTENT);
+    }
+    // Repeats of the same effective selection still persist the explicit
+    // client choice but emit no event: "default", absent and "" are equal.
+    for body in [
+        json!({"model": {"id": "x", "providerID": "p", "variant": "default"}}),
+        json!({"model": {"id": "x", "providerID": "p", "variant": "DEFAULT"}}),
+        json!({"model": {"id": "x", "providerID": "p"}}),
+        json!({"model": {"id": "x", "providerID": "p", "variant": ""}}),
+    ] {
+        assert_eq!(post_model(&app, &sid, body).await, StatusCode::NO_CONTENT);
+    }
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/session/{sid}/log?after=0"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    let selected: Vec<Value> = text
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .map(|line| serde_json::from_str(line).unwrap())
+        .filter(|event: &Value| event["type"] == "session.model.selected")
+        .collect();
+    assert_eq!(selected.len(), 2, "only the two real switches should emit");
+
+    // Repeats of the same effective selection canonicalize "default" / "" /
+    // absent to an omitted variant (`None`) without emitting duplicate events.
+    let session = store.get_session(&sid).await.unwrap().unwrap();
+    assert!(session["model"].get("variant").is_none());
+}
+
+#[tokio::test]
+async fn model_refresh_route_is_registered() {
+    let response = router(state(None))
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/model/refresh")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_ne!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
 #[tokio::test]
 async fn static_directory_paths_are_404_not_not_ready() {
     let dir = tempfile::tempdir().unwrap();

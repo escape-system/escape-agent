@@ -31,6 +31,11 @@ async fn get_json(http: &Client, url: &str, bearer_key: &str) -> Result<Value, S
     let response = http
         .get(url)
         .bearer_auth(bearer_key)
+        .header(
+            reqwest::header::USER_AGENT,
+            concat!("opencode/", env!("CARGO_PKG_VERSION")),
+        )
+        .header(reqwest::header::ACCEPT, "application/json")
         .timeout(PROBE_TIMEOUT)
         .send()
         .await

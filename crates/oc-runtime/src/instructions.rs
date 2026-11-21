@@ -180,13 +180,9 @@ impl InstructionSet {
         {
             out.push(pinned_memory.clone());
         }
-        for key in ["oc/boxes", "oc/goal"] {
-            if let Some(pinned) = self.sources.get(key)
-                && !out.iter().any(|source| source.key == key)
-            {
-                out.push(pinned.clone());
-            }
-        }
+        // When `oc/boxes` or `oc/goal` is absent from `next` (every box deleted/expired
+        // or goal cleared), stop re-injecting the stale pin so the prefix clears once
+        // and matches the cleared tail notice from `epoch_supplement`.
         out.sort_by(|left, right| {
             (left.kind, left.key.as_str()).cmp(&(right.kind, right.key.as_str()))
         });
@@ -273,6 +269,12 @@ impl InstructionSet {
                 if changed {
                     blocks.push(candidate.text.trim().to_owned());
                 }
+            } else if let Some(pinned) = self.sources.get(key) {
+                if key == "oc/boxes" {
+                    blocks.push(empty_boxes_notice(&pinned.text));
+                } else {
+                    blocks.push("<goal status=\"cleared\"/>".to_owned());
+                }
             }
         }
         if blocks.is_empty() {
@@ -342,6 +344,16 @@ fn memory_line_id(line: &str) -> Option<&str> {
     let rest = &line[open + 2..];
     let id = rest.strip_suffix(')')?;
     (!id.is_empty()).then_some(id)
+}
+
+fn empty_boxes_notice(pinned_text: &str) -> String {
+    if let Some(start) = pinned_text.find("root=\"") {
+        let rest = &pinned_text[start + 6..];
+        if let Some(end) = rest.find('"') {
+            return format!("<boxes root=\"{}\" status=\"empty\"/>", &rest[..end]);
+        }
+    }
+    "<boxes status=\"empty\"/>".to_owned()
 }
 
 #[cfg(test)]
@@ -450,5 +462,27 @@ mod tests {
             delta.delta.is_empty(),
             "date rollover and memory churn must not mutate the cached prefix"
         );
+    }
+
+    #[test]
+    fn clearing_all_boxes_emits_empty_notice_once_and_unpins() {
+        let initial = [source(
+            SourceKind::Boxes,
+            "oc/boxes",
+            "<boxes root=\"ses_r\">\n- [temporary] temp (4 chars)\n</boxes>",
+        )];
+        let mut set = InstructionSet::new(&initial);
+        let next = Vec::new();
+        let supplement = set.epoch_supplement(&next, true).expect("empty notice");
+        assert!(supplement.contains("<boxes root=\"ses_r\" status=\"empty\"/>"));
+
+        let stabilized = set.stabilize_epoch_sources(&next);
+        let delta = set.commit(&stabilized);
+        assert_eq!(
+            delta.delta.get("oc/boxes").map(String::as_str),
+            Some("removed")
+        );
+        assert!(set.source("oc/boxes").is_none());
+        assert!(set.epoch_supplement(&next, true).is_none());
     }
 }

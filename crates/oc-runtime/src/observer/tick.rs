@@ -137,6 +137,8 @@ impl Runtime {
                 // Live step from the turn loop (`Runtime::set_step`); `0` for
                 // an idle or never-started session.
                 step: self.current_step(root).unwrap_or(0),
+                step_cap: self.current_step_cap(root),
+                steps_remaining: self.current_steps_remaining(root),
                 state: Some(node.status.clone()),
             },
         );
@@ -216,9 +218,24 @@ impl Runtime {
                     let target = verdict.target.unwrap_or_default();
                     self.observer_inspect(root, &target, &verdict.reason).await;
                 }
-                _ => {}
+                ObserverAction::None
+                | ObserverAction::Repair
+                | ObserverAction::GoalDone
+                | ObserverAction::GoalBlocked
+                | ObserverAction::GoalFailed => {
+                    // No intervention requested; the verdict row is already
+                    // recorded by `record_observer_evaluation`. Repair actions
+                    // are applied by the `ObserverRun::Repair` arm below; a raw
+                    // verdict with action=Repair carries no executor outcome.
+                    // Goal verdicts are applied by the separate `check_goal`
+                    // path in `request_goal_check` and the ticker's goal check.
+                }
             },
             Some(ObserverRun::Repair { verdict, outcome }) => {
+                if outcome.detail.as_deref() == Some("budget_request") {
+                    self.apply_observer_budget_request(root, &verdict).await;
+                    return;
+                }
                 tracing::debug!(
                     root = %root,
                     target = %verdict.target.unwrap_or_default(),
@@ -239,6 +256,50 @@ impl Runtime {
                 tracing::trace!(root = %root, reason = ?reason, "observer tick skipped");
             }
             None => {}
+        }
+    }
+
+    async fn apply_observer_budget_request(
+        &self,
+        root: &str,
+        verdict: &oc_observer::ObserverVerdict,
+    ) {
+        let target = verdict.target.as_deref().unwrap_or_default();
+        if target.is_empty() {
+            return;
+        }
+        let requested = verdict
+            .repair
+            .as_ref()
+            .and_then(|repair| repair.args.get("steps"))
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|n| u32::try_from(n).ok())
+            .filter(|&n| n > 0)
+            .unwrap_or_else(|| {
+                let policy = crate::turn::budget::BudgetPolicy::from_merged(
+                    self.inner.config.config.merged(),
+                );
+                u32::try_from(policy.extension_steps).unwrap_or(15)
+            });
+        if self.grant_step_budget(target, requested) {
+            let notice = format!(
+                "Step budget extended (+{requested} steps requested by observer). \
+                 Continue deepening your investigation or verification methodically."
+            );
+            if let Err(error) = self.observer_synthetic(target, &notice, root).await {
+                tracing::warn!(
+                    root = %root,
+                    target = %target,
+                    error = %error,
+                    "observer budget grant notice failed"
+                );
+            }
+        } else {
+            tracing::debug!(
+                root = %root,
+                target = %target,
+                "observer budget extension skipped; target has no active actor"
+            );
         }
     }
 

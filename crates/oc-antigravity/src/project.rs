@@ -93,6 +93,7 @@ pub async fn load_managed_project(
     let metadata = default_control_plane_metadata(explicit_project_id);
     let body = serde_json::json!({ "metadata": metadata });
 
+    let mut last_err: Option<String> = None;
     for base in endpoints.load_endpoints() {
         let url = format!("{base}/v1internal:loadCodeAssist");
         let headers = headers_for_style(HeaderStyle::Antigravity, &hub_version);
@@ -105,14 +106,25 @@ pub async fn load_managed_project(
             req = req.header(k, v);
         }
 
-        let Ok(resp) = req.send().await else {
-            continue;
+        let resp = match req.send().await {
+            Ok(r) => r,
+            Err(err) => {
+                last_err = Some(format!("loadCodeAssist transport error: {err}"));
+                continue;
+            }
         };
         if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let err_text = resp.text().await.unwrap_or_default();
+            last_err = Some(format!("loadCodeAssist HTTP {status}: {err_text}"));
             continue;
         }
-        let Ok(parsed) = resp.json::<LoadCodeAssistResponse>().await else {
-            continue;
+        let parsed = match resp.json::<LoadCodeAssistResponse>().await {
+            Ok(p) => p,
+            Err(err) => {
+                last_err = Some(format!("loadCodeAssist JSON decode error: {err}"));
+                continue;
+            }
         };
         let managed = extract_project_id(parsed.cloudaicompanion_project.as_ref());
         let current_tier = parsed.current_tier.map(|t| t.id);
@@ -124,6 +136,9 @@ pub async fn load_managed_project(
         return Ok((managed, current_tier, allowed));
     }
 
+    if let Some(msg) = last_err {
+        return Err(AntigravityError::Project(msg));
+    }
     Ok((None, None, Vec::new()))
 }
 
@@ -223,7 +238,7 @@ pub async fn ensure_project_context(
         });
     }
 
-    if allow_onboard {
+    if allow_onboard && !allowed.is_empty() {
         let default_tier = allowed
             .iter()
             .find(|(_, is_def)| *is_def)

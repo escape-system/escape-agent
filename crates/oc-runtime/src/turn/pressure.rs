@@ -36,7 +36,7 @@ impl Runtime {
             return Ok(None);
         };
         let directory = info.location.directory.clone();
-        let Ok(turn) = self.resolve_turn(&info, &directory) else {
+        let Ok(turn) = self.resolve_turn(&info, &directory).await else {
             return Ok(None);
         };
         if turn.context_window == 0 {

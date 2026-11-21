@@ -13,7 +13,7 @@ use serde_json::Value;
 use crate::runtime::{ActorHandle, CancelToken, Runtime, RuntimeError, TerminalState};
 
 mod assistant;
-mod budget;
+pub(crate) mod budget;
 mod compaction;
 mod finalize;
 mod permissions;
@@ -63,6 +63,62 @@ impl oc_types::payload::EventPayload for SessionExecutionStepExtended {
 /// Promotes one inbox row unless the host already wrote the message; a row
 /// that already exists is consumed as a doorbell and reported as the sentinel
 /// `Some(Value::Null)`.
+async fn begin_execution(
+    runtime: &Runtime,
+    session: &str,
+    directory: &str,
+    inbox_id: &str,
+    handle: &Arc<ActorHandle>,
+) -> Result<bool, RuntimeError> {
+    // Some hosts materialise the user row themselves before notifying. When the
+    // row exists, the inbox entry is only a doorbell: consume it instead of
+    // failing on the primary-key conflict.
+    let promoted = promote_inbox_row(&runtime.inner.config.store, session, inbox_id).await?;
+    if promoted.is_none() {
+        return Ok(false);
+    }
+    runtime
+        .emit(
+            session,
+            directory,
+            SessionInboxDelivered {
+                session_id: Runtime::session_id(session),
+                inbox_id: MessageId::from_wire(inbox_id.to_owned()),
+            },
+        )
+        .await?;
+    runtime
+        .inner
+        .config
+        .store
+        .mark_session_busy(session, oc_types::now_millis())
+        .await?;
+    // From this commit onward the session is durably busy: every exit from this
+    // function must publish the terminal pair, including the actor failure path
+    // that fires when an `Err` escapes the drain loop.
+    handle.terminal.begin(true);
+    runtime
+        .emit(
+            session,
+            directory,
+            SessionStatusUpdated {
+                session_id: Runtime::session_id(session),
+                status: SessionStatus::Busy,
+            },
+        )
+        .await?;
+    runtime
+        .emit(
+            session,
+            directory,
+            oc_types::payload::SessionExecutionStarted {
+                session_id: Runtime::session_id(session),
+            },
+        )
+        .await?;
+    Ok(true)
+}
+
 async fn promote_inbox_row(
     store: &oc_store::Store,
     session: &str,
@@ -106,54 +162,11 @@ pub(crate) async fn run_execution(
         return Ok(());
     };
 
-    // Some hosts materialise the user row themselves before notifying. When the
-    // row exists, the inbox entry is only a doorbell: consume it instead of
-    // failing on the primary-key conflict.
-    let promoted = promote_inbox_row(&runtime.inner.config.store, session, inbox_id).await?;
-    if promoted.is_none() {
+    if !begin_execution(runtime, session, &directory, inbox_id, handle).await? {
         return Ok(());
     }
-    runtime
-        .emit(
-            session,
-            &directory,
-            SessionInboxDelivered {
-                session_id: Runtime::session_id(session),
-                inbox_id: MessageId::from_wire(inbox_id.to_owned()),
-            },
-        )
-        .await?;
-    runtime
-        .inner
-        .config
-        .store
-        .mark_session_busy(session, oc_types::now_millis())
-        .await?;
-    // From this commit onward the session is durably busy: every exit from this
-    // function must publish the terminal pair, including the actor failure path
-    // that fires when an `Err` escapes the drain loop.
-    handle.terminal.begin(true);
-    runtime
-        .emit(
-            session,
-            &directory,
-            SessionStatusUpdated {
-                session_id: Runtime::session_id(session),
-                status: SessionStatus::Busy,
-            },
-        )
-        .await?;
-    runtime
-        .emit(
-            session,
-            &directory,
-            oc_types::payload::SessionExecutionStarted {
-                session_id: Runtime::session_id(session),
-            },
-        )
-        .await?;
 
-    let mut turn = match runtime.resolve_turn(&info, &directory) {
+    let mut turn = match runtime.resolve_turn(&info, &directory).await {
         Ok(turn) => turn,
         Err(error) => {
             runtime
@@ -183,11 +196,13 @@ pub(crate) async fn run_execution(
     }
 
     let mut stats = TurnStats::default();
-    let outcome = runtime.run_steps(session, &turn, cancel, &mut stats).await;
+    let outcome = runtime
+        .run_steps(session, &mut turn, cancel, &mut stats)
+        .await;
     // Clear the live step counter here, not inside `run_steps`: the loop body
     // has many `?` early returns, so any epilogue inside it is bypassable.
     // This is the single point every `run_steps` exit flows through.
-    runtime.set_step(session, 0);
+    runtime.reset_step_budget(session);
     let outcome = outcome?;
     // A step-limited turn still answered on its final, tool-less request; it is
     // treated like a success for memory/scribe, but settles with the qualifier.

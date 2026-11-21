@@ -25,7 +25,10 @@ pub mod token;
 pub mod transform;
 pub mod version;
 
-pub use accounts::{AccountManager, ModelFamily, SelectedAccount, quota_key, soft_quota_group};
+pub use accounts::{
+    AccountManager, ModelFamily, SelectedAccount, canonical_quota_model_id, quota_key,
+    soft_quota_group,
+};
 pub use auth::{OAuthAuthDetails, RefreshParts, format_refresh_parts, parse_refresh_parts};
 pub use config::{
     AccountSelectionStrategy, AntigravityConfig, SchedulingMode, SearchMode, load_config,
@@ -50,7 +53,9 @@ pub use oauth_server::{
     LoopbackOAuthListener, OAuthCallbackCapture, escape_html, is_remote_environment,
 };
 pub use project::{ProjectContext, ensure_project_context};
-pub use quota::{AccountQuotaFetch, DiscoveredModelInfo, fetch_account_quota};
+pub use quota::{
+    AccountQuotaFetch, DiscoveredModelInfo, fetch_account_quota, populate_hub_quota_groups,
+};
 pub use rotation::{
     HealthScoreTracker, RateLimitReason, TokenBucketTracker, calculate_backoff_ms,
     extract_retry_info_from_body, parse_duration_ms, parse_rate_limit_reason,

@@ -149,11 +149,9 @@ pub(super) fn build_provider_entry(input: ProviderEntryInput<'_>) -> ProviderQuo
     );
 
     let has_management_key = (provider_id == "openrouter").then_some(input.openrouter_mgmt);
-    let management_key_source = if provider_id == "openrouter" {
-        input.openrouter_source
-    } else {
-        None
-    };
+    let management_key_source = (provider_id == "openrouter")
+        .then_some(input.openrouter_source)
+        .flatten();
 
     if let Some((probe, cached)) = input.probe {
         let status = if probe.error.is_some() {
@@ -193,16 +191,15 @@ pub(super) fn build_provider_entry(input: ProviderEntryInput<'_>) -> ProviderQuo
         };
     }
 
-    let status = if !input.connected {
-        "disconnected"
-    } else if capability == QuotaCapability::LiveApi {
-        "no_api_key"
-    } else if input.rate_limit.is_some() {
-        "headers_only"
-    } else {
-        "local_only"
-    }
-    .to_owned();
+    let has_api_key =
+        resolve_provider_api_key(&provider_id, input.catalog, input.config, input.credentials)
+            .is_some();
+    let status = unprobed_provider_status(
+        input.connected,
+        capability,
+        has_api_key,
+        input.rate_limit.is_some(),
+    );
 
     ProviderQuotaEntry {
         provider_id,
@@ -228,6 +225,24 @@ pub(super) fn build_provider_entry(input: ProviderEntryInput<'_>) -> ProviderQuo
         warnings: Vec::new(),
         error: None,
     }
+}
+
+fn unprobed_provider_status(
+    connected: bool,
+    capability: QuotaCapability,
+    has_api_key: bool,
+    has_rate_limit: bool,
+) -> String {
+    if !connected {
+        "disconnected"
+    } else if capability == QuotaCapability::LiveApi && !has_api_key {
+        "no_api_key"
+    } else if has_rate_limit {
+        "headers_only"
+    } else {
+        "local_only"
+    }
+    .to_owned()
 }
 
 fn provider_display_name(

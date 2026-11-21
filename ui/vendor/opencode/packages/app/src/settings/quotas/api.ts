@@ -70,6 +70,8 @@ export interface AntigravityQuotaGroupSnapshot {
   remainingFraction?: number
   usedPercent?: number
   resetTimeMs?: number
+  label?: string
+  models?: string[]
 }
 
 export interface AntigravityCachedQuota {
@@ -86,6 +88,7 @@ export interface AntigravityAccountStatus {
   activeGemini: boolean
   enabled: boolean
   verificationRequired: boolean
+  verificationUrl?: string
   revoked: boolean
   projectId?: string
   tier?: string
@@ -450,6 +453,11 @@ export function useQuotasData(options: UseQuotasDataOptions = {}) {
       const data = parseQuotasResponse(payload.data)
 
       if (!data) throw new Error("Missing quotas response data")
+      if (data.refreshing && options.refetchInterval) {
+        setTimeout(() => {
+          void client.invalidateQueries({ queryKey: [sdk.scope, ...QUOTAS_QUERY_KEY] })
+        }, 1_500)
+      }
 
       return data
     },

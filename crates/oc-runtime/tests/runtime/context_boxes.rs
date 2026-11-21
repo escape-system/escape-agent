@@ -800,3 +800,190 @@ async fn the_index_reports_more_boxes_than_it_shows() {
         .unwrap_or_else(|| panic!("truncation notice missing: {system}"));
     assert!(notice.contains("1 more boxes"), "{notice}");
 }
+
+async fn wake_child_prompt(harness: &Harness, child: &str, text: &str) {
+    let msg = NewInbox {
+        id: oc_types::MessageId::new().into_inner(),
+        session_id: child.to_owned(),
+        kind: "user".to_owned(),
+        payload: json!({"text": text, "time": {"created": oc_types::now_millis()}}),
+        delivery: Delivery::Steer,
+    };
+    harness.store.enqueue(msg).await.expect("enqueue child");
+    harness.runtime.notify(child).await.expect("notify child");
+    harness
+        .runtime
+        .wait_idle(child, Duration::from_secs(10))
+        .await
+        .expect("child idle");
+}
+
+#[tokio::test]
+async fn session_scoped_boxes_edit_search_meta_and_permissions_work() {
+    let config = json!({
+        "agents": {
+            "restricted": {
+                "mode": "subagent",
+                "permissions": [
+                    {"action": "box:read", "resource": "*", "effect": "allow"},
+                    {"action": "box:read", "resource": "secret*", "effect": "deny"},
+                    {"action": "box:write", "resource": "secret*", "effect": "deny"}
+                ]
+            }
+        }
+    });
+    let harness = Harness::new(
+        vec![text_script("ok"), text_script("ok2")],
+        Arc::new(AllowAll),
+        config,
+        None,
+    )
+    .await;
+
+    run_tool(
+        &harness,
+        &harness.session,
+        "box_write",
+        json!({"key": "secret-keys", "content": "restricted data", "description": "hidden"}),
+    )
+    .await
+    .expect("secret tree box");
+    run_tool(
+        &harness,
+        &harness.session,
+        "box_write",
+        json!({
+            "key": "working", "scope": "session", "kind": "temporary",
+            "tags": ["phase-1"], "description": "initial plan",
+            "content": "step one\nstep two placeholder"
+        }),
+    )
+    .await
+    .expect("session box");
+
+    harness.prompt("turn 1").await;
+    let sys1 = harness.model.requests()[0].system.join("\n");
+    assert!(sys1.contains("[temporary, session] working"), "{sys1}");
+    assert!(sys1.contains("[stable] secret-keys"), "{sys1}");
+
+    run_tool(
+        &harness,
+        &harness.session,
+        "box_edit",
+        json!({"key": "working", "scope": "session", "find": "step two placeholder", "replace": "step two concrete"}),
+    )
+    .await
+    .expect("box_edit");
+    run_tool(
+        &harness,
+        &harness.session,
+        "box_meta",
+        json!({"key": "working", "scope": "session", "new_scope": "tree", "kind": "stable", "tags": ["promoted"]}),
+    )
+    .await
+    .expect("box_meta");
+
+    let child = "ses_restricted_child".to_owned();
+    create_child(&harness, &harness.session, &child, "restricted").await;
+    wake_child_prompt(&harness, &child, "check boxes").await;
+
+    let child_reqs = harness.model.requests();
+    let child_sys = child_reqs.last().expect("child req").system.join("\n");
+    assert!(child_sys.contains("working"), "{child_sys}");
+    assert!(
+        !child_sys.contains("secret-keys"),
+        "denied key leaked: {child_sys}"
+    );
+
+    let search_out = run_tool(
+        &harness,
+        &child,
+        "box_search",
+        json!({"query": "restricted data"}),
+    )
+    .await
+    .expect("search");
+    assert!(
+        !search_out.contains("secret-keys"),
+        "denied key in search: {search_out}"
+    );
+    let rename_err = run_tool(
+        &harness,
+        &child,
+        "box_meta",
+        json!({"key": "working", "new_key": "secret-rename"}),
+    )
+    .await
+    .expect_err("denied new_key must fail");
+    assert!(rename_err.to_string().contains("denied"), "{rename_err}");
+}
+
+#[tokio::test]
+async fn deleting_all_boxes_emits_empty_notice_once_and_unpins() {
+    let harness = Harness::new(
+        vec![text_script("ok"), text_script("ok2"), text_script("ok3")],
+        Arc::new(AllowAll),
+        json!({}),
+        None,
+    )
+    .await;
+
+    run_tool(
+        &harness,
+        &harness.session,
+        "box_write",
+        json!({"key": "ephemeral", "kind": "temporary", "content": "temp note"}),
+    )
+    .await
+    .expect("write");
+
+    harness.prompt("turn 1").await;
+    assert!(
+        harness.model.requests()[0]
+            .system
+            .join("\n")
+            .contains("ephemeral")
+    );
+
+    run_tool(
+        &harness,
+        &harness.session,
+        "box_delete",
+        json!({"key": "ephemeral"}),
+    )
+    .await
+    .expect("delete");
+
+    harness.prompt("turn 2 after deleting all boxes").await;
+    let reqs_after_del = harness.model.requests();
+    let req2 = &reqs_after_del[reqs_after_del.len() - 1];
+    let req2_text: String = req2
+        .messages
+        .iter()
+        .flat_map(|m| m.content.iter().filter_map(|p| p.as_text()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        req2_text.contains("status=\"empty\""),
+        "turn 2 must receive cleared notice once: {req2_text}"
+    );
+    assert!(
+        !req2.system.join("\n").contains("ephemeral"),
+        "stale deleted boxes must stop being pinned in system prompt"
+    );
+
+    harness.prompt("turn 3 steady empty").await;
+    let reqs_steady = harness.model.requests();
+    let req3 = reqs_steady.last().expect("req3");
+    let req3_last: String = req3
+        .messages
+        .last()
+        .into_iter()
+        .flat_map(|m| m.content.iter().filter_map(|p| p.as_text()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !req3_last.contains("status=\"empty\""),
+        "turn 3 must not repeat empty boxes notice: {req3_last}"
+    );
+}

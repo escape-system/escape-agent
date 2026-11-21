@@ -105,7 +105,7 @@ impl Runtime {
         Ok((agent_id, agent))
     }
 
-    pub(super) fn resolve_turn(
+    pub(super) async fn resolve_turn(
         &self,
         info: &SessionInfo,
         directory: &str,
@@ -113,7 +113,7 @@ impl Runtime {
         let config = &self.inner.config;
         let (agent_id, agent) = self.resolve_agent(info)?;
 
-        let model_ref = info
+        let mut model_ref = info
             .model
             .clone()
             .or_else(|| agent.get("model").and_then(prompt::model_ref))
@@ -136,53 +136,25 @@ impl Runtime {
                     })
             })
             .ok_or_else(|| RuntimeError::ModelUnavailable("no model configured".to_owned()))?;
+        model_ref.variant = model_ref
+            .variant
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty() && !v.eq_ignore_ascii_case("default"))
+            .map(str::to_owned);
         let resolved = config
             .client
             .resolve_model(&config.catalog.current(), &model_ref.to_reference())?;
         let context_window = resolved.model.limit.context;
         let session_rules = session_rules(info);
-
-        let registry = {
-            let mut merged = ToolRegistry::new();
-            merged.extend(&config.tools);
-            for tool in self.provider_tools(info, &agent_id) {
-                merged.register(tool);
-            }
-            if let Some(memory) = self.memory() {
-                let memory_registry = MemoryTools::new(memory)
-                    .with_project_id(info.project_id.to_string())
-                    .with_agent_id(agent_id.clone())
-                    .registry();
-                merged.extend(&memory_registry);
-            }
-            merged.extend(&crate::subagent::SubagentTools::new(self.clone()).registry());
-            merged.extend(&crate::goal::GoalTools::new(self.clone()).registry());
-            merged.extend(&crate::context_box::BoxTools::new(self.clone()).registry());
-            merged.extend(&crate::skill::SkillTools::new(self.clone()).registry());
-            // Read-only credential health (`docs/27-key-pool.md`): the tool owns
-            // no state, `turn/tools/run.rs` binds the runtime as its source.
-            merged.register(Arc::new(oc_tools::KeyHealthTool));
-            // LaneTools replaces the built-in `shell` with the lane-aware one.
-            merged.extend(&crate::lane::LaneTools::new(self.clone()).registry());
-            Arc::new(merged)
+        let box_root = if self.memory().is_some() {
+            self.box_root(info.id.as_ref()).await.ok()
+        } else {
+            None
         };
 
-        let mut tools = Vec::new();
-        let mut tool_names = Vec::new();
-        for definition in registry.definitions() {
-            let action = tool_action(&definition.name);
-            if self.effect(&agent_id, &session_rules, action, "*") == ConfigEffect::Deny {
-                continue;
-            }
-            let mut schema = definition.parameters;
-            expectation::inject(&mut schema);
-            tool_names.push(definition.name.clone());
-            tools.push(ToolDef::new(
-                definition.name,
-                definition.description,
-                schema,
-            ));
-        }
+        let (registry, tools, tool_names) =
+            self.build_session_tools(info, &agent_id, &session_rules, box_root);
 
         let agent_system = agent
             .get("system")
@@ -214,6 +186,58 @@ impl Runtime {
         })
     }
 
+    fn build_session_tools(
+        &self,
+        info: &SessionInfo,
+        agent_id: &str,
+        session_rules: &[PermissionRule],
+        box_root: Option<String>,
+    ) -> (Arc<ToolRegistry>, Vec<ToolDef>, Vec<String>) {
+        let mut merged = ToolRegistry::new();
+        merged.extend(&self.inner.config.tools);
+        for tool in self.provider_tools(info, agent_id) {
+            merged.register(tool);
+        }
+        if let Some(memory) = self.memory() {
+            let mut builder = MemoryTools::new(memory)
+                .with_project_id(info.project_id.to_string())
+                .with_agent_id(agent_id.to_owned());
+            if let Some(root) = box_root {
+                builder = builder.with_root_id(root);
+            }
+            let memory_registry = builder.registry();
+            merged.extend(&memory_registry);
+        }
+        merged.extend(&crate::subagent::SubagentTools::new(self.clone()).registry());
+        merged.extend(&crate::goal::GoalTools::new(self.clone()).registry());
+        merged.extend(&crate::context_box::BoxTools::new(self.clone()).registry());
+        merged.extend(&crate::skill::SkillTools::new(self.clone()).registry());
+        // Read-only credential health (`docs/27-key-pool.md`): the tool owns
+        // no state, `turn/tools/run.rs` binds the runtime as its source.
+        merged.register(Arc::new(oc_tools::KeyHealthTool));
+        // LaneTools replaces the built-in `shell` with the lane-aware one.
+        merged.extend(&crate::lane::LaneTools::new(self.clone()).registry());
+        let registry = Arc::new(merged);
+
+        let mut tools = Vec::new();
+        let mut tool_names = Vec::new();
+        for definition in registry.definitions() {
+            let action = tool_action(&definition.name);
+            if self.effect(agent_id, session_rules, action, "*") == ConfigEffect::Deny {
+                continue;
+            }
+            let mut schema = definition.parameters;
+            expectation::inject(&mut schema);
+            tool_names.push(definition.name.clone());
+            tools.push(ToolDef::new(
+                definition.name,
+                definition.description,
+                schema,
+            ));
+        }
+        (registry, tools, tool_names)
+    }
+
     /// Resolve the cache-stable instruction prefix and publish a delta when it
     /// changed. Runs once per execution, before the first provider call.
     #[allow(clippy::too_many_lines)] // One assembly pass: boxes, memory, goal and the pinned prefix.
@@ -235,12 +259,13 @@ impl Runtime {
         let skill_ids = loaded_skill_ids(&stored);
         let context = self.load_context(session).await?;
         let query = prompt::last_user_text(&context);
-        let box_rows = self
+        let mut box_rows = self
             .inner
             .config
             .store
             .list_boxes(oc_store::BoxQuery {
                 root_id: root.clone(),
+                session_id: Some(session.to_owned()),
                 limit: crate::context_box::BOX_INDEX_QUERY_MAX,
                 ..oc_store::BoxQuery::default()
             })
@@ -256,6 +281,10 @@ impl Runtime {
                 },
                 |page| page.items,
             );
+        box_rows.retain(|item| {
+            let key = item.get("key").and_then(Value::as_str).unwrap_or_default();
+            self.effect(&turn.agent_id, &turn.session_rules, "box:read", key) != ConfigEffect::Deny
+        });
         let memory = self.memory();
         let assembly = prompt::assemble_instructions(&prompt::InstructionContext {
             config: &self.inner.config.config,
@@ -431,6 +460,18 @@ impl Runtime {
         {
             return;
         }
+        let Ok(Some(info)) = self.inner.config.store.get_session(session).await else {
+            return;
+        };
+        let Some(project_id) = info
+            .get("projectID")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(str::to_owned)
+        else {
+            return;
+        };
         if stats.tool_calls == 0 && !self.has_goal(session).await {
             return;
         }
@@ -444,8 +485,8 @@ impl Runtime {
                             .write(NewMemoryInput {
                                 text: candidate.text,
                                 kind: Some(candidate.kind),
-                                scope: Some("session".to_owned()),
-                                scope_id: Some(session.clone()),
+                                scope: Some("project".to_owned()),
+                                scope_id: Some(project_id.clone()),
                                 tags: candidate.tags,
                                 importance: Some(candidate.importance),
                                 confidence: Some(candidate.confidence),

@@ -41,6 +41,28 @@ impl Policy {
             requested_agent,
             requested_depth,
             available_agents,
+            None,
+        )
+    }
+
+    /// Decide whether `parent` may create a child for `requested_agent`, using
+    /// the caller's dynamically resolved `primary_only_agents` set instead of
+    /// the static [`crate::PRIMARY_ONLY_AGENTS`] list.
+    pub fn spawn_with_primary(
+        &self,
+        parent: &SessionNode,
+        requested_agent: &str,
+        requested_depth: Option<u32>,
+        available_agents: &[String],
+        primary_only_agents: &[String],
+    ) -> Result<ChildPlan, SpawnError> {
+        spawn_decision(
+            &self.limits,
+            parent,
+            requested_agent,
+            requested_depth,
+            available_agents,
+            Some(primary_only_agents),
         )
     }
 

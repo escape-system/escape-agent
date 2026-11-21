@@ -25,6 +25,16 @@ pub(super) struct BuiltinSpec {
 
 pub(super) const BUILTIN_SPECS: &[BuiltinSpec] = &[
     BuiltinSpec {
+        id: "antigravity-gemini-4-neon",
+        name: "Gemini 4 Neon (Antigravity)",
+        family: "gemini",
+        context: 1_048_576,
+        output: 262_144,
+        base_url: ANTIGRAVITY_ENDPOINT_DAILY,
+        release_date: "2026-11-01",
+        variants: VariantPreset::Effort(&["low", "medium", "high", "xhigh"]),
+    },
+    BuiltinSpec {
         id: "antigravity-gemini-4-hydrogen",
         name: "Gemini 4 Hydrogen (Antigravity)",
         family: "gemini",

@@ -34,6 +34,7 @@ pub(super) async fn dispatch_pool_stream(
     };
     let max_wait = Duration::from_secs(wait_budget_secs);
     let mut excluded_indices: HashSet<usize> = HashSet::new();
+    let mut empty_excluded: HashSet<usize> = HashSet::new();
     let mut last_error: Option<LlmError> = None;
 
     loop {
@@ -43,12 +44,20 @@ pub(super) async fn dispatch_pool_stream(
             .map_err(|e| to_llm_error(&e))?;
 
         let Some(acct) = selected else {
+            tracing::debug!(
+                family = family.as_str(),
+                style = style.as_str(),
+                excluded_count = excluded_indices.len(),
+                empty_count = empty_excluded.len(),
+                "antigravity: no eligible account for dispatch"
+            );
             match wait_when_pool_exhausted(
                 svc,
                 family,
                 style,
                 &request.model.model.id,
                 &excluded_indices,
+                !empty_excluded.is_empty(),
                 &mut last_error,
                 started,
                 max_wait,
@@ -58,7 +67,11 @@ pub(super) async fn dispatch_pool_stream(
             {
                 PoolExhaustedAction::RetryAfterSleep => {
                     excluded_indices.clear();
+                    empty_excluded.clear();
                     continue;
+                }
+                PoolExhaustedAction::RetryEmptyResponse => {
+                    return Ok(DispatchOutcome::RetryEmptyResponse);
                 }
                 PoolExhaustedAction::TryFallbackPool => {
                     return Ok(DispatchOutcome::TryFallbackPool);
@@ -103,6 +116,7 @@ pub(super) async fn dispatch_pool_stream(
             force_strip_thinking,
             attempt,
             &mut excluded_indices,
+            &mut empty_excluded,
             &mut last_error,
             started,
             max_wait,
@@ -116,6 +130,7 @@ pub(super) async fn dispatch_pool_stream(
 
 enum PoolExhaustedAction {
     RetryAfterSleep,
+    RetryEmptyResponse,
     TryFallbackPool,
 }
 
@@ -126,11 +141,15 @@ async fn wait_when_pool_exhausted(
     style: HeaderStyle,
     model_id: &str,
     excluded_indices: &HashSet<usize>,
+    has_empty_excluded: bool,
     last_error: &mut Option<LlmError>,
     started: Instant,
     max_wait: Duration,
     quota_fallback: bool,
 ) -> std::result::Result<PoolExhaustedAction, LlmError> {
+    if has_empty_excluded {
+        return Ok(PoolExhaustedAction::RetryEmptyResponse);
+    }
     let wait_ms = svc
         .min_wait_ms(family, style, Some(model_id))
         .map_err(|e| to_llm_error(&e))?;

@@ -38,7 +38,7 @@ fn push_messages(messages: &[Value], out: &mut Vec<LlmMessage>) {
             Some("user") => {
                 out.push(LlmMessage::new(Role::User, user_parts(message)));
             }
-            Some("synthetic" | "system" | "skill") => {
+            Some("synthetic" | "system" | "skill" | "observer") => {
                 if let Some(text) = message.get("text").and_then(Value::as_str)
                     && !text.is_empty()
                 {
@@ -307,5 +307,23 @@ mod tests {
             &llm[1].content[0],
             ContentPart::ToolResult { tool_call_id, .. } if tool_call_id == "call_run_1"
         ));
+    }
+
+    #[test]
+    fn observer_advisories_are_replayed_as_user_messages() {
+        let messages = vec![
+            json!({ "type": "user", "id": "msg_u1", "text": "keep working" }),
+            json!({
+                "type": "observer",
+                "id": "msg_obs1",
+                "text": "Context pressure at 75%. Call compact_context soon."
+            }),
+        ];
+        let llm = messages_from_store(&messages);
+        assert_eq!(llm.len(), 2);
+        assert_eq!(
+            llm[1].content[0].as_text(),
+            Some("Context pressure at 75%. Call compact_context soon.")
+        );
     }
 }

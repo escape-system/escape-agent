@@ -9,6 +9,65 @@
 //! contract.
 
 use oc_types::message::{AssistantPart, ToolState};
+use serde_json::Value;
+
+/// Tunable step-budget policy, read from `step_budget.*` in merged config.
+///
+/// Defaults are the historical constants, so an absent section keeps every
+/// existing turn byte-identical. All fields are fail-closed: a bad value falls
+/// back to its default rather than loosening the budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BudgetPolicy {
+    pub(crate) extension_steps: usize,
+    pub(super) max_extensions: usize,
+    pub(super) min_cap: usize,
+    pub(super) thrash_limit: usize,
+    pub(super) window: usize,
+    pub(super) ceiling_factor: usize,
+}
+
+impl Default for BudgetPolicy {
+    fn default() -> Self {
+        Self {
+            extension_steps: EXTENSION_STEPS,
+            max_extensions: MAX_EXTENSIONS,
+            min_cap: MIN_CAP_FOR_EXTENSION,
+            thrash_limit: THRASH_LIMIT,
+            window: WINDOW,
+            ceiling_factor: CEILING_FACTOR,
+        }
+    }
+}
+
+impl BudgetPolicy {
+    /// Read overrides from a merged config value. Unknown keys and malformed
+    /// values are ignored so a partial/typo'd section cannot widen the budget.
+    pub(crate) fn from_merged(merged: &Value) -> Self {
+        let defaults = Self::default();
+        let Some(section) = merged.get("step_budget").and_then(Value::as_object) else {
+            return defaults;
+        };
+        let mut policy = defaults;
+        for (key, value) in section {
+            let Some(number) = value.as_u64().and_then(|n| usize::try_from(n).ok()) else {
+                continue;
+            };
+            let (minimum, field) = match key.as_str() {
+                "extension_steps" => (1, &mut policy.extension_steps),
+                "max_extensions" => (0, &mut policy.max_extensions),
+                "min_cap" => (1, &mut policy.min_cap),
+                "thrash_limit" => (1, &mut policy.thrash_limit),
+                "window" => (1, &mut policy.window),
+                "ceiling_factor" => (1, &mut policy.ceiling_factor),
+                _ => continue,
+            };
+            if number >= minimum {
+                *field = number;
+            }
+        }
+        policy
+    }
+}
 
 /// Extra steps granted per extension.
 pub(super) const EXTENSION_STEPS: usize = 15;
@@ -53,45 +112,53 @@ impl BudgetDecision {
         }
     }
 
-    fn grant(reason: &'static str) -> Self {
+    fn grant_with(reason: &'static str, steps: usize) -> Self {
         Self {
-            grant: Some(EXTENSION_STEPS),
+            grant: Some(steps),
             reason,
         }
     }
 }
 
-/// First matching rule wins; every rule is fail-closed.
+/// Policy-aware evaluator. First matching rule wins; every rule is fail-closed.
 ///
-/// The caller is responsible for the `MIN_CAP_FOR_EXTENSION` floor and for
-/// rejecting a zero grant.
-pub(super) fn evaluate(
+/// Thrash detection only inspects the trailing `2 * window` observations so
+/// that a deep run with sequential, distinct failures and intermittent success
+/// can still qualify as progress; a genuine thrash loop stays inside that
+/// window and is still denied.
+pub(super) fn evaluate_with_policy(
     observations: &[ToolObservation],
     tool_calls: usize,
     grants: &[usize],
     initial_cap: usize,
+    policy: &BudgetPolicy,
 ) -> BudgetDecision {
-    if grants.len() >= MAX_EXTENSIONS {
+    if grants.len() >= policy.max_extensions {
         return BudgetDecision::deny("extension limit reached");
     }
     let granted: usize = grants.iter().copied().sum();
-    if granted.saturating_add(EXTENSION_STEPS) > initial_cap.saturating_mul(CEILING_FACTOR) {
+    if granted.saturating_add(policy.extension_steps)
+        > initial_cap.saturating_mul(policy.ceiling_factor)
+    {
         return BudgetDecision::deny("extension ceiling reached");
     }
     if tool_calls == 0 {
         return BudgetDecision::deny("no tool calls in this turn");
     }
-    if is_thrashing(observations) {
+    if is_thrashing(observations, policy) {
         return BudgetDecision::deny("repeated identical tool failure");
     }
-    if !has_recent_success(observations) {
+    if !has_recent_success(observations, policy) {
         return BudgetDecision::deny("no recent successful tool call");
     }
-    BudgetDecision::grant("recent tool progress")
+    BudgetDecision::grant_with("recent tool progress", policy.extension_steps)
 }
 
-fn is_thrashing(observations: &[ToolObservation]) -> bool {
-    for (index, observation) in observations.iter().enumerate() {
+fn is_thrashing(observations: &[ToolObservation], policy: &BudgetPolicy) -> bool {
+    let recent = observations
+        .len()
+        .saturating_sub(policy.window.saturating_mul(2));
+    for (index, observation) in observations.iter().enumerate().skip(recent) {
         let Observation::Err(message) = &observation.outcome else {
             continue;
         };
@@ -101,7 +168,7 @@ fn is_thrashing(observations: &[ToolObservation]) -> bool {
                 && matches!(&other.outcome, Observation::Err(existing) if existing == message)
             {
                 same += 1;
-                if same >= THRASH_LIMIT {
+                if same >= policy.thrash_limit {
                     return true;
                 }
             }
@@ -110,12 +177,43 @@ fn is_thrashing(observations: &[ToolObservation]) -> bool {
     false
 }
 
-fn has_recent_success(observations: &[ToolObservation]) -> bool {
+fn has_recent_success(observations: &[ToolObservation], policy: &BudgetPolicy) -> bool {
     observations
         .iter()
         .rev()
-        .take(WINDOW)
+        .take(policy.window)
         .any(|observation| observation.outcome == Observation::Ok)
+}
+
+/// True when `grants`, `cap`, and `initial_cap` leave room for an automatic
+/// extension under `policy`.
+pub(super) fn can_extend_with_policy(
+    grants: &[usize],
+    initial_cap: usize,
+    cap: usize,
+    policy: &BudgetPolicy,
+) -> bool {
+    if cap < policy.min_cap || grants.len() >= policy.max_extensions {
+        return false;
+    }
+    let granted: usize = grants.iter().copied().sum();
+    granted.saturating_add(policy.extension_steps)
+        <= initial_cap.saturating_mul(policy.ceiling_factor)
+}
+
+/// How many additional steps `initial_cap` may still receive under `policy`.
+pub(super) fn remaining_ceiling_with_policy(
+    grants: &[usize],
+    initial_cap: usize,
+    policy: &BudgetPolicy,
+) -> usize {
+    if grants.len() >= policy.max_extensions {
+        return 0;
+    }
+    let granted: usize = grants.iter().copied().sum();
+    initial_cap
+        .saturating_mul(policy.ceiling_factor)
+        .saturating_sub(granted)
 }
 
 /// Append the tool parts of one finished step to the turn-wide evidence log.
@@ -130,11 +228,29 @@ pub(super) fn observe(accumulated: &mut Vec<ToolObservation>, parts: &[Assistant
             continue;
         };
         let outcome = match &tool.state {
-            ToolState::Completed { metadata, .. } => {
+            ToolState::Completed {
+                input, metadata, ..
+            } => {
                 if tool.name == "shell"
                     && let Some(reason) = super::verify::shell_failure_reason(metadata.as_ref())
                 {
-                    Observation::Err(reason)
+                    let cmd = input
+                        .get("command")
+                        .and_then(Value::as_str)
+                        .map(|raw| {
+                            raw.split_whitespace()
+                                .collect::<Vec<_>>()
+                                .join(" ")
+                                .chars()
+                                .take(80)
+                                .collect::<String>()
+                        })
+                        .filter(|s| !s.is_empty());
+                    let detail = match cmd {
+                        Some(cmd) => format!("{cmd}: {reason}"),
+                        None => reason,
+                    };
+                    Observation::Err(detail)
                 } else {
                     Observation::Ok
                 }
@@ -177,7 +293,7 @@ mod tests {
     #[test]
     fn grants_on_recent_progress() {
         let observations = [ok("read"), err("shell", "boom"), ok("edit")];
-        let decision = evaluate(&observations, 3, &[], 10);
+        let decision = evaluate_with_policy(&observations, 3, &[], 10, &BudgetPolicy::default());
         assert_eq!(decision.grant, Some(EXTENSION_STEPS));
         assert_eq!(decision.reason, "recent tool progress");
     }
@@ -190,7 +306,7 @@ mod tests {
             err("shell", "command not found: foo"),
             err("shell", "command not found: foo"),
         ];
-        let decision = evaluate(&observations, 4, &[], 10);
+        let decision = evaluate_with_policy(&observations, 4, &[], 10, &BudgetPolicy::default());
         assert_eq!(decision.grant, None);
         assert_eq!(decision.reason, "repeated identical tool failure");
     }
@@ -198,7 +314,7 @@ mod tests {
     #[test]
     fn denies_when_no_tool_calls() {
         let observations = [ok("read")];
-        let decision = evaluate(&observations, 0, &[], 10);
+        let decision = evaluate_with_policy(&observations, 0, &[], 10, &BudgetPolicy::default());
         assert_eq!(decision.grant, None);
         assert_eq!(decision.reason, "no tool calls in this turn");
     }
@@ -214,7 +330,7 @@ mod tests {
             other("glob"),
             other("grep"),
         ];
-        let decision = evaluate(&observations, 7, &[], 10);
+        let decision = evaluate_with_policy(&observations, 7, &[], 10, &BudgetPolicy::default());
         assert_eq!(decision.grant, None);
         assert_eq!(decision.reason, "no recent successful tool call");
     }
@@ -223,7 +339,8 @@ mod tests {
     fn denies_at_extension_limit() {
         let observations = [ok("read")];
         let grants = [EXTENSION_STEPS; MAX_EXTENSIONS];
-        let decision = evaluate(&observations, 1, &grants, 100);
+        let decision =
+            evaluate_with_policy(&observations, 1, &grants, 100, &BudgetPolicy::default());
         assert_eq!(decision.grant, None);
         assert_eq!(decision.reason, "extension limit reached");
     }
@@ -241,7 +358,13 @@ mod tests {
         let initial_cap = MIN_CAP_FOR_EXTENSION;
         let grants = [EXTENSION_STEPS];
         let observations = [ok("read"), ok("edit")];
-        let decision = evaluate(&observations, 2, &grants, initial_cap);
+        let decision = evaluate_with_policy(
+            &observations,
+            2,
+            &grants,
+            initial_cap,
+            &BudgetPolicy::default(),
+        );
         assert_eq!(decision.grant, None);
         assert_eq!(decision.reason, "extension ceiling reached");
     }
@@ -250,13 +373,88 @@ mod tests {
     fn caller_enforces_min_cap_floor() {
         // Caller contract: the evaluator has no MIN_CAP_FOR_EXTENSION floor of
         // its own. The caller (`run_steps` in `mod.rs`) must refuse to call
-        // `evaluate` when the current cap is below `MIN_CAP_FOR_EXTENSION`, so
+        // the evaluator when the current cap is below `MIN_CAP_FOR_EXTENSION`, so
         // small deterministic caps (2, 5) keep the legacy behaviour
         // byte-identical. At the floor itself the evaluator must grant.
         let observations = [ok("read")];
-        let decision = evaluate(&observations, 1, &[], MIN_CAP_FOR_EXTENSION);
+        let decision = evaluate_with_policy(
+            &observations,
+            1,
+            &[],
+            MIN_CAP_FOR_EXTENSION,
+            &BudgetPolicy::default(),
+        );
         assert_eq!(decision.grant, Some(EXTENSION_STEPS));
         assert_eq!(decision.reason, "recent tool progress");
+    }
+
+    #[test]
+    fn deepening_with_distinct_sequential_failures_is_granted() {
+        // A long run with distinct failures early and a recent success must not
+        // be denied by the old unbounded thrash scan.
+        let mut observations: Vec<ToolObservation> = Vec::new();
+        for index in 0..12 {
+            observations.push(err("shell", &format!("failure {index}")));
+        }
+        observations.push(ok("read"));
+        observations.push(err("shell", "current failure"));
+        observations.push(ok("edit"));
+        let decision = evaluate_with_policy(
+            &observations,
+            observations.len(),
+            &[],
+            50,
+            &BudgetPolicy::default(),
+        );
+        assert_eq!(decision.grant, Some(EXTENSION_STEPS));
+        assert_eq!(decision.reason, "recent tool progress");
+    }
+
+    #[test]
+    fn configured_policy_changes_grant_size_and_limit() {
+        let policy = BudgetPolicy {
+            extension_steps: 7,
+            max_extensions: 1,
+            min_cap: 10,
+            thrash_limit: 3,
+            window: 5,
+            ceiling_factor: 4,
+        };
+        let decision = evaluate_with_policy(&[ok("read")], 1, &[], 20, &policy);
+        assert_eq!(decision.grant, Some(7));
+        let denied = evaluate_with_policy(&[ok("read")], 1, &[7], 20, &policy);
+        assert_eq!(denied.grant, None);
+        assert_eq!(denied.reason, "extension limit reached");
+    }
+
+    #[test]
+    fn merged_config_reads_step_budget_overrides() {
+        let config = serde_json::json!({
+            "step_budget": {
+                "extension_steps": 9,
+                "max_extensions": 3,
+                "min_cap": 12,
+                "thrash_limit": 2,
+                "window": 6,
+                "ceiling_factor": 3,
+                "extension_steps_bad": "ignored"
+            }
+        });
+        assert_eq!(
+            BudgetPolicy::from_merged(&config),
+            BudgetPolicy {
+                extension_steps: 9,
+                max_extensions: 3,
+                min_cap: 12,
+                thrash_limit: 2,
+                window: 6,
+                ceiling_factor: 3,
+            }
+        );
+        assert_eq!(
+            BudgetPolicy::from_merged(&serde_json::json!({})),
+            BudgetPolicy::default()
+        );
     }
 
     #[test]
@@ -288,8 +486,56 @@ mod tests {
         for _ in 0..3 {
             observe(&mut observations, std::slice::from_ref(&part));
         }
-        let decision = evaluate(&observations, 3, &[], MIN_CAP_FOR_EXTENSION);
+        let decision = evaluate_with_policy(
+            &observations,
+            3,
+            &[],
+            MIN_CAP_FOR_EXTENSION,
+            &BudgetPolicy::default(),
+        );
         assert_eq!(decision.grant, None);
         assert_eq!(decision.reason, "repeated identical tool failure");
+    }
+
+    #[test]
+    fn distinct_failed_shell_commands_do_not_trip_thrash_limit() {
+        use oc_types::message::{ToolPart, ToolTime};
+        use serde_json::{Map, json};
+
+        let mut fail_meta = Map::new();
+        fail_meta.insert("status".to_owned(), json!("completed"));
+        fail_meta.insert("exit".to_owned(), json!(101));
+
+        let mut observations = Vec::new();
+        for cmd in ["cargo test alpha", "cargo test beta", "cargo test gamma"] {
+            let mut input = Map::new();
+            input.insert("command".to_owned(), json!(cmd));
+            let part = AssistantPart::Tool(Box::new(ToolPart {
+                id: "call_sh".to_owned(),
+                name: "shell".to_owned(),
+                executed: Some(true),
+                native: None,
+                time: ToolTime {
+                    created: 1,
+                    ran: Some(1),
+                    completed: Some(2),
+                },
+                state: ToolState::Completed {
+                    input,
+                    content: Vec::new(),
+                    metadata: Some(fail_meta.clone()),
+                },
+            }));
+            observe(&mut observations, std::slice::from_ref(&part));
+        }
+        observations.push(ok("edit"));
+        let decision = evaluate_with_policy(
+            &observations,
+            4,
+            &[],
+            MIN_CAP_FOR_EXTENSION,
+            &BudgetPolicy::default(),
+        );
+        assert_eq!(decision.grant, Some(EXTENSION_STEPS));
     }
 }

@@ -22,7 +22,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.3.11"
+version = "0.3.12"
 edition = "2024"
 rust-version = "1.90"
 license = "MIT"
@@ -56,7 +56,6 @@ clap = { version = "4", features = ["derive", "env"] }
 futures-util = "0.3"
 flate2 = "1"
 globset = "0.4"
-grep-matcher = "0.1"
 grep-regex = "0.1"
 grep-searcher = "0.1"
 hex = "0.4"
@@ -72,7 +71,6 @@ rand = "0.9"
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2", "json", "stream", "gzip", "brotli"] }
 rusqlite = { version = "0.41", features = ["bundled"] }
-rust-embed = "8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"

@@ -144,6 +144,44 @@ mod tests {
     }
 
     #[test]
+    fn live_discovery_overrides_builtin_limits_but_keeps_missing_values() {
+        let mut cache = DiscoveredModelCache::default();
+        for (id, ctx, out) in [
+            ("gemini-4-hydrogen-low", Some(262_144), None),
+            ("gemini-4-hydrogen-high", Some(262_144), Some(32_768)),
+            ("gemini-4-argon-high", None, Some(0)),
+        ] {
+            cache.models.insert(
+                id.to_owned(),
+                DiscoveredModelInfo {
+                    id: id.to_owned(),
+                    display_name: None,
+                    max_tokens: ctx,
+                    max_output_tokens: out,
+                    supports_thinking: true,
+                    remaining_fraction: Some(1.0),
+                    reset_time_ms: None,
+                },
+            );
+        }
+        let merged = merged_antigravity_models(Some(&cache));
+        let hydrogen = merged
+            .get("antigravity-gemini-4-hydrogen")
+            .expect("hydrogen");
+        assert_eq!(hydrogen.limit.context, 262_144, "live context wins");
+        assert_eq!(hydrogen.limit.output, 32_768, "live output wins");
+        let argon = merged.get("antigravity-gemini-4-argon").expect("argon");
+        assert_eq!(
+            argon.limit.context, 1_048_576,
+            "absent live value keeps the floor"
+        );
+        assert_eq!(
+            argon.limit.output, 65_536,
+            "zero live value keeps the floor"
+        );
+    }
+
+    #[test]
     fn overlay_populates_google_provider_and_dynamic_resolution() {
         let mut cat = Catalog::from_snapshot("{}").expect("empty");
         overlay_catalog_models(&mut cat, None);

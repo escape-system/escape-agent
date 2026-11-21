@@ -94,6 +94,7 @@ pub fn needs_thinking_recovery(contents: &[Value], family: ModelFamily) -> bool 
 /// Recover signatures from [`SignatureCache`], remove invalid/unsigned thinking parts, and repair
 /// broken tool-call/thinking sequences across Cloud Code `contents`.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)]
 pub fn repair_contents_thinking(
     contents: &mut Vec<Value>,
     family: ModelFamily,
@@ -176,20 +177,68 @@ pub fn repair_contents_thinking(
                 }
                 cleaned.push(part);
             } else {
-                // On Gemini 3+, functionCall parts may also require thoughtSignature when thinking is active.
+                // Preserve the provider's real function-call id verbatim. Never synthesize or
+                // renumber ids here; an absent/empty id stays absent so distinct calls are not
+                // merged by name downstream.
+                if let Some(fc) = part.get("functionCall") {
+                    let has_id = fc
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .is_some_and(|s| !s.is_empty());
+                    if !has_id
+                        && let Some(part_obj) = part.as_object_mut()
+                        && let Some(Value::Object(fc_obj)) = part_obj.get_mut("functionCall")
+                    {
+                        fc_obj.remove("id");
+                    }
+                }
+                // On Gemini 3+, functionCall parts may carry a provider-returned `thoughtSignature`
+                // (captured in `SignatureCache`). Reuse that authentic signature before falling
+                // back to `SKIP_THOUGHT_SIGNATURE` so Cloud Code history keeps real signatures.
                 if family == ModelFamily::Gemini
                     && thinking_enabled
-                    && part.get("functionCall").is_some()
+                    && let Some(fc) = part.get("functionCall")
                 {
-                    let has_sig = part
+                    let mut sig = part
                         .get("thoughtSignature")
                         .and_then(Value::as_str)
-                        .is_some_and(is_valid_thought_signature);
-                    if !has_sig && let Some(obj) = part.as_object_mut() {
-                        obj.insert(
-                            "thoughtSignature".to_owned(),
-                            Value::String(SKIP_THOUGHT_SIGNATURE.to_owned()),
-                        );
+                        .filter(|s| is_valid_thought_signature(s))
+                        .map(str::to_owned);
+                    if sig.is_none()
+                        && let Some(ref mut c) = cache
+                    {
+                        if let Some(fc_id) = fc
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            && let Some(hit) =
+                                c.get(session_key, &format!("__toolcall__:{fc_id}"), now_ms)
+                        {
+                            sig = Some(hit.signature);
+                        }
+                        if sig.is_none()
+                            && let Some(fc_name) = fc.get("name").and_then(Value::as_str)
+                        {
+                            let args_val = fc
+                                .get("args")
+                                .cloned()
+                                .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
+                            if let Ok(args_json) = serde_json::to_string(&args_val)
+                                && let Some(hit) = c.get(
+                                    session_key,
+                                    &format!("__toolcall_args__:{fc_name}:{args_json}"),
+                                    now_ms,
+                                )
+                            {
+                                sig = Some(hit.signature);
+                            }
+                        }
+                    }
+                    let resolved_sig = sig.unwrap_or_else(|| SKIP_THOUGHT_SIGNATURE.to_owned());
+                    if let Some(obj) = part.as_object_mut() {
+                        obj.insert("thoughtSignature".to_owned(), Value::String(resolved_sig));
                     }
                 }
                 cleaned.push(part);
@@ -246,7 +295,14 @@ pub fn close_tool_loop_for_thinking(contents: &mut Vec<Value>) {
                     "response".to_owned(),
                     json!({ "error": "Tool execution interrupted before completion." }),
                 );
-                if let Some(id) = fc.get("id").and_then(Value::as_str) {
+                // Carry the real provider id through so responses correlate to the correct call.
+                // Whitespace-only ids are treated as absent, never replaced with generated ids.
+                if let Some(id) = fc
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
                     fr.insert("id".to_owned(), json!(id));
                 }
                 responses.push(json!({ "functionResponse": fr }));
@@ -295,6 +351,76 @@ mod tests {
         assert_eq!(parts[0]["thought"], true);
         assert_eq!(parts[0]["text"], "signed");
         assert!(parts[1].get("functionCall").is_some());
+    }
+
+    #[test]
+    fn repair_preserves_distinct_provider_tool_call_ids() {
+        let mut contents = vec![json!({
+            "role": "model",
+            "parts": [
+                { "functionCall": { "id": "call_alpha", "name": "read", "args": {} } },
+                { "functionCall": { "id": "call_beta", "name": "read", "args": {} } }
+            ]
+        })];
+        repair_contents_thinking(
+            &mut contents,
+            ModelFamily::Gemini,
+            false,
+            false,
+            "ses",
+            None,
+            1000,
+        );
+        let parts = contents[0]["parts"].as_array().expect("parts");
+        let ids: Vec<&str> = parts
+            .iter()
+            .filter_map(|p| p["functionCall"]["id"].as_str())
+            .collect();
+        assert_eq!(ids, vec!["call_alpha", "call_beta"]);
+    }
+
+    #[test]
+    fn repair_keeps_empty_id_calls_distinct_without_inventing_ids() {
+        let mut contents = vec![json!({
+            "role": "model",
+            "parts": [
+                { "functionCall": { "name": "read", "args": {} } },
+                { "functionCall": { "id": "  ", "name": "read", "args": {} } }
+            ]
+        })];
+        repair_contents_thinking(
+            &mut contents,
+            ModelFamily::Gemini,
+            false,
+            false,
+            "ses",
+            None,
+            1000,
+        );
+        let parts = contents[0]["parts"].as_array().expect("parts");
+        assert_eq!(parts.len(), 2);
+        for part in parts {
+            assert!(part["functionCall"]["id"].is_null());
+            assert_eq!(part["functionCall"]["name"], "read");
+        }
+    }
+
+    #[test]
+    fn close_tool_loop_uses_real_ids_for_each_response() {
+        let mut contents = vec![json!({
+            "role": "model",
+            "parts": [
+                { "functionCall": { "id": "call_alpha", "name": "read", "args": {} } },
+                { "functionCall": { "id": "call_beta", "name": "read", "args": {} } }
+            ]
+        })];
+        close_tool_loop_for_thinking(&mut contents);
+        let responses = contents[1]["parts"].as_array().expect("responses");
+        let ids: Vec<&str> = responses
+            .iter()
+            .filter_map(|p| p["functionResponse"]["id"].as_str())
+            .collect();
+        assert_eq!(ids, vec!["call_alpha", "call_beta"]);
     }
 
     #[test]

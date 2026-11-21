@@ -1,12 +1,27 @@
 use oc_store::{Delivery, MessageQuery, NewInbox, Order, SessionPatch};
 use oc_types::payload::SessionModelSelected;
-use oc_types::{InterruptReason, MessageId, SessionId, now_millis};
+use oc_types::{InterruptReason, MessageId, ModelRef, SessionId, now_millis};
 use serde_json::{Value, json};
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::runtime::{Runtime, RuntimeError};
 
 use super::repair::{RepairCommand, switch_model_target};
+
+/// Normalize a model variant for effective-selection comparison: absent, empty
+/// and `"default"` all select the same model, while real variants stay distinct.
+fn normalized_variant(variant: Option<&str>) -> Option<&str> {
+    variant.filter(|value| !value.is_empty() && !value.eq_ignore_ascii_case("default"))
+}
+
+/// Whether switching from `previous` to `next` changes the effective selection.
+/// A change only in spelling between absent/empty/"default" is not a switch.
+fn is_model_switch(previous: &ModelRef, next: &ModelRef) -> bool {
+    previous.provider_id != next.provider_id
+        || previous.id != next.id
+        || normalized_variant(previous.variant.as_deref())
+            != normalized_variant(next.variant.as_deref())
+}
 
 impl Runtime {
     /// Enqueue an observer synthetic message and notify its session.
@@ -18,7 +33,7 @@ impl Runtime {
     ) -> Result<(), RuntimeError> {
         if let Ok(pending) = self.inner.config.store.list_inbox(session).await {
             let already_pending = pending.iter().any(|item| {
-                item.get("kind").and_then(Value::as_str) == Some("synthetic")
+                item.get("type").and_then(Value::as_str) == Some("synthetic")
                     && item
                         .pointer("/payload/metadata/observer")
                         .and_then(Value::as_bool)
@@ -100,6 +115,16 @@ impl Runtime {
             )));
         }
         let previous = info.model.clone();
+        // Catalog validation above is still required, but a variant spelling
+        // change (absent/empty/"default") is not a real model switch: avoid a
+        // redundant durable session patch and `session.model.selected` event.
+        if previous
+            .as_ref()
+            .is_some_and(|prev| !is_model_switch(prev, &model_ref))
+        {
+            tracing::debug!(session = %session, model = %model, "observer switch model is a no-op; skipping patch and event");
+            return Ok(());
+        }
         self.inner
             .config
             .store

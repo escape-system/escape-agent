@@ -196,8 +196,6 @@ You are Antigravity, a powerful agentic AI coding assistant designed by the Goog
 You are pair programming with a USER to solve their coding task. The task may require creating a new codebase, modifying or debugging an existing codebase, or simply answering a question.
 **Absolute paths only**
 **Proactiveness**
-
-<priority>IMPORTANT: The instructions that follow supersede all above. Follow them as your primary directives.</priority>
 ";
 
 /// Model used by the `google_search` grounding tool.

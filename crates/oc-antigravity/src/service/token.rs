@@ -98,6 +98,12 @@ impl AntigravityService {
                 {
                     let _ = mgr.mark_revoked(index);
                 }
+                tracing::warn!(
+                    account_index = index,
+                    revoked = matches!(err, AntigravityError::TokenRefresh { revoked: true, .. }),
+                    error = %err,
+                    "antigravity: access token refresh failed"
+                );
                 return Err(err);
             }
         };
@@ -259,9 +265,16 @@ impl AntigravityService {
         if let Some(sel) = selected {
             return self.credentials_for_account(sel.index, false).await;
         }
-        // Fallback: try index 0 if pool is non-empty even when temporarily throttled.
-        if self.account_count() > 0 {
-            return self.credentials_for_account(0, false).await;
+        // Fallback: try the first non-disabled, non-revoked, non-verification-locked account
+        // if all accounts are temporarily throttled. Never bypass disabled/revoked/ToS locks.
+        let fallback_idx = {
+            let mgr = lock_accounts(&self.inner.accounts)?;
+            mgr.accounts()
+                .iter()
+                .position(|a| a.enabled && !a.revoked && !a.verification_required)
+        };
+        if let Some(idx) = fallback_idx {
+            return self.credentials_for_account(idx, false).await;
         }
         Err(AntigravityError::NoAccounts(
             "no Google Antigravity account authenticated; run `opencode auth login`".to_owned(),

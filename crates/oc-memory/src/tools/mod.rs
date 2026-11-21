@@ -36,6 +36,7 @@ struct ToolScope {
     service: Arc<MemoryService>,
     project_id: Option<String>,
     agent_id: Option<String>,
+    root_id: Option<String>,
 }
 
 impl ToolScope {
@@ -83,6 +84,12 @@ impl ToolScope {
             scopes.push(("agent".to_owned(), Some(agent.clone())));
         }
         if !ctx.session_id.trim().is_empty() {
+            if let Some(root_id) = &self.root_id
+                && !root_id.trim().is_empty()
+                && root_id != &ctx.session_id
+            {
+                scopes.push(("session".to_owned(), Some(root_id.clone())));
+            }
             scopes.push(("session".to_owned(), Some(ctx.session_id.clone())));
         }
         Ok(scopes)
@@ -104,6 +111,7 @@ impl MemoryTools {
                 service,
                 project_id: None,
                 agent_id: None,
+                root_id: None,
             }),
         }
     }
@@ -120,6 +128,13 @@ impl MemoryTools {
     #[must_use]
     pub fn with_agent_id(mut self, agent_id: impl Into<String>) -> Self {
         Arc::make_mut(&mut self.scope).agent_id = Some(agent_id.into());
+        self
+    }
+
+    /// Pin the tree root session id so subagents also read root `session` memories.
+    #[must_use]
+    pub fn with_root_id(mut self, root_id: impl Into<String>) -> Self {
+        Arc::make_mut(&mut self.scope).root_id = Some(root_id.into());
         self
     }
 

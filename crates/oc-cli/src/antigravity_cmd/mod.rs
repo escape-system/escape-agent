@@ -182,6 +182,7 @@ mod tests {
                 remaining_fraction: Some(0.42),
                 used_percent: None,
                 reset_time_ms: None,
+                ..QuotaGroupSnapshot::default()
             }),
             Some(42.0)
         );
@@ -190,6 +191,7 @@ mod tests {
                 remaining_fraction: None,
                 used_percent: Some(30.0),
                 reset_time_ms: None,
+                ..QuotaGroupSnapshot::default()
             }),
             Some(70.0)
         );
@@ -201,6 +203,7 @@ mod tests {
                 remaining_fraction: Some(0.8),
                 used_percent: None,
                 reset_time_ms: None,
+                ..QuotaGroupSnapshot::default()
             },
         );
         let accounts = vec![AccountStatusSummary {

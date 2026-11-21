@@ -47,7 +47,9 @@ pub enum WriteError {
     UnknownSender { id: String },
     #[error("session {id} is not in the session tree")]
     UnknownTarget { id: String },
-    #[error("session {to} is not a descendant of {from}")]
+    #[error(
+        "session_write targets descendants only; use talk to message a sibling or parent. (session {to} is not a descendant of {from})"
+    )]
     NotDescendant { from: String, to: String },
     #[error("session {to} is outside the coordinator scope of {from}")]
     NotInScope { from: String, to: String },

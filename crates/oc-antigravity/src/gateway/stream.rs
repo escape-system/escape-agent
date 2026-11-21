@@ -14,7 +14,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use super::SingleAttempt;
-use super::validation::try_single_endpoint;
+use super::validation::{format_reqwest_error, try_single_endpoint};
 
 type ByteStream =
     Pin<Box<dyn futures_util::Stream<Item = std::result::Result<Bytes, reqwest::Error>> + Send>>;
@@ -29,11 +29,22 @@ pub(super) async fn send_stream_once(
 ) -> SingleAttempt {
     let cfg = svc.config();
     let session_key = request
-        .model
-        .model
-        .id
-        .split_once('#')
-        .map_or_else(|| request.model.model.id.clone(), |(a, _)| a.to_owned());
+        .options
+        .cache_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map_or_else(
+            || {
+                request
+                    .model
+                    .model
+                    .id
+                    .split_once('#')
+                    .map_or_else(|| request.model.model.id.clone(), |(a, _)| a.to_owned())
+            },
+            str::to_owned,
+        );
 
     let transformed = {
         let sig_arc = svc.signature_cache();
@@ -96,19 +107,35 @@ pub(super) async fn prime_decoder_stream(
         match byte_stream.next().await {
             Some(Ok(chunk)) => match decoder.push_bytes(&chunk) {
                 Ok(evts) => initial_events.extend(evts),
-                Err(failure) => return in_band_or(failure),
+                Err(failure) => {
+                    tracing::debug!(
+                        stage = "prime_decode",
+                        cause = decode_failure_kind(&failure),
+                        family = family.as_str(),
+                        "antigravity: stream decode failure classified"
+                    );
+                    return in_band_or(failure);
+                }
             },
             Some(Err(err)) => {
                 return SingleAttempt::RetryableFailure {
                     status: 502,
-                    body: format!("stream read error: {err}"),
+                    body: format!("stream read error: {}", format_reqwest_error(&err)),
                 };
             }
             None => {
                 eof = true;
                 match decoder.finish() {
                     Ok(evts) => initial_events.extend(evts),
-                    Err(failure) => return in_band_or(failure),
+                    Err(failure) => {
+                        tracing::debug!(
+                            stage = "prime_eof",
+                            cause = decode_failure_kind(&failure),
+                            family = family.as_str(),
+                            "antigravity: stream decode failure classified"
+                        );
+                        return in_band_or(failure);
+                    }
                 }
                 break;
             }
@@ -116,6 +143,17 @@ pub(super) async fn prime_decoder_stream(
     }
 
     SingleAttempt::Ready(build_llm_stream(initial_events, eof, byte_stream, decoder))
+}
+
+/// Stable log label for a decoder failure. Never includes the provider message.
+fn decode_failure_kind(failure: &StreamDecodeFailure) -> &'static str {
+    match failure {
+        StreamDecodeFailure::QuotaExhausted(_) => "quota_exhausted",
+        StreamDecodeFailure::RateLimited(_) => "rate_limited",
+        StreamDecodeFailure::ThinkingBlockOrder(_) => "thinking_block_order",
+        StreamDecodeFailure::EmptyStream => "empty_stream",
+        StreamDecodeFailure::Fatal(_) => "fatal",
+    }
 }
 
 /// In-band quota/rate-limit SSE frames arrive on an HTTP 200 stream, so they are reported as
@@ -156,6 +194,9 @@ struct TailState {
 /// message must explain the account-level cause instead of echoing raw provider prose.
 fn mid_stream_error_message(failure: StreamDecodeFailure) -> String {
     match failure {
+        // The exact phrase required by the `EmptyResponse` classifier needle in
+        // `oc_llm::error::MESSAGE_RULES`; a mid-stream empty tail must advance
+        // the model fallback chain just like an exhausted pre-stream retry loop.
         StreamDecodeFailure::EmptyStream => "upstream stream ended unexpectedly".to_owned(),
         StreamDecodeFailure::QuotaExhausted(m) => {
             format!("Antigravity account quota exhausted mid-stream (reason: quota_exhausted): {m}")
@@ -210,7 +251,10 @@ fn build_llm_stream(
                         st.finished = true;
                         return Some((
                             stream::iter(vec![LlmEvent::ProviderError {
-                                message: format!("stream transport error: {err}"),
+                                message: format!(
+                                    "stream transport error: {}",
+                                    format_reqwest_error(&err)
+                                ),
                             }]),
                             st,
                         ));
@@ -219,7 +263,6 @@ fn build_llm_stream(
                         st.finished = true;
                         let final_evts = match st.decoder.finish() {
                             Ok(evts) => evts,
-                            Err(StreamDecodeFailure::EmptyStream) => Vec::new(),
                             Err(err) => {
                                 vec![LlmEvent::ProviderError {
                                     message: mid_stream_error_message(err),

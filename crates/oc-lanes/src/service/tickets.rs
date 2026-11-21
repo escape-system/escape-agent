@@ -45,6 +45,52 @@ impl super::LaneService {
             .map(|entry| entry.ticket.clone())
     }
 
+    /// Returns a snapshot of active tickets (and optionally recent terminal ones),
+    /// ordered running -> queued (priority desc) -> recently finished.
+    pub async fn tickets(&self, lane: Option<&str>, include_terminal: bool) -> Vec<Ticket> {
+        const TERMINAL_CAP: usize = 50;
+        let state = self.inner.state.lock().await;
+        let mut active = Vec::new();
+        let mut terminal = Vec::new();
+        for entry in state.tickets.values() {
+            let ticket = &entry.ticket;
+            if let Some(target_lane) = lane
+                && ticket.lane != target_lane
+            {
+                continue;
+            }
+            if ticket.state.is_terminal() {
+                if include_terminal {
+                    terminal.push((entry.sequence, ticket.clone()));
+                }
+            } else {
+                active.push((entry.sequence, ticket.clone()));
+            }
+        }
+        active.sort_by(|(seq_a, a), (seq_b, b)| {
+            let rank = |s: &TicketState| match s {
+                TicketState::Running => 0u8,
+                TicketState::Queued => 1u8,
+                _ => 2u8,
+            };
+            rank(&a.state)
+                .cmp(&rank(&b.state))
+                .then_with(|| b.priority.cmp(&a.priority))
+                .then_with(|| seq_a.cmp(seq_b))
+        });
+        let mut out: Vec<Ticket> = active.into_iter().map(|(_, ticket)| ticket).collect();
+        if include_terminal {
+            terminal.sort_by(|(seq_a, a), (seq_b, b)| {
+                b.finished_ms
+                    .cmp(&a.finished_ms)
+                    .then_with(|| seq_b.cmp(seq_a))
+            });
+            terminal.truncate(TERMINAL_CAP);
+            out.extend(terminal.into_iter().map(|(_, ticket)| ticket));
+        }
+        out
+    }
+
     /// Removes one session's interest in a coalesced ticket.
     ///
     /// If `session` is the ticket's owner, the owner slot is cleared too. The

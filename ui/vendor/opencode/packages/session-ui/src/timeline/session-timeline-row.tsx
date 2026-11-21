@@ -625,13 +625,20 @@ export function createSessionTimelineRowRenderer(input: {
       const value = message()
 
       if (value?.type !== "model-switched") return undefined
+      const cleanVariant = (variant: string | undefined) => {
+        const trimmed = variant?.trim()
+        return trimmed && trimmed.toLowerCase() !== "default" ? trimmed : undefined
+      }
+      const nextVariant = cleanVariant(value.model.variant)
+      const prevVariant = cleanVariant(value.previous?.variant)
       const match = data.store.provider?.all?.get(value.model.providerID)
       const variantOnly = value.previous?.providerID === value.model.providerID && value.previous.id === value.model.id
-      const variant = value.model.variant ?? "default"
+      if (variantOnly && prevVariant === nextVariant) return undefined
+      const variant = nextVariant ?? "default"
 
       return {
         providerID: value.model.providerID,
-        variant: variantOnly ? undefined : value.model.variant,
+        variant: variantOnly ? undefined : nextVariant,
         label: variantOnly
           ? variant === "default"
             ? i18n.t("ui.sessionTimeline.notice.variantDefault")

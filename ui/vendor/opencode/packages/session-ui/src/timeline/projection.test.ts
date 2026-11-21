@@ -269,6 +269,43 @@ describe("createTimelineProjection", () => {
     expect(result.rowByKey.get("user-message:user-1")).toBe(result.rows[2])
   })
 
+  test("drops no-op default variant switches while keeping real switches to Default", () => {
+    const baseModel = { id: "selected", providerID: "provider" } satisfies ModelRef
+    const messages = [
+      { id: "user-1", type: "user", text: "first", time: { created: 1 } },
+      {
+        id: "noop-default-1",
+        type: "model-switched",
+        previous: baseModel,
+        model: { ...baseModel, variant: "default" },
+        time: { created: 2 },
+      },
+      {
+        id: "noop-default-2",
+        type: "model-switched",
+        previous: { ...baseModel, variant: "Default" },
+        model: baseModel,
+        time: { created: 3 },
+      },
+      {
+        id: "real-to-default",
+        type: "model-switched",
+        previous: { ...baseModel, variant: "xhigh" },
+        model: baseModel,
+        time: { created: 4 },
+      },
+    ] satisfies SessionMessageInfo[]
+
+    const result = createTimelineProjection({
+      sessionMessages: messages,
+      status: { type: "idle" },
+      reasoningMode: "full",
+    })
+
+    const noticeIDs = result.rows.flatMap((row) => (row._tag === "Notice" ? [row.messageID] : []))
+    expect(noticeIDs).toEqual(["real-to-default"])
+  })
+
   test("reuses a stable projected row array", () => {
     const messages = [
       { id: "user-1", type: "user", text: "first", time: { created: 1 } },

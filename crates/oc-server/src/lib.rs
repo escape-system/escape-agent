@@ -594,6 +594,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/agent/{id}", get(data::config::agent))
         .route("/api/model", get(data::model::models))
         .route("/api/model/default", get(data::model::default_model))
+        .route("/api/model/refresh", post(data::model::refresh_models))
         .route("/api/models/registry", get(data::models_registry::registry))
         .route("/api/config/models", put(data::models_registry::put_models))
         .route(

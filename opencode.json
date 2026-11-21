@@ -6,7 +6,9 @@
     "experiential": {
       "name": "Experiential Labs",
       "package": "@ai-sdk/openai-compatible",
-      "env": ["EXPLABS_API_KEY"],
+      "env": [
+        "EXPLABS_API_KEY"
+      ],
       "settings": {
         "baseURL": "https://api.experientiallabs.ai/v1"
       },
@@ -20,11 +22,20 @@
           },
           "capabilities": {
             "tools": true,
-            "input": ["text"],
-            "output": ["text"],
+            "input": [
+              "text"
+            ],
+            "output": [
+              "text"
+            ],
             "reasoning": {
               "supported": true,
-              "effort": ["low", "medium", "high", "max"]
+              "effort": [
+                "low",
+                "medium",
+                "high",
+                "max"
+              ]
             }
           },
           "limit": {
@@ -40,11 +51,21 @@
           },
           "capabilities": {
             "tools": true,
-            "input": ["text"],
-            "output": ["text"],
+            "input": [
+              "text"
+            ],
+            "output": [
+              "text"
+            ],
             "reasoning": {
               "supported": true,
-              "effort": ["low", "medium", "high", "xhigh", "max"]
+              "effort": [
+                "low",
+                "medium",
+                "high",
+                "xhigh",
+                "max"
+              ]
             }
           }
         }
@@ -55,7 +76,12 @@
     "default_model": "opencode-go/deepseek-v4.1-flash#max",
     "digest_model": "opencode-go/deepseek-v4.1-flash",
     "timeout_seconds": 3600,
-    "max_children_per_session": 64
+    "max_children_per_session": 64,
+    "agents": {
+      "steward": {
+        "role": "coordinator"
+      }
+    }
   },
   "observer": {
     "model": "opencode-go/deepseek-v4.1-flash",
@@ -80,18 +106,66 @@
       "description": "Build steward: single owner of the cargo lane. Runs the classified cargo queue for other agents, returns results, and never edits code.",
       "steps": 120,
       "permissions": [
-        { "action": "edit", "resource": "*", "effect": "deny" },
-        { "action": "subagent", "resource": "*", "effect": "deny" },
-        { "action": "shell", "resource": "*", "effect": "allow" },
-        { "action": "lane", "resource": "*", "effect": "allow" },
-        { "action": "read", "resource": "*", "effect": "allow" },
-        { "action": "grep", "resource": "*", "effect": "allow" },
-        { "action": "glob", "resource": "*", "effect": "allow" },
-        { "action": "box:read", "resource": "*", "effect": "allow" },
-        { "action": "box:write", "resource": "*", "effect": "allow" },
-        { "action": "talk", "resource": "*", "effect": "allow" },
-        { "action": "roster", "resource": "*", "effect": "allow" },
-        { "action": "digest", "resource": "*", "effect": "allow" }
+        {
+          "action": "edit",
+          "resource": "*",
+          "effect": "deny"
+        },
+        {
+          "action": "subagent",
+          "resource": "*",
+          "effect": "deny"
+        },
+        {
+          "action": "shell",
+          "resource": "*",
+          "effect": "allow"
+        },
+        {
+          "action": "lane",
+          "resource": "*",
+          "effect": "allow"
+        },
+        {
+          "action": "read",
+          "resource": "*",
+          "effect": "allow"
+        },
+        {
+          "action": "grep",
+          "resource": "*",
+          "effect": "allow"
+        },
+        {
+          "action": "glob",
+          "resource": "*",
+          "effect": "allow"
+        },
+        {
+          "action": "box:read",
+          "resource": "*",
+          "effect": "allow"
+        },
+        {
+          "action": "box:write",
+          "resource": "*",
+          "effect": "allow"
+        },
+        {
+          "action": "talk",
+          "resource": "*",
+          "effect": "allow"
+        },
+        {
+          "action": "roster",
+          "resource": "*",
+          "effect": "allow"
+        },
+        {
+          "action": "digest",
+          "resource": "*",
+          "effect": "allow"
+        }
       ]
     }
   }

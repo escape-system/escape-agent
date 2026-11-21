@@ -46,12 +46,37 @@ fn lane_config_from_value(value: Option<&serde_json::Value>) -> oc_lanes::LaneCo
 }
 
 /// Publishes lane lifecycle changes as ephemeral SSE events and persists ticket
-/// transitions to SQLite when a store is attached.
+/// transitions to SQLite strictly in event order when a store is attached.
 #[derive(Clone)]
 pub(crate) struct BusLaneEvents {
-    pub(crate) bus: tokio::sync::broadcast::Sender<Arc<EventEnvelope>>,
-    pub(crate) directory: String,
-    pub(crate) store: Option<Arc<oc_store::Store>>,
+    bus: tokio::sync::broadcast::Sender<Arc<EventEnvelope>>,
+    directory: String,
+    persist_tx: Option<tokio::sync::mpsc::UnboundedSender<serde_json::Value>>,
+}
+
+impl BusLaneEvents {
+    pub(crate) fn new(
+        bus: tokio::sync::broadcast::Sender<Arc<EventEnvelope>>,
+        directory: String,
+        store: Option<Arc<oc_store::Store>>,
+    ) -> Self {
+        let persist_tx = store.map(|store| {
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
+            tokio::spawn(async move {
+                while let Some(value) = rx.recv().await {
+                    if let Err(error) = store.save_lane_ticket(&value).await {
+                        tracing::warn!(%error, "lane ticket persistence failed");
+                    }
+                }
+            });
+            tx
+        });
+        Self {
+            bus,
+            directory,
+            persist_tx,
+        }
+    }
 }
 
 /// Boot-time [`oc_lanes::LaneTicketSource`] over the `lane_ticket` table.
@@ -91,14 +116,10 @@ impl oc_lanes::LaneTicketSource for StoreLaneTickets {
 
 impl oc_lanes::LaneEvents for BusLaneEvents {
     fn changed(&self, ticket: &oc_lanes::Ticket) {
-        if let Some(store) = self.store.clone()
+        if let Some(tx) = &self.persist_tx
             && let Ok(value) = serde_json::to_value(ticket)
         {
-            tokio::spawn(async move {
-                if let Err(error) = store.save_lane_ticket(&value).await {
-                    tracing::warn!(%error, "lane ticket persistence failed");
-                }
-            });
+            let _ = tx.send(value);
         }
         let mut data = serde_json::json!({
             "lane": &ticket.lane,
@@ -151,7 +172,8 @@ mod tests {
             "default": 3,
             "max_queue": 9,
         })));
-        assert_eq!(config.concurrency_for("cargo:workspace"), 1);
+        assert_eq!(config.concurrency_for("cargo:workspace"), 2);
+        assert_eq!(config.concurrency_for("node:workspace"), 1);
         assert_eq!(config.lanes.get("cargo"), Some(&2));
         assert_eq!(config.lanes.get("gpu"), Some(&1));
         assert_eq!(config.default_concurrency, 3);

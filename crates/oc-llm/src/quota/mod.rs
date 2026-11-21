@@ -30,6 +30,7 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(12);
 pub fn default_http_client() -> Client {
     Client::builder()
         .timeout(PROBE_TIMEOUT)
+        .user_agent(concat!("opencode/", env!("CARGO_PKG_VERSION")))
         .build()
         .unwrap_or_else(|_| Client::new())
 }

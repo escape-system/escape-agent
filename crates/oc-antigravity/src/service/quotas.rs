@@ -79,9 +79,7 @@ impl AntigravityService {
             && let Ok(mut cache) = self.inner.discovered_models.lock()
         {
             cache.updated_at = now;
-            for (k, v) in merged_discovered {
-                cache.models.insert(k, v);
-            }
+            cache.models = merged_discovered.into_iter().collect();
             if let Some(ref p) = self.inner.models_cache_path {
                 let _ = save_discovered_models(p, &cache);
             }

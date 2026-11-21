@@ -13,6 +13,22 @@ use serde_json::Value;
 use super::SingleAttempt;
 use super::stream::prime_decoder_stream;
 
+use std::error::Error as _;
+
+pub(super) fn format_reqwest_error(err: &reqwest::Error) -> String {
+    let mut out = err.to_string();
+    let mut source = err.source();
+    while let Some(cause) = source {
+        let msg = cause.to_string();
+        if !msg.is_empty() && !out.contains(&msg) {
+            out.push_str(": ");
+            out.push_str(&msg);
+        }
+        source = cause.source();
+    }
+    out
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn try_single_endpoint(
     svc: &AntigravityService,
@@ -31,6 +47,7 @@ pub(super) async fn try_single_endpoint(
         .bearer_auth(&creds.access_token)
         .header("Content-Type", "application/json")
         .header("Accept", "text/event-stream")
+        .header("Accept-Encoding", "identity")
         .json(envelope);
 
     for (k, v) in header_set.to_pairs() {
@@ -51,7 +68,7 @@ pub(super) async fn try_single_endpoint(
         Err(err) => {
             return SingleAttempt::RetryableFailure {
                 status: 503,
-                body: err.to_string(),
+                body: format_reqwest_error(&err),
             };
         }
     };
@@ -123,6 +140,12 @@ fn finalize_error_attempt(kind: ErrorKind, status: u16, body: String) -> SingleA
                     url: extract_validation_url(&body),
                     body,
                 }
+            } else if is_account_suspended_or_tos_body(&body) {
+                SingleAttempt::ValidationRequired {
+                    reason: "tos_or_account_disabled".to_owned(),
+                    url: extract_validation_url(&body),
+                    body,
+                }
             } else {
                 SingleAttempt::Fatal(LlmError::Provider {
                     message: format!("Cloud Code HTTP 403 Forbidden: {body}"),
@@ -165,6 +188,15 @@ fn is_validation_required_body(body: &str) -> bool {
     lower.contains("validation_required")
         || lower.contains("verify your account")
         || (lower.contains("validation") && lower.contains("accounts.google.com"))
+}
+
+fn is_account_suspended_or_tos_body(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    lower.contains("terms of service")
+        || lower.contains("tos violation")
+        || lower.contains("account has been disabled")
+        || lower.contains("account is suspended")
+        || lower.contains("account_disabled")
 }
 
 fn extract_validation_url(body: &str) -> Option<String> {

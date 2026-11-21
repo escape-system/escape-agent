@@ -53,26 +53,16 @@ impl AntigravityService {
         retry_after_ms: Option<i64>,
     ) -> i64 {
         if let Ok(mut mgr) = lock_accounts(&self.inner.accounts) {
-            let delay = mgr
-                .mark_rate_limited(
-                    index,
-                    family,
-                    style,
-                    model,
-                    reason,
-                    retry_after_ms,
-                    now_ms(),
-                )
-                .unwrap_or(60_000);
-            if matches!(reason, RateLimitReason::ModelCapacityExhausted) {
-                let _ = mgr.regenerate_fingerprint(
-                    index,
-                    "capacity_exhausted",
-                    now_ms(),
-                    &self.inner.version.current(),
-                );
-            }
-            delay
+            mgr.mark_rate_limited(
+                index,
+                family,
+                style,
+                model,
+                reason,
+                retry_after_ms,
+                now_ms(),
+            )
+            .unwrap_or(60_000)
         } else {
             60_000
         }

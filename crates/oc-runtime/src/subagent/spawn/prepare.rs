@@ -111,6 +111,7 @@ pub(super) async fn prepare_spawn_context(
         parent.child_count = active;
     }
     let available = available_agents(&runtime.inner.config.config);
+    let primary_only = crate::subagent::settings::primary_only_agents(&runtime.inner.config.config);
     let policy = Policy::new(limits.clone());
     let requested_depth = input
         .get("spawn")
@@ -118,7 +119,7 @@ pub(super) async fn prepare_spawn_context(
         .and_then(Value::as_u64)
         .map(|depth| u32::try_from(depth).unwrap_or(u32::MAX));
     let mut plan = policy
-        .spawn(&parent, agent, requested_depth, &available)
+        .spawn_with_primary(&parent, agent, requested_depth, &available, &primary_only)
         .map_err(|error| spawn_error(&error))?;
 
     if let Some(over) = settings.overrides.get(agent)

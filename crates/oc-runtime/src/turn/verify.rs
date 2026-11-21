@@ -140,16 +140,29 @@ fn matches_verification_cmd(cmd: &str, args: &[String]) -> bool {
     match cmd {
         "pytest" | "py.test" | "vitest" | "jest" | "ctest" => true,
         "cargo" => {
-            let sub = args
-                .first()
-                .filter(|a| a.starts_with('+'))
-                .map_or_else(|| args.first(), |_| args.get(1));
-            sub.is_some_and(|s| {
-                matches!(
-                    s.as_str(),
-                    "test" | "check" | "clippy" | "build" | "nextest"
-                )
-            })
+            let mut idx = 0usize;
+            if args.first().is_some_and(|a| a.starts_with('+')) {
+                idx += 1;
+            }
+            while let Some(arg) = args.get(idx) {
+                if !arg.starts_with('-') {
+                    break;
+                }
+                let needs_val = matches!(
+                    arg.as_str(),
+                    "--manifest-path" | "--target-dir" | "--config" | "--color" | "-p"
+                );
+                idx += if needs_val && !arg.contains('=') {
+                    2
+                } else {
+                    1
+                };
+            }
+            match args.get(idx).map(String::as_str) {
+                Some("test" | "check" | "clippy" | "build" | "nextest") => true,
+                Some("fmt") => args.iter().any(|arg| arg == "--check"),
+                _ => false,
+            }
         }
         "npm" => match args.first().map(String::as_str) {
             Some("test" | "t") => true,

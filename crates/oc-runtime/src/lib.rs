@@ -104,7 +104,7 @@ pub use goal_store::StoreGoalStore;
 pub use instructions::{
     InstructionDelta, InstructionSet, InstructionSource, SourceKind, hash_text, render,
 };
-pub use lane::{LaneTools, ProcessLaneRunner};
+pub use lane::{LaneTools, ProcessLaneRunner, cleanup_stale_lane_logs};
 pub use observer::{ObserverBinding, RepairChannel, RepairCommand};
 pub use prompt::{
     InstructionAssembly, InstructionContext, MAX_STEPS_PROMPT, assemble_instructions,

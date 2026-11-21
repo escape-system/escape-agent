@@ -27,12 +27,15 @@ pub fn routes() -> Router<AppState> {
         .route("/api/experimental/lane/{id}/cancel", post(cancel))
 }
 
-/// `GET /api/experimental/lane?lane=`
+/// `GET /api/experimental/lane?lane=&include_terminal=`
 #[derive(Debug, Default, Deserialize)]
 pub struct StatusParams {
     /// Restrict the snapshot to one lane.
     #[serde(default)]
     lane: Option<String>,
+    /// Include recent terminal tickets in `tickets` (default false).
+    #[serde(default)]
+    include_terminal: bool,
 }
 
 /// `POST /api/experimental/lane/:id/order`
@@ -52,9 +55,14 @@ pub async fn status(
         .lanes()
         .ok_or_else(|| ApiError::service_unavailable("lane service not attached"))?;
     let rows = lanes.status(params.lane.as_deref()).await;
+    let tickets = lanes
+        .tickets(params.lane.as_deref(), params.include_terminal)
+        .await;
     let value = serde_json::to_value(rows)
         .map_err(|_| ErrorResponse::from(ApiError::internal("Internal error")))?;
-    Ok(Json(json!({ "data": value })))
+    let ticket_values = serde_json::to_value(tickets)
+        .map_err(|_| ErrorResponse::from(ApiError::internal("Internal error")))?;
+    Ok(Json(json!({ "data": value, "tickets": ticket_values })))
 }
 
 /// `POST /api/experimental/lane/:id/order`

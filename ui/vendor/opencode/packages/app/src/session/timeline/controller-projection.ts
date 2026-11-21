@@ -35,6 +35,11 @@ function handoffNotices(
   const time = { created: handoff.message.time.created }
   const selection = handoff.selection
 
+  const effectiveVariant = (variant: string | undefined) => {
+    const trimmed = variant?.trim()
+    return trimmed && trimmed.toLowerCase() !== "default" ? trimmed : undefined
+  }
+
   return [
     ...(session?.agent && session.agent !== selection.agent
       ? [
@@ -50,7 +55,7 @@ function handoffNotices(
     ...(session?.model &&
     (session.model.providerID !== selection.model.providerID ||
       session.model.id !== selection.model.id ||
-      (session.model.variant ?? "default") !== (selection.model.variant ?? "default"))
+      effectiveVariant(session.model.variant) !== effectiveVariant(selection.model.variant))
       ? [
           {
             id: `${handoff.message.id}_model`,

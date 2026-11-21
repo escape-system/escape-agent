@@ -71,7 +71,12 @@ impl ModelRef {
     /// Render `provider/id` or `provider/id#variant`.
     #[must_use]
     pub fn to_reference(&self) -> String {
-        match &self.variant {
+        match self
+            .variant
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty() && !v.eq_ignore_ascii_case("default"))
+        {
             Some(variant) => format!("{}/{}#{variant}", self.provider_id, self.id),
             None => format!("{}/{}", self.provider_id, self.id),
         }

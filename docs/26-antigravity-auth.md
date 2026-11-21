@@ -140,9 +140,17 @@ asserted by `background_maintenance_is_a_noop_when_disabled`,
    cross-model signature sanitization, and thinking signature cache /
    `skip_thought_signature_validator` sentinel injection.
 4. **Envelope & SSE Decoding**: Wraps into `{ project, model, request, userAgent,
-   requestType, requestId }`, decodes `{ response: { candidates, usageMetadata }
-   }` SSE frames into `oc_llm::LlmEvent`, deduplicates cumulative thinking
-   deltas, and caches returned `thoughtSignature` values.
+   requestType, requestId }`, sends `Accept-Encoding: identity` with 30 s connect
+   and 300 s read timeouts plus HTTP/2 and TCP keep-alives, decodes
+   `{ response: { candidates, usageMetadata } }` SSE frames (including mixed
+   `\r\n`/`\n` frame boundaries, UTF-8 multi-byte chunk boundaries,
+   `promptFeedback.blockReason`, and nested `response.error` payloads) into
+   `oc_llm::LlmEvent` (`ToolInputStart`/`Delta`/`End`), deduplicates cumulative
+   thinking deltas, and caches returned `thoughtSignature` values (including on
+   `functionCall` parts). Live `/v1internal:fetchAvailableModels` discovery
+   updates `limit.context` and `limit.output` on built-in specs as well as adding
+   newly discovered models, and cold-start cached catalog loads re-apply the
+   Antigravity overlay.
 
 ## Credential Key Compatibility
 

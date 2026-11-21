@@ -82,6 +82,8 @@ pub enum RepairKind {
     SwitchModel,
     /// Re-deliver the last user prompt.
     Repost,
+    /// Ask the runtime to grant the target a bounded step-budget extension.
+    RequestBudgetExtension,
 }
 
 impl RepairKind {
@@ -95,6 +97,7 @@ impl RepairKind {
             Self::CompactContext => "compact_context",
             Self::SwitchModel => "switch_model",
             Self::Repost => "repost",
+            Self::RequestBudgetExtension => "request_budget_extension",
         }
     }
 }
@@ -310,6 +313,7 @@ fn parse_repair(value: &Value) -> Result<Repair, VerdictError> {
         "compact_context" => RepairKind::CompactContext,
         "switch_model" => RepairKind::SwitchModel,
         "repost" => RepairKind::Repost,
+        "request_budget_extension" => RepairKind::RequestBudgetExtension,
         other => return Err(VerdictError::UnknownRepairKind(other.to_owned())),
     };
     let args = object

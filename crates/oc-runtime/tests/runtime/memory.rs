@@ -450,7 +450,7 @@ async fn turn_end_touches_injected_memories_once() {
 }
 
 #[tokio::test]
-async fn scribe_persists_candidates_in_the_session_scope() {
+async fn scribe_persists_candidates_in_the_project_scope() {
     let harness = Harness::new(
         vec![
             named_tool_script(
@@ -475,10 +475,16 @@ async fn scribe_persists_candidates_in_the_session_scope() {
         .prompt("read hello.txt and remember the runtime detail")
         .await;
 
+    let session_row = harness
+        .store
+        .get_session(&harness.session)
+        .await
+        .expect("get session")
+        .expect("session row");
     let rows = wait_for_memories(&harness.store, "scribe").await;
     assert_eq!(rows.len(), 1, "got {rows:?}");
-    assert_eq!(rows[0]["scope"], "session");
-    assert_eq!(rows[0]["scopeID"], harness.session);
+    assert_eq!(rows[0]["scope"], "project");
+    assert_eq!(rows[0]["scopeID"], session_row["projectID"]);
     assert!(harness.sink.has("session.execution.succeeded"));
 }
 
@@ -739,13 +745,20 @@ async fn child_subagents_inherit_root_session_memories_and_goal_query_matches() 
         requests[1].system[1]
     );
 
+    let session_row = harness
+        .store
+        .get_session(&harness.session)
+        .await
+        .expect("get session")
+        .expect("session row");
     let rows = wait_for_memories(&harness.store, "scribe").await;
     assert_eq!(
         rows.len(),
         1,
         "only the root turn should persist scribe memories: {rows:?}"
     );
-    assert_eq!(rows[0]["scopeID"], harness.session);
+    assert_eq!(rows[0]["scope"], "project");
+    assert_eq!(rows[0]["scopeID"], session_row["projectID"]);
     assert_eq!(
         prompts.prompts.lock().expect("prompts").len(),
         1,

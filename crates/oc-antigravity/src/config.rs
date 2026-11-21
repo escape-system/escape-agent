@@ -194,8 +194,17 @@ pub struct AntigravityConfig {
     pub auto_update: bool,
     /// Retry attempts when Cloud Code returns an empty stream with no candidates.
     pub empty_response_max_attempts: u32,
-    /// Delay between empty-response retries (milliseconds).
+    /// Base delay for exponential backoff on empty-response retries (milliseconds).
+    /// The delay for attempt `n` (0-based) is
+    /// `min(base_ms * 2^n, empty_response_max_delay_ms)`.
     pub empty_response_retry_delay_ms: u64,
+    /// Cap on a single exponential backoff delay for empty-response retries (milliseconds).
+    pub empty_response_max_delay_ms: u64,
+    /// Disable injection of the synthetic `skip_thought_signature_validator` marker
+    /// into histories that would otherwise be repaired for thinking order. When
+    /// `true`, such histories are left untouched; recovery via thinking-stripping
+    /// still applies. Set this when an upstream model rejects the sentinel.
+    pub disable_synthetic_thought_signature: bool,
     /// Repair mismatched tool call/response IDs in cross-turn histories.
     pub tool_id_recovery: bool,
     /// Harden Claude tool schemas and descriptions to avoid hallucinated arguments.
@@ -235,6 +244,8 @@ impl Default for AntigravityConfig {
             auto_update: true,
             empty_response_max_attempts: 4,
             empty_response_retry_delay_ms: 2000,
+            empty_response_max_delay_ms: 20_000,
+            disable_synthetic_thought_signature: false,
             tool_id_recovery: true,
             claude_tool_hardening: true,
             oauth_server_bind_all: false,
@@ -261,6 +272,9 @@ impl AntigravityConfig {
             self.proactive_refresh_interval_seconds.clamp(30, 3600);
         self.empty_response_max_attempts = self.empty_response_max_attempts.clamp(1, 10);
         self.empty_response_retry_delay_ms = self.empty_response_retry_delay_ms.clamp(100, 60_000);
+        self.empty_response_max_delay_ms = self
+            .empty_response_max_delay_ms
+            .clamp(self.empty_response_retry_delay_ms, 300_000);
         self.health_score.max_score = self.health_score.max_score.clamp(10, 1000);
         self.health_score.min_usable = self
             .health_score
@@ -278,6 +292,17 @@ impl AntigravityConfig {
         if self.token_bucket.regeneration_rate_per_minute <= 0.0 {
             self.token_bucket.regeneration_rate_per_minute = 1.0;
         }
+    }
+
+    /// Delay before empty-response retry `attempt` (0-based), with exponential
+    /// growth capped at [`Self::empty_response_max_delay_ms`]. Saturating `u64`
+    /// math keeps large attempt counts from overflowing before the cap.
+    #[must_use]
+    pub fn empty_response_backoff_ms(&self, attempt: u32) -> u64 {
+        let factor = 1u64 << attempt.min(31);
+        self.empty_response_retry_delay_ms
+            .saturating_mul(factor)
+            .min(self.empty_response_max_delay_ms)
     }
 
     /// Merge JSONC contents on top of the current configuration.
@@ -355,6 +380,15 @@ impl AntigravityConfig {
         }
         if let Some(v) = env_bool("OPENCODE_ANTIGRAVITY_AUTO_UPDATE") {
             self.auto_update = v;
+        }
+        if let Some(v) = env_u64("OPENCODE_ANTIGRAVITY_EMPTY_RESPONSE_RETRY_DELAY_MS") {
+            self.empty_response_retry_delay_ms = v;
+        }
+        if let Some(v) = env_u64("OPENCODE_ANTIGRAVITY_EMPTY_RESPONSE_MAX_DELAY_MS") {
+            self.empty_response_max_delay_ms = v;
+        }
+        if let Some(v) = env_bool("OPENCODE_ANTIGRAVITY_DISABLE_SYNTHETIC_THOUGHT_SIGNATURE") {
+            self.disable_synthetic_thought_signature = v;
         }
         self.clamp();
     }
@@ -450,6 +484,10 @@ fn env_u8(key: &str) -> Option<u8> {
     std::env::var(key).ok()?.trim().parse::<u8>().ok()
 }
 
+fn env_u64(key: &str) -> Option<u64> {
+    std::env::var(key).ok()?.trim().parse::<u64>().ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -490,5 +528,56 @@ mod tests {
         assert_eq!(cfg.signature_cache.disk_ttl_seconds, 172_800);
         assert!(cfg.cli_first);
         assert!(!cfg.claude_tool_hardening);
+    }
+
+    #[test]
+    fn empty_response_backoff_is_exponential_and_capped() {
+        let cfg = AntigravityConfig {
+            empty_response_retry_delay_ms: 1000,
+            empty_response_max_delay_ms: 5000,
+            ..AntigravityConfig::default()
+        };
+        let sequence: Vec<u64> = (0..8).map(|n| cfg.empty_response_backoff_ms(n)).collect();
+        assert_eq!(
+            sequence,
+            vec![1000, 2000, 4000, 5000, 5000, 5000, 5000, 5000]
+        );
+        // A malformed attempt count must not overflow into a tiny/zero delay.
+        assert_eq!(cfg.empty_response_backoff_ms(u32::MAX), 5000);
+    }
+
+    #[test]
+    fn default_empty_response_settings_are_sane() {
+        let cfg = AntigravityConfig::default();
+        assert_eq!(cfg.empty_response_max_attempts, 4);
+        assert_eq!(cfg.empty_response_retry_delay_ms, 2000);
+        assert_eq!(cfg.empty_response_max_delay_ms, 20_000);
+        assert_eq!(cfg.empty_response_backoff_ms(0), 2000);
+        assert_eq!(cfg.empty_response_backoff_ms(1), 4000);
+        assert_eq!(cfg.empty_response_backoff_ms(2), 8000);
+        assert_eq!(cfg.empty_response_backoff_ms(3), 16_000);
+        assert_eq!(cfg.empty_response_backoff_ms(4), 20_000);
+        assert!(!cfg.disable_synthetic_thought_signature);
+    }
+
+    #[test]
+    fn empty_response_config_can_be_overridden_and_clamped() {
+        let dir = TempDir::new().expect("tempdir");
+        std::fs::write(
+            dir.path().join("antigravity.jsonc"),
+            r#"{
+                "empty_response_max_attempts": 99,
+                "empty_response_retry_delay_ms": 10000000,
+                "empty_response_max_delay_ms": 1000,
+                "disable_synthetic_thought_signature": true
+            }"#,
+        )
+        .expect("write config");
+        let cfg = load_config(None, Some(dir.path())).expect("load config");
+        assert_eq!(cfg.empty_response_max_attempts, 10);
+        assert_eq!(cfg.empty_response_retry_delay_ms, 60_000);
+        // The cap cannot be lower than the base after clamping.
+        assert_eq!(cfg.empty_response_max_delay_ms, 60_000);
+        assert!(cfg.disable_synthetic_thought_signature);
     }
 }

@@ -91,7 +91,8 @@ Input (hard cap `max_input_tokens`, default 600):
 {
   // `done` is 0 until the goal is accepted `done`, then it equals `total`.
   "goal": {"id":"gol_…","objective":"…","status":"active","criteria":["…"],"done":0,"total":3},
-  "root": {"id":"ses_…","agent":"engineer","model":"…","step":7,"state":"busy"},
+  "root": {"id":"ses_…","agent":"engineer","model":"…","step":7,"state":"busy",
+           "stepCap":50,"stepsRemaining":43},
   "active": [
     {"sid":"ses_…","agent":"general","tool":"subagent","why":"20 workers; pass/fail list",
      "age_s":95,"expect_s":90,"intervene_s":150,"state":"running"}
@@ -102,6 +103,11 @@ Input (hard cap `max_input_tokens`, default 600):
   "tree": [{"sid":"ses_…","parent":"ses_…","agent":"general","state":"busy","depth":2}]
 }
 ```
+
+`stepCap` and `stepsRemaining` in the `root` header are optional and omitted
+when unknown; the Rust fields are `step_cap` / `steps_remaining` with serde
+defaults. They let the observer see how close a session is to its step limit.
+Generated wire types win if prose here conflicts with them.
 
 No message text, no tool arguments, no file contents.
 
@@ -115,7 +121,7 @@ action → `none`):
   "reason": "≤ 20 words, why you intervened",
   "message": "nudge text (≤ 400 chars)",
   "repair": {
-    "kind": "retry_tool | cancel_tool | restart_subagent | compact_context | switch_model | repost",
+    "kind": "retry_tool | cancel_tool | restart_subagent | compact_context | switch_model | repost | request_budget_extension",
     "args": {}
   },
   "goal_evidence": ["tool_call_id", "message_id"]
@@ -135,6 +141,7 @@ action → `none`):
 | `repair.compact_context` | force compaction on target | once per target per 10 min |
 | `repair.switch_model` | switch target to `observer.escalation_model` | only if configured |
 | `repair.repost` | re-deliver last user prompt to a stalled session | only if no user input pending |
+| `repair.request_budget_extension` | ask the runtime to extend the target session's step budget (`RepairKind::RequestBudgetExtension`, serde `request_budget_extension`); reuses the existing repair audit/notification channel, and the deterministic budget policy still decides the grant | target must be a known/busy session; inherits the repair budget; no new `ObserverAction` or wire shape |
 | `goal_done` | mark goal done | requires evidence refs that exist |
 | `goal_blocked` / `goal_failed` | mark goal, stop the loop | one terminal verdict |
 
@@ -237,7 +244,12 @@ goal(id, root_id, objective, criteria, status, rounds, stalls,
 Tools:
 
 - `goal_set {objective, criteria[]}` — fails if an active goal exists.
-- `goal_update {progress?, blocked_reason?}` — agent-reported progress.
+- `goal_update {progress?, blocked_reason?}` — agent-reported progress. When the
+  step-budget early warning fires (`stepsRemaining <= 5`), this is also the
+  agent's path to ask the observer for more steps: report progress and the need
+  for an extension, and the observer may answer with
+  `repair.request_budget_extension`. The deterministic budget policy
+  (`docs/24`) still makes the final grant decision.
 - `goal_complete {evidence[]}` — asks the observer to judge; does not mark done
   directly.
 - `goal_status` — returns status, rounds, stalls, evidence.

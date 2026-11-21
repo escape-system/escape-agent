@@ -277,6 +277,11 @@ fn clean_property_entry(
                         other => Value::String(other.to_string()),
                     })
                     .collect();
+                // Protobuf/Gemini `enum` values are always strings; keep `type` consistent
+                // when upstream schema originally tagged an integer/number enum.
+                if !converted.is_empty() {
+                    out.insert("type".to_owned(), Value::String("string".to_owned()));
+                }
                 out.insert("enum".to_owned(), Value::Array(converted));
             }
         }

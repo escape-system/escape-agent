@@ -535,6 +535,124 @@ async fn lane_reports_unattached_service() {
     assert_eq!(body["message"], "lane service not attached");
 }
 
+#[derive(Debug, Default)]
+struct LaneTestClock(std::sync::atomic::AtomicI64);
+
+impl oc_lanes::Clock for LaneTestClock {
+    fn now_ms(&self) -> i64 {
+        self.0.fetch_add(10, std::sync::atomic::Ordering::SeqCst) + 1_000
+    }
+    fn mono_ms(&self) -> i64 {
+        self.now_ms()
+    }
+}
+
+#[derive(Debug, Default)]
+struct NoLaneEvents;
+
+impl oc_lanes::LaneEvents for NoLaneEvents {
+    fn changed(&self, _ticket: &oc_lanes::Ticket) {}
+}
+
+struct ImmediateLaneRunner;
+
+impl oc_lanes::LaneRunner for ImmediateLaneRunner {
+    fn run<'a>(
+        &'a self,
+        _ticket: &'a oc_lanes::Ticket,
+    ) -> oc_lanes::BoxFuture<'a, oc_lanes::RunnerResult> {
+        Box::pin(async { oc_lanes::RunnerResult::success() })
+    }
+}
+
+#[tokio::test]
+async fn lane_route_returns_lanes_and_tickets() {
+    use oc_lanes::{LaneConfig, LaneService, NewTicket};
+    use std::path::PathBuf;
+
+    let db = tempfile::tempdir().unwrap();
+    let store = Arc::new(Store::open(db.path().join("data.sqlite")).await.unwrap());
+    let lanes = Arc::new(LaneService::new(
+        LaneConfig::default().with_lane("cargo:test", 2),
+        Arc::new(ImmediateLaneRunner),
+        Arc::new(NoLaneEvents),
+        Arc::new(LaneTestClock::default()),
+    ));
+    let id = lanes
+        .enqueue(
+            "cargo:test".to_owned(),
+            NewTicket {
+                command: "cargo test -p oc-lanes".to_owned(),
+                cwd: PathBuf::from("."),
+                priority: 0,
+                owner_session: Some("ses_lane".to_owned()),
+                label: Some("unit".to_owned()),
+                tree_rev: None,
+            },
+        )
+        .await
+        .expect("enqueue");
+    let _ = lanes
+        .wait(&id, std::time::Duration::from_secs(2))
+        .await
+        .expect("wait");
+
+    let app = router(
+        AppState::new(
+            ServerInfo {
+                version: "0.0.0-test".to_owned(),
+                pid: 4242,
+                hostname: None,
+                urls: vec![],
+                paths: ServerPaths {
+                    tmp: std::env::temp_dir().to_string_lossy().into_owned(),
+                },
+                capabilities: None,
+            },
+            None,
+            db.path().to_path_buf(),
+        )
+        .with_store(store)
+        .with_lanes(lanes),
+    );
+
+    let (status, body) = call(&app, Method::GET, "/api/experimental/lane", None).await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    let body = body.unwrap();
+    let rows = body["data"].as_array().expect("data array");
+    assert!(
+        rows.iter()
+            .any(|row| row["lane"] == "cargo:test" && row["concurrency"] == 2),
+        "{rows:?}"
+    );
+    assert!(
+        body["tickets"]
+            .as_array()
+            .expect("tickets array")
+            .is_empty(),
+        "default excludes finished tickets: {body}"
+    );
+
+    let (status, body) = call(
+        &app,
+        Method::GET,
+        "/api/experimental/lane?include_terminal=true",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    let tickets = body.unwrap()["tickets"]
+        .as_array()
+        .expect("tickets array")
+        .clone();
+    assert!(
+        tickets
+            .iter()
+            .any(|ticket| ticket["id"] == id && ticket["lane"] == "cargo:test"),
+        "{tickets:?}"
+    );
+}
+
 #[tokio::test]
 async fn observer_check_requires_runtime_and_known_session() {
     let harness = harness().await;

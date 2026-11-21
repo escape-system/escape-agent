@@ -99,6 +99,10 @@ pub fn build_cloud_code_request(
         );
     }
 
+    if cfg.disable_synthetic_thought_signature {
+        remove_synthetic_thought_signatures(&mut contents);
+    }
+
     let mut req_obj = Map::new();
     req_obj.insert("contents".to_owned(), Value::Array(contents));
     insert_system_instruction(&mut req_obj, &resolved, request);
@@ -162,6 +166,39 @@ fn insert_system_instruction(
     }
 }
 
+/// Conservative ceiling for a single Cloud Code output request. Models such as
+/// Gemini 4 Hydrogen advertise a 262,144-token output limit; asking for that
+/// whole budget up front is rejected upstream / stalls the turn. Callers may
+/// request less (their value is honored); anything above is clamped to this cap
+/// and to the model's own output limit.
+pub const MAX_OUTPUT_TOKENS_CAP: u64 = 32_768;
+
+/// Resolve the effective `maxOutputTokens` sent upstream.
+fn effective_max_output_tokens(requested: Option<u64>, model_limit: u64) -> u64 {
+    let base = requested.unwrap_or(model_limit.max(8192));
+    if model_limit == 0 {
+        return base.min(MAX_OUTPUT_TOKENS_CAP);
+    }
+    base.min(model_limit).min(MAX_OUTPUT_TOKENS_CAP)
+}
+
+fn remove_synthetic_thought_signatures(contents: &mut [Value]) {
+    for msg in contents.iter_mut() {
+        let Some(parts) = msg.get_mut("parts").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for part in parts.iter_mut() {
+            let is_sentinel = part
+                .get("thoughtSignature")
+                .and_then(Value::as_str)
+                .is_some_and(|sig| sig == crate::constants::SKIP_THOUGHT_SIGNATURE);
+            if is_sentinel && let Some(obj) = part.as_object_mut() {
+                obj.remove("thoughtSignature");
+            }
+        }
+    }
+}
+
 fn insert_tools_and_gen_config(
     req_obj: &mut Map<String, Value>,
     request: &LlmRequest,
@@ -183,6 +220,27 @@ fn insert_tools_and_gen_config(
             "tools".to_owned(),
             json!([{ "functionDeclarations": decls }]),
         );
+        if let Some(choice) = request
+            .options
+            .tool_choice
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            let fcc = match choice.to_ascii_lowercase().as_str() {
+                "none" => json!({ "mode": "NONE" }),
+                "auto" => json!({ "mode": "AUTO" }),
+                "required" | "any" => json!({ "mode": "ANY" }),
+                _ => json!({
+                    "mode": "ANY",
+                    "allowedFunctionNames": [choice]
+                }),
+            };
+            req_obj.insert(
+                "toolConfig".to_owned(),
+                json!({ "functionCallingConfig": fcc }),
+            );
+        }
     }
 
     let mut gen_cfg = Map::new();
@@ -192,14 +250,13 @@ fn insert_tools_and_gen_config(
     if let Some(top_p) = request.options.top_p {
         gen_cfg.insert("topP".to_owned(), json!(top_p));
     }
-    if let Some(max_out) = request.options.max_output_tokens {
-        gen_cfg.insert("maxOutputTokens".to_owned(), json!(max_out));
-    } else {
-        gen_cfg.insert(
-            "maxOutputTokens".to_owned(),
-            json!(request.model.model.limit.output.max(8192)),
-        );
-    }
+    gen_cfg.insert(
+        "maxOutputTokens".to_owned(),
+        json!(effective_max_output_tokens(
+            request.options.max_output_tokens,
+            request.model.model.limit.output,
+        )),
+    );
     if !gen_cfg.is_empty() {
         req_obj.insert("generationConfig".to_owned(), Value::Object(gen_cfg));
     }
@@ -437,5 +494,61 @@ mod tests {
             out_opus.envelope["request"]["generationConfig"]["thinkingConfig"]["includeThoughts"],
             true
         );
+    }
+
+    #[test]
+    fn effective_max_output_tokens_is_capped_for_huge_output_models() {
+        // Gemini 4 Hydrogen advertises 262,144 output tokens: the default must
+        // not forward that enormous budget upstream.
+        assert_eq!(effective_max_output_tokens(None, 262_144), 32_768);
+        // Explicit smaller values are respected.
+        assert_eq!(effective_max_output_tokens(Some(4096), 262_144), 4096);
+        // Explicit huge values are clamped to both the model limit and the cap.
+        assert_eq!(effective_max_output_tokens(Some(262_144), 262_144), 32_768);
+        assert_eq!(effective_max_output_tokens(Some(100_000), 4096), 4096);
+        // A model with no advertised limit still gets the floor, capped.
+        assert_eq!(effective_max_output_tokens(None, 0), 8192);
+        assert_eq!(MAX_OUTPUT_TOKENS_CAP, 32_768);
+    }
+
+    #[test]
+    fn envelope_caps_hydrogen_output_and_keeps_explicit_smaller_value() {
+        let mut cat = Catalog::from_snapshot("{}").expect("empty");
+        overlay_catalog_models(&mut cat, None);
+        let cfg = AntigravityConfig::default();
+        let h2 = cat
+            .resolve("google/antigravity-gemini-4-hydrogen#high")
+            .expect("resolve h2");
+
+        let mut req = LlmRequest::new(h2.clone());
+        req.messages = vec![LlmMessage::user("hi")];
+        let out = build_cloud_code_request(&req, "proj", "ses", &cfg, None, None, false, 1);
+        assert_eq!(
+            out.envelope["request"]["generationConfig"]["maxOutputTokens"],
+            32_768
+        );
+
+        req.options.max_output_tokens = Some(2048);
+        let out = build_cloud_code_request(&req, "proj", "ses", &cfg, None, None, false, 1);
+        assert_eq!(
+            out.envelope["request"]["generationConfig"]["maxOutputTokens"],
+            2048
+        );
+    }
+
+    #[test]
+    fn disabling_synthetic_thought_signatures_removes_only_the_sentinel() {
+        let real_sig = "a-real-signature-value-12345678";
+        let mut contents = vec![json!({
+            "role": "model",
+            "parts": [
+                { "text": "thinking", "thought": true, "thoughtSignature": crate::constants::SKIP_THOUGHT_SIGNATURE },
+                { "text": "answer", "thoughtSignature": real_sig }
+            ]
+        })];
+        remove_synthetic_thought_signatures(&mut contents);
+        let parts = contents[0]["parts"].as_array().expect("parts");
+        assert_eq!(parts[0].get("thoughtSignature"), None);
+        assert_eq!(parts[1]["thoughtSignature"], real_sig);
     }
 }

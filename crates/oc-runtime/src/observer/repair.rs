@@ -74,6 +74,19 @@ impl RepairExecutor for ChannelExecutor {
         verdict: &'a oc_observer::ObserverVerdict,
     ) -> BoxFuture<'a, Result<RepairOutcome, ObserverError>> {
         Box::pin(async move {
+            // A budget request is a signal to the runtime tick handler, not a
+            // `RepairCommand`: adding a command variant would break the
+            // exhaustive match in `repair_worker.rs`. `tick.rs` intercepts the
+            // verdict and publishes the extension guidance when it sees this
+            // applied outcome with the `budget_request` detail.
+            if verdict.repair.as_ref().and_then(|repair| repair.kind)
+                == Some(RepairKind::RequestBudgetExtension)
+            {
+                return Ok(RepairOutcome {
+                    applied: true,
+                    detail: Some("budget_request".to_owned()),
+                });
+            }
             let command = command_from_verdict(verdict)?;
             self.sender
                 .send(command)
@@ -143,6 +156,12 @@ fn command_from_verdict(
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_owned(),
+        }),
+        // Handled by `ChannelExecutor::apply` before a command is built;
+        // `repair_worker.rs` has no command variant for a budget signal.
+        RepairKind::RequestBudgetExtension => Ok(RepairCommand::Repost {
+            session_id: target,
+            text: String::new(),
         }),
     }
 }

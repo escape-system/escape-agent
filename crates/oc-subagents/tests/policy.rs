@@ -130,6 +130,31 @@ fn spawn_rejects_unknown_and_primary_only_agents() {
     ));
     assert!(policy.spawn(&root(), "explore", None, &agents()).is_ok());
     assert!(policy.spawn(&root(), "general", None, &agents()).is_ok());
+
+    let dynamic_available = vec!["general".to_owned(), "review".to_owned()];
+    let dynamic_primary = vec!["engineer".to_owned(), "custom_primary".to_owned()];
+    assert!(
+        policy
+            .spawn_with_primary(
+                &root(),
+                "review",
+                None,
+                &dynamic_available,
+                &dynamic_primary
+            )
+            .is_ok(),
+        "a built-in reconfigured to subagent mode is spawnable"
+    );
+    assert!(matches!(
+        policy.spawn_with_primary(
+            &root(),
+            "custom_primary",
+            None,
+            &dynamic_available,
+            &dynamic_primary
+        ),
+        Err(SpawnError::PrimaryOnlyAgent { .. })
+    ));
 }
 
 #[test]

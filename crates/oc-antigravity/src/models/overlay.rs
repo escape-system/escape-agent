@@ -13,8 +13,28 @@ use super::discovery::{DiscoveredModelCache, insert_discovered_models};
 pub fn merged_antigravity_models(
     cache: Option<&DiscoveredModelCache>,
 ) -> BTreeMap<String, ModelInfo> {
+    let live_only = cache.is_some_and(|c| c.updated_at > 0 && c.models.len() >= 4);
     let mut map = Map::new();
     for spec in BUILTIN_SPECS {
+        if live_only {
+            let matches_discovered = cache.is_some_and(|c| {
+                c.models.keys().any(|raw_id| {
+                    if is_skipped_discovered_id(raw_id) {
+                        return false;
+                    }
+                    let cat_id = catalog_id_for_raw(raw_id);
+                    if cat_id == spec.id || raw_id == spec.id {
+                        return true;
+                    }
+                    split_tier_suffix(raw_id).is_some_and(|(base, _)| {
+                        catalog_id_for_raw(base) == spec.id || base == spec.id
+                    })
+                })
+            });
+            if !matches_discovered {
+                continue;
+            }
+        }
         map.insert(spec.id.to_owned(), spec_to_snapshot_entry(spec));
     }
 
@@ -74,6 +94,7 @@ pub fn resolve_antigravity_catalog_model(
     if let Some(provider) = base_catalog.provider(ANTIGRAVITY_PROVIDER_ID) {
         overlay.upsert_provider(provider.clone());
     }
+    overlay_catalog_models(&mut overlay, None);
     overlay_catalog_models(&mut overlay, discovered);
 
     if let Ok(resolved) = overlay.resolve(reference) {
@@ -123,6 +144,9 @@ pub(super) fn is_skipped_discovered_id(raw_id: &str) -> bool {
         || raw_id.starts_with("chat_")
         || raw_id.starts_with("tab_")
         || raw_id.ends_with("-tiered")
+        || raw_id.contains("-tiered-")
+        || raw_id.ends_with("-sonar")
+        || raw_id.ends_with("-image")
 }
 
 pub(super) fn split_tier_suffix(raw_id: &str) -> Option<(&str, &str)> {

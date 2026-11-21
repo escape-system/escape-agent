@@ -21,6 +21,20 @@ use super::types::{
     tokens_from_usage,
 };
 
+/// Normalize a variant the way the UI does: absent, empty and `"default"` all
+/// select the same model; real variants remain distinct.
+fn normalized_variant(variant: Option<&str>) -> Option<&str> {
+    variant.filter(|value| !value.is_empty() && !value.eq_ignore_ascii_case("default"))
+}
+
+/// Whether a fallback candidate changes the effective (provider, id, variant).
+fn is_model_switch(previous: &ModelRef, next: &ModelRef) -> bool {
+    previous.provider_id != next.provider_id
+        || previous.id != next.id
+        || normalized_variant(previous.variant.as_deref())
+            != normalized_variant(next.variant.as_deref())
+}
+
 /// Turn a raw provider message into a typed failure when the text names a known
 /// class.
 ///
@@ -40,6 +54,54 @@ pub(super) fn classified_provider_error(message: &str) -> oc_llm::LlmError {
             kind,
             message: message.to_owned(),
         }
+    }
+}
+
+/// Normalize any [`oc_llm::LlmError`] (pre-stream or in-band) into a typed
+/// [`oc_llm::LlmError::Failure`] when its failure class is known so key rotation
+/// and model fallback handle transport, timeout, and transient HTTP errors
+/// consistently instead of aborting the turn.
+fn classify_llm_error(error: oc_llm::LlmError) -> oc_llm::LlmError {
+    match error {
+        oc_llm::LlmError::Provider { message } => classified_provider_error(&message),
+        oc_llm::LlmError::Transport { message } => oc_llm::LlmError::Failure {
+            kind: oc_llm::FailureKind::Transport,
+            message,
+        },
+        oc_llm::LlmError::Timeout { phase } => oc_llm::LlmError::Failure {
+            kind: oc_llm::FailureKind::Transport,
+            message: format!("request timed out while {phase}"),
+        },
+        oc_llm::LlmError::Http {
+            status,
+            message,
+            retry_after_ms,
+        } => {
+            let msg_kind = oc_llm::classify_provider_message(&message);
+            let mapped = if msg_kind == oc_llm::FailureKind::Unknown {
+                match status {
+                    401 | 403 => Some(oc_llm::FailureKind::Auth),
+                    429 => Some(oc_llm::FailureKind::RateLimit),
+                    408 | 425 | 500..=599 => Some(oc_llm::FailureKind::Transport),
+                    _ => None,
+                }
+            } else {
+                Some(msg_kind)
+            };
+            if let Some(kind) = mapped {
+                oc_llm::LlmError::Failure {
+                    kind,
+                    message: format!("HTTP {status}: {message}"),
+                }
+            } else {
+                oc_llm::LlmError::Http {
+                    status,
+                    message,
+                    retry_after_ms,
+                }
+            }
+        }
+        other => other,
     }
 }
 
@@ -147,7 +209,7 @@ impl Runtime {
     pub(super) async fn stream_step(
         &self,
         session: &str,
-        turn: &ResolvedTurn,
+        turn: &mut ResolvedTurn,
         messages: &[LlmMessage],
         final_call: bool,
         cancel: &Arc<CancelToken>,
@@ -221,22 +283,33 @@ impl Runtime {
                         provider_id: resolved.model.provider_id.clone(),
                         variant: resolved.variant.as_ref().map(|variant| variant.id.clone()),
                     };
-                    // One switch implementation: catalog guard + `patch_session`
-                    // + `session.model.selected` (`observer/repair_worker.rs`).
-                    self.observer_switch_model(session, &next).await?;
+                    // A bare chain entry with no variant resolves to the same
+                    // effective model as the failed attempt; retry it, but do
+                    // not write a redundant session patch or emit switch events.
+                    // Genuine provider/id/variant changes still do both.
+                    if is_model_switch(&model_ref, &next_ref) {
+                        // One switch implementation: catalog guard + `patch_session`
+                        // + `session.model.selected` (`observer/repair_worker.rs`).
+                        self.observer_switch_model(session, &next).await?;
+                        self.emit(
+                            session,
+                            &turn.directory,
+                            SessionModelFallback {
+                                session_id: Runtime::session_id(session),
+                                from: model_ref.clone(),
+                                to: next_ref.clone(),
+                                kind: kind.as_str().to_owned(),
+                                attempt: Some(hops.saturating_add(1)),
+                            },
+                        )
+                        .await?;
+                    }
                     hops = hops.saturating_add(1);
-                    self.emit(
-                        session,
-                        &turn.directory,
-                        SessionModelFallback {
-                            session_id: Runtime::session_id(session),
-                            from: model_ref.clone(),
-                            to: next_ref.clone(),
-                            kind: kind.as_str().to_owned(),
-                            attempt: Some(hops),
-                        },
-                    )
-                    .await?;
+                    turn.model = resolved.clone();
+                    turn.model_ref = next_ref.clone();
+                    if resolved.model.limit.context > 0 {
+                        turn.context_window = resolved.model.limit.context;
+                    }
                     model = resolved;
                     model_ref = next_ref;
                     reuse = reusable.then(|| state.clone());
@@ -290,7 +363,17 @@ impl Runtime {
     ) -> Result<StepAttempt, RuntimeError> {
         let provider = model.provider.id.clone();
         let now_ms = oc_types::now_millis();
-        let pool = self.credential_pool(&provider, now_ms).await;
+        let hook_owns_pool = self
+            .inner
+            .config
+            .client
+            .hook()
+            .is_some_and(|hook| hook.handles(&LlmRequest::new(model.clone())));
+        let pool = if hook_owns_pool {
+            Vec::new()
+        } else {
+            self.credential_pool(&provider, now_ms).await
+        };
         // An empty pool means "no stored credential and no environment key": the
         // client resolves the provider's environment on its own, so the request
         // is attempted exactly once with `api_key: None` — today's behavior.
@@ -499,13 +582,9 @@ impl Runtime {
         let mut stream = match stream_result {
             Ok(stream) => stream,
             Err(error) => {
-                // A pre-stream provider message carries the same classes as an
-                // in-band `ProviderError`; normalizing it keeps one
-                // classification path for both (`Unknown` stays `Provider`).
-                let error = match error {
-                    oc_llm::LlmError::Provider { message } => classified_provider_error(&message),
-                    other => other,
-                };
+                // Classify all pre-stream provider/transport/timeout/HTTP errors
+                // uniformly so fallback/rotation recovers reliably.
+                let error = classify_llm_error(error);
                 // Copy the class out before moving `error`: `FailureKind` is
                 // `Copy`, so the borrow ends with the `if let` arm.
                 if let oc_llm::LlmError::Failure { kind, .. } = &error {
@@ -690,8 +769,35 @@ impl Runtime {
                     }
                     self.close_reasoning(session, turn, &mut state).await?;
                     self.mark_streamed(session, turn, &mut state).await?;
+                    let created_tool = state.tool_index(&call_id).is_none();
                     let index = state.ensure_tool(&call_id, &name);
                     let (clean, expectation, invalid) = strip_expectation(&name, input);
+                    if created_tool {
+                        let input_text =
+                            serde_json::to_string(&clean).unwrap_or_else(|_| "{}".to_owned());
+                        self.emit(
+                            session,
+                            &turn.directory,
+                            SessionToolInputStarted {
+                                session_id: Runtime::session_id(session),
+                                assistant_message_id: id.clone(),
+                                id: call_id.clone(),
+                                name: name.clone(),
+                            },
+                        )
+                        .await?;
+                        self.emit(
+                            session,
+                            &turn.directory,
+                            SessionToolInputEnded {
+                                session_id: Runtime::session_id(session),
+                                assistant_message_id: id.clone(),
+                                id: call_id.clone(),
+                                text: input_text,
+                            },
+                        )
+                        .await?;
+                    }
                     if let Some(AssistantPart::Tool(tool)) = state.content.get_mut(index) {
                         tool.name.clone_from(&name);
                         tool.state = ToolState::Running {
@@ -765,19 +871,18 @@ impl Runtime {
         self.close_reasoning(session, turn, &mut state).await?;
         self.close_text(session, turn, &mut state).await?;
         if let Some(message) = provider_error {
-            // A classifiable in-band provider error advances the model chain
-            // instead of killing the step: another candidate may serve the
-            // request. The partial output already streamed, so the assistant row
-            // is NOT reusable — it stays durable as a failed attempt
-            // (`stream_step` records it and switches models).
+            // A classifiable in-band provider/transport error advances the model
+            // chain instead of killing the step. If zero output was streamed
+            // yet, the assistant row stays reusable (`reusable == true`).
             let error = classified_provider_error(&message);
             if let oc_llm::LlmError::Failure { kind, .. } = &error {
                 let kind = *kind;
+                let reusable = state.streamed.is_none();
                 return Ok(StepAttempt::Retry(StreamFailure {
                     error,
                     state,
                     kind,
-                    reusable: false,
+                    reusable,
                 }));
             }
             let error = StructuredError::new("ProviderError", message.clone());
@@ -793,13 +898,24 @@ impl Runtime {
             return Err(RuntimeError::Cancelled);
         }
         if state.finish.is_none() {
-            let message = "stream closed before finish event".to_string();
-            let error = StructuredError::new("ProviderError", message.clone());
+            let message = "stream closed before finish event";
+            let error = classified_provider_error(message);
+            if let oc_llm::LlmError::Failure { kind, .. } = &error {
+                let kind = *kind;
+                let reusable = state.streamed.is_none();
+                return Ok(StepAttempt::Retry(StreamFailure {
+                    error,
+                    state,
+                    kind,
+                    reusable,
+                }));
+            }
+            let structured = StructuredError::new("ProviderError", message.to_owned());
             let tokens = state.tokens.clone().unwrap_or_default();
             let cost = state.cost.unwrap_or(0.0);
-            self.fail_step(session, turn, state, error, Some(tokens), cost)
+            self.fail_step(session, turn, state, structured, Some(tokens), cost)
                 .await?;
-            return Err(RuntimeError::Llm(classified_provider_error(&message)));
+            return Err(RuntimeError::Llm(error));
         }
         self.persist_assistant(session, &state).await?;
         Ok(StepAttempt::Done(StepRun {

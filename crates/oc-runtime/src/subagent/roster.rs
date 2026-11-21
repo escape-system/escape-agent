@@ -36,7 +36,7 @@ impl Tool for RosterTool {
                     "type": "integer",
                     "minimum": 0,
                     "maximum": MAX_ROSTER_WAIT_SECONDS,
-                    "description": "Optional seconds to wait until at least one running child settles or a peer/subagent message arrives in this session's inbox before returning."
+                    "description": "Optional seconds to wait until at least one running child settles or a peer/subagent message arrives in this session's inbox (steer or queue delivery) before returning."
                 }
             },
             "additionalProperties": false
@@ -163,14 +163,20 @@ async fn wait_for_roster_event(
             .list_inbox(caller)
             .await
             .map_err(|error| store_error(&error))?;
-        let has_steer = inbox.iter().any(|item| {
-            item.get("delivery").and_then(Value::as_str) == Some("steer")
-                && matches!(
-                    item.get("type").and_then(Value::as_str),
-                    Some("user" | "synthetic" | "peer" | "observer")
-                )
+        // Any real inbox message is an event worth returning for: a queued
+        // row is durable input even though it does not wake an idle target on
+        // its own (issue #3). Waiting on steer only could strand a parent for
+        // the whole `wait_seconds` window while a child's queue row sat there.
+        let has_message = inbox.iter().any(|item| {
+            matches!(
+                item.get("delivery").and_then(Value::as_str),
+                Some("steer" | "queue") | None
+            ) && matches!(
+                item.get("type").and_then(Value::as_str),
+                Some("user" | "synthetic" | "peer" | "observer")
+            )
         });
-        if has_steer {
+        if has_message {
             return Ok(());
         }
         let current_children = store

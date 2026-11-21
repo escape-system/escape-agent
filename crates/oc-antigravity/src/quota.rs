@@ -1,6 +1,7 @@
 //! Cloud Code Assist quota & tier inspection (`/v1internal:fetchAvailableModels` &
 //! `/v1internal:retrieveUserQuota`), plus model discovery metadata parsing.
 
+use crate::accounts::canonical_quota_model_id;
 use crate::constants::{AntigravityEndpoints, HeaderStyle, headers_for_style};
 use crate::error::Result;
 use crate::storage::{CachedAccountQuota, QuotaGroupSnapshot};
@@ -52,6 +53,31 @@ pub struct AccountQuotaFetch {
 struct FetchAvailableModelsResponse {
     #[serde(default)]
     models: BTreeMap<String, UpstreamModelEntry>,
+    #[serde(default)]
+    agent_model_sorts: Vec<UpstreamAgentModelSort>,
+    #[serde(default)]
+    grouped_models: BTreeMap<String, UpstreamGroupedModel>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpstreamAgentModelSort {
+    #[serde(default)]
+    groups: Vec<UpstreamAgentModelGroup>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpstreamAgentModelGroup {
+    #[serde(default)]
+    model_ids: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpstreamGroupedModel {
+    #[serde(default)]
+    display_name: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -65,6 +91,8 @@ struct UpstreamModelEntry {
     max_output_tokens: Option<u64>,
     #[serde(default)]
     supports_thinking: Option<bool>,
+    #[serde(default)]
+    disabled: Option<bool>,
     #[serde(default)]
     quota_info: Option<UpstreamQuotaInfo>,
 }
@@ -257,7 +285,41 @@ async fn fetch_hub_quota(
     match hub_req.send().await {
         Ok(resp) if resp.status().is_success() => {
             if let Ok(parsed) = resp.json::<FetchAvailableModelsResponse>().await {
-                for (id, entry) in parsed.models {
+                let mut ordered_agent_ids: Vec<String> = Vec::new();
+                for sort in &parsed.agent_model_sorts {
+                    for grp in &sort.groups {
+                        for mid in &grp.model_ids {
+                            if !ordered_agent_ids.contains(mid) {
+                                ordered_agent_ids.push(mid.clone());
+                            }
+                        }
+                    }
+                }
+                let has_agent_sorts = !ordered_agent_ids.is_empty();
+                let mut candidate_ids: Vec<String> = if has_agent_sorts {
+                    ordered_agent_ids
+                } else {
+                    parsed.models.keys().cloned().collect()
+                };
+                // Also include any tiered member of `groupedModels` whose group or sibling is present.
+                if has_agent_sorts {
+                    for k in parsed.models.keys() {
+                        let base = canonical_quota_model_id(k);
+                        if parsed.grouped_models.contains_key(&base) && !candidate_ids.contains(k) {
+                            candidate_ids.push(k.clone());
+                        }
+                    }
+                }
+
+                for id in candidate_ids {
+                    let Some(entry) = parsed.models.get(&id) else {
+                        continue;
+                    };
+                    if entry.disabled.unwrap_or(false)
+                        || is_skipped_quota_model(&id, entry.display_name.as_deref())
+                    {
+                        continue;
+                    }
                     let rem = entry
                         .quota_info
                         .as_ref()
@@ -275,9 +337,17 @@ async fn fetch_hub_quota(
                         merge_group_snapshot(groups, group, r, reset_ms);
                     }
 
+                    let base_id = canonical_quota_model_id(&id);
+                    let display_name = entry.display_name.clone().or_else(|| {
+                        parsed
+                            .grouped_models
+                            .get(&base_id)
+                            .and_then(|g| g.display_name.clone())
+                    });
+
                     discovered_models.push(DiscoveredModelInfo {
                         id,
-                        display_name: entry.display_name,
+                        display_name,
                         max_tokens: entry.max_tokens,
                         max_output_tokens: entry.max_output_tokens,
                         supports_thinking: entry.supports_thinking.unwrap_or(false),
@@ -285,6 +355,7 @@ async fn fetch_hub_quota(
                         reset_time_ms: reset_ms,
                     });
                 }
+                populate_hub_quota_groups(groups, discovered_models);
             }
         }
         Ok(resp) => warnings.push(format!(
@@ -384,7 +455,165 @@ fn merge_group_snapshot(
             remaining_fraction: Some(remaining_fraction),
             used_percent: Some(used),
             reset_time_ms,
+            label: None,
+            models: Vec::new(),
         });
+}
+
+const DISPLAY_TIER_SUFFIXES: &[&str] = &[
+    " (Minimal)",
+    " (Low)",
+    " (Medium)",
+    " (High)",
+    " (XHigh)",
+    " (Extra High)",
+    " (Extra-High)",
+    " (Extra)",
+    " (Thinking)",
+];
+
+fn is_skipped_quota_model(raw_id: &str, display_name: Option<&str>) -> bool {
+    raw_id.ends_with("-disabled")
+        || raw_id.starts_with("chat_")
+        || raw_id.starts_with("tab_")
+        || raw_id.ends_with("-tiered")
+        || raw_id.contains("-tiered-")
+        || raw_id.ends_with("-sonar")
+        || raw_id.ends_with("-image")
+        || (display_name.is_none() && raw_id.contains("image"))
+}
+
+fn clean_quota_model_label(base_id: &str, display_name: Option<&str>) -> String {
+    if let Some(raw) = display_name.map(str::trim).filter(|s| !s.is_empty()) {
+        let mut cleaned = raw;
+        for suffix in DISPLAY_TIER_SUFFIXES {
+            if let Some(stripped) = cleaned.strip_suffix(suffix) {
+                cleaned = stripped.trim();
+            }
+        }
+        if !cleaned.is_empty() {
+            return cleaned.to_owned();
+        }
+    }
+    base_id.to_owned()
+}
+
+fn summarize_bucket_labels(labels: &[String]) -> String {
+    match labels.len() {
+        0 => "Antigravity Pool".to_owned(),
+        1 => labels[0].clone(),
+        2 => format!("{} / {}", labels[0], labels[1]),
+        3 => format!("{} / {} / {}", labels[0], labels[1], labels[2]),
+        n => format!("{} / {} (+{})", labels[0], labels[1], n - 2),
+    }
+}
+
+/// Derive dynamic quota pools directly from the live `/v1internal:fetchAvailableModels`
+/// entries without relying on a hardcoded 3-pool list.
+///
+/// Tier variants of the same base model collapse to `canonical_quota_model_id`, and base
+/// models that share the same `(coarse_family, remaining_bp, reset_time_ms)` (when
+/// `reset_time_ms` is present) coalesce into one dynamic `pool:<id>` entry carrying its
+/// human-readable `label` and `models` list. Models with distinct quota limits or reset
+/// times (such as `Gemini 4 Argon` vs `Gemini 4 Hydrogen`) automatically form separate
+/// quota pools.
+pub fn populate_hub_quota_groups(
+    groups: &mut BTreeMap<String, QuotaGroupSnapshot>,
+    models: &[DiscoveredModelInfo],
+) {
+    struct BaseModelQuota {
+        id: String,
+        label: String,
+        remaining: f64,
+        reset_time_ms: Option<i64>,
+    }
+
+    let mut base_models: BTreeMap<String, BaseModelQuota> = BTreeMap::new();
+    for info in models {
+        if is_skipped_quota_model(&info.id, info.display_name.as_deref()) {
+            continue;
+        }
+        let Some(rem) = info.remaining_fraction.map(|v| v.clamp(0.0, 1.0)) else {
+            continue;
+        };
+        let base_id = canonical_quota_model_id(&info.id);
+        if base_id.is_empty() {
+            continue;
+        }
+        let label = clean_quota_model_label(&base_id, info.display_name.as_deref());
+        base_models
+            .entry(base_id.clone())
+            .and_modify(|existing| {
+                if rem < existing.remaining {
+                    existing.remaining = rem;
+                }
+                if existing.reset_time_ms.is_none() {
+                    existing.reset_time_ms = info.reset_time_ms;
+                }
+            })
+            .or_insert(BaseModelQuota {
+                id: base_id,
+                label,
+                remaining: rem,
+                reset_time_ms: info.reset_time_ms,
+            });
+    }
+
+    // Group base models that share the same family + live quota state + reset timestamp.
+    // When `reset_time_ms` is absent, keep each base model in its own bucket so unrelated
+    // models are never merged by guesswork.
+    let mut buckets: BTreeMap<(String, i64, Option<i64>, String), Vec<BaseModelQuota>> =
+        BTreeMap::new();
+    for (_, bm) in base_models {
+        let family = if bm.id.contains("claude") || bm.id.contains("gpt-oss") {
+            "claude".to_owned()
+        } else if bm.id.contains("gemini") {
+            "gemini".to_owned()
+        } else {
+            bm.id.clone()
+        };
+        #[allow(clippy::cast_possible_truncation)]
+        let rem_bp = (bm.remaining * 1000.0).round() as i64;
+        let disambiguator = if bm.reset_time_ms.is_some() {
+            String::new()
+        } else {
+            bm.id.clone()
+        };
+        buckets
+            .entry((family, rem_bp, bm.reset_time_ms, disambiguator))
+            .or_default()
+            .push(bm);
+    }
+
+    for ((_, _, reset_time_ms, _), entries) in buckets {
+        let Some(first) = entries.first() else {
+            continue;
+        };
+        let min_rem = entries
+            .iter()
+            .map(|e| e.remaining)
+            .fold(first.remaining, f64::min);
+        let used = ((1.0 - min_rem) * 100.0).clamp(0.0, 100.0);
+        let model_ids: Vec<String> = entries.iter().map(|e| e.id.clone()).collect();
+        let mut unique_labels: Vec<String> = Vec::new();
+        for e in &entries {
+            if !unique_labels.contains(&e.label) {
+                unique_labels.push(e.label.clone());
+            }
+        }
+        let label = summarize_bucket_labels(&unique_labels);
+        let key = format!("pool:{}", first.id);
+        groups.insert(
+            key,
+            QuotaGroupSnapshot {
+                remaining_fraction: Some(min_rem),
+                used_percent: Some(used),
+                reset_time_ms,
+                label: Some(label),
+                models: model_ids,
+            },
+        );
+    }
 }
 
 #[cfg(test)]
@@ -564,5 +793,78 @@ mod tests {
         );
         // A bucket without `modelId` contributes only to the aggregate group.
         assert!(!groups.contains_key("gemini-cli:"));
+    }
+
+    #[test]
+    fn dynamic_hub_quota_groups_separate_argon_hydrogen_and_claude_pools() {
+        let mut groups = BTreeMap::new();
+        let models = vec![
+            DiscoveredModelInfo {
+                id: "gemini-4-argon-low".into(),
+                display_name: Some("Gemini 4 Argon (Low)".into()),
+                max_tokens: Some(1_048_576),
+                max_output_tokens: Some(65_535),
+                supports_thinking: true,
+                remaining_fraction: Some(0.81),
+                reset_time_ms: Some(1_795_891_100_000),
+            },
+            DiscoveredModelInfo {
+                id: "gemini-4-argon-high".into(),
+                display_name: Some("Gemini 4 Argon (High)".into()),
+                max_tokens: Some(1_048_576),
+                max_output_tokens: Some(65_535),
+                supports_thinking: true,
+                remaining_fraction: Some(0.81),
+                reset_time_ms: Some(1_795_891_100_000),
+            },
+            DiscoveredModelInfo {
+                id: "gemini-4-hydrogen-high".into(),
+                display_name: Some("Gemini 4 Hydrogen (High)".into()),
+                max_tokens: Some(1_048_576),
+                max_output_tokens: Some(65_535),
+                supports_thinking: true,
+                remaining_fraction: Some(0.01),
+                reset_time_ms: Some(1_795_297_700_000),
+            },
+            DiscoveredModelInfo {
+                id: "gemini-4-neon-xhigh".into(),
+                display_name: Some("Gemini 4 Neon (Extra High)".into()),
+                max_tokens: Some(1_048_576),
+                max_output_tokens: Some(65_535),
+                supports_thinking: true,
+                remaining_fraction: Some(0.01),
+                reset_time_ms: Some(1_795_297_700_000),
+            },
+            DiscoveredModelInfo {
+                id: "claude-opus-5-5-high".into(),
+                display_name: Some("Claude Opus 5.5 (High)".into()),
+                max_tokens: Some(200_000),
+                max_output_tokens: Some(64_000),
+                supports_thinking: true,
+                remaining_fraction: Some(0.50),
+                reset_time_ms: Some(1_795_891_100_000),
+            },
+        ];
+
+        populate_hub_quota_groups(&mut groups, &models);
+
+        let argon = groups.get("pool:gemini-4-argon").expect("argon pool");
+        assert_eq!(argon.label.as_deref(), Some("Gemini 4 Argon"));
+        assert!((argon.remaining_fraction.unwrap_or_default() - 0.81).abs() < 1e-6);
+        assert_eq!(argon.models, vec!["gemini-4-argon"]);
+
+        let hydrogen = groups
+            .get("pool:gemini-4-hydrogen")
+            .expect("hydrogen+neon pool");
+        assert_eq!(
+            hydrogen.label.as_deref(),
+            Some("Gemini 4 Hydrogen / Gemini 4 Neon")
+        );
+        assert!((hydrogen.remaining_fraction.unwrap_or_default() - 0.01).abs() < 1e-6);
+        assert_eq!(hydrogen.models, vec!["gemini-4-hydrogen", "gemini-4-neon"]);
+
+        let claude = groups.get("pool:claude-opus-5-5").expect("claude 5.5 pool");
+        assert_eq!(claude.label.as_deref(), Some("Claude Opus 5.5"));
+        assert!((claude.remaining_fraction.unwrap_or_default() - 0.50).abs() < 1e-6);
     }
 }

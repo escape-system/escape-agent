@@ -87,7 +87,12 @@ impl AntigravityService {
             .unwrap_or_default();
 
         let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(120))
+            .connect_timeout(Duration::from_secs(30))
+            .read_timeout(Duration::from_secs(300))
+            .tcp_keepalive(Duration::from_secs(30))
+            .http2_keep_alive_interval(Some(Duration::from_secs(30)))
+            .http2_keep_alive_timeout(Duration::from_secs(15))
+            .http2_keep_alive_while_idle(true)
             .build()?;
 
         let svc = Self {

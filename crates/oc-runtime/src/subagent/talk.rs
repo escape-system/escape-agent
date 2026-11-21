@@ -12,7 +12,7 @@ use super::protocol::SubagentPeerMessage;
 use super::settings::settings_for_session;
 use super::tree::{
     budget_error, load_info, load_node, load_tree, message_error, optional_bool, optional_str,
-    required_str, runtime_error, store_error,
+    required_str, runtime_error,
 };
 
 #[derive(Debug, Clone)]
@@ -113,10 +113,7 @@ impl Tool for TalkTool {
 
         let message_id = MessageId::new().into_inner();
         runtime
-            .inner
-            .config
-            .store
-            .enqueue(NewInbox {
+            .enqueue_and_emit(NewInbox {
                 id: message_id.clone(),
                 session_id: to.clone(),
                 kind: "peer".to_owned(),
@@ -138,7 +135,7 @@ impl Tool for TalkTool {
                 delivery: Delivery::Steer,
             })
             .await
-            .map_err(|error| store_error(&error))?;
+            .map_err(|error| runtime_error(&error))?;
         // The inbox row is durable; publish the ephemeral UI event before the
         // target is woken so a client sees the message before output starts.
         runtime
@@ -157,7 +154,7 @@ impl Tool for TalkTool {
             )
             .await
             .map_err(|error| runtime_error(&error))?;
-        if settings.siblings_wake {
+        if settings.siblings_wake || to_node.parent_id.as_deref() == Some(&caller) {
             runtime
                 .notify(&to)
                 .await

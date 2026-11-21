@@ -90,8 +90,22 @@ memory block (ours) → goal block (ours) → per-session entries
 
 - Every source is keyed and hashed. A change emits a delta, never a rewrite of
   history: `session.instructions.updated {delta: {key: hash|"removed"}, text?}`.
-- `agent.system` **replaces** the default prompt; instructions are always
-  appended. A subagent with no system gets the same default as its parent.
+  Clearing all boxes or clearing the active goal emits a one-shot empty marker
+  (`<boxes status="empty"/>` / `<goal status="cleared"/>`) and unpins deleted
+  entries from the epoch snapshot.
+- `agent.system` **replaces** the default base prompt, and both `agent.system`
+  and `default_system_prompt` append dynamic capability routing (`box_*`,
+  `memory_*`, `lane`, `code_map`, `compact_context`, `subagent`, `skill_write`)
+  filtered strictly to the tools actually present in the turn's `tool_names`.
+  Instructions are always appended. A subagent with no system gets the same
+  default as its parent.
+- When `compact_context` is in `tool_names` and the context pressure estimate
+  reaches ≥ 65% of the trigger threshold, the turn loop appends a
+  `<system-reminder>` nudging the agent to compact at a natural phase boundary.
+  During compaction, if the compaction request overflows the provider context
+  window, `shorten_messages_for_compaction_to_limit` caps oversized messages and
+  drops middle turns to fit 70% of the window while preserving `keepID`,
+  `box_index`, and the caller's `note`/`reason`.
 - Skills are advertised as `<available_skills>` filtered by permission,
   `description` present, `autoinvoke !== false`, sorted by id.
 - Memory, box index and goal blocks are instruction sources (`oc/memory`,

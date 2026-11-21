@@ -38,6 +38,11 @@ impl RateLimitReason {
 #[must_use]
 pub fn parse_rate_limit_reason(status: u16, body: &str) -> RateLimitReason {
     if status >= 500 {
+        tracing::debug!(
+            status,
+            reason = "server_error",
+            "antigravity: rate-limit reason classified"
+        );
         return RateLimitReason::ServerError;
     }
     let upper = body.to_ascii_uppercase();
@@ -69,6 +74,11 @@ pub fn parse_rate_limit_reason(status: u16, body: &str) -> RateLimitReason {
     {
         return RateLimitReason::RateLimitExceeded;
     }
+    tracing::debug!(
+        status,
+        reason = ?RateLimitReason::Unknown,
+        "antigravity: rate-limit reason classified"
+    );
     RateLimitReason::Unknown
 }
 

@@ -31,6 +31,7 @@ pub(crate) fn spawn_decision(
     requested_agent: &str,
     requested_depth: Option<u32>,
     available_agents: &[String],
+    primary_only_agents: Option<&[String]>,
 ) -> Result<ChildPlan, SpawnError> {
     if !limits.enabled {
         return Err(SpawnError::Disabled);
@@ -65,16 +66,20 @@ pub(crate) fn spawn_decision(
         });
     }
 
-    if !available_agents
+    let is_available = available_agents
         .iter()
-        .any(|agent| agent.as_str() == requested_agent)
-    {
-        return Err(SpawnError::UnknownAgent {
+        .any(|agent| agent.as_str() == requested_agent);
+    let is_primary_only = match primary_only_agents {
+        Some(list) => list.iter().any(|agent| agent.as_str() == requested_agent),
+        None => PRIMARY_ONLY_AGENTS.contains(&requested_agent),
+    };
+    if is_primary_only && (primary_only_agents.is_none() || !is_available) {
+        return Err(SpawnError::PrimaryOnlyAgent {
             agent: requested_agent.to_owned(),
         });
     }
-    if PRIMARY_ONLY_AGENTS.contains(&requested_agent) {
-        return Err(SpawnError::PrimaryOnlyAgent {
+    if !is_available {
+        return Err(SpawnError::UnknownAgent {
             agent: requested_agent.to_owned(),
         });
     }

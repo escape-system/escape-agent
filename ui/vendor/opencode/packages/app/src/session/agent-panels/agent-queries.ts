@@ -1,3 +1,4 @@
+import { onCleanup } from "solid-js"
 import { useQuery } from "@tanstack/solid-query"
 import { serverMessage, useAgenticRequest } from "@/settings/agentic/config"
 import { useServerSDK } from "@/runtime/server/client"
@@ -46,7 +47,7 @@ export function useSubagentTreeQuery(sessionID: () => string | undefined) {
   const sdk = useServerSDK()
   const request = useAgenticRequest()
 
-  return useQuery(() => ({
+  const query = useQuery(() => ({
     queryKey: [sdk.scope, "agent-panels", "tree", sessionID()],
     queryFn: async ({ signal }): Promise<Fetched<SubagentTree>> => {
       const id = sessionID()
@@ -59,10 +60,31 @@ export function useSubagentTreeQuery(sessionID: () => string | undefined) {
       return tree ? { available: true, value: tree } : { available: false, reason: "malformed tree" }
     },
     enabled: !!sessionID() && sdk.connection.status() === "connected",
-    refetchOnMount: false,
-    staleTime: 30_000,
+    // A spawned child emits `session.created` and lifecycle transitions; we both
+    // refetch immediately on those SSE events below and keep a 2 s poll as a floor.
+    refetchInterval: 2_000,
+    refetchOnMount: true,
+    staleTime: 1_000,
     retry: false,
   }))
+
+  const stop = sdk.event.listen((event) => {
+    const raw = event as unknown as { type?: string }
+    if (!sessionID() || !raw.type) return
+    if (
+      raw.type === "session.created" ||
+      raw.type === "session.deleted" ||
+      raw.type === "session.updated" ||
+      raw.type === "session.renamed" ||
+      raw.type === "session.status" ||
+      raw.type.startsWith("session.execution.")
+    ) {
+      void query.refetch()
+    }
+  })
+  onCleanup(stop)
+
+  return query
 }
 
 export function useObserverRepairsQuery(sessionID: () => string | undefined) {

@@ -152,7 +152,10 @@ fn system_prompt(nudge_max_chars: usize) -> String {
          - target is required except when action is \"none\"\n\
          - reason is required (at most 20 words)\n\
          - message is only for \"nudge\" (must be <= {nudge_max_chars} chars; omit for other actions)\n\
-         - repair is only for \"repair\" (omit for other actions)\n\
+         - repair is only for \"repair\" (omit for other actions). Allowed kinds: \
+           `retry_tool`, `cancel_tool`, `restart_subagent`, `compact_context`, \
+           `switch_model`, `repost`, `request_budget_extension` (optional `args: {{\"steps\": 15}}` \
+           when a busy session near its stepCap is making real progress instead of thrashing)\n\
          - goal_evidence is only for \"goal_done\" (omit for other actions)\n\
          - A session whose latest settled execution was interrupted with reason \"user\" is stopped by the user. \
          Treat it as terminal: do not choose nudge, repost, or restart_subagent for that session or any of its descendants. \
@@ -162,7 +165,7 @@ fn system_prompt(nudge_max_chars: usize) -> String {
          \"target\":\"session or tool-call id\",\
          \"reason\":\"why, at most 20 words\",\
          \"message\":\"nudge text, at most {nudge_max_chars} chars\",\
-         \"repair\":{{\"kind\":\"retry_tool|cancel_tool|restart_subagent|compact_context|switch_model|repost\",\"args\":{{}}}},\
+         \"repair\":{{\"kind\":\"retry_tool|cancel_tool|restart_subagent|compact_context|switch_model|repost|request_budget_extension\",\"args\":{{}}}},\
          \"goal_evidence\":[\"tool_call_id or message_id\"]}}"
     )
 }

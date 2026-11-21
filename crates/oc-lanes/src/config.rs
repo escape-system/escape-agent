@@ -54,11 +54,20 @@ impl LaneConfig {
     }
 
     /// Resolves the concurrency for a lane.
+    ///
+    /// Precedence: exact lane key -> `<prefix>` override (e.g. `cargo` for
+    /// `cargo:/workspace`) -> built-in default -> `default_concurrency`.
     pub fn concurrency_for(&self, lane: &str) -> usize {
         self.lanes
             .get(lane)
             .copied()
             .filter(|&value| value > 0)
+            .or_else(|| {
+                lane.split_once(':')
+                    .and_then(|(prefix, _)| self.lanes.get(prefix))
+                    .copied()
+                    .filter(|&value| value > 0)
+            })
             .or_else(|| builtin_concurrency(lane))
             .unwrap_or(self.default_concurrency)
             .max(1)
@@ -72,5 +81,22 @@ fn builtin_concurrency(lane: &str) -> Option<usize> {
         Some(1)
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn concurrency_resolution_honors_exact_then_prefix_then_builtin() {
+        let cfg = LaneConfig::default()
+            .with_lane("cargo", 2)
+            .with_lane("cargo:/special", 3);
+        assert_eq!(cfg.concurrency_for("cargo:/special"), 3);
+        assert_eq!(cfg.concurrency_for("cargo:/other"), 2);
+        assert_eq!(cfg.concurrency_for("node:/other"), 1);
+        assert_eq!(cfg.concurrency_for("network"), 4);
+        assert_eq!(cfg.concurrency_for("unknown"), DEFAULT_CONCURRENCY);
     }
 }

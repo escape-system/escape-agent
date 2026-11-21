@@ -18,6 +18,18 @@ use crate::data::location;
 use crate::data::{no_content, require_config, require_store, schema_error, session_not_found};
 use crate::error::ErrorResponse;
 
+/// Normalize a variant: absent, empty and `"default"` select the same model.
+fn normalized_variant(variant: Option<&str>) -> Option<&str> {
+    variant.filter(|value| !value.is_empty() && !value.eq_ignore_ascii_case("default"))
+}
+
+fn same_effective_model(previous: &ModelRef, next: &ModelRef) -> bool {
+    previous.provider_id == next.provider_id
+        && previous.id == next.id
+        && normalized_variant(previous.variant.as_deref())
+            == normalized_variant(next.variant.as_deref())
+}
+
 /// `POST /api/session/:sid/agent`
 pub async fn select_agent(
     Path(session_id): Path<String>,
@@ -82,12 +94,16 @@ pub async fn select_model(
     State(state): State<AppState>,
     body: Result<Json<ModelBody>, JsonRejection>,
 ) -> Result<Response, ErrorResponse> {
-    let Json(body) = body.map_err(|error| ErrorResponse::from(schema_error(error)))?;
+    let Json(mut body) = body.map_err(|error| ErrorResponse::from(schema_error(error)))?;
     if body.model.id.is_empty() || body.model.provider_id.is_empty() {
         return Err(
             ApiError::new(400, "BadRequestError", "model requires id and providerID").into(),
         );
     }
+    body.model.variant = normalized_variant(body.model.variant.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && !value.eq_ignore_ascii_case("default"))
+        .map(str::to_owned);
     if let Some(catalog) = state.catalog()
         && catalog
             .model(&body.model.provider_id, &body.model.id)
@@ -138,6 +154,16 @@ pub async fn select_model(
         )
         .await?;
 
+    // The explicit client choice is always persisted, but repeating the same
+    // effective selection (variant absent/empty/"default") must not spam the
+    // session timeline with `session.model.selected` notices.
+    if previous
+        .as_ref()
+        .is_some_and(|prev| same_effective_model(prev, &body.model))
+    {
+        tracing::debug!(session = %session_id, "model selection unchanged; skipping session.model.selected event");
+        return Ok(no_content());
+    }
     let payload = SessionModelSelected {
         session_id: SessionId::from_wire(session_id.as_str()),
         model: body.model,

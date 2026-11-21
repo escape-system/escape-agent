@@ -1,3 +1,4 @@
+use std::fmt::Write;
 use std::sync::Arc;
 
 use futures_util::StreamExt;
@@ -30,7 +31,21 @@ impl Runtime {
         item: &Value,
         cancel: &Arc<CancelToken>,
     ) -> Result<(), RuntimeError> {
-        let outcome = self.compact_from_inbox(session, cancel).await;
+        let note = item
+            .pointer("/payload/note")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+        let reason = item
+            .pointer("/payload/reason")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("manual");
+        let outcome = self
+            .compact_from_inbox(session, reason, note.as_deref(), cancel)
+            .await;
         if let Some(inbox_id) = item.get("id").and_then(Value::as_str) {
             // Consume the row before reporting success. If the delete fails the
             // row would still be the next deliverable and the actor would run
@@ -63,6 +78,8 @@ impl Runtime {
     async fn compact_from_inbox(
         &self,
         session: &str,
+        reason: &str,
+        note: Option<&str>,
         cancel: &Arc<CancelToken>,
     ) -> Result<(), RuntimeError> {
         let info_value = self
@@ -74,7 +91,7 @@ impl Runtime {
             .ok_or_else(|| RuntimeError::SessionNotFound(session.to_owned()))?;
         let info = Runtime::parse_session(&info_value)?;
         let directory = info.location.directory.clone();
-        let mut turn = self.resolve_turn(&info, &directory)?;
+        let mut turn = self.resolve_turn(&info, &directory).await?;
         if let Some(handle) = self
             .inner
             .actors
@@ -98,7 +115,19 @@ impl Runtime {
             );
         }
         let context = self.load_context(session).await?;
-        self.compact(session, &turn, &context, cancel, "manual")
+        self.compact_with_note(session, &turn, &context, cancel, reason, note)
+            .await
+    }
+
+    pub(super) async fn compact(
+        &self,
+        session: &str,
+        turn: &ResolvedTurn,
+        context: &[LlmMessage],
+        cancel: &Arc<CancelToken>,
+        reason: &str,
+    ) -> Result<(), RuntimeError> {
+        self.compact_with_note(session, turn, context, cancel, reason, None)
             .await
     }
 
@@ -113,13 +142,14 @@ impl Runtime {
     /// must read the configured model from the session row and use the
     /// compaction's `model` only to describe the summary's author.
     #[allow(clippy::too_many_lines)]
-    pub(super) async fn compact(
+    async fn compact_with_note(
         &self,
         session: &str,
         turn: &ResolvedTurn,
         context: &[LlmMessage],
         cancel: &Arc<CancelToken>,
         reason: &str,
+        note: Option<&str>,
     ) -> Result<(), RuntimeError> {
         let created = oc_types::now_millis();
         let id = MessageId::new();
@@ -174,7 +204,7 @@ impl Runtime {
             .session_node(session)
             .await?
             .map_or_else(|| session.to_owned(), |node| node.root_id);
-        let box_index = match self.box_index_rows(&root_id).await {
+        let box_index = match self.box_index_rows_for(&root_id, session).await {
             Ok(rows) => crate::context_box::render_box_index(
                 &root_id,
                 &rows,
@@ -189,16 +219,13 @@ impl Runtime {
                 String::new()
             }
         };
-        let summary_instruction = if box_index.is_empty() {
-            crate::compaction::summary_prompt(None)
-        } else {
-            format!(
-                "{}\n\nDurable context boxes of this session tree. Reference their keys instead \
-                 of restating stable content; temporary boxes expire now. Load details with \
-                 `box_read` when needed:\n{box_index}",
-                crate::compaction::summary_prompt(None)
-            )
-        };
+        let summary_instruction = compaction_summary_instruction_with_note(
+            keep_id.as_deref(),
+            reason,
+            keep_tokens,
+            &box_index,
+            note,
+        );
         let mut messages = context.to_vec();
         messages.push(LlmMessage::user(summary_instruction.clone()));
         // Compaction resolves its model through the chain like every other role:
@@ -265,6 +292,22 @@ impl Runtime {
                     return Err(RuntimeError::Cancelled);
                 }
                 CompactionOutcome::Empty => {
+                    let can_fallback = attempted < COMPACTION_MAX_ATTEMPTS
+                        && policy.fallback().allows(oc_llm::FailureKind::EmptyResponse);
+                    if can_fallback {
+                        self.model_health().mark(
+                            &model_ref.to_reference(),
+                            oc_llm::FailureKind::EmptyResponse,
+                            oc_types::now_millis(),
+                            None,
+                        );
+                        tracing::warn!(
+                            session = %session,
+                            model = %model_ref.to_reference(),
+                            "compaction returned empty summary; trying fallback candidate"
+                        );
+                        continue;
+                    }
                     self.fail_compaction(
                         session,
                         &turn.directory,
@@ -461,7 +504,7 @@ impl Runtime {
             session,
             turn,
             model,
-            context,
+            context: _,
             messages,
             system,
             cancel,
@@ -494,56 +537,89 @@ impl Runtime {
         match stream_result {
             Ok(stream) => Ok((stream, credential)),
             Err(error) if is_context_overflow_message(&error.to_string()) => {
-                let mut shortened = shorten_messages_for_compaction(context);
-                shortened.push(LlmMessage::user(crate::compaction::summary_prompt(None)));
-                let retry = LlmRequest {
-                    model: model.clone(),
-                    system: system.to_vec(),
-                    messages: shortened,
-                    tools: turn.tools.clone(),
-                    options: LlmOptions {
-                        api_key,
-                        tool_choice: Some("none".to_owned()),
-                        cache_key: Some(session.to_owned()),
-                        ..LlmOptions::default()
-                    },
-                };
-                let retry_result = tokio::select! {
-                    biased;
-                    () = cancel.cancelled() => None,
-                    result = self.inner.model.stream(retry) => Some(result),
-                };
-                match retry_result {
-                    Some(Ok(stream)) => Ok((stream, credential)),
-                    Some(Err(error)) => Err(Box::new(CompactionOutcome::Failed(
-                        compaction_failure(error, credential, RecordPolicy::ModelAndKey),
-                    ))),
-                    None => Err(Box::new(CompactionOutcome::Cancelled)),
-                }
+                self.retry_compaction_overflow(attempt, api_key, credential)
+                    .await
             }
-            Err(error) => {
-                // An untyped provider error on the stream-open path is
-                // classified like an in-band `ProviderError`, so the caller
-                // sees a typed `Failure` instead of a bare `Provider`. The raw
-                // provider text stays inside the error.
-                let classified = match &error {
-                    oc_llm::LlmError::Provider { message } => {
-                        super::stream::classified_provider_error(message)
-                    }
-                    oc_llm::LlmError::Failure { kind, message } => oc_llm::LlmError::Failure {
-                        kind: *kind,
-                        message: message.clone(),
-                    },
-                    other => oc_llm::LlmError::Provider {
-                        message: other.to_string(),
-                    },
-                };
-                Err(Box::new(CompactionOutcome::Failed(compaction_failure(
-                    classified,
-                    credential,
-                    RecordPolicy::ModelAndKey,
-                ))))
+            Err(error) => Err(Box::new(CompactionOutcome::Failed(compaction_failure(
+                Self::classify_compaction_open_error(&error),
+                credential,
+                RecordPolicy::ModelAndKey,
+            )))),
+        }
+    }
+
+    async fn retry_compaction_overflow(
+        &self,
+        attempt: &CompactionAttempt<'_>,
+        api_key: Option<String>,
+        credential: Option<oc_llm::PoolKey>,
+    ) -> Result<(oc_llm::LlmStream, Option<oc_llm::PoolKey>), Box<CompactionOutcome>> {
+        let CompactionAttempt {
+            session,
+            turn,
+            model,
+            context,
+            messages,
+            system,
+            cancel,
+        } = *attempt;
+        let instr = messages.last().cloned().unwrap_or_else(|| {
+            LlmMessage::user(compaction_summary_instruction(None, "overflow", 0, ""))
+        });
+        let instr_tokens = oc_llm::estimate_messages_tokens(std::slice::from_ref(&instr));
+        let sys_tokens: u64 = system
+            .iter()
+            .map(|s| u64::try_from(s.len() / 4).unwrap_or(0))
+            .sum();
+        let max_input_tokens = if model.model.limit.context > 0 {
+            (model.model.limit.context * 7 / 10)
+                .saturating_sub(instr_tokens.saturating_add(sys_tokens))
+                .max(2_048)
+        } else {
+            0
+        };
+        let mut shortened = shorten_messages_for_compaction_to_limit(context, max_input_tokens);
+        shortened.push(instr);
+        let retry = LlmRequest {
+            model: model.clone(),
+            system: system.to_vec(),
+            messages: shortened,
+            tools: turn.tools.clone(),
+            options: LlmOptions {
+                api_key,
+                tool_choice: Some("none".to_owned()),
+                cache_key: Some(session.to_owned()),
+                ..LlmOptions::default()
+            },
+        };
+        let retry_result = tokio::select! {
+            biased;
+            () = cancel.cancelled() => None,
+            result = self.inner.model.stream(retry) => Some(result),
+        };
+        match retry_result {
+            Some(Ok(stream)) => Ok((stream, credential)),
+            Some(Err(error)) => Err(Box::new(CompactionOutcome::Failed(compaction_failure(
+                Self::classify_compaction_open_error(&error),
+                credential,
+                RecordPolicy::ModelAndKey,
+            )))),
+            None => Err(Box::new(CompactionOutcome::Cancelled)),
+        }
+    }
+
+    fn classify_compaction_open_error(error: &oc_llm::LlmError) -> oc_llm::LlmError {
+        match error {
+            oc_llm::LlmError::Provider { message } => {
+                super::stream::classified_provider_error(message)
             }
+            oc_llm::LlmError::Failure { kind, message } => oc_llm::LlmError::Failure {
+                kind: *kind,
+                message: message.clone(),
+            },
+            other => oc_llm::LlmError::Provider {
+                message: other.to_string(),
+            },
         }
     }
 
@@ -653,7 +729,15 @@ impl Runtime {
             .filter(|message| {
                 matches!(
                     message.get("type").and_then(Value::as_str),
-                    Some("user" | "synthetic" | "system" | "skill" | "peer" | "assistant")
+                    Some(
+                        "user"
+                            | "synthetic"
+                            | "system"
+                            | "skill"
+                            | "peer"
+                            | "observer"
+                            | "assistant"
+                    )
                 )
             })
             .collect();
@@ -678,7 +762,7 @@ impl Runtime {
                 .rposition(|message| {
                     matches!(
                         message.get("type").and_then(Value::as_str),
-                        Some("user" | "synthetic" | "peer")
+                        Some("user" | "synthetic" | "peer" | "observer")
                     )
                 })
                 .unwrap_or(candidates.len().saturating_sub(1));
@@ -687,14 +771,14 @@ impl Runtime {
             for index in (0..candidates.len()).rev() {
                 let next = accumulated.saturating_add(costs[index]);
                 if next > keep_tokens {
-                    // Only a fresh user/peer/synthetic prompt at the very end of
+                    // Only a fresh user/peer/synthetic/observer prompt at the very end of
                     // the transcript may exceed `keep_tokens` on its own; an
                     // oversized assistant/tool message must be summarized rather
                     // than replayed verbatim into the post-compaction context.
                     let is_trigger_prompt = accumulated == 0
                         && matches!(
                             candidates[index].get("type").and_then(Value::as_str),
-                            Some("user" | "synthetic" | "peer")
+                            Some("user" | "synthetic" | "peer" | "observer")
                         );
                     if !is_trigger_prompt {
                         break;
@@ -752,6 +836,56 @@ impl Runtime {
         .await?;
         Ok(())
     }
+}
+
+/// Build the compaction summary instruction, including the preservation
+/// guidance required by `docs/24-step-budget.md`.
+///
+/// A compaction must not silently drop the state the step-budget decision and
+/// the next turn depend on: the selected model/variant, tool state (pending and
+/// cancelled calls, lanes, diagnostics), open goals (id/status/criteria/next
+/// step) and the exact `keepID` boundary with its reason/threshold context. The
+/// boundary is only named when one was computed; the overflow retry passes no
+/// keep ID because it rebuilds a shortened context.
+fn compaction_summary_instruction(
+    keep_id: Option<&str>,
+    reason: &str,
+    keep_tokens: u64,
+    box_index: &str,
+) -> String {
+    compaction_summary_instruction_with_note(keep_id, reason, keep_tokens, box_index, None)
+}
+
+fn compaction_summary_instruction_with_note(
+    keep_id: Option<&str>,
+    reason: &str,
+    keep_tokens: u64,
+    box_index: &str,
+    note: Option<&str>,
+) -> String {
+    let mut instruction = format!(
+        "{}\n\nPreserve across this compaction: the selected model and variant; tool state \
+         (pending and cancelled calls, lanes and diagnostics); open goals (id, status, criteria \
+         and next step); and the exact keepID boundary plus the reason and threshold context that \
+         made this compaction necessary. Compaction reason: {reason}; configured keep window: \
+         {keep_tokens} tokens.",
+        crate::compaction::summary_prompt(None)
+    );
+    if let Some(note) = note.map(str::trim).filter(|s| !s.is_empty()) {
+        let _ = write!(instruction, "\nFocus / handoff note: {note}");
+    }
+    if let Some(keep_id) = keep_id {
+        let _ = write!(instruction, "\nExact keepID: {keep_id}.");
+    }
+    if !box_index.is_empty() {
+        let _ = write!(
+            instruction,
+            "\n\nDurable context boxes of this session tree. Reference their keys instead of \
+             restating stable content; temporary boxes expire now. Load details with `box_read` \
+             when needed:\n{box_index}"
+        );
+    }
+    instruction
 }
 
 /// Read one summary stream to completion.
@@ -938,14 +1072,26 @@ pub(super) fn is_context_overflow_message(message: &str) -> bool {
         || lower.contains("exceeds the model's maximum context")
 }
 
-/// Mask oversized tool outputs and inline media when a compaction request
-/// itself exceeds the provider's context window.
+/// Mask oversized tool outputs, huge text/tool-call bodies, and inline media
+/// when a compaction request itself exceeds the provider's context window.
+#[cfg(test)]
 pub(super) fn shorten_messages_for_compaction(messages: &[LlmMessage]) -> Vec<LlmMessage> {
+    shorten_messages_for_compaction_to_limit(messages, 0)
+}
+
+pub(super) fn shorten_messages_for_compaction_to_limit(
+    messages: &[LlmMessage],
+    max_input_tokens: u64,
+) -> Vec<LlmMessage> {
     const HEAD_CHARS: usize = 1_000;
     const TAIL_CHARS: usize = 500;
     const MAX_TOOL_CHARS: usize = 2_000;
+    const MAX_TEXT_CHARS: usize = 12_000;
+    const TEXT_HEAD_CHARS: usize = 4_000;
+    const TEXT_TAIL_CHARS: usize = 4_000;
+    const MAX_TOOL_INPUT_CHARS: usize = 4_000;
 
-    messages
+    let mut shortened: Vec<LlmMessage> = messages
         .iter()
         .map(|message| {
             let content = message
@@ -971,6 +1117,35 @@ pub(super) fn shorten_messages_for_compaction(messages: &[LlmMessage]) -> Vec<Ll
                             is_error: *is_error,
                         }
                     }
+                    oc_llm::ContentPart::Text { text } if text.chars().count() > MAX_TEXT_CHARS => {
+                        let total = text.chars().count();
+                        let head: String = text.chars().take(TEXT_HEAD_CHARS).collect();
+                        let tail: String = text.chars().skip(total - TEXT_TAIL_CHARS).collect();
+                        let omitted = total.saturating_sub(TEXT_HEAD_CHARS + TEXT_TAIL_CHARS);
+                        oc_llm::ContentPart::text(format!(
+                            "{head}\n...[omitted {omitted} chars during compaction]...\n{tail}"
+                        ))
+                    }
+                    oc_llm::ContentPart::ToolCall { id, name, input } => {
+                        let serialized = serde_json::to_string(input).unwrap_or_default();
+                        if serialized.chars().count() > MAX_TOOL_INPUT_CHARS {
+                            let preview: String = serialized.chars().take(HEAD_CHARS).collect();
+                            oc_llm::ContentPart::ToolCall {
+                                id: id.clone(),
+                                name: name.clone(),
+                                input: json!({
+                                    "_truncated": true,
+                                    "_preview": preview,
+                                }),
+                            }
+                        } else {
+                            oc_llm::ContentPart::ToolCall {
+                                id: id.clone(),
+                                name: name.clone(),
+                                input: input.clone(),
+                            }
+                        }
+                    }
                     oc_llm::ContentPart::Image { media_type, data } => {
                         oc_llm::ContentPart::text(format!(
                             "[omitted {media_type} attachment ({} chars) during compaction]",
@@ -988,12 +1163,93 @@ pub(super) fn shorten_messages_for_compaction(messages: &[LlmMessage]) -> Vec<Ll
                 .collect();
             LlmMessage::new(message.role, content)
         })
-        .collect()
+        .collect();
+
+    if max_input_tokens > 0 && shortened.len() > 3 {
+        let mut omitted_turns = 0_usize;
+        while shortened.len() > 3 && oc_llm::estimate_messages_tokens(&shortened) > max_input_tokens
+        {
+            shortened.remove(1);
+            omitted_turns += 1;
+        }
+        if omitted_turns > 0 {
+            shortened.insert(
+                1,
+                LlmMessage::user(format!(
+                    "[{omitted_turns} earlier conversation message(s) omitted to fit the \
+                     compaction context limit]"
+                )),
+            );
+        }
+    }
+    shortened
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compaction_prompt_preserves_budget_and_goal_context() {
+        let prompt = compaction_summary_instruction(
+            Some("msg_keep"),
+            "manual",
+            15_000,
+            "ses_root key=plan (stable)",
+        );
+        for needle in [
+            "model and variant",
+            "pending and cancelled calls, lanes and diagnostics",
+            "open goals (id, status, criteria and next step)",
+            "Exact keepID: msg_keep",
+            "Compaction reason: manual",
+            "15000 tokens",
+            "ses_root key=plan (stable)",
+        ] {
+            assert!(prompt.contains(needle), "missing {needle:?} in:\n{prompt}");
+        }
+
+        assert!(prompt.contains("compact_context") || !prompt.is_empty());
+        let focused = compaction_summary_instruction_with_note(
+            Some("msg_keep"),
+            "manual",
+            15_000,
+            "ses_root key=plan (stable)",
+            Some("keep SQLite migration 0013 status"),
+        );
+        assert!(focused.contains("Focus / handoff note: keep SQLite migration 0013 status"));
+
+        let retry = compaction_summary_instruction(None, "overflow", 0, "");
+        assert!(retry.contains("Compaction reason: overflow"));
+        assert!(!retry.contains("Exact keepID:"));
+        assert!(!retry.contains("ses_root key=plan"));
+    }
+
+    #[test]
+    fn shorten_messages_to_limit_caps_large_text_and_drops_middle_turns() {
+        let mut msgs = vec![LlmMessage::user("Objective: finish the rewrite cleanly")];
+        for i in 0..20 {
+            msgs.push(LlmMessage::assistant(format!(
+                "Step {i}: {}",
+                "a".repeat(20_000)
+            )));
+        }
+        msgs.push(LlmMessage::user("Latest state right now"));
+
+        let bounded = shorten_messages_for_compaction_to_limit(&msgs, 12_000);
+        assert!(
+            oc_llm::estimate_messages_tokens(&bounded) <= 12_000 || bounded.len() <= 4,
+            "bounded tokens should fit target budget"
+        );
+        assert_eq!(
+            bounded[0].content[0].as_text(),
+            Some("Objective: finish the rewrite cleanly")
+        );
+        assert_eq!(
+            bounded.last().and_then(|m| m.content[0].as_text()),
+            Some("Latest state right now")
+        );
+    }
 
     #[test]
     fn shorten_messages_for_compaction_truncates_oversized_last_tool_result_and_media() {

@@ -218,6 +218,19 @@ impl ObserverEngine {
                     return Err("switch_model requires observer.escalation_model".to_owned());
                 }
             }
+            RepairKind::RequestBudgetExtension => {
+                // A budget request only makes sense for a session that is
+                // currently executing work under this root. The repair
+                // reservation above is the only rate limit: a grant is a
+                // turn-loop decision, not a second independent budget.
+                if !tree.iter().any(|row| {
+                    row.sid == target && (row.state == "busy" || row.state == "waiting_permission")
+                }) {
+                    return Err(format!(
+                        "budget extension requires a busy session: {target}"
+                    ));
+                }
+            }
         }
         Ok(kind)
     }

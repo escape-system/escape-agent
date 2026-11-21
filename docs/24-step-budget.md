@@ -1,9 +1,12 @@
 # 24 — Step budget extension
 
-A subagent at 49 of 50 steps with its tests unrun loses the whole turn; asking
-the model or the observer for more steps would add a provider round trip in the
-stop path. The decision is instead deterministic, in memory, and never an LLM
-call: the runtime extends the budget only when the turn shows visible progress.
+A subagent at 49 of 50 steps with its tests unrun loses the whole turn; deciding
+whether to extend it by calling a model *in the stop path* would add a provider
+round trip exactly when the turn is ending. The decision is instead
+deterministic, in memory, and never an LLM call: the runtime extends the budget
+only when the turn shows visible progress. The agent can still *ask* early
+through the observer path (see *Early warning and budget requests*), but the
+grant itself is decided by the deterministic policy below.
 
 ## Current behaviour
 
@@ -52,25 +55,80 @@ call: the runtime extends the budget only when the turn shows visible progress.
 
 ## Policy
 
-Runtime-private constants, no config surface: `EXTENSION_STEPS = 15`,
-`MAX_EXTENSIONS = 2`, `MIN_CAP_FOR_EXTENSION = 10` (caller-enforced floor),
-`THRASH_LIMIT = 3`, `WINDOW = 5`, `CEILING_FACTOR = 2` (grant <= initial cap * 2).
+The extension policy is deterministic and configurable through the `step_budget`
+object in the merged config. Every key has a default equal to the legacy
+constant, so a config that does not set `step_budget` keeps the same behaviour:
 
-`budget::evaluate` (`crates/oc-runtime/src/turn/budget.rs:68`) is a pure function
-of the observations, `tool_calls`, the grants made and the initial cap; first
-match wins and every rule fails closed:
+| Config key | Default | Meaning |
+|---|---|---|
+| `step_budget.extension_steps` | `15` | steps granted by one extension |
+| `step_budget.max_extensions` | `2` | maximum grants per turn |
+| `step_budget.min_cap` | `10` | caller-enforced floor; below it evaluation is skipped |
+| `step_budget.thrash_limit` | `3` | repeats of one `(name, message)` error that deny |
+| `step_budget.window` | `5` | trailing observations checked for recent success |
+| `step_budget.ceiling_factor` | `2` | total granted <= initial cap * factor |
+
+`budget::evaluate_with_policy` (`crates/oc-runtime/src/turn/budget.rs`) is a pure
+function of the observations, `tool_calls`, the grants made and the initial cap;
+first match wins and every rule fails closed. `budget::evaluate` delegates to
+the default policy:
 
 | Rule | Condition | Result |
 |---|---|---|
-| 1 | `grants.len() >= MAX_EXTENSIONS` | deny "extension limit reached" |
-| 2 | `granted_so_far + EXTENSION_STEPS > initial_cap * CEILING_FACTOR` | deny "extension ceiling reached" |
+| 1 | `grants.len() >= max_extensions` | deny "extension limit reached" |
+| 2 | `granted_so_far + extension_steps > initial_cap * ceiling_factor` | deny "extension ceiling reached" |
 | 3 | `tool_calls == 0` | deny "no tool calls in this turn" |
-| 4 | a `(name, message)` error pair seen `>= THRASH_LIMIT` times | deny "repeated identical tool failure" |
-| 5 | no `Ok` among the last `WINDOW` observations | deny "no recent successful tool call" |
-| 6 | otherwise | grant 15, "recent tool progress" |
+| 4 | a `(name, message)` error pair seen `>= thrash_limit` times in the recent history | deny "repeated identical tool failure" |
+| 5 | no `Ok` among the last `window` observations | deny "no recent successful tool call" |
+| 6 | otherwise | grant `extension_steps`, "recent tool progress" |
+
+Thrash detection is bounded to the most recent `window * 2` observations. A
+deep, sequential run of *distinct* failures (a failing test, a fix, another
+failing test) followed by a recent success is therefore not thrashing: rule 4
+only matches an identical `(name, message)` pair repeated, and rule 5 needs one
+success in the trailing window. Such a turn can be granted an extension.
+Repeated identical failures and turns with no recent success still fail closed.
 
 A grant raises `cap`, appends to `grants` and continues the loop with tools
 re-enabled (`crates/oc-runtime/src/turn/mod.rs:529-561`).
+
+## Early warning and budget requests
+
+At `cap - step_number <= 5` the step prompt carries an early warning telling the
+agent it may request an extension through the observer path
+(`goal_update`/observer). The warning text lives in
+`crates/oc-runtime/src/prompt/mod.rs` (`STEP_BUDGET_WARNING`). It is advisory:
+the deterministic policy above remains the authority and no provider call is
+made merely to ask for steps.
+
+The request channel reuses the existing `ObserverAction::Repair`; no new
+`ObserverAction` variant is introduced. The observer emits a repair with
+`kind` = `RepairKind::RequestBudgetExtension` (serde
+`request_budget_extension`), so the request inherits the existing repair
+reservation, audit row and notification channel instead of new wire shapes.
+Before `run_steps` enters the tool-less `final_call` at `step_number >= cap`, it
+checks both pending observer grants (`take_granted_steps` from `extra_steps`)
+and deterministic auto-extension (`budget::evaluate_with_policy`), so an active
+turn with recent progress extends seamlessly without dropping tools on step
+`cap`. The runtime evaluator still decides whether `cap` actually rises; an
+observer request cannot bypass the thrash, ceiling or grant-count rules.
+
+When no grant is available the terminal path is unchanged: the final call at
+`step_number >= cap` still disables tools and carries `MAX_STEPS_PROMPT`, which
+now notes that the deterministic policy was consulted and declined without
+promising a retry. `step_limit` is stored with the wire terminal `succeeded`
+and `session.execution.step_limit {sessionID, steps}` is published only after
+the step row and outcome are committed. The stored outcome, event grammar and
+wire shape are unchanged.
+
+## Compaction guidance
+
+The guidance emitted when an agent is asked to compact — including the
+overflow-retry prompt — tells the model to preserve the selected model/variant,
+tool state (pending and cancelled calls, lanes, diagnostics), open goals
+(id/status/criteria/next step), and the exact `keepID` boundary and threshold
+context that made compaction necessary. This keeps the context the budget
+decision depends on from being silently dropped across a compaction.
 
 ## Durability and replay
 
@@ -89,7 +147,7 @@ twice: rule 2 bounds the total, rule 1 the count.
 |---|---|
 | evaluator denies | unchanged `StepLimited` path, byte-identical to today: same qualifier and event; the deny reason is not published |
 | `granted == 0` | filtered out (`crates/oc-runtime/src/turn/mod.rs:536`), so deny path |
-| cap below `MIN_CAP_FOR_EXTENSION` | `evaluate` is never called; caps 2 and 5 keep the legacy path |
+| cap below `step_budget.min_cap` | policy evaluation is skipped; caps 2 and 5 keep the legacy path |
 | no tool observations | rule 3 or 5 denies; the turn ends as before |
 
 ## Tests
@@ -121,18 +179,16 @@ twice: rule 2 bounds the total, rule 1 the count.
   (`ui/vendor/opencode/packages/app/src/session/agent-panels/goal-chip.tsx:28-32`).
   Attributing a specific evidence id to a specific criterion would need a new
   column and is intentionally out of scope.
-- **Observer-granted budget.** Adding an `ObserverAction` variant breaks
-  compilation in several exhaustive matches, not only the dispatch match at
-  `crates/oc-observer/src/engine/actions.rs:20`: `ObserverAction::as_str`
-  (`crates/oc-observer/src/verdict.rs:44`) is exhaustive too, and the repair path
-  adds three more over `RepairKind`/verdicts — `RepairKind::as_str`
-  (`crates/oc-observer/src/verdict.rs:90`), `command_from_verdict`
-  (`crates/oc-runtime/src/observer/repair.rs:95`; `match kind` at `:112`) and
-  `validate_repair` (`crates/oc-observer/src/engine/repair.rs:149`; `match kind`
-  at `:170`). By contrast `crates/oc-runtime/src/observer/tick.rs:180` matches
-  `verdict.action` non-exhaustively, with `_ => {}` at `:219`, so a brand-new
-  `ObserverAction` would be silently ignored there. Any future observer-granted
-  budget must therefore be a `RepairKind`/`RepairCommand` (which inherits budget
-  reservation and the audit channel), not a new action. The UI needs no change
-  either way (the observer audit response,
-  `crates/oc-server/src/data/observer.rs:62`, has no action field).
+- **Host wiring gaps are tracked by the implementation handoff, not by this
+  document.** The budget policy and the early-warning text are exposed as
+  deterministic runtime behavior; the points where the live step values and the
+  merged config reach them (the step-boundary call site and the root snapshot
+  mapping) are owned by the implementation wave and recorded in its handoff.
+  Any missing host wiring there is reported honestly as a gap, not claimed as
+  shipped by this document. This doc intentionally does not add an
+  `ObserverAction` variant: `ObserverAction` and its dispatch are exhaustive in
+  files outside the budget owner's scope, so the request channel is the
+  existing `RepairKind::RequestBudgetExtension` on `ObserverAction::Repair`.
+  Wire shapes are unchanged; the generated wire types in
+  `../opencode/packages/client/src/promise/generated/types.ts` and
+  `../opencode/packages/protocol/openapi.json` win if prose here ever conflicts.

@@ -42,9 +42,9 @@ request from root.
   `unknown_api_and_spa_fallbacks_are_distinct` fails against a stale dist.
 - Never `cargo clean`, never change `RUSTFLAGS`, never `cargo update`, never
   install or upgrade a toolchain.
-- Before enqueueing, call `lane` with `action: "status"`. If a ticket with the
-  same `(lane, command, cwd, tree_rev)` is queued or running, subscribe to that
-  ticket instead of enqueueing a duplicate.
+- Before enqueueing, call `lane` with `action: "status"` (or `"list"` to see queued/running
+  tickets). `lane queue` auto-computes `tree_rev` for cargo lanes, so identical `(lane, command, cwd, tree_rev)`
+  submissions automatically coalesce onto the live ticket.
 - Never merge two different commands into one invocation; that changes
   semantics and hides which command failed.
 
@@ -78,7 +78,7 @@ command you would have run.
 
 ## Memory and honesty
 
-Keep a `box_write` note under key `steward-<tree>` with the last 20 ticket
+Keep a `box_write` (`scope: "tree"`) note under key `steward-<tree>` (or use `box_edit` / `box_search`) with the last 20 ticket
 results, so a restarted steward can answer "what did we already try" without
 re-running anything. Use `digest` when a requester asks what a sibling already
 proved.

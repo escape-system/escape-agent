@@ -215,10 +215,12 @@ public surface; `cargo doc -p <crate> --no-deps` is the reference.
     (`ShellLaneTool`) that classifies cargo/test commands into lanes and
     delegates everything else to `oc_tools::ShellTool`.
   - `BoxTools::new(runtime).registry()` → `box_list`, `box_read`, `box_write`,
-    `box_delete`, `compact_context` (`docs/25-context-boxes.md`).
-    `box_read`/`box_list` map to `box:read`, `box_write`/`box_delete` to
-    `box:write` with the box key as the resource; `compact_context` maps to
-    action `compaction`, resource `*`. `compact_context(note)` always targets
+    `box_edit`, `box_search`, `box_meta`, `box_delete`, `compact_context`
+    (`docs/25-context-boxes.md`).
+    `box_read`/`box_list`/`box_search` map to `box:read`,
+    `box_write`/`box_edit`/`box_meta`/`box_delete` to `box:write` with the box
+    key as the resource; `compact_context` maps to action `compaction`,
+    resource `*`. `compact_context(note)` always targets
     the CALLER's own session, never a supplied id. It never compacts inline:
     it commits an inbox row (`kind = "compaction"`, `delivery = Queue`,
     `reason = "manual"`), notifies the actor and returns `scheduled`; the
@@ -866,10 +868,62 @@ rejected. A successful swap re-applies the same overlays the boot path uses
 (config `providers`, Antigravity discovery) and then publishes
 `models-dev.refreshed` so clients re-read the catalog.
 
+**Provider-side `opencode-go` model discovery (issue #12).** Unlike the
+Antigravity client, the `opencode-go` provider does serve a public OpenAI-style
+model list: `GET https://opencode.ai/zen/go/v1/models` returned
+`{"object":"list","data":[…]}` with 28 models on 2026-11-20, including
+`hy4-flash-free` (canonical `tencent/hy4-flash`, context 1,048,576, $0/$0).
+The endpoint is unauthenticated; `/zen/go/v1/usage` is the authenticated quota
+sibling and is unrelated. New public helpers in `catalog::refresh`:
+`OPENCODE_GO_MODELS_URL`, `OPENCODE_GO_MODELS_URL_ENV` (`OPENCODE_GO_MODELS_URL`,
+an env-overridable URL), `MIN_PLAUSIBLE_PROVIDER_MODELS`,
+`opencode_go_models_url()`, and `parse_provider_models(body, provider_id) ->
+Result<Vec<ModelInfo>, LlmError>`, which copies only fields the feed actually
+publishes (`id`, `name`, `canonical_id`, `release_date`,
+`limit.context`/`limit.output`, `capabilities.tools.supported`) and rejects
+truncated/malformed lists. No new dependency: it reuses `reqwest`, `serde_json`
+and the existing `fetch_live` client.
+
+**Honest status:** these helpers are *landed API only* — no caller polls the
+provider list yet. Wiring them into the background refresh loop, the
+`POST /api/model/refresh` overlay, and the catalog cell is deliberately left to
+the integration owner (out of this wave's file ownership). Until that wiring
+exists, the served `opencode-go` models still come from the models.dev snapshot
+plus overlays, and this doc does not claim full dynamic provider discovery.
+
 A background loop refreshes 30 s after boot (startup stays offline, per
 `docs/15-performance.md`) and every 6 h. At startup the cached body replaces the
 embedded floor under the same plausibility gate, so an offline start serves the
-last fetched catalog.
+last fetched catalog. `refresh_now` is the one-shot form: it fetches an
+**explicit** URL (never mutating process environment), atomically caches the raw
+body and only then invokes `apply`; a failed fetch never calls `apply`. The
+background loop remains unchanged.
+
+`POST /api/model/refresh` (oc-server, additive local route) invokes that
+one-shot path with `refresh::models_url()` and `refresh::cache_path()`. Its
+`apply` closure uses the same layering as the CLI boot refresh: `parse_live`,
+the `is_plausible` gate, config `providers` overlay, Antigravity discovery
+overlay, `CatalogCell::replace`, then publish `models-dev.refreshed`. It answers
+`{"data":{"modelCount":N,"refreshed":true}}` only when the swap really happened;
+a missing catalog cell is `503 ServiceUnavailableError`, while fetch, parse,
+plausibility and overlay failures are `502 ProviderError` and neither swap the
+cell nor publish the event. `GET /api/model` keeps its `{location,data:[...]}`
+shape.
+
+Event `models-dev.refreshed` carries `{data:{}}` with no extra fields; clients
+use it as a cache-invalidation signal and re-read the catalog. It shares the
+wire-legal empty-data shape with the other lifecycle events (generated
+`types.ts` / `openapi.json`).
+
+Variant dedup contract for `session.model.selected` and
+`session.model.fallback`: when the next selection keeps the same `providerID`
+and model `id` and its normalized variant is unchanged, the redundant durable
+event is suppressed. Normalization treats absent, `""` and `"default"`
+(case-insensitive) as the same variant; `"high"` → `"max"` is a real switch and
+still patches the session and emits the event. Manual `POST /api/session/:sid/model`
+with an unchanged selection likewise omits the notice event while remaining a
+successful request. Catalog validation and resolution
+still run before any dedup decision.
 
 ```rust
 pub struct CatalogCell { /* RwLock<Arc<Catalog>> + revision */ }
@@ -886,7 +940,11 @@ impl CatalogCell {
     pub fn providers(&self) -> Vec<ProviderInfo>;
 }
 pub mod catalog::refresh {
+    pub fn client() -> reqwest::Client;          // on-demand refreshes without a reqwest dep
     pub async fn fetch_live(client: &reqwest::Client, url: &str) -> Result<String, LlmError>;
+    pub async fn refresh_now<F>(client: &reqwest::Client, url: &str,
+        cache: &std::path::Path, apply: F) -> Result<(), String>
+        where F: Fn(&str) -> Result<(), String>;
     pub fn parse_live(body: &str) -> Result<Catalog, LlmError>;
     pub fn is_plausible(catalog: &Catalog) -> bool;
     pub fn replace_live(cell: &CatalogCell, body: &str) -> Result<usize, LlmError>;

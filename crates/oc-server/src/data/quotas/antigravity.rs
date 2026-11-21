@@ -1,7 +1,7 @@
 //! `Google Antigravity` quota projection: the account refresh and the window
 //! summary built from it.
 
-use oc_antigravity::AccountStatusSummary;
+use oc_antigravity::{AccountStatusSummary, populate_hub_quota_groups};
 use oc_llm::{ProviderRateLimit, QuotaCapability};
 
 use crate::AppState;
@@ -42,7 +42,27 @@ pub(super) async fn refresh_antigravity_if_needed(
         };
     }
 
-    let accounts = svc.list_accounts_status().unwrap_or_default();
+    let mut accounts = svc.list_accounts_status().unwrap_or_default();
+    let discovered: Vec<_> = svc
+        .cached_discovered_models()
+        .models
+        .into_values()
+        .collect();
+    if !discovered.is_empty() {
+        let usable_count = accounts
+            .iter()
+            .filter(|a| a.enabled && !a.revoked && !a.verification_required)
+            .count();
+        for acc in &mut accounts {
+            let is_primary_or_only = usable_count == 1 || acc.active_claude || acc.active_gemini;
+            if is_primary_or_only
+                && let Some(ref mut quota) = acc.quota
+                && !quota.groups.keys().any(|k| k.starts_with("pool:"))
+            {
+                populate_hub_quota_groups(&mut quota.groups, &discovered);
+            }
+        }
+    }
     let newest = accounts
         .iter()
         .filter_map(|acc| acc.quota.as_ref().map(|q| q.updated_at))
@@ -65,7 +85,7 @@ pub(super) fn build_antigravity_entry(
 ) -> ProviderQuotaEntry {
     let capability = QuotaCapability::LiveApi;
     let capability_note = Some(
-        "Fetches live Cloud Code Assist pool quotas (Claude, Gemini Pro, Gemini Flash) per connected Google account."
+        "Fetches live Cloud Code Assist model pool quotas dynamically per connected Google account."
             .to_owned(),
     );
 
@@ -150,77 +170,129 @@ pub(super) fn build_antigravity_entry(
     }
 }
 
-/// Percent windows for the pool's primary **usable** account.
+/// Percent windows across the pool's **usable** accounts.
 ///
+fn antigravity_group_rank(k: &str) -> usize {
+    const ORDER: [&str; 4] = ["claude", "gemini-pro", "gemini-flash", "gemini-cli"];
+    if k.starts_with("pool:claude") || k == "claude" {
+        0
+    } else if k.starts_with("pool:gemini-4-argon") {
+        1
+    } else if k.starts_with("pool:gemini-4") {
+        2
+    } else if k.starts_with("pool:gemini") {
+        3
+    } else {
+        ORDER
+            .iter()
+            .position(|known| known == &k)
+            .map_or(5, |pos| 4 + pos)
+    }
+}
+
 /// Only enabled, non-revoked, non-verification-blocked accounts can produce
 /// windows; a pool whose every account is unusable yields none rather than
-/// reporting the quota of an account the user cannot use.
+/// reporting the quota of an account the user cannot use. When dynamic `pool:*`
+/// buckets discovered from `/v1internal:fetchAvailableModels` are present on an
+/// account, they are emitted directly (using their API-derived `label`) and the
+/// coarse legacy `claude` / `gemini-pro` / `gemini-flash` rollup keys are skipped.
 fn antigravity_summary_windows(accounts: &[AccountStatusSummary]) -> Vec<QuotaWindowEntry> {
-    let primary = accounts
+    let mut usable: Vec<&AccountStatusSummary> = accounts
         .iter()
-        .find(|acc| {
-            acc.enabled
-                && !acc.revoked
-                && !acc.verification_required
-                && (acc.active_claude || acc.active_gemini)
-        })
-        .or_else(|| {
-            accounts
-                .iter()
-                .find(|acc| acc.enabled && !acc.revoked && !acc.verification_required)
-        });
-    let Some(account) = primary else {
+        .filter(|acc| acc.enabled && !acc.revoked && !acc.verification_required)
+        .collect();
+    if usable.is_empty() {
         return Vec::new();
-    };
-    let Some(quota) = &account.quota else {
-        return Vec::new();
-    };
+    }
+    usable.sort_by_key(|acc| (!(acc.active_claude || acc.active_gemini), acc.index));
+    let multi_account = usable
+        .iter()
+        .filter(|acc| acc.quota.as_ref().is_some_and(|q| !q.groups.is_empty()))
+        .count()
+        > 1;
 
-    let order = ["claude", "gemini-pro", "gemini-flash", "gemini-cli"];
-    let mut keys: Vec<String> = quota.groups.keys().cloned().collect();
-    keys.sort_by_key(|k| {
-        order
-            .iter()
-            .position(|known| known == k)
-            .unwrap_or(order.len())
-    });
-
-    let mut windows = Vec::with_capacity(keys.len());
-    for group in keys {
-        let Some(snap) = quota.groups.get(&group) else {
+    let mut windows = Vec::new();
+    for account in usable {
+        let Some(quota) = &account.quota else {
             continue;
         };
-        let remaining_pct = snap.remaining_fraction.map(|frac| {
-            let pct = if frac <= 1.0 { frac * 100.0 } else { frac };
-            pct.clamp(0.0, 100.0)
+        let has_dynamic_pools = quota.groups.keys().any(|k| k.starts_with("pool:"));
+        let mut keys: Vec<String> = quota
+            .groups
+            .keys()
+            .filter(|k| {
+                !has_dynamic_pools
+                    || !matches!(k.as_str(), "claude" | "gemini-pro" | "gemini-flash")
+            })
+            .cloned()
+            .collect();
+        keys.sort_by(|a, b| {
+            antigravity_group_rank(a)
+                .cmp(&antigravity_group_rank(b))
+                .then_with(|| a.cmp(b))
         });
-        let used_pct = snap
-            .used_percent
-            .map(|pct| pct.clamp(0.0, 100.0))
-            .or_else(|| remaining_pct.map(|rem| (100.0 - rem).clamp(0.0, 100.0)));
-        let remaining_pct =
-            remaining_pct.or_else(|| used_pct.map(|used| (100.0 - used).clamp(0.0, 100.0)));
 
-        windows.push(QuotaWindowEntry {
-            id: group.clone(),
-            label: antigravity_group_label(&group),
-            group_key: Some(antigravity_group_key(&group)),
-            unit: "percent".to_owned(),
-            limit: Some(100.0),
-            used: used_pct,
-            remaining: remaining_pct,
-            used_percent: used_pct,
-            remaining_percent: remaining_pct,
-            limited: remaining_pct.map(|rem| rem <= 0.0),
-            reset_at_ms: snap.reset_time_ms,
-            reset_label: None,
+        let account_prefix = multi_account.then(|| {
+            account
+                .email
+                .as_deref()
+                .or(account.label.as_deref())
+                .unwrap_or(&account.id)
         });
+
+        for group in keys {
+            let Some(snap) = quota.groups.get(&group) else {
+                continue;
+            };
+            let remaining_pct = snap.remaining_fraction.map(|frac| {
+                let pct = if frac <= 1.0 { frac * 100.0 } else { frac };
+                pct.clamp(0.0, 100.0)
+            });
+            let used_pct = snap
+                .used_percent
+                .map(|pct| pct.clamp(0.0, 100.0))
+                .or_else(|| remaining_pct.map(|rem| (100.0 - rem).clamp(0.0, 100.0)));
+            let remaining_pct =
+                remaining_pct.or_else(|| used_pct.map(|used| (100.0 - used).clamp(0.0, 100.0)));
+
+            let base_label = snap
+                .label
+                .clone()
+                .unwrap_or_else(|| antigravity_group_label(&group));
+            let label = match account_prefix {
+                Some(prefix) => format!("{base_label} ({prefix})"),
+                None => base_label,
+            };
+            let id = if multi_account {
+                format!("{}:{group}", account.id)
+            } else {
+                group.clone()
+            };
+
+            windows.push(QuotaWindowEntry {
+                id,
+                label,
+                group_key: Some(antigravity_group_key(&group)),
+                unit: "percent".to_owned(),
+                limit: Some(100.0),
+                used: used_pct,
+                remaining: remaining_pct,
+                used_percent: used_pct,
+                remaining_percent: remaining_pct,
+                limited: remaining_pct.map(|rem| rem <= 0.0),
+                reset_at_ms: snap.reset_time_ms,
+                reset_label: None,
+            });
+        }
     }
     windows
 }
 
 /// Stable localization token for a quota pool group.
 fn antigravity_group_key(group: &str) -> String {
+    if let Some(rest) = group.strip_prefix("pool:") {
+        return rest.to_owned();
+    }
     match group {
         "claude" | "gemini-pro" | "gemini-flash" | "gemini-cli" => group.to_owned(),
         _ => "other".to_owned(),
@@ -228,6 +300,9 @@ fn antigravity_group_key(group: &str) -> String {
 }
 
 fn antigravity_group_label(group: &str) -> String {
+    if let Some(rest) = group.strip_prefix("pool:") {
+        return rest.to_owned();
+    }
     match group {
         "claude" => "Claude / GPT-OSS Pool".to_owned(),
         "gemini-pro" => "Gemini Pro Pool".to_owned(),

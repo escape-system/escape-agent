@@ -4,11 +4,16 @@ use axum::Json;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, State};
 use axum::response::Response;
-use oc_types::ApiError;
+use oc_types::{
+    ApiError, EventPayload, MessageId, SessionId, SessionInboxCancelled,
+    SessionInboxDeliveryChanged,
+};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::AppState;
+use crate::data::events::publish_durable;
+use crate::data::session::notify;
 use crate::data::{delivery_from_wire, no_content, require_store, schema_error, session_not_found};
 use crate::error::ErrorResponse;
 
@@ -56,6 +61,23 @@ pub async fn update(
             )),
             other => ErrorResponse::from(other),
         })?;
+    let payload = SessionInboxDeliveryChanged {
+        session_id: SessionId::from_wire(session_id.clone()),
+        inbox_id: MessageId::from_wire(id),
+        delivery: match delivery {
+            oc_store::Delivery::Steer => oc_types::Delivery::Steer,
+            oc_store::Delivery::Queue => oc_types::Delivery::Queue,
+        },
+    };
+    publish_durable(
+        &state,
+        &session_id,
+        SessionInboxDeliveryChanged::TYPE,
+        payload.data(),
+        SessionInboxDeliveryChanged::VERSION,
+    )
+    .await?;
+    notify(&state, &session_id).await?;
     Ok(no_content())
 }
 
@@ -70,6 +92,19 @@ pub async fn delete(
         .await?
         .ok_or_else(|| session_not_found(&session_id))?;
     // A delivered item is already gone; cancellation is a no-op, not an error.
-    store.cancel_inbox(&session_id, &id).await?;
+    if store.cancel_inbox(&session_id, &id).await? {
+        let payload = SessionInboxCancelled {
+            session_id: SessionId::from_wire(session_id.clone()),
+            inbox_id: MessageId::from_wire(id),
+        };
+        publish_durable(
+            &state,
+            &session_id,
+            SessionInboxCancelled::TYPE,
+            payload.data(),
+            SessionInboxCancelled::VERSION,
+        )
+        .await?;
+    }
     Ok(no_content())
 }

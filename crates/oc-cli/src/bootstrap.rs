@@ -111,6 +111,12 @@ pub(crate) async fn open_services(
                         .apply_config(providers)
                         .context("apply providers to the cached catalog")?;
                 }
+                // `catalog = live` dropped the Antigravity overlay applied
+                // above; without re-applying it the cached catalog would hide
+                // every Antigravity model until the first background refresh.
+                if let Some(svc) = &antigravity {
+                    svc.overlay_catalog(&mut catalog);
+                }
             }
             Ok(live) => tracing::warn!(
                 models = live.models().len(),
@@ -270,12 +276,17 @@ pub(crate) async fn attach_extensions(
     // when no JS `plugins` are configured. The inventory simply stays empty.
     state = state.with_plugins(Arc::new(oc_plugin::PluginRegistry::new()));
 
+    let pruned = oc_runtime::cleanup_stale_lane_logs(std::time::Duration::from_secs(24 * 3600));
+    if pruned > 0 {
+        tracing::debug!(removed = pruned, "cleaned stale lane log files");
+    }
+
     let runner = Arc::new(oc_runtime::ProcessLaneRunner::unbound());
-    let events: Arc<dyn oc_lanes::LaneEvents> = Arc::new(BusLaneEvents {
-        bus: state.bus().clone(),
-        directory: directory.to_string_lossy().into_owned(),
-        store: Some(Arc::clone(&services.store)),
-    });
+    let events: Arc<dyn oc_lanes::LaneEvents> = Arc::new(BusLaneEvents::new(
+        state.bus().clone(),
+        directory.to_string_lossy().into_owned(),
+        Some(Arc::clone(&services.store)),
+    ));
     // The service takes the erased runner; keep the concrete handle for `bind`.
     let runner_handle: Arc<dyn oc_lanes::LaneRunner> = runner.clone();
     let clock: Arc<dyn oc_lanes::Clock> = Arc::new(oc_lanes::SystemClock);

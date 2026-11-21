@@ -205,6 +205,31 @@ impl LaneRunner for ProcessLaneRunner {
     }
 }
 
+/// Remove stale `lane-*.log` capture files older than `max_age` under
+/// `<temp>/opencode-lanes` (best-effort cleanup on server startup).
+pub fn cleanup_stale_lane_logs(max_age: std::time::Duration) -> usize {
+    let directory = std::env::temp_dir().join(LANE_DIR);
+    let Ok(entries) = fs::read_dir(&directory) else {
+        return 0;
+    };
+    let cutoff = std::time::SystemTime::now().checked_sub(max_age);
+    let mut removed = 0usize;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("log") {
+            continue;
+        }
+        let stale = match (entry.metadata().and_then(|m| m.modified()), cutoff) {
+            (Ok(modified), Some(limit)) => modified < limit,
+            _ => false,
+        };
+        if stale && fs::remove_file(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
 /// Combined temp file path for one ticket. The directory is created on demand.
 fn output_path(ticket_id: &str) -> io::Result<PathBuf> {
     let directory = std::env::temp_dir().join(LANE_DIR);

@@ -398,21 +398,29 @@ serializes on its lock, agents block, turns stall, tokens burn.
 ### Mechanism (does not rely on the model cooperating)
 
 1. **Command classifier** parses the shell command (`shell-words`, no shell
-   evaluation) and maps `cargo build|test|clippy|nextest|run`, `rustc`,
-   `npm|pnpm|bun|yarn test`, `go test`, `pytest`, `dotnet test`, `gradle`,
-   `mvn` to a resource key: `cargo:<canonical workspace>`, `node:<workspace>`,
-   etc. Workspace = nearest `Cargo.toml` with `[workspace]` or the package root.
-2. **LaneService** owns named lanes with concurrency and queue policy. Defaults:
+   evaluation), unwraps `env` (`-u`/`--unset`/`-C`/`-S`/`VAR=val`), `nice`,
+   `timeout`, `stdbuf`, and recursive `sh|bash|zsh|dash -c` wrappers, and maps
+   `cargo build|test|clippy|check|fmt|nextest|run|bench|doc`, `rustc`,
+   `npm|pnpm|bun|yarn test`, `go test`, `pytest`, `python -m pytest|unittest`,
+   `uv run`, `dotnet test`, `gradle`, `mvn` to a resource key:
+   `cargo:<canonical workspace>`, `node:<workspace>`, etc. Workspace = nearest
+   `Cargo.toml` with `[workspace]` or the package root.
+2. **LaneService** owns named lanes with concurrency and queue policy
+   (`LaneConfig::concurrency_for` resolves exact lane keys first, then prefix
+   overrides such as `cargo` for `cargo:<ws>`). Defaults:
    `cargo:<ws>` = 1, `node:<ws>` = 1, `network` = 4, `gpu` = 1, `default` = 8.
-3. The `shell` tool submits classified commands to a lane and returns a
-   **ticket**. No thread blocks; the tool reports progress and streams output
-   when the ticket runs. `lane.wait` is an await on a channel with a deadline.
+3. The `shell` tool submits classified commands to a lane (after
+   `shell_guard::check_shell_command`) and returns a **ticket**. No thread
+   blocks; the tool reports progress and streams output when the ticket runs.
+   `lane.wait` is an await on a channel with a deadline, returning `outputTail`
+   and `outputTruncated` alongside ticket state.
 4. **Coordinator subagent** (`steward`, role `coordinator`, project agent
    template) gets the `lane` tool:
    - `lane.queue {lane, command, cwd, priority, owner, tree_rev?}` →
-     `{id, subscribed}`
+     `{id, subscribed}` (auto-computes `tree_rev` on `cargo:` lanes when omitted)
    - `lane.order {ticket, priority}`
-   - `lane.status {ticket|lane}`
+   - `lane.status {ticket|lane}` (includes active `tickets` and `outputTail`)
+   - `lane.list` (lists all configured lanes and active tickets)
    - `lane.cancel {ticket}`
    - `lane.notify {session_id, text}`
    It decides ordering (format → clippy → test, or affected crate first),
@@ -471,6 +479,21 @@ the template loads with default permissions. `mode: subagent` is required for
 are advertised as spawnable. No lane coordinator is a built-in, and none ever
 was: the builtin set stays `engineer`, `architect`, `review`, `general`,
 `explore`, `ui`, `docs`, `compaction`, `title`, `summary`.
+
+Canonical capability routing for every agent (mirrored in the builtin prompts at
+`crates/oc-config/src/agents.rs`): context boxes are session-tree shared, not
+private per-session notes and not `oc-memory`; `engineer` reads and writes boxes,
+`explore` only reads them. Multi-step work uses `goal_set`/`goal_update` with the
+observer as the judge of completion, and durable progress notes go into a
+`stable` box after each completed file or area. Load a matching skill with the
+`skill` tool before a repeatable workflow and save new ones with `skill_write`.
+**All builds, tests, clippy and fmt go through the lane and the `steward`
+template (or the `lane` tool directly) — never parallel ad-hoc cargo from many
+agents**, with one ticket per command, scoped `-p <crate>`, lock-protected target
+dir and verbatim output tails. Subagents are for disjoint parallel work only:
+respect depth and file ownership, use `roster(wait_seconds=...)` instead of
+sleep polling, and use `talk`/box notes for peer communication. The spawn model
+is `opencode-go/hy4-flash-free` unless the user explicitly approves a change.
 
 ## Failure modes
 

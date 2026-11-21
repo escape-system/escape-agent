@@ -713,6 +713,25 @@ pub(super) fn available_agents(config: &ConfigService) -> Vec<String> {
         .collect()
 }
 
+pub(super) fn primary_only_agents(config: &ConfigService) -> Vec<String> {
+    config
+        .agents()
+        .into_iter()
+        .filter(|agent| {
+            let mode = agent
+                .get("mode")
+                .and_then(Value::as_str)
+                .unwrap_or("primary");
+            let hidden = agent
+                .get("hidden")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            hidden || (mode != "subagent" && mode != "all")
+        })
+        .filter_map(|agent| agent.get("id").and_then(Value::as_str).map(str::to_owned))
+        .collect()
+}
+
 pub(super) fn available_models(catalog: &Catalog, client: &SharedLlmClient) -> Vec<String> {
     let mut all_models = catalog.models();
     for extra in client.dynamic_models() {

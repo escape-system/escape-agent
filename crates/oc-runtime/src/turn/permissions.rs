@@ -150,8 +150,8 @@ pub(super) fn tool_action(name: &str) -> &str {
         "goal_set" | "goal_update" | "goal_complete" | "goal_status" => "goal",
         "skill" | "skill_lint" => "skill",
         "skill_write" => "skill:write",
-        "box_list" | "box_read" => "box:read",
-        "box_write" | "box_delete" => "box:write",
+        "box_list" | "box_read" | "box_search" => "box:read",
+        "box_write" | "box_edit" | "box_meta" | "box_delete" => "box:write",
         "compact_context" => "compaction",
         "lane" => "lane",
         other => other,
@@ -224,7 +224,8 @@ pub(super) fn permission_target(
         "goal_set" | "goal_update" | "goal_complete" | "goal_status" => {
             (action, "*".to_owned(), None)
         }
-        "box_list" | "box_read" | "box_write" | "box_delete" => {
+        "box_list" | "box_read" | "box_search" | "box_write" | "box_edit" | "box_meta"
+        | "box_delete" => {
             let key = input.get("key").and_then(Value::as_str).unwrap_or("*");
             (action, key.to_owned(), None)
         }

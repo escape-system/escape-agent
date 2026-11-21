@@ -11,7 +11,7 @@ pub(super) const DROPPED_EXPERIMENTAL: [&str; 5] = [
 
 pub(super) const CONSUMED_EXPERIMENTAL: [&str; 3] = ["policies", "mcp_timeout", "subagent_depth"];
 
-pub(super) const HANDLED: [&str; 53] = [
+pub(super) const HANDLED: [&str; 54] = [
     "$schema",
     "shell",
     "model",
@@ -65,4 +65,5 @@ pub(super) const HANDLED: [&str; 53] = [
     "lanes",
     "events",
     "models",
+    "step_budget",
 ];

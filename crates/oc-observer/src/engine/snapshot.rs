@@ -72,6 +72,8 @@ impl ObserverEngine {
                 .unwrap_or_else(|| "engineer".to_owned()),
             model: context.model,
             step: context.step,
+            step_cap: context.step_cap,
+            steps_remaining: context.steps_remaining,
             state: context
                 .state
                 .or_else(|| root_row.map(|row| row.state.clone()))
@@ -92,5 +94,82 @@ impl ObserverEngine {
             recent,
             tree: tree.to_vec(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use crate::clock::{EngineNow, SystemClock};
+    use crate::config::ObserverConfig;
+    use crate::engine::notice::RepairOutcome;
+    use crate::engine::traits::BoxFuture;
+    use crate::error::ObserverError;
+    use crate::input::RootContext;
+    use crate::verdict::ObserverVerdict;
+
+    use super::*;
+
+    struct NeverCalled;
+
+    impl crate::ObserverModel for NeverCalled {
+        fn judge<'a>(
+            &'a self,
+            _input: &'a str,
+            _cfg: &'a ObserverConfig,
+        ) -> BoxFuture<'a, Result<String, ObserverError>> {
+            Box::pin(async { Err(ObserverError::Model("not used".to_owned())) })
+        }
+    }
+
+    impl crate::RepairExecutor for NeverCalled {
+        fn apply<'a>(
+            &'a self,
+            _verdict: &'a ObserverVerdict,
+        ) -> BoxFuture<'a, Result<RepairOutcome, ObserverError>> {
+            Box::pin(async { Err(ObserverError::Executor("not used".to_owned())) })
+        }
+    }
+
+    impl crate::ObserverNotifier for NeverCalled {
+        fn notify(&self, _event: crate::ObserverNotice) {}
+    }
+
+    #[test]
+    fn root_step_budget_reaches_the_observer_input() {
+        let noop = Arc::new(NeverCalled);
+        let engine = ObserverEngine::new(
+            ObserverConfig::default(),
+            Arc::new(SystemClock),
+            noop.clone(),
+            noop.clone(),
+            noop,
+        );
+        engine.set_root_context(
+            "ses_root",
+            RootContext {
+                agent: Some("engineer".to_owned()),
+                model: Some("opencode-go/hy4-flash-free".to_owned()),
+                step: 45,
+                step_cap: Some(50),
+                steps_remaining: Some(5),
+                state: Some("busy".to_owned()),
+            },
+        );
+
+        let input = engine.build_input("ses_root", &[], None, EngineNow::from_clock(&SystemClock));
+        assert_eq!(input.root.step_cap, Some(50));
+        assert_eq!(input.root.steps_remaining, Some(5));
+
+        let rendered = crate::input::render(&input, ObserverConfig::default().max_input_tokens);
+        assert!(
+            rendered.contains("\"stepCap\":50"),
+            "rendered observer input must publish the cap: {rendered}"
+        );
+        assert!(
+            rendered.contains("\"stepsRemaining\":5"),
+            "rendered observer input must publish the remaining steps: {rendered}"
+        );
     }
 }

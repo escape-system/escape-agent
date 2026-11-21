@@ -906,11 +906,15 @@ async fn build_registry(
     let fallback_disabled = policy.fallback().disabled_by_config();
 
     let available = available_provider_ids(state, catalog.as_ref()).await;
+    let direct_google = super::model::has_direct_google_access(state, catalog.as_ref()).await;
     let mut infos: Vec<ModelInfo> = catalog.models();
     infos.retain(|model| available.contains(&model.provider_id));
     if available.contains("google")
         && let Some(antigravity) = state.antigravity()
     {
+        if !direct_google {
+            infos.retain(|model| model.provider_id != "google");
+        }
         for extra in antigravity.antigravity_model_infos() {
             if let Some(position) = infos
                 .iter()

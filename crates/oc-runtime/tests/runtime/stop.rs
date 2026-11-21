@@ -88,6 +88,7 @@ async fn stop_withdraws_a_queued_compaction() {
             kind: Some("temporary".to_owned()),
             include_expired: false,
             limit: 0,
+            ..BoxQuery::default()
         })
         .await
         .expect("live boxes");

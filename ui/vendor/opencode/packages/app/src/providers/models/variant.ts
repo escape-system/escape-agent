@@ -20,9 +20,10 @@ type VariantInput = {
 }
 
 export function getConfiguredAgentVariant(input: { agent: Agent | undefined; model: Model | undefined }) {
-  if (!input.agent?.variant) return undefined
+  const variant = input.agent?.variant?.trim()
+  if (!variant || variant.toLowerCase() === "default") return undefined
 
-  if (!input.agent.model) return undefined
+  if (!input.agent?.model) return undefined
 
   if (!input.model?.variants) return undefined
 
@@ -30,14 +31,14 @@ export function getConfiguredAgentVariant(input: { agent: Agent | undefined; mod
 
   if (input.agent.model.modelID !== input.model.modelID) return undefined
 
-  return input.agent.variant
+  return variant
 }
 
 export function resolveModelVariant(input: VariantInput) {
   if (input.selected === null) return undefined
-  const value = input.selected ?? input.preferred ?? input.configured
+  const value = (input.selected ?? input.preferred ?? input.configured)?.trim()
 
-  return value && value !== "default" && input.variants.includes(value) ? value : undefined
+  return value && value.toLowerCase() !== "default" && input.variants.includes(value) ? value : undefined
 }
 
 export function cycleModelVariant(input: VariantInput) {

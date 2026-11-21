@@ -505,12 +505,12 @@ fn builtin_agents_have_contract_modes_permissions_and_prompts() {
     assert_eq!(engineer["mode"], "primary");
     assert_eq!(engineer["hidden"], false);
     assert!(engineer.get("model").is_none());
+    let engineer_prompt = engineer["system"]
+        .as_str()
+        .expect("engineer has a real prompt");
     assert!(
-        engineer["system"]
-            .as_str()
-            .expect("engineer has a real prompt")
-            .contains("docs/17-interfaces.md"),
-        "the engineer prompt encodes the docs-first invariant"
+        engineer_prompt.contains("README.md") && engineer_prompt.contains("AGENTS.md"),
+        "the engineer prompt encodes the generic docs-first invariant: {engineer_prompt}"
     );
     assert_eq!(engineer["request"]["settings"], serde_json::json!({}));
 
@@ -654,6 +654,16 @@ fn explore_toolset_allows_read_only_code_map_and_still_denies_edits() {
         service.evaluate(Some("explore"), "code_map", "*"),
         Effect::Allow,
         "explore must see code_map: its action is the tool name"
+    );
+    assert_eq!(
+        service.evaluate(Some("explore"), "skill", "*"),
+        Effect::Allow,
+        "explore may read skills"
+    );
+    assert_eq!(
+        service.evaluate(Some("explore"), "skill:write", "*"),
+        Effect::Deny,
+        "explore must not write skills"
     );
     // `build` composes the default `* * allow`, so code_map stays visible.
     assert_eq!(

@@ -26,7 +26,7 @@ impl Tool for WriteSessionTool {
     }
 
     fn description(&self) -> &'static str {
-        "Write text into a descendant session (or self). Siblings and parents are rejected by policy."
+        "Write text into a descendant session (or self). Siblings and parents are rejected by policy: use `talk` for them. `delivery:\"steer\"` (default) wakes an idle target or joins an active turn at its next step boundary; `delivery:\"queue\"` wakes an idle target or queues for the next turn after an active turn completes (never injects mid-turn). Returns a confirmation naming the target and delivery mode."
     }
 
     fn schema(&self) -> Value {
@@ -35,7 +35,7 @@ impl Tool for WriteSessionTool {
             "properties": {
                 "session_id": { "type": "string", "description": "Target session id." },
                 "text": { "type": "string" },
-                "delivery": { "type": "string", "enum": ["steer", "queue"] },
+                "delivery": { "type": "string", "enum": ["steer", "queue"], "description": "steer (default) wakes the target or joins its active turn at the next step boundary; queue wakes an idle target or runs as the next turn after a busy turn finishes." },
                 "interrupt": { "type": "boolean", "description": "Interrupt the target's current execution first." }
             },
             "required": ["session_id", "text"],
@@ -123,6 +123,9 @@ impl Tool for WriteSessionTool {
             })
             .await
             .map_err(|error| runtime_error(&error))?;
+        // Always wake the target actor after enqueueing so `queue` deliveries reach
+        // idle subagents instead of sitting inert in SQLite; `promote_steers`
+        // keeps `queue` rows out of an in-flight turn until the next turn.
         runtime
             .notify(&to)
             .await
@@ -142,6 +145,12 @@ impl Tool for WriteSessionTool {
                 settings.timeout,
             );
         }
-        Ok(ToolResult::text(format!("wrote to {to}")))
+        let notice = match delivery {
+            Delivery::Steer => format!("wrote to {to} (delivery: steer)"),
+            Delivery::Queue => format!(
+                "queued for {to} (delivery: queue); runs immediately if idle or after the current turn finishes"
+            ),
+        };
+        Ok(ToolResult::text(notice))
     }
 }

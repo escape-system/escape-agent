@@ -12,7 +12,7 @@ use axum::Json;
 use axum::extract::rejection::{JsonRejection, QueryRejection};
 use axum::extract::{Path, Query, State};
 use oc_store::{NewInbox, SessionNodeRow};
-use oc_types::{ApiError, MessageId};
+use oc_types::{ApiError, EventEnvelope, EventId, EventLocation, MessageId, now_millis};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
@@ -94,15 +94,26 @@ pub async fn message(
     }
     let delivery = delivery_from_wire(body.delivery.as_deref())?;
     let store = require_store(&state)?;
-    store
+    let session = store
         .get_session(&session_id)
         .await?
         .ok_or_else(|| session_not_found(&session_id))?;
+    let directory = session
+        .pointer("/location/directory")
+        .and_then(Value::as_str)
+        .map_or_else(
+            || state.directory().to_string_lossy().into_owned(),
+            str::to_owned,
+        );
 
     let id = MessageId::new().into_inner();
     let mut payload = Map::new();
-    payload.insert("text".to_owned(), Value::String(body.text));
+    payload.insert("text".to_owned(), Value::String(body.text.clone()));
     payload.insert("peer".to_owned(), Value::Bool(true));
+    payload.insert(
+        "metadata".to_owned(),
+        json!({ "source": "peer", "from": "user" }),
+    );
     let item = store
         .enqueue(NewInbox {
             id: id.clone(),
@@ -113,6 +124,23 @@ pub async fn message(
         })
         .await?;
     publish_enqueued(&state, &session_id, &id, &item).await?;
+    state.publish(EventEnvelope {
+        id: EventId::new(),
+        created: Some(now_millis()),
+        kind: "subagent.peer.message".to_owned(),
+        metadata: None,
+        location: Some(EventLocation { directory }),
+        data: json!({
+            "sessionID": &session_id,
+            "from": "user",
+            "agent": "user",
+            "kind": "note",
+            "text": body.text,
+            "requestReply": false,
+            "messageID": &id,
+        }),
+        durable: None,
+    });
     notify(&state, &session_id).await?;
     Ok(Json(json!({ "data": item })))
 }

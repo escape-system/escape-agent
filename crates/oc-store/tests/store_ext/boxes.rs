@@ -2,7 +2,10 @@
 //! expiry and soft deletion (`docs/25-context-boxes.md`).
 
 use crate::support::{new_session, seed_session};
-use oc_store::{BoxQuery, MAX_BOX_CHARS, NewBox, NewSession, NewSessionTree, Store, StoreError};
+use oc_store::{
+    BoxMetaPatch, BoxQuery, BoxSearchQuery, EditBox, MAX_BOX_CHARS, NewBox, NewSession,
+    NewSessionTree, Store, StoreError, WriteBox,
+};
 
 fn new_box(root: &str, key: &str, kind: &str, content: &str) -> NewBox {
     NewBox {
@@ -396,11 +399,311 @@ async fn list_reports_has_more_and_orders_by_key() {
 
     let filtered = store
         .list_boxes(BoxQuery {
-            root_id: root,
+            root_id: root.clone(),
             kind: Some("temporary".to_owned()),
             ..BoxQuery::default()
         })
         .await
         .expect("filtered");
     assert!(filtered.items.is_empty());
+}
+
+#[tokio::test]
+async fn session_scoped_boxes_isolate_siblings_while_preserving_tree_boxes() {
+    let store = Store::open_memory().await.expect("memory store");
+    let root = seed_tree(&store).await;
+    store
+        .create_session_with_tree(
+            NewSession {
+                parent_id: Some("ses_root".to_owned()),
+                ..new_session("ses_sibling")
+            },
+            NewSessionTree {
+                root_id: "ses_root".to_owned(),
+                depth: 1,
+                role: "subagent".to_owned(),
+                spawn_allowed: true,
+            },
+        )
+        .await
+        .expect("sibling session");
+
+    store
+        .write_box(
+            new_box(&root, "scratch", "stable", "shared tree scratch"),
+            false,
+        )
+        .await
+        .expect("tree box");
+    store
+        .write_box_scoped(
+            WriteBox {
+                root_id: root.clone(),
+                owner_session: "ses_child".to_owned(),
+                scope: Some("session".to_owned()),
+                key: "scratch".to_owned(),
+                kind: Some("temporary".to_owned()),
+                tags: Some(vec!["worker-a".to_owned()]),
+                content: "child private scratch".to_owned(),
+                ..WriteBox::default()
+            },
+            false,
+        )
+        .await
+        .expect("child private");
+    store
+        .write_box_scoped(
+            WriteBox {
+                root_id: root.clone(),
+                owner_session: "ses_sibling".to_owned(),
+                scope: Some("session".to_owned()),
+                key: "scratch".to_owned(),
+                kind: Some("stable".to_owned()),
+                tags: Some(vec!["worker-b".to_owned()]),
+                content: "sibling private scratch".to_owned(),
+                ..WriteBox::default()
+            },
+            false,
+        )
+        .await
+        .expect("sibling private");
+
+    // Child's default get_box_scoped sees its own private session box; root sees tree box.
+    let child_read = store
+        .get_box_scoped(&root, None, Some("ses_child"), "scratch", false)
+        .await
+        .expect("read")
+        .expect("child box");
+    assert_eq!(child_read["scope"], "session");
+    assert_eq!(child_read["content"], "child private scratch");
+
+    let tree_read = store
+        .get_box_scoped(&root, Some("tree"), Some("ses_child"), "scratch", false)
+        .await
+        .expect("read")
+        .expect("tree box");
+    assert_eq!(tree_read["scope"], "tree");
+    assert_eq!(tree_read["content"], "shared tree scratch");
+
+    let root_list = store
+        .list_boxes(BoxQuery {
+            root_id: root.clone(),
+            session_id: Some("ses_root".to_owned()),
+            ..BoxQuery::default()
+        })
+        .await
+        .expect("root list");
+    assert_eq!(root_list.items.len(), 1);
+    assert_eq!(root_list.items[0]["content"], "shared tree scratch");
+
+    let child_list = store
+        .list_boxes(BoxQuery {
+            root_id: root.clone(),
+            session_id: Some("ses_child".to_owned()),
+            ..BoxQuery::default()
+        })
+        .await
+        .expect("child list");
+    assert_eq!(child_list.items.len(), 2);
+    assert!(
+        child_list
+            .items
+            .iter()
+            .all(|item| item["content"] != "sibling private scratch")
+    );
+}
+
+#[tokio::test]
+async fn write_box_scoped_preserves_kind_and_tags_and_clears_deleted_metadata() {
+    let store = Store::open_memory().await.expect("memory store");
+    let root = seed_tree(&store).await;
+
+    let created = store
+        .write_box_scoped(
+            WriteBox {
+                root_id: root.clone(),
+                owner_session: root.clone(),
+                key: "notes".to_owned(),
+                title: Some("Old Title".to_owned()),
+                description: Some("Old Description".to_owned()),
+                kind: Some("temporary".to_owned()),
+                tags: Some(vec!["alpha".to_owned(), "beta".to_owned()]),
+                content: "line 1".to_owned(),
+                ..WriteBox::default()
+            },
+            false,
+        )
+        .await
+        .expect("create");
+    assert_eq!(created["kind"], "temporary");
+
+    // Append with omitted kind & tags must keep temporary & existing tags.
+    let appended = store
+        .write_box_scoped(
+            WriteBox {
+                root_id: root.clone(),
+                owner_session: root.clone(),
+                key: "notes".to_owned(),
+                content: "line 2".to_owned(),
+                expected_revision: Some(1),
+                ..WriteBox::default()
+            },
+            true,
+        )
+        .await
+        .expect("append");
+    assert_eq!(appended["kind"], "temporary");
+    assert_eq!(appended["tags"], serde_json::json!(["alpha", "beta"]));
+    assert_eq!(appended["revision"], 2);
+
+    // Revision conflict rejects stale writes.
+    let err = store
+        .write_box_scoped(
+            WriteBox {
+                root_id: root.clone(),
+                owner_session: root.clone(),
+                key: "notes".to_owned(),
+                content: "stale".to_owned(),
+                expected_revision: Some(1),
+                ..WriteBox::default()
+            },
+            false,
+        )
+        .await
+        .expect_err("stale revision");
+    assert!(matches!(err, StoreError::Invalid(_)));
+
+    // Recreating a deleted box without title/description clears stale metadata.
+    assert!(store.delete_box(&root, "notes").await.expect("delete"));
+    let recreated = store
+        .write_box_scoped(
+            WriteBox {
+                root_id: root.clone(),
+                owner_session: root.clone(),
+                key: "notes".to_owned(),
+                content: "fresh".to_owned(),
+                ..WriteBox::default()
+            },
+            false,
+        )
+        .await
+        .expect("recreate");
+    assert_eq!(recreated["revision"], 1);
+    assert_eq!(recreated["kind"], "stable");
+    assert!(recreated.get("title").is_none());
+    assert!(recreated.get("description").is_none());
+}
+
+#[tokio::test]
+async fn edit_meta_search_and_cursor_pagination_work() {
+    let store = Store::open_memory().await.expect("memory store");
+    let root = seed_tree(&store).await;
+
+    let draft = store
+        .write_box_scoped(
+            WriteBox {
+                root_id: root.clone(),
+                owner_session: "ses_child".to_owned(),
+                scope: Some("session".to_owned()),
+                key: "plan-draft".to_owned(),
+                description: Some("Draft plan".to_owned()),
+                kind: Some("temporary".to_owned()),
+                tags: Some(vec!["plan".to_owned(), "backend".to_owned()]),
+                content: "step 1: check config\nstep 2: TODO later\nstep 3: verify".to_owned(),
+                ..WriteBox::default()
+            },
+            false,
+        )
+        .await
+        .expect("draft");
+    assert_eq!(draft["revision"], 1);
+
+    let edited = store
+        .edit_box(EditBox {
+            root_id: root.clone(),
+            owner_session: "ses_child".to_owned(),
+            scope: Some("session".to_owned()),
+            key: "plan-draft".to_owned(),
+            find: "TODO later".to_owned(),
+            replace: "update migration".to_owned(),
+            replace_all: false,
+            expected_revision: Some(1),
+        })
+        .await
+        .expect("edit");
+    assert_eq!(edited["revision"], 2);
+    assert!(
+        edited["content"]
+            .as_str()
+            .unwrap()
+            .contains("update migration")
+    );
+
+    // Promote from session temporary -> tree stable and rename key.
+    let promoted = store
+        .update_box_meta(BoxMetaPatch {
+            root_id: root.clone(),
+            owner_session: "ses_child".to_owned(),
+            scope: Some("session".to_owned()),
+            key: "plan-draft".to_owned(),
+            new_key: Some("plan-final".to_owned()),
+            new_scope: Some("tree".to_owned()),
+            kind: Some("stable".to_owned()),
+            expected_revision: Some(2),
+            ..BoxMetaPatch::default()
+        })
+        .await
+        .expect("meta");
+    assert_eq!(promoted["scope"], "tree");
+    assert_eq!(promoted["key"], "plan-final");
+    assert_eq!(promoted["kind"], "stable");
+    assert_eq!(promoted["revision"], 3);
+
+    // Search matches case-insensitively with line and charOffset.
+    let hits = store
+        .search_boxes(BoxSearchQuery {
+            root_id: root.clone(),
+            session_id: Some("ses_root".to_owned()),
+            tag: Some("backend".to_owned()),
+            query: "MIGRATION".to_owned(),
+            ..BoxSearchQuery::default()
+        })
+        .await
+        .expect("search");
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0]["key"], "plan-final");
+    assert_eq!(hits[0]["line"], 2);
+    assert!(hits[0]["charOffset"].as_u64().is_some());
+
+    // Prefix + cursor pagination across multiple boxes.
+    for key in ["mod-a", "mod-b", "mod-c"] {
+        store
+            .write_box(new_box(&root, key, "stable", key), false)
+            .await
+            .expect("write");
+    }
+    let page1 = store
+        .list_boxes(BoxQuery {
+            root_id: root.clone(),
+            prefix: Some("mod-".to_owned()),
+            limit: 2,
+            ..BoxQuery::default()
+        })
+        .await
+        .expect("page1");
+    assert_eq!(page1.items.len(), 2);
+    assert!(page1.has_more);
+    let page2 = store
+        .list_boxes(BoxQuery {
+            root_id: root,
+            prefix: Some("mod-".to_owned()),
+            cursor: page1.next_cursor,
+            limit: 2,
+            ..BoxQuery::default()
+        })
+        .await
+        .expect("page2");
+    assert_eq!(page2.items.len(), 1);
+    assert!(!page2.has_more);
+    assert_eq!(page2.items[0]["key"], "mod-c");
 }

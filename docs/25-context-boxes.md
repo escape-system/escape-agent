@@ -1,15 +1,22 @@
 # 25 — Context boxes
 
-Context boxes are durable, root-shared stores of working context. They exist
-because compaction used to *replace* history with the newest summary: each
-generation re-summarized the previous summary, facts eroded, and long sessions
-turned into a telephone game. Boxes are the stable substrate a summary can
-point at instead of restating.
+Context boxes are durable, session- or session-tree-shared stores of working
+context (`scope = 'tree' | 'session'`, migration `0013_context_box_scope`; never
+project-scoped). They exist because compaction used to *replace* history with
+the newest summary: each generation re-summarized the previous summary, facts
+eroded, and long sessions turned into a telephone game. Boxes are the stable
+substrate a summary can point at instead of restating.
 
 They are not `oc-memory` (doc 06): memory is scribe-driven, capped at 2,000
 characters, scoped global/project/agent/session and retrieved by FTS. Boxes are
-explicitly authored by the agent, larger, addressed by key, lifecycle-tagged and
-shared by the whole session tree.
+explicitly authored by the agent (`box_write`, `box_edit`, `box_read`,
+`box_search`, `box_meta`, `box_list`, `box_delete`), larger, addressed by key
+within `tree` (root-shared) or `session` (private to one session) scope, and
+support optimistic concurrency (`expected_revision`) and cursor pagination. Both
+render into the prompt prefix (`oc/memory` then `oc/boxes`), which makes them
+look like one store; they are not. Memory is a separate scribe system for
+cross-session project knowledge; boxes are an explicit, durable working-context
+substrate for the active session or session tree.
 
 ## Compaction policy
 
@@ -55,10 +62,25 @@ CREATE TABLE context_box (
 );
 ```
 
-Scope is the session tree: every session whose `session_v2.root_id` is the
-same root sees the same boxes. A subagent writes to the tree it belongs to, not
-to a private copy. A box is addressed by `key` within its root, so two boxes in
-one tree cannot share a key.
+Scope is the session tree **by design**, not per session and not per project:
+every session whose `session_v2.root_id` is the same root sees the same boxes.
+A subagent writes to the tree it belongs to, not to a private copy. A box is
+addressed by `key` within its root, so two boxes in one tree cannot share a key.
+`owner_session` records who last wrote a row for audit and permission checks; it
+does **not** make the box private to that session. This is deliberate: children
+need the parent's decisions and a parent needs a child's findings without a copy
+step, and the tree is the unit that survives compaction and restarts together.
+
+Per-session scope is a recurring request. A backward-compatible option would add
+a `scope` column (`tree` | `session`) with `tree` as the default and a unique key
+on `(root_id, scope_owner, key)`, where `scope_owner` is the root for `tree` and
+the session id for `session`. `box_list` would then accept a scope filter and the
+prompt prefix would gain a separate `<boxes scope="session">` section, rendered
+after the tree section. Writes by a child default to `tree` unless the caller
+passes an explicit scope, and existing rows keep their meaning without a data
+migration beyond backfilling the default. This is a **sketch only**: no schema
+change, wire change or tool argument exists today, and no session-private box
+can be created with the current tools.
 
 Wire shape (`id`, `rootID`, `key`, `title`, `description`, `kind`, `tags`,
 `revision`, `size` = content characters, `timeCreated`, `timeUpdated`,

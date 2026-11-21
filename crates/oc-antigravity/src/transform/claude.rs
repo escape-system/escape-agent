@@ -55,7 +55,9 @@ fn transform_claude_tools(request_obj: &mut Map<String, Value>, tool_hardening: 
             .entry("functionCallingConfig".to_owned())
             .or_insert_with(|| json!({}));
         if let Some(fcc_obj) = fcc.as_object_mut() {
-            fcc_obj.insert("mode".to_owned(), json!("VALIDATED"));
+            fcc_obj
+                .entry("mode".to_owned())
+                .or_insert_with(|| json!("VALIDATED"));
         }
     }
 

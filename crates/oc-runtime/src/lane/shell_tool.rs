@@ -119,6 +119,12 @@ impl Tool for ShellLaneTool {
             Some(value) => util::resolve_from(&ctx.cwd, &value),
             None => ctx.cwd.clone(),
         };
+        if !background && let Err(reason) = oc_tools::shell_guard::check_shell_command(&command) {
+            return Err(ToolError::new(reason));
+        }
+        if !background && let Err(reason) = oc_tools::shell_guard::check_shell_command(&command) {
+            return Err(ToolError::new(reason));
+        }
         if background {
             return self.shell.execute(ctx, input).await;
         }

@@ -26,7 +26,7 @@ mod runner;
 mod shell_tool;
 mod tool;
 
-pub use runner::ProcessLaneRunner;
+pub use runner::{ProcessLaneRunner, cleanup_stale_lane_logs};
 pub use shell_tool::ShellLaneTool;
 pub use tool::LaneTool;
 

@@ -12,10 +12,11 @@ use crate::service::NewMemoryInput;
 use super::common::{optional_confidence, string_array};
 use super::{SCOPES, ToolScope};
 
-const WRITE_DESCRIPTION: &str = "Store one durable memory that survives sessions: a project fact, decision, preference, \
-     pattern or gotcha. Prefer memories a future session cannot derive from the repository. \
-     Text is capped at 2000 characters; credentials are rejected. Write at most one memory per \
-     turn unless the user asks for more.";
+const WRITE_DESCRIPTION: &str = "Store one durable cross-session memory that survives sessions: a project fact, \
+     decision, preference, pattern or gotcha. Prefer memories a future session cannot derive from the \
+     repository. Never use memory_write for single-session working notes, plans, or scratchpads — use \
+     box_write for session-only state instead. Text is capped at 2000 characters; credentials are rejected. \
+     Write at most one memory per turn unless the user asks for more.";
 
 /// `memory_write {text, kind?, scope?, tags?, importance?, confidence?}`
 #[derive(Debug)]

@@ -104,6 +104,17 @@ pub(super) fn collect_tool_lines(
                             stats.record_verification(step_number);
                         }
                     }
+                    "lane" => {
+                        if lane_verified_command(metadata.as_ref()) {
+                            stats.record_verification(step_number);
+                        }
+                    }
+                    "subagent"
+                        if input.get("agent").and_then(Value::as_str) == Some("steward")
+                            && steward_verified_command(&text) =>
+                    {
+                        stats.record_verification(step_number);
+                    }
                     _ => {}
                 }
                 if let Some(reason) = shell_failure {
@@ -152,6 +163,38 @@ pub(super) fn tool_summary(text: &str) -> String {
     }
     let summary: String = first.chars().take(160).collect();
     format!(" ({summary})")
+}
+
+fn lane_verified_command(metadata: Option<&serde_json::Map<String, Value>>) -> bool {
+    let Some(ticket) = metadata.and_then(|meta| meta.get("ticket")) else {
+        return false;
+    };
+    let succeeded = ticket
+        .get("state")
+        .and_then(|state| state.get("state"))
+        .and_then(Value::as_str)
+        == Some("succeeded");
+    let command = ticket
+        .get("command")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    succeeded && verify::is_verification_command(command)
+}
+
+fn steward_verified_command(text: &str) -> bool {
+    let has_ok = text
+        .lines()
+        .any(|line| line.to_ascii_lowercase().contains("status: ok"));
+    let has_no_failures = text
+        .lines()
+        .any(|line| line.trim().eq_ignore_ascii_case("failures: none"));
+    let has_cmd = text.lines().any(|line| {
+        line.trim()
+            .strip_prefix("cmd:")
+            .map(str::trim)
+            .is_some_and(verify::is_verification_command)
+    });
+    has_ok && has_no_failures && has_cmd
 }
 
 pub(super) fn scribe_digest(stats: &TurnStats) -> String {
@@ -234,5 +277,49 @@ mod tests {
         ok_meta.insert("exit".to_owned(), json!(0));
         collect_tool_lines(&mut stats, &shell_step("cargo test", Some(ok_meta)), 2);
         assert_eq!(stats.last_verification_step, Some(2));
+    }
+
+    #[test]
+    fn lane_and_steward_verification_record_verified_step() {
+        let mut stats = TurnStats::default();
+        let mut msg = AssistantState::new(
+            MessageId::from_wire("msg_2"),
+            "engineer".to_owned(),
+            ModelRef {
+                provider_id: "test".to_owned(),
+                id: "alpha".to_owned(),
+                variant: None,
+            },
+            3,
+        );
+        let mut lane_meta = Map::new();
+        lane_meta.insert(
+            "ticket".to_owned(),
+            json!({
+                "id": "tkt_1",
+                "command": "env -u OC_WEB_DIST cargo test -p oc-runtime",
+                "state": {"state": "succeeded", "exit": 0}
+            }),
+        );
+        msg.content.push(AssistantPart::Tool(Box::new(ToolPart {
+            id: "call_lane".to_owned(),
+            name: "lane".to_owned(),
+            executed: Some(true),
+            native: None,
+            time: ToolTime {
+                created: 1,
+                ran: Some(1),
+                completed: Some(2),
+            },
+            state: ToolState::Completed {
+                input: Map::new(),
+                content: vec![ToolContent::Text {
+                    text: "done".to_owned(),
+                }],
+                metadata: Some(lane_meta),
+            },
+        })));
+        collect_tool_lines(&mut stats, &msg, 3);
+        assert_eq!(stats.last_verification_step, Some(3));
     }
 }

@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use futures_util::stream::{self, BoxStream, StreamExt};
-use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderName, HeaderValue};
+use reqwest::header::{ACCEPT, ACCEPT_ENCODING, CONTENT_TYPE, HeaderName, HeaderValue};
 use std::sync::RwLock;
 
 use reqwest::{Client, Response};
@@ -40,9 +40,14 @@ impl LlmClient {
     /// timeout, 900s chunk timeout).
     pub fn new() -> Result<Self, LlmError> {
         let http = Client::builder()
+            .connect_timeout(Duration::from_secs(30))
+            .tcp_keepalive(Duration::from_secs(30))
+            .http2_keep_alive_interval(Some(Duration::from_secs(30)))
+            .http2_keep_alive_timeout(Duration::from_secs(15))
+            .http2_keep_alive_while_idle(true)
             .build()
             .map_err(|error| LlmError::Transport {
-                message: error.to_string(),
+                message: format_error_chain(&error),
             })?;
         Ok(Self {
             http,
@@ -262,6 +267,7 @@ impl LlmClient {
             .post(url)
             .header(CONTENT_TYPE, "application/json")
             .header(ACCEPT, "text/event-stream")
+            .header(ACCEPT_ENCODING, "identity")
             .body(body.to_vec());
         for (name, value) in headers {
             let name = HeaderName::from_bytes(name.as_bytes()).map_err(|error| {
@@ -363,7 +369,11 @@ fn into_llm_stream(state: StreamState) -> LlmStream {
             let next = match read_chunk(&mut state).await {
                 Ok(next) => next,
                 Err(event) => {
-                    state.pending.push_back(event);
+                    if state.decoder.had_completion() {
+                        state.close();
+                    } else {
+                        state.pending.push_back(event);
+                    }
                     state.finished = true;
                     continue;
                 }
@@ -428,7 +438,7 @@ async fn read_chunk(state: &mut StreamState) -> Result<Option<Bytes>, LlmEvent> 
     match tokio::time::timeout_at(limit, state.body.next()).await {
         Ok(Some(Ok(bytes))) => Ok(Some(bytes)),
         Ok(Some(Err(error))) => Err(LlmEvent::ProviderError {
-            message: format!("stream read failed: {error}"),
+            message: format!("stream read failed: {}", format_error_chain(&error)),
         }),
         Ok(None) => Ok(None),
         Err(_)
@@ -444,6 +454,20 @@ async fn read_chunk(state: &mut StreamState) -> Result<Option<Bytes>, LlmEvent> 
             message: "provider stream chunk timed out".to_string(),
         }),
     }
+}
+
+fn format_error_chain(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut out = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        let msg = cause.to_string();
+        if !msg.is_empty() && !out.contains(&msg) {
+            out.push_str(": ");
+            out.push_str(&msg);
+        }
+        source = cause.source();
+    }
+    out
 }
 
 fn join_url(base: &str, path: &str) -> String {

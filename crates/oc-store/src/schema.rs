@@ -431,6 +431,44 @@ CREATE INDEX context_box_root_key_idx ON context_box(root_id, key);
 CREATE INDEX context_box_root_live_idx ON context_box(root_id, deleted, time_expired);
 ";
 
+const CONTEXT_BOX_SCOPE: &str = r"
+CREATE TABLE context_box_new (
+  id TEXT PRIMARY KEY,
+  root_id TEXT NOT NULL REFERENCES session_v2(id) ON DELETE CASCADE,
+  owner_session TEXT NOT NULL,
+  scope TEXT NOT NULL DEFAULT 'tree' CHECK (scope IN ('tree', 'session')),
+  key TEXT NOT NULL,
+  title TEXT,
+  description TEXT,
+  kind TEXT NOT NULL CHECK (kind IN ('stable', 'temporary')),
+  tags TEXT NOT NULL DEFAULT '[]',
+  content TEXT NOT NULL,
+  revision INTEGER NOT NULL DEFAULT 1,
+  time_created INTEGER NOT NULL,
+  time_updated INTEGER NOT NULL,
+  time_expired INTEGER,
+  deleted INTEGER NOT NULL DEFAULT 0
+);
+INSERT INTO context_box_new (
+  id, root_id, owner_session, scope, key, title, description, kind, tags, content,
+  revision, time_created, time_updated, time_expired, deleted
+)
+SELECT
+  id, root_id, owner_session, 'tree', key, title, description, kind, tags, content,
+  revision, time_created, time_updated, time_expired, deleted
+FROM context_box;
+DROP TABLE context_box;
+ALTER TABLE context_box_new RENAME TO context_box;
+CREATE INDEX context_box_root_key_idx ON context_box(root_id, key);
+CREATE INDEX context_box_root_live_idx ON context_box(root_id, deleted, time_expired);
+CREATE UNIQUE INDEX context_box_tree_key_uniq
+  ON context_box(root_id, key) WHERE scope = 'tree';
+CREATE UNIQUE INDEX context_box_session_key_uniq
+  ON context_box(root_id, owner_session, key) WHERE scope = 'session';
+CREATE INDEX context_box_root_scope_live_idx
+  ON context_box(root_id, scope, owner_session, deleted, time_expired);
+";
+
 /// Durable reason for the last idle outcome. Distinguishes a user-initiated
 /// stop from other interrupts so the observer does not resume a stopped
 /// session. Internal only; never serialised onto the wire session shape.
@@ -500,5 +538,10 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         id: "0012_session_idle_reason",
         sql: SESSION_IDLE_REASON,
         column_guard: Some(("session_v2", "idle_reason")),
+    },
+    Migration {
+        id: "0013_context_box_scope",
+        sql: CONTEXT_BOX_SCOPE,
+        column_guard: Some(("context_box", "scope")),
     },
 ];

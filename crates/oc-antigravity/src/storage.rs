@@ -17,14 +17,20 @@ pub const CURRENT_STORAGE_VERSION: u32 = 4;
 #[serde(rename_all = "camelCase")]
 pub struct QuotaGroupSnapshot {
     /// Fraction used `0.0..=1.0` or percentage `0.0..=100.0` (normalized helper converts).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remaining_fraction: Option<f64>,
     /// Percentage used (`0..=100`), if known.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub used_percent: Option<f64>,
     /// Reset timestamp in epoch milliseconds, if provided.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reset_time_ms: Option<i64>,
+    /// Human-readable display label derived from the live API models sharing this quota pool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// Canonical base model IDs covered by this quota pool.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<String>,
 }
 
 /// Cached quota snapshot across logical groups (`claude`, `gemini-pro`, `gemini-flash`, `gemini-cli`).

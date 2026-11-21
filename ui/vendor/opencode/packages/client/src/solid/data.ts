@@ -744,6 +744,10 @@ export function createData(config: CreateDataInput) {
         refresh(() => result.session.sync(event.data.sessionID))
         if (event.data.parentID) {
           result.session.invalidate(event.data.parentID)
+          // The family sync is keyed apart from the plain session sync. Without invalidating it, a parent whose
+          // family was already loaded answers `sync(parent, { children: true })` from the completed key and the
+          // new subagent only appears after F5.
+          sync.invalidate(`session.family:${event.data.parentID}`)
           refresh(() => result.session.sync(event.data.parentID, { children: true }))
         }
         // Band-aid: a newly created session starts empty, so live events can be its source of truth.
@@ -785,6 +789,19 @@ export function createData(config: CreateDataInput) {
         const previous = event.data.previous ?? store.session.info[event.data.sessionID]?.model
         if (store.session.info[event.data.sessionID])
           setStore("session", "info", event.data.sessionID, "model", event.data.model)
+        // `""`, `"default"` and an absent variant are one selection: the Default variant. A repeat of the same
+        // effective model must not render as "Switched variant to Default".
+        const effectiveVariant = (variant: string | undefined) => {
+          const value = variant?.trim().toLowerCase()
+          return value ? (value === "default" ? undefined : value) : undefined
+        }
+        if (
+          previous &&
+          previous.providerID === event.data.model.providerID &&
+          previous.id === event.data.model.id &&
+          effectiveVariant(previous.variant) === effectiveVariant(event.data.model.variant)
+        )
+          return
         if (!store.session.message[event.data.sessionID]) return
         message.insert(event.data.sessionID, {
           id: SessionMessage.ID.fromEvent(event.id),

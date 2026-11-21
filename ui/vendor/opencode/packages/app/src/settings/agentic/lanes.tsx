@@ -37,9 +37,24 @@ export const SettingsLanes: Component = () => {
   const request = useAgenticRequest()
 
   const section = () => config.section("lanes")
-  const concurrency = (key: (typeof LANES)[number]["key"]) =>
+  const concurrency = (key: string) =>
     typeof section()[key] === "number" ? (section()[key] as number) : undefined
   const commit = (changes: Record<string, unknown>) => void config.save("lanes", changes)
+  const knownLaneKeys = new Set<string>(LANES.map((item) => item.key))
+  const customLaneKeys = () => {
+    const keys = new Set<string>()
+    for (const key of Object.keys(section())) {
+      if (key !== "max_queue" && !knownLaneKeys.has(key) && typeof section()[key] === "number") {
+        keys.add(key)
+      }
+    }
+    for (const item of status.data?.lanes ?? []) {
+      if (!knownLaneKeys.has(item.lane)) {
+        keys.add(item.lane)
+      }
+    }
+    return [...keys].sort()
+  }
 
   const status = useQuery(() => ({
     queryKey: [sdk.scope, "settings-lane-status"],
@@ -88,6 +103,19 @@ export const SettingsLanes: Component = () => {
                     value={concurrency(item.key)}
                     fallback={item.fallback}
                     onCommit={(value) => commit({ [item.key]: value })}
+                  />
+                </SettingsRow>
+              )}
+            </For>
+            <For each={customLaneKeys()}>
+              {(key) => (
+                <SettingsRow title={key} description={language.t("settings.lanes.description")}>
+                  <NumberField
+                    label={key}
+                    testid={`settings-lanes-${key}`}
+                    value={concurrency(key)}
+                    fallback={1}
+                    onCommit={(value) => commit({ [key]: value })}
                   />
                 </SettingsRow>
               )}

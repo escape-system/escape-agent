@@ -76,8 +76,10 @@ impl Runtime {
     /// because no handler exists and it can never become a turn.
     async fn withdraw_queued_input(&self, session: &str) -> Result<bool, RuntimeError> {
         const WITHDRAWN: [&str; 5] = ["user", "synthetic", "peer", "observer", "compaction"];
+        let items = self.inner.config.store.list_inbox(session).await?;
+        let mut directory: Option<String> = None;
         let mut withdrawn = false;
-        for item in self.inner.config.store.list_inbox(session).await? {
+        for item in items {
             let kind = item.get("type").and_then(Value::as_str).unwrap_or_default();
             if !WITHDRAWN.contains(&kind) {
                 continue;
@@ -87,6 +89,34 @@ impl Runtime {
             };
             if self.inner.config.store.cancel_inbox(session, id).await? {
                 withdrawn = true;
+                let dir = if let Some(dir) = &directory {
+                    dir.clone()
+                } else {
+                    let resolved = self
+                        .inner
+                        .config
+                        .store
+                        .get_session(session)
+                        .await?
+                        .and_then(|value| {
+                            value
+                                .pointer("/location/directory")
+                                .and_then(Value::as_str)
+                                .map(str::to_owned)
+                        })
+                        .unwrap_or_default();
+                    directory = Some(resolved.clone());
+                    resolved
+                };
+                self.emit(
+                    session,
+                    &dir,
+                    oc_types::payload::SessionInboxCancelled {
+                        session_id: Runtime::session_id(session),
+                        inbox_id: oc_types::MessageId::from_wire(id.to_owned()),
+                    },
+                )
+                .await?;
             }
         }
         Ok(withdrawn)

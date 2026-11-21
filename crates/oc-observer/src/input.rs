@@ -46,6 +46,16 @@ pub struct RootInput {
     pub model: Option<String>,
     /// Current step number.
     pub step: u32,
+    /// Total step cap for the turn, when the host published one.
+    #[serde(rename = "stepCap", default, skip_serializing_if = "Option::is_none")]
+    pub step_cap: Option<u32>,
+    /// Tool-enabled steps remaining, when the host published them.
+    #[serde(
+        rename = "stepsRemaining",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub steps_remaining: Option<u32>,
     /// `busy`, `idle`, `interrupted`.
     pub state: String,
     /// True when the root was stopped by the user and is still idle as a
@@ -73,6 +83,12 @@ pub struct RootContext {
     pub model: Option<String>,
     /// Current step number.
     pub step: u32,
+    /// Total step cap for the turn, when the host published one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step_cap: Option<u32>,
+    /// Tool-enabled steps remaining, when the host published them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub steps_remaining: Option<u32>,
     /// `busy`, `idle`, `interrupted`.
     pub state: Option<String>,
 }
@@ -247,6 +263,8 @@ mod tests {
                 agent: "build".to_owned(),
                 model: Some("anthropic/claude-sonnet-4-5".to_owned()),
                 step: 7,
+                step_cap: None,
+                steps_remaining: None,
                 state: "busy".to_owned(),
                 stopped_by_user: false,
             },

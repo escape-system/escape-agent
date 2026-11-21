@@ -99,13 +99,11 @@ async fn small_cap_is_never_extended() {
 
 #[tokio::test]
 async fn progress_extensions_continue_the_turn() {
-    // `steps: 10` with a tool that completes on every step: at the limit the
-    // evaluator sees ten `Completed` reads and grants a fresh batch, the next
-    // request runs with tools enabled again, and the model then answers so the
-    // turn is *not* step-limited.
-    let mut scripts = reads(&["hello.txt"; 10]);
-    scripts.push(text_script("finishing after the extension")); // tool-less limit call -> grant
-    scripts.extend(reads(&["hello.txt"])); // first extended step
+    // `steps: 10` with a tool that completes on every step: when step 10 reaches
+    // the initial boundary, the evaluator extends the cap BEFORE forcing a
+    // tool-less summary request, so step 11 runs directly with tools enabled and
+    // zero wasted wrap-up round trip.
+    let mut scripts = reads(&["hello.txt"; 11]);
     scripts.push(text_script("all done"));
     let harness = Harness::new(
         scripts,
@@ -119,17 +117,16 @@ async fn progress_extensions_continue_the_turn() {
     let requests = harness.model.requests();
     assert_eq!(
         requests.len(),
-        13,
-        "10 budgeted steps, one tool-less limit call, one extended step, one answer"
+        12,
+        "10 budgeted steps + 1 seamless extended step + 1 final answer"
     );
     assert_eq!(
-        requests[10].options.tool_choice.as_deref(),
-        Some("none"),
-        "the limit is reached through the usual tool-less request"
+        requests[10].options.tool_choice, None,
+        "the step at the old boundary keeps tools enabled because the extension ran beforehand"
     );
     assert_eq!(
         requests[11].options.tool_choice, None,
-        "the granted step runs with tools enabled again"
+        "the answer follows cleanly"
     );
 
     let extended = harness.sink.data("session.execution.step_extended");
@@ -297,12 +294,11 @@ async fn extension_is_bounded() {
         .map(|grant| grant["steps"].as_u64().expect("steps is a number"))
         .sum();
     assert!(granted > 0, "a grant must buy at least one step");
-    // 10 budgeted steps, then every granted step actually ran, and each grant
-    // (plus the final deny) cost one tool-less limit request.
+    // 10 initial steps + every granted step ran seamlessly with tools enabled + 1 final tool-less step.
     assert_eq!(
         u64::try_from(harness.model.calls()).expect("call count fits"),
-        10 + granted + u64::try_from(extensions).expect("extension count fits") + 1,
-        "each granted step was actually requested before the budget bound again"
+        10 + granted + 1,
+        "each granted step ran seamlessly before the hard ceiling disabled tools"
     );
 
     assert_eq!(
@@ -312,8 +308,9 @@ async fn extension_is_bounded() {
     );
     let step_limit = harness.sink.data("session.execution.step_limit");
     assert_eq!(
-        step_limit[0]["steps"], 10,
-        "the qualifier reports the configured budget, not the extended cap"
+        step_limit[0]["steps"],
+        10 + granted,
+        "the qualifier reports the actual consumed cap after extensions"
     );
     let session = harness
         .store

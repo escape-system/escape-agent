@@ -24,7 +24,7 @@ use crate::error::Respond;
 static CONFIG_LOCK: Mutex<()> = Mutex::new(());
 static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
-const ALLOWED: [&str; 9] = [
+const ALLOWED: [&str; 10] = [
     "shell",
     "subagents",
     "observer",
@@ -37,6 +37,7 @@ const ALLOWED: [&str; 9] = [
     // `PUT /api/config/models` (`data::models_registry`), which deep-merges
     // instead of replacing. Listing it here keeps the key tables consistent.
     "models",
+    "step_budget",
 ];
 
 pub async fn patch(State(_state): State<AppState>, Json(body): Json<Value>) -> Response {

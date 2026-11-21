@@ -12,6 +12,7 @@ use super::stream::send_stream_once;
 use super::{DispatchOutcome, SingleAttempt};
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)]
 pub(super) async fn handle_single_attempt(
     svc: &AntigravityService,
     request: &LlmRequest,
@@ -22,6 +23,7 @@ pub(super) async fn handle_single_attempt(
     force_strip_thinking: bool,
     attempt: SingleAttempt,
     excluded_indices: &mut HashSet<usize>,
+    empty_excluded: &mut HashSet<usize>,
     last_error: &mut Option<LlmError>,
     started: Instant,
     max_wait: Duration,
@@ -33,11 +35,29 @@ pub(super) async fn handle_single_attempt(
         }
         SingleAttempt::RetryStripThinking => {
             svc.refund_token(account_index);
+            tracing::warn!(
+                account_index,
+                family = family.as_str(),
+                style = style.as_str(),
+                outcome = "retry_strip_thinking",
+                "antigravity: refunded token bucket for non-upstream retry"
+            );
             return Ok(Some(DispatchOutcome::RetryStripThinking));
         }
         SingleAttempt::RetryEmptyResponse => {
             svc.refund_token(account_index);
-            return Ok(Some(DispatchOutcome::RetryEmptyResponse));
+            excluded_indices.insert(account_index);
+            empty_excluded.insert(account_index);
+            *last_error = Some(LlmError::Provider {
+                message: format!("Cloud Code account {account_index} returned an empty response"),
+            });
+            tracing::warn!(
+                account_index,
+                family = family.as_str(),
+                style = style.as_str(),
+                outcome = "retry_empty_response",
+                "antigravity: refunded token bucket and rotating away from empty account"
+            );
         }
         SingleAttempt::Unauthorized => {
             if let Ok(fresh) = svc.credentials_for_account(account_index, true).await

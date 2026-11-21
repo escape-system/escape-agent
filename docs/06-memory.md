@@ -115,9 +115,11 @@ recent user intent + assistant final text + tool outcomes (one line each)
 
 Filters: confidence ≥ 0.6, text 20–2000 chars, not a duplicate, not a secret
 (regex for keys/tokens), not transient ("currently running…"). Scribe writes
-are marked `source:"scribe"` and are visible/deletable in the UI. The scribe
-never blocks the turn and is skipped when the session has no goal and no tools
-ran.
+are marked `source:"scribe"`, saved under `scope: "project"` (`scope_id` set to
+the session's `projectID`, falling back to `"global"` when absent; session- or
+tree-local scratch notes belong in Context Boxes, `docs/25-context-boxes.md`),
+and are visible/deletable in the UI. The scribe never blocks the turn and is
+skipped when the session has no goal and no tools ran.
 
 ## Retention
 

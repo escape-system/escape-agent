@@ -71,7 +71,7 @@ impl Runtime {
     pub(super) async fn run_steps(
         &self,
         session: &str,
-        turn: &ResolvedTurn,
+        turn: &mut ResolvedTurn,
         cancel: &Arc<CancelToken>,
         stats: &mut TurnStats,
     ) -> Result<ExecutionOutcome, RuntimeError> {
@@ -103,26 +103,60 @@ impl Runtime {
         // `step.state.content` at the limit branch only ever holds text.
         let mut observations: Vec<budget::ToolObservation> = Vec::new();
         let compaction = self.compaction_config();
-        let ceiling = if turn.context_window == 0 {
-            u64::MAX
-        } else {
-            // The ceiling is derived from the model's real window; the old
-            // hard-coded 150k cap is gone (`docs/04-agent-runtime.md`).
-            tokens::ceiling(turn.context_window, compaction.ceiling_tokens)
-        };
         let guard_armed = compaction.auto || compaction.ceiling_tokens.is_some();
-        let trigger = if turn.context_window == 0 {
-            u64::MAX
-        } else {
-            tokens::trigger(ceiling, turn.context_window, compaction.buffer)
-        };
+        let policy = budget::BudgetPolicy::from_merged(self.inner.config.config.merged());
 
         loop {
+            // Recompute context ceiling/trigger from `turn.context_window` on every
+            // iteration so mid-turn model fallbacks enforce the active model's window.
+            let ceiling = if turn.context_window == 0 {
+                u64::MAX
+            } else {
+                // The ceiling is derived from the model's real window; the old
+                // hard-coded 150k cap is gone (`docs/04-agent-runtime.md`).
+                tokens::ceiling(turn.context_window, compaction.ceiling_tokens)
+            };
+            let trigger = if turn.context_window == 0 {
+                u64::MAX
+            } else {
+                tokens::trigger(ceiling, turn.context_window, compaction.buffer)
+            };
+            let observer_grant = usize::try_from(self.take_granted_steps(session)).unwrap_or(0);
+            if observer_grant > 0 && cap >= policy.min_cap {
+                let headroom =
+                    budget::remaining_ceiling_with_policy(&grants, turn.max_steps, &policy);
+                let granted = observer_grant.min(headroom);
+                if granted > 0 {
+                    cap = cap.saturating_add(granted);
+                    grants.push(granted);
+                    tracing::info!(
+                        session = %session,
+                        granted,
+                        cap,
+                        reason = "observer grant",
+                        "step budget extended by observer"
+                    );
+                    self.emit(
+                        session,
+                        &turn.directory,
+                        SessionExecutionStepExtended {
+                            session_id: session.to_owned(),
+                            steps: granted,
+                            total_steps: cap,
+                            grant_index: grants.len(),
+                            reason: "observer grant",
+                        },
+                    )
+                    .await?;
+                }
+            }
             // Publish the step this iteration is about to run. Placing it at
             // the loop top covers all three `step_number += 1` sites below
             // (length continuation, verification nudge, normal advance) with a
             // single write instead of three.
             self.set_step(session, u32::try_from(step_number).unwrap_or(u32::MAX));
+            let published_cap = u32::try_from(cap).unwrap_or(u32::MAX);
+            self.set_step_budget(session, published_cap);
             if cancel.is_cancelled() {
                 return Ok(ExecutionOutcome::Interrupted(cancel.reason()));
             }
@@ -174,6 +208,69 @@ impl Runtime {
                 }
             }
 
+            let context_pressure_notice = if turn.context_window > 0
+                && context.len() >= 6
+                && turn.tool_names.iter().any(|name| name == "compact_context")
+            {
+                let estimate = self.estimate_turn_tokens(session, turn, &context).await?;
+                let effective_trigger = trigger.min(ceiling.min(turn.context_window * 85 / 100));
+                if effective_trigger > 0
+                    && estimate.saturating_mul(100) >= effective_trigger.saturating_mul(65)
+                {
+                    let pct = ((estimate.saturating_mul(100)) / turn.context_window).min(100);
+                    Some(format!(
+                        "<system-reminder>\nContext budget: ~{pct}% used \
+                         (~{estimate}/{} tokens; compaction trigger {effective_trigger}). \
+                         Call `compact_context` with a focused handoff `note` before starting a \
+                         major new phase so compaction compresses cleanly at the turn \
+                         boundary.\n</system-reminder>",
+                        turn.context_window
+                    ))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            // Evaluate automatic step-budget extension *before* treating this
+            // step as `final_call` so an eligible extension continues seamlessly
+            // with tools enabled instead of first forcing a tool-less summary.
+            if step_number >= cap && step_number > 0 && cap >= policy.min_cap {
+                let decision = budget::evaluate_with_policy(
+                    &observations,
+                    stats.tool_calls,
+                    &grants,
+                    turn.max_steps,
+                    &policy,
+                );
+                if let Some(granted) = decision.grant.filter(|granted| *granted > 0) {
+                    cap = cap.saturating_add(granted);
+                    grants.push(granted);
+                    let published_cap = u32::try_from(cap).unwrap_or(u32::MAX);
+                    self.set_step_budget(session, published_cap);
+                    tracing::info!(
+                        session = %session,
+                        granted,
+                        cap,
+                        reason = decision.reason,
+                        "step budget extended"
+                    );
+                    self.emit(
+                        session,
+                        &turn.directory,
+                        SessionExecutionStepExtended {
+                            session_id: session.to_owned(),
+                            steps: granted,
+                            total_steps: cap,
+                            grant_index: grants.len(),
+                            reason: decision.reason,
+                        },
+                    )
+                    .await?;
+                }
+            }
+
             let final_call = step_number >= cap;
             let mut messages = context.clone();
             if let Some(supplement) = &turn.memory_supplement {
@@ -188,17 +285,29 @@ impl Runtime {
             if let Some(notice) = pending_stall_notice.take() {
                 messages.push(LlmMessage::user(notice));
             }
+            if let Some(notice) = context_pressure_notice {
+                messages.push(LlmMessage::user(notice));
+            }
             if final_call {
                 messages.push(LlmMessage::user(MAX_STEPS_PROMPT));
-            } else if cap >= 10 {
+            } else if cap >= policy.min_cap {
                 let remaining = cap - step_number;
-                if remaining == 5 || remaining == 1 {
+                let can_auto_extend =
+                    budget::can_extend_with_policy(&grants, turn.max_steps, cap, &policy);
+                if !can_auto_extend && remaining <= 5 {
                     messages.push(LlmMessage::user(format!(
-                        "<system-reminder>\nStep budget notice: {remaining} tool-enabled step(s) remain \
-                         before the hard step limit ({}/{}) disables tools. Finish any pending \
-                         verification or git commit now and prepare your final summary.\n</system-reminder>",
+                        "<system-reminder>\n{remaining} tool-enabled step(s) remain before the hard \
+                         step limit ({}/{}). {}\n</system-reminder>",
                         step_number + 1,
-                        cap
+                        cap,
+                        prompt::STEP_BUDGET_WARNING
+                    )));
+                } else if can_auto_extend && remaining <= 3 {
+                    messages.push(LlmMessage::user(format!(
+                        "<system-reminder>\nCheckpoint: {remaining} tool-enabled step(s) remain in the \
+                         current slice ({}/{cap}); automatic extension applies while tool progress \
+                         continues. Keep investigating systematically.\n</system-reminder>",
+                        step_number + 1,
                     )));
                 }
             }
@@ -309,53 +418,11 @@ impl Runtime {
             if final_call || step.calls.is_empty() {
                 stats.assistant_text = assistant_text(&step.state);
                 if final_call && step_number > 0 {
-                    // The budget, not the model, ended the turn: tools were
-                    // disabled for this final request. Before accepting that,
-                    // offer the deterministic policy a chance to extend the
-                    // budget from the in-memory tool evidence (no IO, no model
-                    // call). A grant re-enables tools and continues the loop;
-                    // anything else keeps the historical `StepLimited` return
-                    // byte-identical. See `docs/24-step-budget.md`.
-                    if cap >= budget::MIN_CAP_FOR_EXTENSION {
-                        let decision = budget::evaluate(
-                            &observations,
-                            stats.tool_calls,
-                            &grants,
-                            turn.max_steps,
-                        );
-                        if let Some(granted) = decision.grant.filter(|granted| *granted > 0) {
-                            cap = cap.saturating_add(granted);
-                            grants.push(granted);
-                            tracing::info!(
-                                session = %session,
-                                granted,
-                                cap,
-                                reason = decision.reason,
-                                "step budget extended"
-                            );
-                            self.emit(
-                                session,
-                                &turn.directory,
-                                SessionExecutionStepExtended {
-                                    session_id: session.to_owned(),
-                                    steps: granted,
-                                    total_steps: cap,
-                                    grant_index: grants.len(),
-                                    reason: decision.reason,
-                                },
-                            )
-                            .await?;
-                            // The finished step's assistant row is already
-                            // durable, so the extended request must see it.
-                            context = self.load_context(session).await?;
-                            continue;
-                        }
-                    }
-                    // The outcome carries the consumed budget so settle can
-                    // qualify the terminal and persist the honest session
-                    // outcome.
+                    // Any eligible automatic or observer extension already ran at the
+                    // top of this step before `final_call` disabled tools; reaching
+                    // here means the hard ceiling was genuinely exhausted.
                     return Ok(ExecutionOutcome::StepLimited {
-                        steps: u64::try_from(turn.max_steps).unwrap_or(u64::MAX),
+                        steps: u64::try_from(cap).unwrap_or(u64::MAX),
                     });
                 }
                 return Ok(ExecutionOutcome::Succeeded);

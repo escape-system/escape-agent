@@ -24,8 +24,8 @@ fn lane_schema() -> Value {
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["queue", "order", "status", "wait", "cancel", "notify"],
-                "description": "Lane operation to perform."
+                "enum": ["queue", "order", "status", "list", "wait", "cancel", "notify"],
+                "description": "Lane operation to perform (`list` aliases `status` with active tickets)."
             },
             "lane": {
                 "type": "string",
@@ -105,7 +105,7 @@ impl Tool for LaneTool {
     }
 
     fn description(&self) -> &'static str {
-        "Inspect and steer build lanes. `queue` submits a command as a ticket, `order` changes a queued ticket's priority, `status` returns lane or ticket state, `wait` blocks until a ticket is terminal, `cancel` stops a ticket, and `notify` sends a message to another session. Identical `queue` submissions (same lane, command, cwd and tree_rev) reuse the active ticket and just add the caller as a subscriber; `subscribed: true` means the run was already in flight and its result is still delivered by `lane wait`."
+        "Inspect and steer build lanes. `queue` submits a command as a ticket (auto-populating `tree_rev` for cargo lanes so identical runs coalesce), `order` changes a queued ticket's priority, `status` / `list` returns lane counts and active tickets (or one ticket plus trailing output), `wait` blocks until a ticket is terminal and includes output tail, `cancel` stops a ticket, and `notify` sends a message to another session."
     }
 
     fn schema(&self) -> Value {
@@ -117,12 +117,12 @@ impl Tool for LaneTool {
         match action.as_str() {
             "queue" => self.queue(ctx, &input).await,
             "order" => self.order(&input).await,
-            "status" => self.status(&input).await,
+            "status" | "list" => self.status(&input).await,
             "wait" => self.wait(&input).await,
             "cancel" => self.cancel(&input).await,
             "notify" => self.notify(&input).await,
             other => Err(ToolError::new(format!(
-                "Invalid arguments: unknown lane action `{other}`; expected queue, order, status, wait, cancel or notify"
+                "Invalid arguments: unknown lane action `{other}`; expected queue, order, status, list, wait, cancel or notify"
             ))),
         }
     }
@@ -132,6 +132,9 @@ impl LaneTool {
     async fn queue(&self, ctx: &ToolContext, input: &Value) -> Result<ToolResult, ToolError> {
         let lanes = self.lanes()?;
         let command = util::required_string(input, "command")?;
+        if let Err(reason) = oc_tools::shell_guard::check_shell_command(&command) {
+            return Err(ToolError::new(reason));
+        }
         let cwd = match util::optional_string(input, "cwd")? {
             Some(value) => util::resolve_from(&ctx.cwd, &value),
             None => ctx.cwd.clone(),
@@ -143,6 +146,14 @@ impl LaneTool {
                 Some(lane) => lane,
                 None => classify(&command, &cwd).map_or_else(|| "default".to_owned(), |r| r.lane),
             };
+        let tree_rev =
+            match util::optional_string(input, "tree_rev")?.filter(|rev| !rev.trim().is_empty()) {
+                Some(rev) => Some(rev),
+                None if lane.starts_with("cargo:") => {
+                    crate::lane::tree_rev(&cwd.to_string_lossy()).await
+                }
+                None => None,
+            };
         let queued = lanes
             .enqueue_detailed(
                 lane,
@@ -152,7 +163,7 @@ impl LaneTool {
                     priority,
                     owner_session: owner,
                     label: None,
-                    tree_rev: util::optional_string(input, "tree_rev")?,
+                    tree_rev,
                 },
             )
             .await
@@ -192,10 +203,15 @@ impl LaneTool {
         let lane = util::optional_string(input, "lane")?.filter(|value| !value.is_empty());
         let output = if let Some(id) = ticket {
             let ticket = lanes.ticket(&id).await;
-            json!({ "ticket": ticket })
+            let mut value = json!({ "ticket": ticket });
+            if let Some(ticket) = ticket.as_ref() {
+                attach_ticket_output(&mut value, ticket);
+            }
+            value
         } else {
             let statuses = lanes.status(lane.as_deref()).await;
-            json!({ "lanes": statuses })
+            let tickets = lanes.tickets(lane.as_deref(), false).await;
+            json!({ "lanes": statuses, "tickets": tickets })
         };
         Ok(ToolResult::new(
             Some(serde_json::to_string_pretty(&output).unwrap_or_else(|_| output.to_string())),
@@ -206,15 +222,22 @@ impl LaneTool {
 
     async fn wait(&self, input: &Value) -> Result<ToolResult, ToolError> {
         let lanes = self.lanes()?;
-        let ticket = util::required_string(input, "ticket")?;
+        let ticket_id = util::required_string(input, "ticket")?;
         let timeout = wait_timeout(input)?;
-        let result = lanes.wait(&ticket, timeout).await;
+        let result = lanes.wait(&ticket_id, timeout).await;
         let current = if matches!(&result, Err(LaneError::Timeout { .. })) {
-            lanes.ticket(&ticket).await
+            lanes.ticket(&ticket_id).await
         } else {
             None
         };
-        let output = wait_result(result, current.as_ref())?;
+        let resolved_ticket = match &result {
+            Ok(ticket) => Some(ticket.clone()),
+            Err(_) => current.clone(),
+        };
+        let mut output = wait_result(result, current.as_ref())?;
+        if let Some(ticket) = resolved_ticket.as_ref() {
+            attach_ticket_output(&mut output, ticket);
+        }
         Ok(ToolResult::new(
             Some(serde_json::to_string_pretty(&output).unwrap_or_else(|_| output.to_string())),
             None,
@@ -294,6 +317,22 @@ fn wait_timeout(input: &Value) -> Result<Duration, ToolError> {
 /// `current` is the ticket snapshot fetched after a timeout; `None` means the
 /// service no longer knows the ticket, which the caller reports as a `null`
 /// view rather than inventing state.
+fn attach_ticket_output(output: &mut Value, ticket: &Ticket) {
+    let Some(path) = ticket.output_path.as_deref() else {
+        return;
+    };
+    let Ok(tail) = super::output::read_tail(path) else {
+        return;
+    };
+    if let Some(obj) = output.as_object_mut() {
+        obj.insert("outputTruncated".to_owned(), json!(tail.truncated));
+        obj.insert(
+            "outputTail".to_owned(),
+            Value::String(super::output::tail_body(tail)),
+        );
+    }
+}
+
 fn wait_result(
     result: Result<Ticket, LaneError>,
     current: Option<&Ticket>,
@@ -409,5 +448,15 @@ mod tests {
         let object: &serde_json::Map<String, Value> = output.as_object().expect("object");
         assert_eq!(object.len(), 1);
         assert!(object.contains_key("ticket"));
+    }
+
+    #[test]
+    fn lane_schema_advertises_list_action() {
+        let schema = lane_schema();
+        let actions = schema["properties"]["action"]["enum"]
+            .as_array()
+            .expect("action enum");
+        assert!(actions.iter().any(|action| action == "list"), "{actions:?}");
+        assert!(oc_tools::shell_guard::check_shell_command("rm -rf /").is_err());
     }
 }

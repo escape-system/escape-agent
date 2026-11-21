@@ -63,15 +63,23 @@ pub(super) fn insert_discovered_models(map: &mut Map<String, Value>, cache: &Dis
             continue;
         }
         let catalog_id = catalog_id_for_raw(raw_id);
-        if map.contains_key(&catalog_id) || map.contains_key(raw_id) {
+        if map.contains_key(&catalog_id) {
+            // A built-in spec is only the cold-start floor: Cloud Code's live
+            // limits win, so a context window it shrinks or grows never stays
+            // frozen at the compiled-in number.
+            apply_live_limits(map, &catalog_id, info);
+            continue;
+        }
+        if map.contains_key(raw_id) {
             continue;
         }
         if let Some((base, tier)) = split_tier_suffix(raw_id) {
             let base_catalog_id = catalog_id_for_raw(base);
-            if map.contains_key(&base_catalog_id)
-                || map.contains_key(base)
-                || is_legacy_gemini3_tier(base)
-            {
+            if map.contains_key(&base_catalog_id) {
+                apply_live_limits(map, &base_catalog_id, info);
+                continue;
+            }
+            if map.contains_key(base) || is_legacy_gemini3_tier(base) {
                 continue;
             }
             tiered_groups
@@ -90,6 +98,25 @@ pub(super) fn insert_discovered_models(map: &mut Map<String, Value>, cache: &Dis
             let catalog_id = catalog_id_for_raw(&info.id);
             insert_single_discovered_model(map, &catalog_id, &info.id, info);
         }
+    }
+}
+
+/// Overwrite a built-in entry's `limit.context` / `limit.output` with the
+/// non-zero values Cloud Code reported. Absent or zero live values keep the
+/// built-in number; nothing is invented.
+fn apply_live_limits(map: &mut Map<String, Value>, catalog_id: &str, info: &DiscoveredModelInfo) {
+    let Some(limit) = map
+        .get_mut(catalog_id)
+        .and_then(|entry| entry.get_mut("limit"))
+        .and_then(Value::as_object_mut)
+    else {
+        return;
+    };
+    if let Some(context) = info.max_tokens.filter(|value| *value > 0) {
+        limit.insert("context".to_owned(), json!(context));
+    }
+    if let Some(output) = info.max_output_tokens.filter(|value| *value > 0) {
+        limit.insert("output".to_owned(), json!(output));
     }
 }
 

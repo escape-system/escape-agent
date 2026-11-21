@@ -36,8 +36,10 @@ pub fn classify(command: &str, cwd: &Path) -> Option<LaneRequest> {
             effective_cwd = effective_cwd.join(dir);
             continue;
         }
-        if let Some(family) = classify_tokens(&tokens) {
-            if family == Family::Cargo
+        if let Some((family, nested_cwd)) = classify_tokens(&tokens, &effective_cwd) {
+            if let Some(nested) = nested_cwd {
+                effective_cwd = nested;
+            } else if family == Family::Cargo
                 && let Some(manifest_dir) = cargo_manifest_dir(&tokens)
             {
                 effective_cwd = effective_cwd.join(manifest_dir);
@@ -107,7 +109,7 @@ impl Family {
     }
 }
 
-const CARGO_SUBCOMMANDS: &[&str] = &["build", "test", "clippy", "nextest", "run", "check"];
+const CARGO_SUBCOMMANDS: &[&str] = &["build", "test", "clippy", "nextest", "run", "check", "fmt"];
 
 fn parse_segment(segment: &str) -> Option<Vec<String>> {
     if segment.trim().is_empty() {
@@ -118,24 +120,71 @@ fn parse_segment(segment: &str) -> Option<Vec<String>> {
         .filter(|tokens| !tokens.is_empty())
 }
 
-fn classify_tokens(tokens: &[String]) -> Option<Family> {
+fn classify_tokens(tokens: &[String], cwd: &Path) -> Option<(Family, Option<PathBuf>)> {
     let index = skip_wrappers(tokens);
     let name = command_name(tokens.get(index)?);
     let args = tokens.get(index + 1..).unwrap_or_default();
-    match name.as_str() {
+    if matches!(name.as_str(), "sh" | "bash" | "zsh" | "dash")
+        && let Some(script) = extract_shell_c_script(args)
+    {
+        return classify_nested(script, cwd);
+    }
+    let family = match name.as_str() {
         "cargo" => cargo_subcommand(args).then_some(Family::Cargo),
         "rustc" => Some(Family::Cargo),
         "npm" | "pnpm" | "bun" | "yarn" => node_command(args).then_some(Family::Node),
         "go" => go_test(args).then_some(Family::Go),
         "pytest" => Some(Family::Python),
         "python" | "python3" | "py" => python_pytest(args).then_some(Family::Python),
+        "uv" => uv_pytest(args).then_some(Family::Python),
         "dotnet" => first_non_option(args)
             .is_some_and(|word| word == "test")
             .then_some(Family::Dotnet),
         "gradle" | "gradlew" => Some(Family::Gradle),
         "mvn" | "mvnw" => Some(Family::Maven),
         _ => None,
+    }?;
+    Some((family, None))
+}
+
+fn classify_nested(script: &str, cwd: &Path) -> Option<(Family, Option<PathBuf>)> {
+    let mut effective_cwd = cwd.to_path_buf();
+    for segment in split_segments(script) {
+        let Some(tokens) = parse_segment(segment) else {
+            continue;
+        };
+        if let Some(dir) = cd_target(&tokens) {
+            effective_cwd = effective_cwd.join(dir);
+            continue;
+        }
+        if let Some((family, nested_cwd)) = classify_tokens(&tokens, &effective_cwd) {
+            let final_cwd = if let Some(nested) = nested_cwd {
+                nested
+            } else if family == Family::Cargo
+                && let Some(manifest_dir) = cargo_manifest_dir(&tokens)
+            {
+                effective_cwd.join(manifest_dir)
+            } else {
+                effective_cwd
+            };
+            return Some((family, Some(final_cwd)));
+        }
     }
+    None
+}
+
+fn extract_shell_c_script(args: &[String]) -> Option<&str> {
+    for (index, arg) in args.iter().enumerate() {
+        let is_c = arg == "-c"
+            || (arg.starts_with('-')
+                && !arg.starts_with("--")
+                && arg.chars().skip(1).all(char::is_alphabetic)
+                && arg.contains('c'));
+        if is_c {
+            return args.get(index + 1).map(String::as_str);
+        }
+    }
+    None
 }
 
 fn cargo_subcommand(args: &[String]) -> bool {
@@ -230,9 +279,9 @@ fn python_pytest(args: &[String]) -> bool {
     let mut index = 0;
     while let Some(token) = args.get(index) {
         if token == "-m" {
-            return args
-                .get(index + 1)
-                .is_some_and(|module| module == "pytest" || module == "py.test");
+            return args.get(index + 1).is_some_and(|module| {
+                matches!(module.as_str(), "pytest" | "py.test" | "unittest")
+            });
         }
         if token == "-c" {
             index += 2;
@@ -241,6 +290,13 @@ fn python_pytest(args: &[String]) -> bool {
         }
     }
     false
+}
+
+fn uv_pytest(args: &[String]) -> bool {
+    args.first().map(String::as_str) == Some("run")
+        && args
+            .get(1)
+            .is_some_and(|tool| matches!(tool.as_str(), "pytest" | "py.test" | "unittest"))
 }
 
 fn first_non_option(args: &[String]) -> Option<&str> {
@@ -262,11 +318,53 @@ fn skip_wrappers(tokens: &[String]) -> usize {
         match command_name(token).as_str() {
             "env" => {
                 index += 1;
-                while tokens
-                    .get(index)
-                    .is_some_and(|arg| is_env_assignment(arg) || arg.starts_with('-'))
-                {
+                while let Some(arg) = tokens.get(index) {
+                    if matches!(
+                        arg.as_str(),
+                        "-u" | "--unset" | "-C" | "--chdir" | "-S" | "--split-string"
+                    ) {
+                        index += 2;
+                    } else if is_env_assignment(arg) || arg.starts_with('-') {
+                        index += 1;
+                    } else {
+                        break;
+                    }
+                }
+            }
+            "nice" => {
+                index += 1;
+                if tokens.get(index).is_some_and(|arg| arg == "-n") {
+                    index += 2;
+                } else if tokens.get(index).is_some_and(|arg| arg.starts_with('-')) {
                     index += 1;
+                }
+            }
+            "timeout" => {
+                index += 1;
+                while let Some(arg) = tokens.get(index) {
+                    if !arg.starts_with('-') {
+                        break;
+                    }
+                    let needs_val =
+                        matches!(arg.as_str(), "-k" | "-s" | "--kill-after" | "--signal");
+                    index += if needs_val { 2 } else { 1 };
+                }
+                if tokens.get(index).is_some() {
+                    // Skip timeout duration operand.
+                    index += 1;
+                }
+            }
+            "stdbuf" => {
+                index += 1;
+                while let Some(arg) = tokens.get(index) {
+                    if !arg.starts_with('-') {
+                        break;
+                    }
+                    let needs_val = matches!(
+                        arg.as_str(),
+                        "-i" | "-o" | "-e" | "--input" | "--output" | "--error"
+                    );
+                    index += if needs_val { 2 } else { 1 };
                 }
             }
             "command" | "exec" | "nohup" | "time" => {

@@ -303,9 +303,14 @@ export const SettingsModels: Component<{
    */
   const systemRoles = (): AgentOption[] => {
     const hiddenBuiltins = (agents.data ?? []).filter((agent: AgentOption) => agent.hidden)
-    const synthesized: AgentOption[] = SYSTEM_ROLE_NAMES.filter(
-      (name) => !hiddenBuiltins.some((agent) => agent.name === name) && !visibleAgents().some((agent) => agent.name === name),
-    ).map((name) => ({ id: name, name, mode: "all", hidden: true }))
+    const configuredRoles = Object.keys(state()?.chains ?? {})
+    const roleNames = [...new Set([...SYSTEM_ROLE_NAMES, ...configuredRoles])]
+    const synthesized: AgentOption[] = roleNames
+      .filter(
+        (name) =>
+          !hiddenBuiltins.some((agent) => agent.name === name) && !visibleAgents().some((agent) => agent.name === name),
+      )
+      .map((name) => ({ id: name, name, mode: "all", hidden: true }))
 
     return [...hiddenBuiltins, ...synthesized]
   }

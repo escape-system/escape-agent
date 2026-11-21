@@ -48,6 +48,42 @@ impl ModelFamily {
     }
 }
 
+const QUOTA_MODEL_TIER_SUFFIXES: &[&str] = &[
+    "-tiered-xhigh",
+    "-tiered-high",
+    "-tiered-medium",
+    "-tiered-low",
+    "-tiered-minimal",
+    "-tiered",
+    "-xhigh",
+    "-minimal",
+    "-medium",
+    "-high",
+    "-low",
+    "-thinking",
+];
+
+/// Normalize a model reference or raw Cloud Code model ID to its canonical
+/// quota base model ID (e.g. `google/antigravity-gemini-4-argon#high` or
+/// `gemini-4-argon-low` -> `gemini-4-argon`).
+#[must_use]
+pub fn canonical_quota_model_id(model: &str) -> String {
+    let without_variant = model.trim().split('#').next().unwrap_or_default().trim();
+    let without_provider = without_variant
+        .strip_prefix("google/")
+        .unwrap_or(without_variant);
+    let lower = without_provider.to_ascii_lowercase();
+    let base = lower.strip_prefix("antigravity-").unwrap_or(&lower);
+    for suffix in QUOTA_MODEL_TIER_SUFFIXES {
+        if let Some(stripped) = base.strip_suffix(suffix)
+            && !stripped.is_empty()
+        {
+            return stripped.to_owned();
+        }
+    }
+    base.to_owned()
+}
+
 /// Build the primary quota key used to isolate rate limits by family, header style, and model.
 #[must_use]
 pub fn quota_key(family: ModelFamily, style: HeaderStyle, model: Option<&str>) -> String {
@@ -59,11 +95,9 @@ pub fn quota_key(family: ModelFamily, style: HeaderStyle, model: Option<&str>) -
         },
     };
     if let Some(m) = model {
-        // Variant-insensitive: `model#high` and `model#xhigh` are the same upstream quota
-        // bucket, so a cooldown recorded for one must apply to the other.
-        let trimmed = m.trim().split('#').next().unwrap_or_default().trim();
-        if !trimmed.is_empty() {
-            return format!("{base}:{}", trimmed.to_ascii_lowercase());
+        let canonical = canonical_quota_model_id(m);
+        if !canonical.is_empty() {
+            return format!("{base}:{canonical}");
         }
     }
     base
@@ -363,10 +397,37 @@ impl AccountManager {
         let ttl_ms = i64::try_from(self.cfg.soft_quota_cache_ttl_minutes.saturating_mul(60_000))
             .unwrap_or(600_000);
         if now_ms - cached.updated_at > ttl_ms {
+            tracing::debug!(
+                account_index = index,
+                family = family.as_str(),
+                style = style.as_str(),
+                group = soft_quota_group(family, style, model),
+                age_ms = now_ms - cached.updated_at,
+                ttl_ms,
+                "antigravity: stale quota snapshot; soft quota gate fails open"
+            );
             return false;
         }
-        let group = soft_quota_group(family, style, model);
-        let Some(snapshot) = cached.groups.get(group) else {
+        let canonical = canonical_quota_model_id(model);
+        let snapshot = if style == HeaderStyle::GeminiCli {
+            cached
+                .groups
+                .get(&format!("gemini-cli:{canonical}"))
+                .or_else(|| cached.groups.get("gemini-cli"))
+        } else {
+            cached
+                .groups
+                .get(&format!("pool:{canonical}"))
+                .or_else(|| cached.groups.get(&canonical))
+                .or_else(|| {
+                    cached
+                        .groups
+                        .values()
+                        .find(|g| g.models.iter().any(|m| m == &canonical))
+                })
+                .or_else(|| cached.groups.get(soft_quota_group(family, style, model)))
+        };
+        let Some(snapshot) = snapshot else {
             return false;
         };
         let used = snapshot.used_percent.or_else(|| {
@@ -394,6 +455,7 @@ impl AccountManager {
 
     /// Select an eligible account for the given `family` / `style` / `model`.
     /// Returns `None` if all enabled non-revoked accounts are currently rate-limited or blocked.
+    #[allow(clippy::too_many_lines)]
     pub fn select_for_request(
         &mut self,
         family: ModelFamily,
@@ -408,7 +470,7 @@ impl AccountManager {
         }
 
         let sticky = self.active_cursor(family);
-        let eligible: Vec<usize> = (0..self.storage.accounts.len())
+        let mut eligible: Vec<usize> = (0..self.storage.accounts.len())
             .filter(|&i| {
                 let acct = &self.storage.accounts[i];
                 acct.enabled
@@ -420,7 +482,39 @@ impl AccountManager {
             })
             .collect();
 
+        // If every enabled, non-revoked account is flagged `verification_required`, still
+        // allow one probe attempt per request: if the user has since completed the browser
+        // verification link, `mark_success` clears the flag automatically; otherwise upstream
+        // returns a fresh verification URL instead of a misleading "no usable accounts" error.
+        if eligible.is_empty()
+            && !self
+                .storage
+                .accounts
+                .iter()
+                .any(|a| a.enabled && !a.revoked && !a.verification_required)
+        {
+            eligible = (0..self.storage.accounts.len())
+                .filter(|&i| {
+                    let acct = &self.storage.accounts[i];
+                    acct.enabled
+                        && !acct.revoked
+                        && !excluded_indices.contains(&i)
+                        && !self.is_rate_limited(i, family, style, Some(model), now_ms)
+                        && !self.is_soft_quota_exceeded(i, family, style, model, now_ms)
+                })
+                .collect();
+        }
+
         if eligible.is_empty() {
+            tracing::debug!(
+                family = family.as_str(),
+                style = style.as_str(),
+                strategy = ?self.cfg.account_selection_strategy,
+                eligible_count = 0,
+                account_count = self.storage.accounts.len(),
+                excluded_count = excluded_indices.len(),
+                "antigravity: account selection found no eligible account"
+            );
             return None;
         }
 
@@ -483,6 +577,15 @@ impl AccountManager {
             }
         };
 
+        tracing::debug!(
+            account_index = picked,
+            family = family.as_str(),
+            style = style.as_str(),
+            strategy = ?self.cfg.account_selection_strategy,
+            eligible_count = eligible.len(),
+            excluded_count = excluded_indices.len(),
+            "antigravity: account selected for request"
+        );
         self.storage
             .active_index_by_family
             .insert(family.as_str().to_owned(), picked);
@@ -541,6 +644,10 @@ impl AccountManager {
     pub fn mark_success(&mut self, index: usize, now_ms: i64) -> Result<()> {
         if let Some(acct) = self.storage.accounts.get_mut(index) {
             acct.last_used = now_ms;
+            acct.verification_required = false;
+            acct.verification_required_at = None;
+            acct.verification_required_reason = None;
+            acct.verification_url = None;
             self.health.record_success(&acct.token_hash, now_ms);
         }
         self.save()
@@ -578,13 +685,6 @@ impl AccountManager {
         let delay = calculate_backoff_ms(reason, failures, retry_after_ms, default_ms, max_ms);
         let reset_at = now_ms + delay;
         acct.rate_limit_reset_times.insert(key, reset_at);
-        if model.is_some() {
-            let base = quota_key(family, style, None);
-            // Only apply short capacity pause on base key when capacity exhausted across models.
-            if matches!(reason, RateLimitReason::QuotaExhausted) {
-                acct.rate_limit_reset_times.insert(base, reset_at);
-            }
-        }
         self.save()?;
         Ok(delay)
     }
@@ -850,5 +950,24 @@ mod tests {
             )
             .expect("select claude");
         assert_eq!(claude.index, 0);
+
+        // An independent Gemini model pool (e.g. `gemini-4-argon`) on account 0 also stays usable!
+        assert!(!mgr.is_rate_limited(
+            0,
+            ModelFamily::Gemini,
+            HeaderStyle::Antigravity,
+            Some("antigravity-gemini-4-argon#high"),
+            now + 1000,
+        ));
+        let argon = mgr
+            .select_for_request(
+                ModelFamily::Gemini,
+                HeaderStyle::Antigravity,
+                "antigravity-gemini-4-argon#high",
+                now + 1000,
+                &[1],
+            )
+            .expect("select argon on account 0");
+        assert_eq!(argon.index, 0);
     }
 }

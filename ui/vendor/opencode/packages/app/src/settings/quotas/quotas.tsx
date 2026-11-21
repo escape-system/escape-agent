@@ -1,4 +1,4 @@
-import { createSignal, For, Show, type Component } from "solid-js"
+import { createMemo, createSignal, For, Show, type Component } from "solid-js"
 import { Badge } from "@opencode/ui/badge"
 import { Button } from "@opencode/ui/button"
 import { Collapsible } from "@opencode/ui/collapsible"
@@ -209,8 +209,16 @@ const AntigravityAccountsSection: Component<{
   const language = useLanguage()
   const poolEntries = (account: AntigravityAccountStatus) => {
     const groups = account.quota?.groups ?? {}
-    return Object.entries(groups).map(([name, snap]) => ({
-      name,
+    const entries = Object.entries(groups)
+    const hasDynamicPools = entries.some(([key, snap]) => key.startsWith("pool:") || Boolean(snap.label))
+    const filtered = hasDynamicPools
+      ? entries.filter(
+          ([key, snap]) =>
+            key.startsWith("pool:") || key.startsWith("gemini-cli") || Boolean(snap.label),
+        )
+      : entries
+    return filtered.map(([name, snap]) => ({
+      name: snap.label || name,
       remaining: antigravityPoolRemaining(snap),
       resetAtMs: snap.resetTimeMs,
     }))
@@ -251,7 +259,21 @@ const AntigravityAccountsSection: Component<{
                     <Badge variant="neutral">{language.t("settings.quotas.antigravity.revoked")}</Badge>
                   </Show>
                   <Show when={acc.verificationRequired}>
-                    <Badge variant="neutral">{language.t("settings.quotas.antigravity.verify")}</Badge>
+                    <Show
+                      when={acc.verificationUrl}
+                      fallback={<Badge variant="neutral">{language.t("settings.quotas.antigravity.verify")}</Badge>}
+                    >
+                      {(url) => (
+                        <a
+                          href={url()}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          class="inline-flex items-center underline"
+                        >
+                          <Badge variant="accent">{language.t("settings.quotas.antigravity.verify")}</Badge>
+                        </a>
+                      )}
+                    </Show>
                   </Show>
                   <Show when={accCooldown(acc)}>
                     {(text) => (
@@ -504,6 +526,8 @@ const ProviderKeysSection: Component<{ keys: ProviderKeyEntry[] }> = (props) => 
  */
 const ProviderQuotaRow: Component<{
   entry: ProviderQuotaEntry
+  open: boolean
+  onToggle: () => void
   envManaged: boolean
   busyAccountId: string | undefined
   savingMgmt: boolean
@@ -512,7 +536,7 @@ const ProviderQuotaRow: Component<{
   onClearMgmtKey: () => Promise<void>
 }> = (props) => {
   const language = useLanguage()
-  const [open, setOpen] = createSignal(false)
+  const open = () => props.open
   const e = () => props.entry
   const day = () => e().localUsage?.day
   const remaining = () => {
@@ -533,7 +557,7 @@ const ProviderQuotaRow: Component<{
         class="flex w-full flex-wrap items-center gap-x-3 gap-y-1 rounded-md border border-v2-border-border-base bg-v2-background-bg-base px-3 py-2 text-start hover:bg-v2-overlay-simple-overlay-hover focus-visible:outline focus-visible:outline-2 focus-visible:outline-v2-border-border-focus"
         aria-expanded={open()}
         aria-label={language.t("settings.quotas.usage.expand", { provider: e().name })}
-        onClick={() => setOpen((value) => !value)}
+        onClick={() => props.onToggle()}
       >
         <span class={`shrink-0 text-v2-icon-icon-muted transition-transform ${open() ? "rotate-90" : ""}`}>
           <Icon name="chevron-right" size="small" />
@@ -726,8 +750,19 @@ export const SettingsQuotas: Component = () => {
   const [savingMgmt, setSavingMgmt] = createSignal(false)
   const [busyAccountId, setBusyAccountId] = createSignal<string | undefined>()
   const [envManaged, setEnvManaged] = createSignal(false)
+  const [openProviders, setOpenProviders] = createSignal<Record<string, boolean>>({})
   const data = () => quotasData(quotas.query.data)
   const unavailable = () => quotasUnavailable(quotas.query.data)
+  const providerIds = createMemo<string[]>(
+    () => (data()?.providers ?? []).map((p) => p.providerID),
+    [],
+    {
+      equals: (a, b) => a.length === b.length && a.every((v, i) => v === b[i]),
+    },
+  )
+  const toggleProvider = (id: string) => {
+    setOpenProviders((prev) => ({ ...prev, [id]: !prev[id] }))
+  }
 
   const onRefresh = async () => {
     setRefreshing(true)
@@ -906,18 +941,28 @@ export const SettingsQuotas: Component = () => {
                       }
                     >
                       <div class="flex flex-col gap-1.5">
-                        <For each={snapshot().providers}>
-                          {(entry) => (
-                            <ProviderQuotaRow
-                              entry={entry}
-                              envManaged={envManaged()}
-                              busyAccountId={busyAccountId()}
-                              savingMgmt={savingMgmt()}
-                              onAccountAction={(id, action) => void onAccountAction(id, action)}
-                              onSaveMgmtKey={onSaveMgmt}
-                              onClearMgmtKey={onClearMgmt}
-                            />
-                          )}
+                        <For each={providerIds()}>
+                          {(providerID) => {
+                            const current = () =>
+                              snapshot().providers.find((item) => item.providerID === providerID)
+                            return (
+                              <Show when={current()}>
+                                {(entry) => (
+                                  <ProviderQuotaRow
+                                    entry={entry()}
+                                    open={Boolean(openProviders()[providerID])}
+                                    onToggle={() => toggleProvider(providerID)}
+                                    envManaged={envManaged()}
+                                    busyAccountId={busyAccountId()}
+                                    savingMgmt={savingMgmt()}
+                                    onAccountAction={(id, action) => void onAccountAction(id, action)}
+                                    onSaveMgmtKey={onSaveMgmt}
+                                    onClearMgmtKey={onClearMgmt}
+                                  />
+                                )}
+                              </Show>
+                            )
+                          }}
                         </For>
                       </div>
                     </Show>

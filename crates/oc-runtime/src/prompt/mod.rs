@@ -31,7 +31,18 @@ pub use transcript::{last_user_text, messages_from_store};
 pub const MAX_STEPS_PROMPT: &str = "\
 You have reached the step limit for this request. Do not call any more tools. \
 Answer the user using the information gathered so far, and state clearly \
-anything that remains unverified.";
+anything that remains unverified. The deterministic budget policy was consulted \
+and denied an extension this turn; do not promise another retry.";
+
+/// Early-warning notice appended while tool-enabled steps remain. Unlike
+/// [`MAX_STEPS_PROMPT`] this does NOT disable tools: the agent may finish
+/// verification, or request a bounded extension through `goal_update` and the
+/// observer (`repair.request_budget_extension`). Must be sent at every
+/// `stepsRemaining <= 5` boundary, not only at exactly 5 or 1.
+pub const STEP_BUDGET_WARNING: &str = "\
+Step budget notice: tool-enabled steps are running low. Finish pending \
+verification or commits now, or request a bounded extension via `goal_update` \
+and the observer (`repair.request_budget_extension`). Tools remain enabled.";
 
 /// Instruction appended when a step finishes with `FinishReason::Length` and no
 /// tool calls so the model can finish a truncated response cleanly.
@@ -80,7 +91,38 @@ pub fn default_system_prompt_with_memory(
          - When a tool fails, report the failure and try a different approach.\n\
          - Finish with a direct answer; do not describe hidden reasoning.\n"
     );
-    if tool_names.iter().any(|name| name == "subagent") {
+    append_capability_routing(&mut prompt, tool_names, has_memory);
+    let _ = write!(
+        prompt,
+        "\n\
+         Environment:\n\
+         - working directory: {directory}\n\
+         - platform: {} {}\n",
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+    );
+    prompt
+}
+
+fn has_tool(tool_names: &[String], name: &str) -> bool {
+    tool_names.iter().any(|tool| tool == name)
+}
+
+fn has_any_tool(tool_names: &[String], names: &[&str]) -> bool {
+    names.iter().any(|name| has_tool(tool_names, name))
+}
+
+fn append_capability_routing(prompt: &mut String, tool_names: &[String], has_memory: bool) {
+    append_coordination_and_memory_routing(prompt, tool_names, has_memory);
+    append_workspace_and_workflow_routing(prompt, tool_names);
+}
+
+fn append_coordination_and_memory_routing(
+    prompt: &mut String,
+    tool_names: &[String],
+    has_memory: bool,
+) {
+    if has_tool(tool_names, "subagent") {
         prompt.push_str(
             "- When the user explicitly asks you to spawn subagents, call `subagent` before reading \
              files or running commands; give each child a self-contained prompt. Otherwise delegate \
@@ -94,23 +136,76 @@ pub fn default_system_prompt_with_memory(
              and reports the result later as a synthetic message.\n",
         );
     }
-    if tool_names
-        .iter()
-        .any(|name| name == "goal_complete" || name == "goal_update")
-    {
+    if has_any_tool(tool_names, &["talk", "roster", "session_write", "digest"]) {
+        let mut parts = Vec::new();
+        if has_tool(tool_names, "roster") {
+            parts.push(
+                "`roster` (`wait_seconds` blocks until child state changes; never poll with sleep)",
+            );
+        }
+        if has_tool(tool_names, "talk") {
+            parts.push("`talk` (send/request asynchronous peer or parent/coordinator messages)");
+        }
+        if has_tool(tool_names, "session_write") {
+            parts.push("`session_write` (`delivery=\"queue\"` queues or wakes an idle child; `delivery=\"steer\"` interrupts/injects urgently mid-turn)");
+        }
+        if has_tool(tool_names, "digest") {
+            parts.push("`digest` (summarize a child session transcript compactly)");
+        }
+        let _ = writeln!(prompt, "- Subagent coordination: {}.", parts.join("; "));
+    }
+    if has_any_tool(
+        tool_names,
+        &["goal_set", "goal_update", "goal_complete", "goal_status"],
+    ) {
         prompt.push_str(
             "- When working under an active goal, call `goal_complete` with evidence references \
-             (tool or message IDs) when finishing a criterion, or `goal_update` to record progress for the observer.\n",
+             (tool or message IDs) when finishing a criterion, or `goal_update` to record progress \
+             for the observer; if a task genuinely needs more steps, request a bounded extension via \
+             `goal_update` and the observer (`request_budget_extension`).\n",
+        );
+    }
+    if has_any_tool(
+        tool_names,
+        &[
+            "box_list",
+            "box_read",
+            "box_write",
+            "box_edit",
+            "box_search",
+            "box_meta",
+            "box_delete",
+        ],
+    ) {
+        prompt.push_str(
+            "- Context boxes (`box_*`) are session-only working state (`<boxes>` index in your \
+             context): `scope=\"tree\"` (default) shares across your parent/subagent tree while \
+             `scope=\"session\"` keeps private worker scratchpads without collisions; `stable` survives \
+             compactions while `temporary` expires at the next one. Check `box_list`/`box_search`/`box_read` \
+             before re-deriving shared notes; prefer `box_edit` for small updates and `box_meta` to \
+             rename, switch `kind`/`scope`, or revive an expired box.\n",
         );
     }
     if has_memory {
         prompt.push_str(
-            "- Durable notes relevant to this session are included in the `<memory>` \
-             instruction source; use them before re-deriving facts, and do not write \
-             memory for things the repository already records.\n",
+            "- Permanent memory (`<memory>` / `memory_*`) is cross-session knowledge (project facts, \
+             decisions, preferences, gotchas <=2000 chars); use `<memory>` before re-deriving facts, \
+             never write repo-derivable facts or single-session scratch/plans into `memory_write` (use `box_write` for session state).\n",
+        );
+    } else if has_any_tool(
+        tool_names,
+        &["memory_write", "memory_search", "memory_list"],
+    ) {
+        prompt.push_str(
+            "- Permanent memory (`memory_*`) is cross-session knowledge (project facts, \
+             decisions, preferences, gotchas <=2000 chars); never write repo-derivable facts or \
+             single-session scratch/plans into `memory_write` (use `box_write` for session state).\n",
         );
     }
-    if tool_names.iter().any(|name| name == "code_map") {
+}
+
+fn append_workspace_and_workflow_routing(prompt: &mut String, tool_names: &[String]) {
+    if has_tool(tool_names, "code_map") {
         prompt.push_str(
             "- Prefer `code_map` FIRST before repeated `grep` or whole-file `read` calls:\n  \
                - Start unfamiliar tasks with `code_map(operation=\"pack_task\", query=...)` (or add `partitions=N` for multi-agent slices), or `communities` / `map` for module hubs and architecture.\n  \
@@ -118,19 +213,36 @@ pub fn default_system_prompt_with_memory(
                - For deeper analysis use `lego` (trait/interface contracts), `slice` (data/variable flow), `cochange` (files historically edited together), `doc_drift`, `flags`, and `quality` (`delta`/`dead_code`/`clones`/`hotspots`/`deps`/`seams`); pass `precision: \"scip\" | \"lsp\" | \"hybrid\"` when compiler-exact typing is needed.\n",
         );
     }
-    if tool_names.iter().any(|name| name == "symbol_edit") {
+    if has_tool(tool_names, "symbol_edit") {
         prompt.push_str(
             "- Prefer `symbol_edit` (`replace`, `insert_before`, `insert_after`, `preview`) over brittle text matching when replacing or annotating whole functions, structs, methods, or classes by symbol name; act on any `<lsp_diagnostics>` or `<post_edit_radar>` surfaced after edits.\n",
         );
     }
-    if tool_names.iter().any(|name| name == "skill_write") {
+    if has_tool(tool_names, "lane") {
+        prompt.push_str(
+            "- Build & test serialization (`lane`): inspect `status` (or `list`) for active/queued \
+             tickets before submitting duplicate builds; `queue` submits a ticket and auto-computes \
+             `tree_rev` for cargo coalescing; `wait` waits and returns trailing output; `order`/`cancel`/`notify` steer execution.\n",
+        );
+    } else if has_tool(tool_names, "shell") {
+        prompt.push_str(
+            "- Build and test commands (`cargo`, `npm`/`pnpm`/`bun`/`yarn`, `pytest`, `go test`, etc.) \
+             run through workspace lanes automatically so concurrent builds serialize cleanly without lock fights.\n",
+        );
+    }
+    if has_tool(tool_names, "skill") {
+        prompt.push_str(
+            "- Load matching project/workflow skills with `skill` before repeating multi-step procedures.\n",
+        );
+    }
+    if has_tool(tool_names, "skill_write") {
         prompt.push_str(
             "- When you discover or complete a repeatable multi-step engineering workflow or \
              project-specific convention that future sessions will repeat, persist it as a reusable \
              skill using `skill_write`. Keep bodies under 200 lines and include a '## When to use' section.\n",
         );
     }
-    if tool_names.iter().any(|name| name == "compact_context") {
+    if has_tool(tool_names, "compact_context") {
         prompt.push_str(
             "- You may compact your own session by calling `compact_context` with a short `note` \
              saying why. It does not run inline: the request is queued and the compaction happens \
@@ -138,16 +250,6 @@ pub fn default_system_prompt_with_memory(
              60-70% of the model's context window, or before starting a long multi-step task.\n",
         );
     }
-    let _ = write!(
-        prompt,
-        "\n\
-         Environment:\n\
-         - working directory: {directory}\n\
-         - platform: {} {}\n",
-        std::env::consts::OS,
-        std::env::consts::ARCH,
-    );
-    prompt
 }
 
 /// The two-part system prefix: base prompt, then the builtin instructions.
@@ -179,14 +281,26 @@ pub fn system_prefix(
     // not only for the built-in default prompt.
     let base = match agent_system {
         Some(agent) => {
-            if has_memory {
-                format!(
-                    "{agent}\n- Durable notes relevant to this session are included in the \
-                     `<memory>` instruction source; use them before re-deriving facts, and do \
-                     not write memory for things the repository already records.\n"
-                )
-            } else {
+            let mut extra = String::new();
+            append_capability_routing(&mut extra, tool_names, has_memory);
+            if extra.is_empty() && tool_names.is_empty() {
                 agent.to_owned()
+            } else {
+                let mut combined = agent.trim_end().to_owned();
+                if !tool_names.is_empty() {
+                    let tools = tool_names.join(", ");
+                    let _ = write!(
+                        combined,
+                        "\n\nAvailable tools: {tools}.\n\
+                         - Every tool schema includes an `expectation` contract (`why`, \
+                         `expect_seconds`, `intervene_after_seconds`); pass realistic estimates."
+                    );
+                }
+                if !extra.is_empty() {
+                    combined.push('\n');
+                    combined.push_str(&extra);
+                }
+                combined
             }
         }
         None => default_system_prompt_with_memory(tool_names, directory, has_memory),

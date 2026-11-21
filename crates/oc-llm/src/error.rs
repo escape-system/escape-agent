@@ -69,7 +69,33 @@ impl fmt::Display for FailureKind {
 
 /// Substring rules, in evaluation order: the first group with any matching
 /// entry decides the kind, so earlier groups win over later ones.
-const MESSAGE_RULES: [(&[&str], FailureKind); 5] = [
+const MESSAGE_RULES: [(&[&str], FailureKind); 7] = [
+    (
+        &[
+            // Emitted by `oc-antigravity` after its bounded empty-response
+            // retries and for an empty stream observed after the first event.
+            // Both are empty model output, not a credential-level failure.
+            "cloud code returned an empty response after",
+            "upstream stream ended unexpectedly",
+        ],
+        FailureKind::EmptyResponse,
+    ),
+    (
+        &[
+            // Broken SSE transport / body decode / chunk timeout / premature EOF
+            // emitted by `oc-llm`, `oc-antigravity`, or `oc-runtime`: retryable
+            // transport failures, never evidence of empty model output.
+            "error decoding response body",
+            "stream read failed:",
+            "stream read error:",
+            "stream transport error:",
+            "provider stream closed before completion",
+            "provider stream chunk timed out",
+            "provider stream exceeded its total timeout",
+            "stream closed before finish event",
+        ],
+        FailureKind::Transport,
+    ),
     (
         &[
             "no longer available",
@@ -521,6 +547,79 @@ mod tests {
         assert_eq!(
             serde_json::to_value(FailureKind::ModelUnavailable).expect("serialize"),
             json!("model_unavailable")
+        );
+    }
+
+    #[test]
+    fn classifier_maps_exhausted_empty_response_attempts_to_empty_response() {
+        // Exact message emitted by `oc-antigravity`'s gateway after its bounded
+        // retry loop, plus variants where the configured attempt count differs.
+        for message in [
+            "Cloud Code returned an empty response after 4 attempts",
+            "Cloud Code returned an empty response after 1 attempts",
+            "Cloud Code returned an empty response after 10 attempts",
+        ] {
+            assert_eq!(
+                classify_provider_message(message),
+                FailureKind::EmptyResponse,
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn classifier_maps_mid_stream_empty_output_to_empty_response() {
+        let message = "upstream stream ended unexpectedly";
+        assert_eq!(
+            classify_provider_message(message),
+            FailureKind::EmptyResponse
+        );
+        assert!(
+            LlmError::Failure {
+                kind: classify_provider_message(message),
+                message: message.to_owned(),
+            }
+            .is_retryable()
+        );
+    }
+
+    #[test]
+    fn classifier_maps_body_decode_and_stream_transport_failures_to_transport() {
+        for message in [
+            "stream read failed: error decoding response body",
+            "STREAM READ FAILED: ERROR DECODING RESPONSE BODY: unexpected EOF",
+            "stream read failed: connection reset",
+            "stream read error: unexpected EOF",
+            "stream transport error: broken pipe",
+            "provider stream closed before completion",
+            "provider stream chunk timed out",
+            "stream closed before finish event",
+        ] {
+            let kind = classify_provider_message(message);
+            assert_eq!(kind, FailureKind::Transport, "{message}");
+            assert!(kind.is_retryable(), "{message}");
+        }
+    }
+
+    #[test]
+    fn classifier_keeps_unrelated_provider_errors_in_their_prior_kind() {
+        // Rate-limit, auth and unrelated transport prose must keep their prior
+        // classes; the new needles match exact phrases only.
+        assert_eq!(
+            classify_provider_message("429 Too Many Requests: rate limit reached"),
+            FailureKind::RateLimit
+        );
+        assert_eq!(
+            classify_provider_message("401 Unauthorized: invalid api key"),
+            FailureKind::Auth
+        );
+        assert_eq!(
+            classify_provider_message("connection reset by peer"),
+            FailureKind::Unknown
+        );
+        assert_eq!(
+            classify_provider_message("cloud code returned a non-empty response"),
+            FailureKind::Unknown
         );
     }
 }

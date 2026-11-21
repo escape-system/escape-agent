@@ -53,6 +53,33 @@ fn system_prefix_is_two_parts() {
 }
 
 #[test]
+fn system_prefix_injects_dynamic_capability_routing_for_custom_agent_prompts() {
+    let tools = vec![
+        "read".to_owned(),
+        "box_write".to_owned(),
+        "lane".to_owned(),
+        "code_map".to_owned(),
+        "compact_context".to_owned(),
+    ];
+    let parts = system_prefix(Some("Custom engineer prompt."), &tools, "/work", true, "");
+    assert_eq!(parts.len(), 1);
+    let sys = &parts[0];
+    assert!(sys.contains("Custom engineer prompt."), "{sys}");
+    assert!(
+        sys.contains("Available tools: read, box_write, lane, code_map, compact_context"),
+        "{sys}"
+    );
+    assert!(sys.contains("box_*"), "{sys}");
+    assert!(sys.contains("<memory>"), "{sys}");
+    assert!(sys.contains("`lane`"), "{sys}");
+    assert!(sys.contains("`code_map`"), "{sys}");
+    assert!(sys.contains("`compact_context`"), "{sys}");
+    // Absent tools are never advertised.
+    assert!(!sys.contains("`subagent`"), "{sys}");
+    assert!(!sys.contains("`skill_write`"), "{sys}");
+}
+
+#[test]
 fn compaction_summary_is_the_context_boundary() {
     let messages = vec![
         json!({"type": "user", "text": "old"}),
