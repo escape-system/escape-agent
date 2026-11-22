@@ -1610,6 +1610,29 @@
     white-space: nowrap;
   }
 
+  /* A tool card's file name opens the file in the side panel; it must not look like the accordion toggle. */
+  button[data-slot="apply-patch-filename"] {
+    font: inherit;
+    letter-spacing: inherit;
+    background: none;
+    border: 0;
+    padding: 0;
+    text-align: start;
+    cursor: pointer;
+
+    &:hover {
+      color: var(--v2-text-text-accent);
+      text-decoration: underline;
+      text-underline-offset: 2px;
+    }
+
+    &:focus-visible {
+      outline: 1px solid var(--v2-border-border-strong);
+      outline-offset: 2px;
+      border-radius: 2px;
+    }
+  }
+
   [data-slot="apply-patch-trigger-actions"] {
     flex-shrink: 0;
     display: flex;

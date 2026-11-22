@@ -20,7 +20,6 @@ import { ResizeHandle } from "@opencode/ui/resize-handle"
 import { Mark } from "@opencode/ui/logo"
 import { Keybind } from "@opencode/ui/keybind"
 import { Tooltip } from "@opencode/ui/tooltip"
-import { Menu } from "@opencode/ui/menu"
 import {
   type MountedSession,
   type SessionScreen,
@@ -224,6 +223,29 @@ export function PaneTabs(props: {
   const current = createMemo(() => props.region.shownNewTab(props.pane.id))
   const add = () => props.region.openNewTab(props.pane.id)
 
+  // "+" always opens the host's New tab view. A dropdown here was a dead end: the tab strip redirects focus that
+  // enters it, so the menu closed before it opened and Terminal / Open file could not be reached.
+  const addFallback = () => (
+    <Show
+      when={modifier}
+      fallback={
+        <Tooltip value={language.t("session.tab.add")} placement="bottom" class="flex items-center">
+          <IconButton
+            icon={<Icon name="plus" />}
+            variant="ghost-muted"
+            size="large"
+            onClick={add}
+            aria-label={language.t("session.tab.add")}
+          />
+        </Tooltip>
+      }
+    >
+      {(key) => (
+        <NewTabButton modifier={key()} entries={closed.entries} onReopen={closed.onReopen} onNewTab={add} />
+      )}
+    </Show>
+  )
+
   let selectionEvent: Event | undefined
 
   return (
@@ -309,40 +331,7 @@ export function PaneTabs(props: {
           <div class="h-full shrink-0 sticky end-0 z-10 flex items-center justify-center bg-v2-background-bg-base">
             <Show
               when={primary() ?? (launchers().length === 0 && menu().length === 1 ? menu()[0] : undefined)}
-              fallback={
-                <Show
-                  when={launchers().length > 0}
-                  fallback={
-                    <Show when={menu().length > 1}>
-                      <AddMenu items={menu()} onChoose={target} />
-                    </Show>
-                  }
-                >
-                  <Show
-                    when={modifier}
-                    fallback={
-                      <Tooltip value={language.t("session.tab.add")} placement="bottom" class="flex items-center">
-                        <IconButton
-                          icon={<Icon name="plus" />}
-                          variant="ghost-muted"
-                          size="large"
-                          onClick={add}
-                          aria-label={language.t("session.tab.add")}
-                        />
-                      </Tooltip>
-                    }
-                  >
-                    {(key) => (
-                      <NewTabButton
-                        modifier={key()}
-                        entries={closed.entries}
-                        onReopen={closed.onReopen}
-                        onNewTab={add}
-                      />
-                    )}
-                  </Show>
-                </Show>
-              }
+              fallback={addFallback()}
             >
               {(item) => <AddButton item={item()} onChoose={target} />}
             </Show>
@@ -377,7 +366,7 @@ export function PaneTabs(props: {
       <Show when={current()}>
         {(entry) => (
           <Tabs.Content value={entry().id} class="flex flex-col h-full overflow-hidden contain-strict">
-            <Launchers items={launchers()} onChoose={target} closed={closed} />
+            <Launchers items={menu()} onChoose={target} closed={closed} />
           </Tabs.Content>
         )}
       </Show>
@@ -442,76 +431,6 @@ function AddButton(props: { item: SessionPanelMenuItem; onChoose: () => void }):
         }}
         aria-label={props.item.title}
       />
-    </Tooltip>
-  )
-}
-
-function AddMenu(props: { items: readonly SessionPanelMenuItem[]; onChoose: () => void }): JSX.Element {
-  const language = useLanguage()
-  const command = useCommand()
-  // A chosen item runs once the closing menu has returned focus to "+", and the tab strip has passed it on to the
-  // selected tab. Releasing that focus first lets the item move it where its tab needs it, e.g. into a new terminal,
-  // without the strip taking it back for the tab it remembers.
-  let chosen: SessionPanelMenuItem | undefined
-
-  return (
-    <Tooltip value={language.t("session.tab.add")} placement="bottom" class="flex items-center">
-      <Menu appearance="standard" modal={false} placement="bottom-start" gutter={4}>
-        <Menu.Trigger
-          as={IconButton}
-          icon={<Icon name="plus" />}
-          variant="ghost-muted"
-          size="large"
-          aria-label={language.t("session.tab.add")}
-          // The tablist redirects focus entering it to the selected
-          // tab, which counts as focus-outside and closes the menu.
-          onPointerDown={(event: PointerEvent) => event.preventDefault()}
-        />
-        <Menu.Portal>
-          <Menu.Content
-            onCloseAutoFocus={() => {
-              const item = chosen
-
-              if (!item) return
-              chosen = undefined
-              setTimeout(() => {
-                if (document.activeElement instanceof HTMLElement) document.activeElement.blur()
-                // A pane-targeting failure must never swallow the chosen action:
-                // terminal and file-open rely on this dispatch to open their tabs.
-                try {
-                  props.onChoose()
-                } catch (error) {
-                  console.error("side panel target failed", error)
-                }
-                item.run()
-              })
-            }}
-          >
-            <For each={props.items}>
-              {(item) => {
-                const keybind = createMemo(() => (item.keybind ? command.keybindParts(item.keybind) : []))
-
-                return (
-                  <Menu.Item
-                    class="!gap-6"
-                    onSelect={() => (chosen = item)}
-                    shortcut={
-                      <Show when={keybind().length > 0}>
-                        <Keybind keys={keybind()} variant="neutral" />
-                      </Show>
-                    }
-                  >
-                    <div class="flex items-center gap-2">
-                      <Show when={item.icon}>{(icon) => <Icon name={icon()} size="small" />}</Show>
-                      <span>{item.title}</span>
-                    </div>
-                  </Menu.Item>
-                )
-              }}
-            </For>
-          </Menu.Content>
-        </Menu.Portal>
-      </Menu>
     </Tooltip>
   )
 }

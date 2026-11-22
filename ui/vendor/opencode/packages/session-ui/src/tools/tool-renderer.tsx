@@ -1188,6 +1188,54 @@ function FileTool(props: ToolProps & { title: string; count: number; children?: 
   )
 }
 
+/**
+ * A tool card's file name as a button that opens that file in the side panel. It goes through the markdown context's
+ * `openLocalFile`, which the session screen routes to the file plugin's LinkHandler, so absolute and workspace paths
+ * resolve exactly as a link the agent prints does. Without that context (stories, a bare render) it stays plain text.
+ */
+function useOpenToolFile() {
+  const markdown = useMarkdown()
+
+  return (path: string | undefined) => {
+    if (!path || !markdown?.openLocalFile) return
+    markdown.openLocalFile(path)
+  }
+}
+
+function FileNameLink(props: { path: string; children?: JSX.Element; class?: string }) {
+  const markdown = useMarkdown()
+
+  return (
+    <Show
+      when={props.path && markdown?.openLocalFile ? markdown.openLocalFile : undefined}
+      fallback={<span data-slot="apply-patch-filename">{props.children ?? getFilename(props.path)}</span>}
+    >
+      {(open) => (
+        <button
+          type="button"
+          data-slot="apply-patch-filename"
+          class="clickable"
+          title={props.path}
+          onClick={(event) => {
+            // The header is a collapsible trigger (or the tool's own row): opening the file must not also toggle it.
+            event.stopPropagation()
+            event.preventDefault()
+            open()(props.path)
+          }}
+          onKeyDown={(event) => {
+            if (event.key !== "Enter" && event.key !== " ") return
+            event.stopPropagation()
+            event.preventDefault()
+            open()(props.path)
+          }}
+        >
+          {props.children ?? getFilename(props.path)}
+        </button>
+      )}
+    </Show>
+  )
+}
+
 function FileAccordionGroup(props: { children: JSX.Element }) {
   return (
     <div
@@ -1321,7 +1369,7 @@ function ToolFileAccordion(props: {
                 <Show when={props.path.includes("/")}>
                   <span data-slot="apply-patch-directory">{`\u202A${displayDirectory(props.path)}\u202C`}</span>
                 </Show>
-                <span data-slot="apply-patch-filename">{getFilename(props.path)}</span>
+                <FileNameLink path={props.path} />
               </div>
             </div>
             <div data-slot="apply-patch-trigger-actions">
@@ -1474,6 +1522,7 @@ ToolRegistry.register({
   render(props) {
     const data = useData()
     const i18n = useI18n()
+    const openFile = useOpenToolFile()
     const image = createMemo(() => (props.status === "completed" ? readImagePath(props.input) : undefined))
 
     const loaded = createMemo(() => {
@@ -1504,6 +1553,7 @@ ToolRegistry.register({
             props.onOpenChange?.(open)
             props.onContentRendered?.()
           }}
+          onSubtitleClick={() => openFile(toolInput(props.input).path)}
           trigger={{
             title: i18n.t("ui.tool.read"),
             subtitle: getFilename(toolInput(props.input).path ?? ""),
@@ -2582,7 +2632,7 @@ ToolRegistry.register({
                             <Show when={file().path.includes("/")}>
                               <span data-slot="apply-patch-directory">{`\u202A${displayDirectory(file().path)}\u202C`}</span>
                             </Show>
-                            <span data-slot="apply-patch-filename">{getFilename(file().path)}</span>
+                            <FileNameLink path={file().path} />
                           </div>
                         </div>
                         <div data-slot="apply-patch-trigger-actions">

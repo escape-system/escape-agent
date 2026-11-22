@@ -96,6 +96,21 @@ export function SessionFileBrowserTab(props: {
     }
 
     if (!query()) return
+
+    // A typed path the index returns nothing for still opens: a literal path the agent printed, or a file the index
+    // skips (an ignored `.env`), resolves against the workspace root instead of dead-ending on the empty state.
+    if (event.key === "Enter" && files().length === 0) {
+      const path = file.resolve(query().trim().replace(/^\.\//, ""))
+
+      if (path) {
+        event.preventDefault()
+        setFilter("")
+        shared.open(props.session, path)
+
+        return
+      }
+    }
+
     applyFileListKeyDown(event, files(), highlighted(), {
       onHighlight: setExplicitHighlight,
       onSelect: props.onSelectPermanent,
