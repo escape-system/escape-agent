@@ -89,13 +89,14 @@ impl FallbackPolicy {
         false
     }
 
-    /// The classes an explicit `models.fallback.on` switched off.
+    /// The classes an explicit `models.fallback.on` switched off, for wire
+    /// reporting only.
     ///
-    /// Only the opt-in classes (`empty_response`, `transport`) can be disabled:
-    /// [`FallbackPolicy::allows`] advances on the recovery classes regardless, so
-    /// reporting them here would be a lie. Empty when `models.fallback` is absent
-    /// (the default set is complete) — the Models tab renders a warning from this
-    /// list instead of adding a new route.
+    /// [`FallbackPolicy::allows`] is always `false`, so the list is advisory:
+    /// no class advances the chain whatever the document says. The recovery
+    /// classes (`quota`, `rate_limit`) are excluded for compatibility with the
+    /// Models control plane. Empty when `models.fallback` is absent — the
+    /// Models tab renders a warning from this list instead of adding a route.
     #[must_use]
     pub fn disabled_by_config(&self) -> Vec<&'static str> {
         if !self.configured {
@@ -109,12 +110,12 @@ impl FallbackPolicy {
             .collect()
     }
 
-    /// The effective advance set: the configured `on` plus the recovery classes
-    /// that cannot be switched off.
-    ///
-    /// This is what the UI and the docs report; [`FallbackPolicy::on`] stays the
-    /// raw configured list so a round trip through `PUT /api/config/models`
-    /// never rewrites the document behind the user's back.
+    /// The effective `on` set: the configured `on` plus the recovery classes,
+    /// kept for wire compatibility. It no longer advances anything —
+    /// [`FallbackPolicy::allows`] is always `false`. [`FallbackPolicy::on`]
+    /// stays the raw configured list so a round trip through
+    /// `PUT /api/config/models` never rewrites the document behind the user's
+    /// back.
     #[must_use]
     pub fn effective_on(&self) -> Vec<FailureKind> {
         let mut kinds = self.on.clone();

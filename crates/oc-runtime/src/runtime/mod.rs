@@ -97,11 +97,12 @@ pub(crate) struct Inner {
     pub(crate) lanes: Mutex<Option<Arc<oc_lanes::LaneService>>>,
     pub(crate) subagents: Mutex<crate::subagent::SubagentState>,
     /// Recent model-level provider failures, shared by the spawn chooser (skips)
-    /// and the turn fallback (`docs/05-subagents.md`, contract §4).
+    /// and control-plane reporting (`docs/05-subagents.md`, contract §4). Turn
+    /// fallback is disabled; failed turns surface the typed provider error.
     pub(crate) model_health: Arc<oc_llm::ModelHealth>,
     /// Per-credential rotation state: which keys are cooling down for which
-    /// provider. The turn loop retries the SAME model on the next key before
-    /// `models.chain` is consulted (`turn/stream.rs`).
+    /// provider. The turn loop retries the SAME model on the next key and never
+    /// advances `models.chain` (`turn/stream.rs`).
     pub(crate) key_pool: Arc<oc_llm::KeyPool>,
     pub(crate) tool_cancels: Mutex<HashMap<String, ToolCancelEntry>>,
     pub(crate) pending_permissions: Mutex<HashMap<String, usize>>,

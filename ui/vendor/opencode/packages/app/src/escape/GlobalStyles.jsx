@@ -491,18 +491,15 @@ body {
 :root[data-color-scheme="light"] [data-slot="session-chat-panel"] {
   background-color: rgb(255 251 242 / 0.88);
 }
-[data-slot="session-timeline-visible"] .scroll-view__thumb[data-orientation="vertical"] {
-  width: 14px;
-}
 [data-slot="session-timeline-visible"] .scroll-view__thumb[data-orientation="vertical"]::after {
-  width: 5px;
+  width: 3px;
   background-color: rgb(var(--ea-gold-rgb) / 0.34);
   backdrop-filter: none;
   transition: background-color 150ms ease, width 150ms ease;
 }
 [data-slot="session-timeline-visible"] .scroll-view__thumb[data-orientation="vertical"]:hover::after,
 [data-slot="session-timeline-visible"] .scroll-view__thumb[data-orientation="vertical"][data-dragging="true"]::after {
-  width: 7px;
+  width: 4px;
   background-color: rgb(var(--ea-gold-rgb) / 0.65);
 }
 :root[data-color-scheme="light"] [data-slot="home-panel"],

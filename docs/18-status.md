@@ -515,28 +515,25 @@ Verified workspace suite for this release wave: **1,155 passed, 0 failed, 3 igno
   `chain_for("compaction")` in order, then the turn's
   `turn.model_ref.to_reference()`, deduplicated by exact reference with the first
   occurrence kept (`crates/oc-runtime/src/turn/compaction.rs:418`).
-  `COMPACTION_MAX_ATTEMPTS = 2` allows exactly **one** fallback hop — not
-  `models.fallback.max_hops` — and each hop is gated by
-  `policy.fallback().allows(kind)`, which is always true for
-  `Quota`/`RateLimit`/`ModelUnavailable` (`:216,309,852`). The completed
-  compaction row and the `session.compaction.ended` payload report the model that
-  **actually produced** the summary, i.e. the chain candidate that answered,
-  which is not `turn.model_ref` once the chain advanced; `session.model` is never
-  rewritten (`:105-115,345-355`). Preserved from before: one shortened retry on a
+  `COMPACTION_MAX_ATTEMPTS = 1` makes exactly one attempt; automatic model
+  fallback is disabled (`policy.fallback().allows(kind)` always returns `false`),
+  so a retired first entry is skipped without spending the attempt and a failed
+  attempt is reported rather than switching models. The completed compaction row
+  and the `session.compaction.ended` payload report the model that **actually
+  produced** the summary, and `session.model` is never rewritten
+  (`:105-115,345-355`). Preserved from before: one shortened retry on a
   context-window overflow on the same candidate, key cooling via
-  `mark_compaction_key`, `model_health().mark`, and single-row reuse — the
+  `mark_compaction_key`, and single-row reuse — the
   `compaction` message is appended `status:"running"` and updated to `completed`
   in place rather than appended twice (`:124-150,349-361`). As before, no path
   spawns the ids `compaction`, `title` or `summary`.
-- Fallback: `FallbackPolicy::allows` advances the chain unconditionally for
-  `ModelUnavailable`, `Quota` and `RateLimit`, so `models.fallback.on` can no
-  longer switch quota/rate-limit recovery off; an explicit `on` only gates the
-  opt-in classes `empty_response`/`transport`, and `disabled_by_config()` names
-  the classes a user switched off. Reason: the live config listed
-  `on = ["empty_response","transport"]`, so a quota failure killed the turn.
+- Fallback: automatic model fallback is disabled — `FallbackPolicy::allows`
+  always returns `false`. `models.fallback.on` / `max_hops` remain accepted in
+  config and wire payloads for compatibility; `disabled_by_config()` reports
+  which classes an explicit `on` omits, but no class now advances the chain.
   `"cooling down"` (every Antigravity account exhausted) classifies as
-  `FailureKind::Quota` in `oc_llm::classify_provider_message`, so it advances the
-  chain and records model health.
+  `FailureKind::Quota` in `oc_llm::classify_provider_message`; after same-model
+  key/account rotation fails, the typed error is surfaced without a model switch.
 - Chat-picker visibility is `!models.hidden[ref] && providerConnected`, ordered
   favorites first, then chain index, then name
   (`ui/vendor/opencode/packages/app/src/providers/models/policy.ts`).
@@ -548,11 +545,11 @@ Verified workspace suite for this release wave: **1,155 passed, 0 failed, 3 igno
   (`call|chain|agent|default|parent`), `quota`, and
   `rejectedModels: [{reference, source, reason}]`
   (`malformed|not_available|denied`, omitted when empty). Nothing is `null`.
-- `FailureKind::ModelUnavailable` (`model_unavailable`) always advances the
-  chain, independently of `models.fallback.on` (whose default set still excludes
-  it); `oc_llm::classify_provider_message` supplies the kind, and
-  `oc_llm::ModelHealth` remembers the failing reference (24 h / 5 min / 60 s /
-  30 s for model-unavailable / quota / rate-limit / transport).
+- `FailureKind::ModelUnavailable` (`model_unavailable`) is classified by
+  `oc_llm::classify_provider_message` and reported as a typed provider failure;
+  it does not advance the chain. `oc_llm::ModelHealth` keeps the reporting table
+  (24 h / 5 min / 60 s / 30 s for model-unavailable / quota / rate-limit /
+  transport).
 - `GET /api/models/registry` reports that table as the additive, optional
   `modelHealth[]` and per-model `unavailable` fields, omitted when healthy.
 - The credential axis is separate and shipped: top-level `keyHealth:
@@ -564,8 +561,10 @@ Verified workspace suite for this release wave: **1,155 passed, 0 failed, 3 igno
   and `Store::set_credential_primary` moves the durable primary pointer. An
   in-flight turn rotates on the same model via `stream_model_attempts`
   (`MAX_KEY_ATTEMPTS = 8`) with per-key cooldowns from `oc_llm::KeyPool`, and
-  publishes no `session.model.fallback`; the chain advances once, and only after
-  the pool is spent. Compaction cools but does not rotate. Tests:
+  publishes no `session.model.fallback`; after the pool is spent the typed
+  failure is returned to the caller without a model switch (asserted by
+  `all_keys_exhausted_fails_without_model_fallback` in `key_pool.rs`). Compaction
+  cools but does not rotate. Tests:
   `crates/oc-runtime/tests/runtime/key_pool.rs` (4),
   `auth_failure_on_two_keys_does_not_advance_the_chain`
   (`tests/runtime/models_policy.rs:554`). Cooldowns are in-memory (cleared on

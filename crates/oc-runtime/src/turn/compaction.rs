@@ -228,13 +228,13 @@ impl Runtime {
         );
         let mut messages = context.to_vec();
         messages.push(LlmMessage::user(summary_instruction.clone()));
-        // Compaction resolves its model through the chain like every other role:
-        // `models.chains.compaction` (else `models.chain`) first, the turn's
-        // current model last. It allows exactly ONE fallback hop — unlike a turn
-        // step it reuses one shortened request, so this is a single switch, not a
-        // loop — and a key-level failure still marks that key
-        // ([`Runtime::mark_compaction_key`]), so the *next* turn picks another
-        // one instead of paying for the same dead key again.
+        // Compaction selects a model from `models.chains.compaction` (else
+        // `models.chain`), then the turn's current model. Automatic model
+        // fallback is disabled: it makes one attempt, and a candidate the
+        // catalog cannot run is skipped without spending it. A key-level
+        // failure still marks that key ([`Runtime::mark_compaction_key`]), so
+        // the *next* turn picks another one instead of paying for the same dead
+        // key again.
         let policy = models_policy(&self.inner.config.config);
         let candidates = self.compaction_candidates(turn);
         let mut attempted = 0_usize;
@@ -243,9 +243,8 @@ impl Runtime {
             if attempted >= COMPACTION_MAX_ATTEMPTS {
                 break;
             }
-            // A reference the catalog cannot run is skipped without spending one
-            // of the two attempts, exactly like the turn loop's chain walk, so a
-            // retired entry falls through instead of stalling every compaction.
+            // A reference the catalog cannot run is skipped without spending
+            // the single attempt, so a retired entry does not stall compaction.
             let Ok(model) = self
                 .inner
                 .config

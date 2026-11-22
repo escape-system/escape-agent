@@ -143,6 +143,11 @@ export function createTimelineVirtualizer(input: Input) {
 
   const knownKeys = new Set(rowKeys())
   const addedKeys = new Set<string>()
+  // Programmatic corrections (pin, measure, history reconcile) move scrollTop
+  // without a user intent. Only a real gesture may load older history when the
+  // resulting scroll event lands near the top, otherwise a correction becomes
+  // a prepend -> key change -> correction loop that jumps to earlier messages.
+  let userScrollIntent = false
 
   const getItemKey = createMemo(() => {
     const keys = rowKeys()
@@ -152,8 +157,11 @@ export function createTimelineVirtualizer(input: Input) {
         knownKeys.add(key)
         addedKeys.add(key)
       })
+    for (const key of [...addedKeys]) {
+      if (!keys.includes(key)) addedKeys.delete(key)
+    }
 
-    return (index: number) => keys[index] ?? `removed:${index}`
+    return (index: number) => keys[index] ?? "removed"
   })
 
   const rangeExtractor = createMemo(() => {
@@ -774,6 +782,7 @@ export function createTimelineVirtualizer(input: Input) {
   // the end must stop following, even though the resulting position still looks like the end.
   const handleListWheel = (event: WheelEvent & { currentTarget: HTMLDivElement }) => {
     releaseAnchor()
+    userScrollIntent = true
     input.onUserScroll(event.target)
 
     if (event.deltaY < 0) input.onUnpin()
@@ -782,6 +791,7 @@ export function createTimelineVirtualizer(input: Input) {
   const handleListTouchStart = (event: TouchEvent) => {
     clearTouchTarget()
     releaseAnchor()
+    userScrollIntent = true
     input.onUserScroll(event.target)
     touchScrolling = true
     touchStart = event.touches[0]?.clientY
@@ -839,6 +849,7 @@ export function createTimelineVirtualizer(input: Input) {
   // so a held pointer is what separates those from the virtualizer's own measurement adjustments.
   const handleListPointerDown = (event: PointerEvent) => {
     releaseAnchor()
+    userScrollIntent = true
     input.onUserScroll(event.target)
     pointerHeld = true
   }
@@ -865,6 +876,7 @@ export function createTimelineVirtualizer(input: Input) {
 
     if (scrollKeyOwner(event.currentTarget, event.target, key) !== event.currentTarget) return
     releaseAnchor()
+    userScrollIntent = true
     input.onUserScroll(event.currentTarget)
 
     if (upwardKeys.has(key)) input.onUnpin()
@@ -892,7 +904,10 @@ export function createTimelineVirtualizer(input: Input) {
     else if (arrived && !rendering.anchor && maxScroll - scrollTop <= zoomSlack) endPending = true
     settleColdBottom()
     input.onScheduleScrollState(root)
-    input.onHistoryScroll()
+    if (pointerHeld || touchScrolling || userScrollIntent) {
+      userScrollIntent = false
+      input.onHistoryScroll()
+    }
   }
 
   function View(props: ViewProps) {

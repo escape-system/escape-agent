@@ -78,8 +78,8 @@ pub(super) struct StepRun {
 /// A streaming attempt that ended in a *classifiable* provider failure.
 ///
 /// Only `LlmError::Failure` produces this: an untyped `LlmError::Provider` has
-/// no `FailureKind`, so it can never advance `models.chain` (guessing a class
-/// from message text would silently rewrite provider semantics).
+/// no `FailureKind`, so the error is surfaced without a class. No class advances
+/// `models.chain` now; the kind exists for typed reporting and key rotation.
 #[derive(Debug)]
 pub(super) struct StreamFailure {
     pub(super) error: oc_llm::LlmError,

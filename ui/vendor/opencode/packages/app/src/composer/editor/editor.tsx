@@ -493,6 +493,11 @@ const mentionParts = new WeakMap<HTMLElement, Exclude<ComposerPrompt[number], Co
 
 function renderComposerEditor(editor: HTMLDivElement, prompt: ComposerPrompt) {
   const active = document.activeElement === editor
+
+  // A status/event refresh can re-create the prompt parts with identical text.
+  // Replacing the contenteditable children then drops the selection, which makes
+  // typing and backspace stutter. Skip a write that would produce the same DOM.
+  if (composerModel(editor) === promptModel(prompt)) return
   editor.replaceChildren(
     ...prompt.flatMap<Node>((part) => {
       if (isAttachment(part)) return []
@@ -535,6 +540,42 @@ function renderComposerEditor(editor: HTMLDivElement, prompt: ComposerPrompt) {
   range.collapse(false)
   selection?.removeAllRanges()
   selection?.addRange(range)
+}
+
+function mentionKey(part: Exclude<ComposerPrompt[number], ComposerAttachment | { type: "text" }>) {
+  return part.type === "file" && part.mime === "application/x-directory" ? "reference" : part.type
+}
+
+function promptModel(prompt: ComposerPrompt) {
+  let text = ""
+  const mentions: string[] = []
+
+  for (const part of prompt) {
+    if (isAttachment(part)) continue
+    if (part.type === "text") {
+      text += part.content
+
+      continue
+    }
+    mentions.push(`${text.length}:${mentionKey(part)}:${part.content}`)
+    text += part.content
+  }
+
+  return JSON.stringify([text, mentions])
+}
+
+function composerModel(editor: HTMLDivElement) {
+  let text = ""
+  const mentions: string[] = []
+
+  for (const node of editor.childNodes) {
+    if (node instanceof HTMLElement && node.dataset.mention) {
+      mentions.push(`${text.length}:${node.dataset.mention}:${node.textContent ?? ""}`)
+    }
+    text += node.textContent ?? ""
+  }
+
+  return JSON.stringify([text, mentions])
 }
 
 function parseComposerEditor(editor: HTMLDivElement) {

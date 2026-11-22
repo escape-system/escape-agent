@@ -223,10 +223,11 @@ impl Runtime {
     /// primary pointer when the dead key was primary, and retries immediately.
     ///
     /// A key rotation is not a model fallback: no `session.model.fallback` event
-    /// is published here, and `models.chain` is untouched. Only when every key is
-    /// exhausted is the last failure returned to [`Runtime::stream_step`], which
-    /// then runs the chain advance exactly once. `MAX_KEY_ATTEMPTS` bounds the
-    /// work even if a pool somehow reports more keys than that.
+    /// is published here, and `models.chain` is untouched. When every key is
+    /// exhausted the last failure is returned to [`Runtime::stream_step`],
+    /// which surfaces it to the caller without switching models.
+    /// `MAX_KEY_ATTEMPTS` bounds the work even if a pool somehow reports more
+    /// keys than that.
     #[allow(clippy::too_many_arguments)]
     async fn stream_model_attempts(
         &self,

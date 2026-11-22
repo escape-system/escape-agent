@@ -132,13 +132,14 @@ chain.
   `LlmError::Provider`, both in-band (`LlmEvent::ProviderError`) and on a
   pre-stream (stream-open) error, in `turn/stream.rs` and `turn/compaction.rs`.
   `Http { status: 429 }` keeps its existing retry-after behavior.
-- `FailureKind::ModelUnavailable` (`model_unavailable`) ALWAYS advances the
-  chain, regardless of `models.fallback.on`. The default `on` set is
-  `[empty_response, transport, rate_limit, quota]` and deliberately excludes it,
-  yet an unlisted `model_unavailable` still advances. Every other class keeps the
-  historical gate: it must be retryable AND listed in `on`.
-- Before advancing, the runtime marks the failing reference in
-  `oc_llm::ModelHealth`; the next turn and the next spawn skip it.
+- `FailureKind::ModelUnavailable` (`model_unavailable`) is classified and
+  reported, but automatic model fallback is disabled: no failure class advances
+  the chain mid-turn. `models.fallback.on` and `max_hops` are accepted for wire
+  compatibility only (`FallbackPolicy::allows` always returns `false`). A turn
+  that fails after same-model key rotation surfaces the typed provider error to
+  the caller without switching models (`crates/oc-runtime/src/turn/stream.rs`).
+- `oc_llm::ModelHealth` remains shared with `AppState::model_health()` for
+  explicit control-plane reporting; it no longer drives turn fallback.
 
 `ModelHealth` is owned by `Runtime` (`Runtime::model_health()`), shared with
 `AppState::model_health()` for the registry.
@@ -166,12 +167,14 @@ Two independent axes, and they must not be confused:
   credentials ([27](27-key-pool.md)); when one is exhausted (`auth`, `quota`,
   `rate_limit`, `transport`) the runtime retries the same model with the next
   key and reuses the same assistant row. It MUST NOT emit
-  `session.model.fallback`: that event means the model changed
-  (`crates/oc-types/src/payload/meta.rs:55`), and the runtime publishes it only
-  on a chain advance (`crates/oc-runtime/src/turn/stream.rs`).
-- **Model fallback** happens only when every key — and, for Antigravity, every
-  account — of the current model is exhausted. Then `models.fallback` may
-  advance to the next chain entry exactly as described above.
+  `session.model.fallback`; that event means the model changed
+  (`crates/oc-types/src/payload/meta.rs:55`) and the runtime never publishes it
+  automatically (`crates/oc-runtime/src/turn/stream.rs`).
+- **Model fallback is disabled.** When every key — and, for Antigravity, every
+  account — of the current model is exhausted, the last typed failure is
+  surfaced to the caller. Model selection belongs to the caller; the
+  `models.chain` / `models.chains.<role>` lists are preference order for the
+  picker and standalone roles, never an automatic turn fallback path.
 
 Classification is the same for both paths: `Resource has been exhausted (e.g.
 check quota).` classifies as `FailureKind::Quota`, never `RateLimit`
@@ -498,7 +501,7 @@ is `opencode-go/hy4-flash-free` unless the user explicitly approves a change.
 | Parent dies | Children are interrupted (`reason:"shutdown"`); on boot each repaired child is settled to the parent as failed exactly once (no automatic resume; observers may `restart_subagent`) |
 | Sibling message to a deleted session | Tool error `SessionNotFoundError`; sender is notified |
 | Depth/child limit hit | Tool error before session creation; no partial state |
-| Model unavailable | Resolution skips the entry (or the runtime marks it and advances the chain mid-turn); if nothing is usable, `NoUsableCandidate` names every skip with reason and source |
+| Model unavailable | Resolution skips the entry; if nothing is usable, `NoUsableCandidate` names every skip with reason and source. A mid-turn provider failure is reported without switching models |
 | Every chain model denied by quota | Spawn fails with a tool error naming each denied model and its reason; no child session is created |
 | Sibling storm | `max_messages_per_min` per sender, after `can_message`; exhaustion is a tool **error** (`BudgetError: rate limit reached …`), not a queued warning |
 | Write storm | `max_writes_per_min` per sender, consumed after `can_write` and before any enqueue/interrupt; exhaustion is the same structured `BudgetError` and no inbox row is written |

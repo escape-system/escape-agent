@@ -46,13 +46,15 @@ export function ObserverRepairPanel(props: {
     })
   }
 
+  const rowIdentity = (rows: ObserverRepair[]) => rows.map(identity).join("\u0001")
+
   const rows = createMemo(() => {
     const fetched = history.data?.available ? history.data.value : []
     const seen = new Set(fetched.map(identity))
     const live = props.live().filter((row) => !seen.has(identity(row)))
 
     return [...live, ...fetched].slice(0, 20)
-  })
+  }, [], { equals: (a, b) => rowIdentity(a) === rowIdentity(b) })
 
   const budget = createMemo(() => (state.data?.available ? state.data.value.budget : undefined))
 

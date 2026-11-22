@@ -100,12 +100,12 @@ candidate the order is:
    the next usable key, reusing the same assistant row when nothing streamed.
    Every other class returns immediately: a model- or request-scoped failure is
    not a key problem (`key_failure_kind`, `:61-75`).
-4. Only when **every** key for that model is exhausted does the last failure
-   return to `stream_step`, which runs the existing model chain advance exactly
-   once.
+ 4. When **every** key for that model is exhausted, the last typed failure
+    returns to `stream_step`, which reports it to the caller. Automatic model
+    fallback is disabled; there is no chain advance.
 
 `MAX_KEY_ATTEMPTS = 8` bounds the work per candidate even if a pool reports more
-keys (`crates/oc-runtime/src/turn/stream.rs:51`, `:300`). An empty pool is not a
+keys (`crates/oc-runtime/src/turn/stream.rs:98`). An empty pool is not a
 key problem: the request is attempted exactly once with `api_key: None` and the
 client resolves the provider environment itself (`:293-301`).
 
@@ -228,7 +228,7 @@ repeating the upstream sentence.
 | `oc-llm` | `env_keys_are_tracked_separately_from_stored_keys` | `__env__` is its own slot |
 | `oc-llm` | `provider_ids_compare_case_insensitively`, `debug_redacts_key_material` | normalization, redaction |
 | `oc-runtime` | `quota_on_the_active_key_rotates_to_the_backup_key` (`crates/oc-runtime/tests/runtime/key_pool.rs:51`) | key A exhausted -> key B serves the same model, 2 provider calls, 0 `session.model.fallback` |
-| `oc-runtime` | `all_keys_exhausted_advances_the_chain_once` (`key_pool.rs:112`) | the chain advances exactly once, and only after the pool is spent |
+| `oc-runtime` | `all_keys_exhausted_fails_without_model_fallback` (`key_pool.rs:112`) | both keys are attempted, then the turn fails without a chain advance or `session.model.fallback` |
 | `oc-runtime` | `auth_failure_rotates_without_chain_advance` (`key_pool.rs:165`), `auth_failure_on_two_keys_does_not_advance_the_chain` (`crates/oc-runtime/tests/runtime/models_policy.rs:554`) | a permanent class rotates the key and never advances the chain, even across two keys |
 | `oc-runtime` | `rotate_uses_the_same_model_reference` (`key_pool.rs:198`) | the retry re-resolves the *same* model reference; rotation is not a model fallback |
 | `oc-antigravity` | `gateway_rotates_on_in_band_quota_error` (`crates/oc-antigravity/src/gateway/mod.rs:369`) | `RESOURCE_EXHAUSTED` frame rotates accounts instead of failing the turn |
