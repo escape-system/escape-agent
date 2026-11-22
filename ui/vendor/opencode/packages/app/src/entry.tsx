@@ -14,6 +14,7 @@ import zh from "@/runtime/i18n/zh"
 import { authFromToken } from "@/runtime/server/api"
 import pkg from "../package.json"
 import { ServerConnection } from "@/runtime/server/registry"
+import { registerServiceWorker } from "./pwa-update"
 
 const getLocale = () => {
   if (typeof navigator === "undefined") return "en" as const
@@ -51,9 +52,7 @@ const clearAuthToken = () => {
 
 const web = createWebPlatform(pkg.version)
 
-if (import.meta.env.PROD && "serviceWorker" in navigator) {
-  window.addEventListener("load", () => void navigator.serviceWorker.register("/sw.js"), { once: true })
-}
+registerServiceWorker()
 
 if (import.meta.env.VITE_SENTRY_DSN) {
   init({
