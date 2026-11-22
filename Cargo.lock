@@ -1205,7 +1205,7 @@ dependencies = [
 
 [[package]]
 name = "oc-antigravity"
-version = "0.3.17"
+version = "0.3.18"
 dependencies = [
  "async-trait",
  "axum",
@@ -1234,7 +1234,7 @@ dependencies = [
 
 [[package]]
 name = "oc-cli"
-version = "0.3.17"
+version = "0.3.18"
 dependencies = [
  "anyhow",
  "axum",
@@ -1269,7 +1269,7 @@ dependencies = [
 
 [[package]]
 name = "oc-config"
-version = "0.3.17"
+version = "0.3.18"
 dependencies = [
  "jsonc-parser",
  "serde",
@@ -1280,7 +1280,7 @@ dependencies = [
 
 [[package]]
 name = "oc-lanes"
-version = "0.3.17"
+version = "0.3.18"
 dependencies = [
  "futures-util",
  "oc-observer",
@@ -1294,7 +1294,7 @@ dependencies = [
 
 [[package]]
 name = "oc-llm"
-version = "0.3.17"
+version = "0.3.18"
 dependencies = [
  "axum",
  "bytes",
@@ -1311,7 +1311,7 @@ dependencies = [
 
 [[package]]
 name = "oc-lsp"
-version = "0.3.17"
+version = "0.3.18"
 dependencies = [
  "futures-util",
  "parking_lot",
@@ -1326,7 +1326,7 @@ dependencies = [
 
 [[package]]
 name = "oc-mcp"
-version = "0.3.17"
+version = "0.3.18"
 dependencies = [
  "async-trait",
  "axum",
@@ -1345,7 +1345,7 @@ dependencies = [
 
 [[package]]
 name = "oc-memory"
-version = "0.3.17"
+version = "0.3.18"
 dependencies = [
  "async-trait",
  "oc-store",
@@ -1360,7 +1360,7 @@ dependencies = [
 
 [[package]]
 name = "oc-observer"
-version = "0.3.17"
+version = "0.3.18"
 dependencies = [
  "parking_lot",
  "serde",
@@ -1371,7 +1371,7 @@ dependencies = [
 
 [[package]]
 name = "oc-plugin"
-version = "0.3.17"
+version = "0.3.18"
 dependencies = [
  "async-trait",
  "parking_lot",
@@ -1384,7 +1384,7 @@ dependencies = [
 
 [[package]]
 name = "oc-pty"
-version = "0.3.17"
+version = "0.3.18"
 dependencies = [
  "bytes",
  "portable-pty",
@@ -1394,7 +1394,7 @@ dependencies = [
 
 [[package]]
 name = "oc-runtime"
-version = "0.3.17"
+version = "0.3.18"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -1420,7 +1420,7 @@ dependencies = [
 
 [[package]]
 name = "oc-server"
-version = "0.3.17"
+version = "0.3.18"
 dependencies = [
  "async-trait",
  "axum",
@@ -1466,7 +1466,7 @@ dependencies = [
 
 [[package]]
 name = "oc-store"
-version = "0.3.17"
+version = "0.3.18"
 dependencies = [
  "base64 0.22.1",
  "hex",
@@ -1483,14 +1483,14 @@ dependencies = [
 
 [[package]]
 name = "oc-subagents"
-version = "0.3.17"
+version = "0.3.18"
 dependencies = [
  "thiserror 2.0.21",
 ]
 
 [[package]]
 name = "oc-testkit"
-version = "0.3.17"
+version = "0.3.18"
 dependencies = [
  "anyhow",
  "axum",
@@ -1506,7 +1506,7 @@ dependencies = [
 
 [[package]]
 name = "oc-tools"
-version = "0.3.17"
+version = "0.3.18"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -1526,7 +1526,7 @@ dependencies = [
 
 [[package]]
 name = "oc-types"
-version = "0.3.17"
+version = "0.3.18"
 dependencies = [
  "rand 0.9.5",
  "serde",
