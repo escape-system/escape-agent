@@ -115,8 +115,13 @@ export function scrollOffsetFromThumbPointer(input: {
 }) {
   const padding = 8
   const maxThumbStart = input.clientSize - padding * 2 - input.thumbSize
+  const maxScroll = Math.max(0, input.scrollSize - (input.scrollClientSize ?? input.clientSize))
 
-  if (maxThumbStart <= 0) return 0
+  // A collapsed/zero-height track (e.g. a very tall composer over a short
+  // viewport) used to return 0 here, which snapped the timeline to the very
+  // top on the first thumb movement. In that degenerate case the scroll range
+  // cannot be mapped, so leave the current offset alone instead.
+  if (maxThumbStart <= 0) return undefined
 
   const thumbStart = Math.max(
     0,
@@ -125,7 +130,7 @@ export function scrollOffsetFromThumbPointer(input: {
 
   const progress = input.reverse ? 1 - thumbStart / maxThumbStart : thumbStart / maxThumbStart
 
-  return progress * Math.max(0, input.scrollSize - (input.scrollClientSize ?? input.clientSize))
+  return progress * maxScroll
 }
 
 /**
@@ -340,6 +345,8 @@ export function ScrollView(props: ScrollViewProps) {
         thumbSize: vertical ? state.verticalThumbSize : state.horizontalThumbSize,
         reverse: rtl,
       })
+
+      if (offset === undefined) return
 
       if (vertical) {
         viewportRef.scrollTop = offset

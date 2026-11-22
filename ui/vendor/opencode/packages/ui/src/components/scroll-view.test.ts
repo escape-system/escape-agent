@@ -111,4 +111,11 @@ describe("scrollOffsetFromThumbPointer", () => {
     expect(scrollOffsetFromThumbPointer({ ...input, pointer: 118, reverse: true })).toBe(600)
     expect(scrollOffsetFromThumbPointer({ ...input, pointer: 402, reverse: true })).toBe(0)
   })
+
+  test("does not snap to the top when the thumb track has collapsed", () => {
+    // A tall composer can shrink the external track below the padding + thumb
+    // size. Returning 0 here used to set scrollTop = 0 on the first drag.
+    expect(scrollOffsetFromThumbPointer({ ...input, clientSize: 8, thumbSize: 60 })).toBeUndefined()
+    expect(scrollOffsetFromThumbPointer({ ...input, clientSize: 0, thumbSize: 0 })).toBeUndefined()
+  })
 })
