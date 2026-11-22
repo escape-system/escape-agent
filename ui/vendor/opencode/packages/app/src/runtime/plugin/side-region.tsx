@@ -476,7 +476,13 @@ function AddMenu(props: { items: readonly SessionPanelMenuItem[]; onChoose: () =
               chosen = undefined
               setTimeout(() => {
                 if (document.activeElement instanceof HTMLElement) document.activeElement.blur()
-                props.onChoose()
+                // A pane-targeting failure must never swallow the chosen action:
+                // terminal and file-open rely on this dispatch to open their tabs.
+                try {
+                  props.onChoose()
+                } catch (error) {
+                  console.error("side panel target failed", error)
+                }
                 item.run()
               })
             }}
