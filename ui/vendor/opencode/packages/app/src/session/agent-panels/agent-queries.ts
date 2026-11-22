@@ -68,6 +68,7 @@ export function useSubagentTreeQuery(sessionID: () => string | undefined) {
     retry: false,
   }))
 
+  let refetchTimer: ReturnType<typeof setTimeout> | undefined
   const stop = sdk.event.listen((event) => {
     const raw = event as unknown as { type?: string }
     if (!sessionID() || !raw.type) return
@@ -79,10 +80,17 @@ export function useSubagentTreeQuery(sessionID: () => string | undefined) {
       raw.type === "session.status" ||
       raw.type.startsWith("session.execution.")
     ) {
-      void query.refetch()
+      if (refetchTimer !== undefined) return
+      refetchTimer = setTimeout(() => {
+        refetchTimer = undefined
+        void query.refetch()
+      }, 250)
     }
   })
-  onCleanup(stop)
+  onCleanup(() => {
+    if (refetchTimer !== undefined) clearTimeout(refetchTimer)
+    stop()
+  })
 
   return query
 }

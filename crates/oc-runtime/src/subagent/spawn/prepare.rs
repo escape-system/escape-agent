@@ -152,12 +152,14 @@ pub(super) async fn prepare_spawn_context(
         &runtime.inner.config.catalog.current(),
         &runtime.inner.config.client,
     );
-    let chain = models.chain_for(agent);
     let call_model = optional_str(input, "model");
 
-    // The candidate list in resolution order, with provenance. Built here so the
-    // quota scan, the health filter and the typed `rejectedModels` report can all
-    // name a model's origin; `resolve_model_with` rebuilds the same order.
+    // Candidate resolution without model fallback:
+    // - An explicit `model:` call argument is strict: only that single reference
+    //   is evaluated, and any error/denial fails the spawn instead of falling back.
+    // - When `model` is omitted, resolve the configured hierarchy (`Agent` ->
+    //   `Default` -> `Parent`) without consulting `models.chain` or blocking
+    //   on transient `model_health` cooldowns.
     let mut ordered: Vec<(String, oc_subagents::ModelSource)> = Vec::new();
     let push_ordered =
         |list: &mut Vec<(String, oc_subagents::ModelSource)>, reference: &str, source| {
@@ -171,33 +173,28 @@ pub(super) async fn prepare_spawn_context(
         };
     if let Some(reference) = call_model.as_deref() {
         push_ordered(&mut ordered, reference, oc_subagents::ModelSource::Call);
+    } else {
+        if let Some(reference) = defaults.agent_models.get(agent) {
+            push_ordered(&mut ordered, reference, oc_subagents::ModelSource::Agent);
+        }
+        if let Some(reference) = defaults.policy_models.get(agent) {
+            push_ordered(&mut ordered, reference, oc_subagents::ModelSource::Agent);
+        }
+        if let Some(reference) = defaults.default_model.as_deref() {
+            push_ordered(&mut ordered, reference, oc_subagents::ModelSource::Default);
+        }
+        push_ordered(
+            &mut ordered,
+            &parent_model,
+            oc_subagents::ModelSource::Parent,
+        );
     }
-    for reference in chain {
-        push_ordered(&mut ordered, reference, oc_subagents::ModelSource::Chain);
-    }
-    if let Some(reference) = defaults.agent_models.get(agent) {
-        push_ordered(&mut ordered, reference, oc_subagents::ModelSource::Agent);
-    }
-    if let Some(reference) = defaults.policy_models.get(agent) {
-        push_ordered(&mut ordered, reference, oc_subagents::ModelSource::Agent);
-    }
-    if let Some(reference) = defaults.default_model.as_deref() {
-        push_ordered(&mut ordered, reference, oc_subagents::ModelSource::Default);
-    }
-    push_ordered(
-        &mut ordered,
-        &parent_model,
-        oc_subagents::ModelSource::Parent,
-    );
-    // Variant-insensitive like the quota scan: `candidates` dedups on
-    // `provider/id` while `ordered` dedups on the exact reference, so a denied
-    // variant must still resolve to the source it was proposed with.
     let source_of = |reference: &str| {
         let key = crate::subagent::settings::model_key(reference);
         ordered
             .iter()
             .find(|(seen, _)| crate::subagent::settings::model_key(seen) == key)
-            .map_or(oc_subagents::ModelSource::Chain, |(_, source)| *source)
+            .map_or(oc_subagents::ModelSource::Parent, |(_, source)| *source)
     };
 
     // Variant-insensitive de-duplication for the quota scan.
@@ -212,25 +209,8 @@ pub(super) async fn prepare_spawn_context(
         list.push(reference.to_owned());
     };
 
-    // Every candidate the resolver could pick, in resolution order. The list is
-    // rebuilt inside `resolve_model_with`; the copy here exists so quota can be
-    // evaluated for ALL candidates — a `models.quota` without a `models.chain`
-    // must still stop an exhausted parent/default model.
     let mut candidates: Vec<String> = Vec::new();
-    if let Some(reference) = call_model.as_deref() {
-        push_candidate(&mut candidates, reference);
-    }
-    if let Some(reference) = defaults.agent_models.get(agent) {
-        push_candidate(&mut candidates, reference);
-    }
-    if let Some(reference) = defaults.policy_models.get(agent) {
-        push_candidate(&mut candidates, reference);
-    }
-    if let Some(reference) = defaults.default_model.as_deref() {
-        push_candidate(&mut candidates, reference);
-    }
-    push_candidate(&mut candidates, &parent_model);
-    for reference in chain {
+    for (reference, _) in &ordered {
         push_candidate(&mut candidates, reference);
     }
 
@@ -289,31 +269,26 @@ pub(super) async fn prepare_spawn_context(
         }
     }
 
-    // Models the turn fallback just watched fail in a model-level class are
-    // removed from this spawn's candidate list: paying the same failed round
-    // trip would only re-teach the same lesson. The reasons for such skips are
-    // typed later (Denied, with the candidate's own source).
-    let now = oc_types::now_millis();
-    let mut unhealthy: Vec<String> = Vec::new();
-    for (reference, _) in &ordered {
-        if denied.contains(reference) {
-            continue;
-        }
-        if !runtime.model_health().is_available(reference, now) {
-            unhealthy.push(reference.clone());
-            denied.push(reference.clone());
-        }
+    let filter = oc_subagents::model::CandidateFilter::new(&[], &denied);
+    let choice = if let Some(reference) = call_model.as_deref() {
+        oc_subagents::model::resolve_model_with(
+            Some(reference),
+            None,
+            oc_subagents::model::ModelDefaults::new(),
+            "",
+            &available,
+            Some(&filter),
+        )
+    } else {
+        oc_subagents::model::resolve_model_with(
+            None,
+            Some(agent),
+            defaults,
+            &parent_model,
+            &available,
+            Some(&filter),
+        )
     }
-
-    let filter = oc_subagents::model::CandidateFilter::new(chain, &denied);
-    let choice = oc_subagents::model::resolve_model_with(
-        call_model.as_deref(),
-        Some(agent),
-        defaults,
-        &parent_model,
-        &available,
-        Some(&filter),
-    )
     .map_err(|error| {
         let denials = quota_denials
             .iter()
@@ -329,11 +304,7 @@ pub(super) async fn prepare_spawn_context(
         }
     })?;
 
-    // One typed skip list for both sources of denial: the quota scan keeps its
-    // human-readable reason in the error text, while `rejectedModels` reports
-    // `{reference, source, reason}`. Resolver skips (malformed / absent from the
-    // catalog / denied) keep their own typed reason; a reference denied by quota
-    // or health is `Denied`, carrying the source it was proposed with.
+    // One typed skip list for both quota denials and resolver skips.
     let mut rejected_models: Vec<oc_subagents::ModelSkip> = Vec::new();
     for (reference, reason) in &quota_denials {
         rejected_models.push(oc_subagents::ModelSkip::new(
@@ -342,15 +313,6 @@ pub(super) async fn prepare_spawn_context(
             oc_subagents::SkipReason::Denied,
         ));
         tracing::debug!(reference, reason, "models.quota denial");
-    }
-    for (reference, source) in &ordered {
-        if unhealthy.iter().any(|seen| seen == reference) {
-            rejected_models.push(oc_subagents::ModelSkip::new(
-                reference.clone(),
-                *source,
-                oc_subagents::SkipReason::Denied,
-            ));
-        }
     }
     for skip in &choice.skipped {
         if rejected_models

@@ -241,3 +241,113 @@ async fn proactive_refresh_skips_tokens_outside_the_buffer() {
         .expect("sweep");
     assert_eq!(refreshed, 1);
 }
+
+async fn open_service_in_dir(dir: &std::path::Path, base: &str) -> AntigravityService {
+    let dir_buf = dir.to_path_buf();
+    AntigravityService::open(
+        None,
+        Some(dir_buf.clone()),
+        Some(dir_buf),
+        AntigravityEndpoints::mock(base),
+    )
+    .await
+    .expect("open service")
+}
+
+fn resolve_hydrogen(svc: &AntigravityService) -> oc_llm::ResolvedModel {
+    let mut catalog = oc_llm::Catalog::from_snapshot("{}").expect("empty");
+    svc.overlay_catalog(&mut catalog);
+    catalog
+        .resolve("google/antigravity-gemini-4-hydrogen#xhigh")
+        .expect("resolve hydrogen")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn signature_cache_persists_across_service_restart() {
+    use futures_util::StreamExt;
+    use oc_llm::{ContentPart, LlmClient, LlmMessage, LlmRequest};
+
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let base = serve(Router::new().route(
+        "/v1internal:streamGenerateContent",
+        post(|| async {
+            let sse = concat!(
+                "data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"id\":\"call_persist_1\",\"name\":\"read\",\"args\":{\"path\":\"Cargo.toml\"}},\"thoughtSignature\":\"sig_persisted_restart_check_123456\"}]},\"finishReason\":\"STOP\"}]}}\n\n",
+                "data: [DONE]\n\n"
+            );
+            axum::response::Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "text/event-stream")
+                .body(axum::body::Body::from(sse))
+                .expect("sse")
+        }),
+    ))
+    .await;
+
+    {
+        let svc = open_service_in_dir(dir.path(), &base).await;
+        svc.upsert_exchange_result(
+            AntigravityTokenExchange {
+                refresh: "1//persist|proj-p".to_owned(),
+                refresh_token: "1//persist".to_owned(),
+                access: "ya29.persist".to_owned(),
+                expires: now_ms() + 3_600_000,
+                email: Some("persist@example.com".to_owned()),
+                project_id: "proj-p".to_owned(),
+                explicit_project_id: Some("proj-p".to_owned()),
+                managed_project_id: None,
+            },
+            None,
+        )
+        .await
+        .expect("add account");
+
+        let client = LlmClient::new().expect("client");
+        client.set_hook(Some(Arc::new(svc.clone())));
+
+        let mut req = LlmRequest::new(resolve_hydrogen(&svc));
+        req.options.cache_key = Some("ses_persist_1".to_owned());
+        req.messages = vec![LlmMessage::user("hi")];
+        let mut stream = client.stream(req).await.expect("stream");
+        while stream.next().await.is_some() {}
+    }
+
+    assert!(
+        dir.path()
+            .join("antigravity-signature-cache.json")
+            .is_file()
+    );
+
+    let reopened = open_service_in_dir(dir.path(), &base).await;
+    let mut followup = LlmRequest::new(resolve_hydrogen(&reopened));
+    followup.messages = vec![
+        LlmMessage::user("hi"),
+        LlmMessage::new(
+            oc_llm::Role::Assistant,
+            vec![ContentPart::tool_call(
+                "call_persist_1",
+                "read",
+                json!({ "path": "Cargo.toml" }),
+            )],
+        ),
+        LlmMessage::tool_result("call_persist_1", Some("read".to_owned()), "ok", false),
+    ];
+
+    let cfg = reopened.config();
+    let sig_arc = reopened.signature_cache();
+    let mut sig_guard = sig_arc.lock().expect("lock");
+    let transformed = crate::transform::build_cloud_code_request(
+        &followup,
+        "proj-p",
+        "ses_persist_1",
+        &cfg,
+        None,
+        Some(&mut sig_guard),
+        false,
+        now_ms(),
+    );
+    assert_eq!(
+        transformed.envelope["request"]["contents"][1]["parts"][0]["thoughtSignature"],
+        "sig_persisted_restart_check_123456"
+    );
+}

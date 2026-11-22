@@ -480,6 +480,7 @@ impl AppState {
 /// the 7.9 MB snapshot is too expensive for a request handler.
 pub fn catalog_from_config(config: &ConfigService) -> Result<Catalog, LlmError> {
     let mut catalog = Catalog::from_snapshot(oc_llm::catalog::EMBEDDED_SNAPSHOT)?;
+    oc_llm::catalog::refresh::apply_builtin_providers(&mut catalog);
     if let Some(providers) = config.merged().get("providers") {
         catalog.apply_config(providers)?;
     }

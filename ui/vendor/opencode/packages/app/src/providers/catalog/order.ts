@@ -6,5 +6,6 @@ export const popularProviders = [
   "openai",
   "google",
   "openrouter",
+  "nous",
   "vercel",
 ]

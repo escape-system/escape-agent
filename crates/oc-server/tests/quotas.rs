@@ -1352,3 +1352,66 @@ async fn quotas_hide_google_when_every_antigravity_account_is_disabled() {
         "a pool with no usable account must not be probed"
     );
 }
+
+#[tokio::test]
+async fn quotas_surface_nous_research_rate_limits_and_local_usage() {
+    let mut parts = harness_parts().await;
+    oc_llm::catalog::refresh::apply_builtin_providers(&mut parts.catalog);
+    parts
+        .store
+        .create_credential(NewCredential {
+            id: Some("cred_nous".to_owned()),
+            integration_id: "nous".to_owned(),
+            label: Some("Nous Research".to_owned()),
+            value: json!({ "type": "key", "key": "sk-nous-test-1" }),
+            active: Some(true),
+        })
+        .await
+        .unwrap();
+    let created = now_millis() - 60_000;
+    parts
+        .store
+        .append_message(NewMessage {
+            id: "msg_nous_usage".to_owned(),
+            session_id: "ses_quota_history".to_owned(),
+            kind: "assistant".to_owned(),
+            data: json!({
+                "model": { "providerID": "nous", "id": "google/gemini-4-hydrogen" },
+                "tokens": { "input": 800, "output": 400, "reasoning": 0, "cache": { "read": 0, "write": 0 } },
+                "cost": 0.42,
+                "time": { "created": created, "completed": created + 100 }
+            }),
+            time_created: created,
+        })
+        .await
+        .unwrap();
+    parts
+        .llm_client
+        .record_rate_limit(rate_limit_snapshot("nous"));
+
+    let app = router(state_from(&parts));
+    let (status, body) = call(&app, Method::POST, "/api/quotas/refresh", None).await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    let body = body.unwrap();
+    assert_no_nulls(&body, "$");
+
+    let nous = find_provider(&body, "nous");
+    assert_eq!(nous["name"], "Nous Research");
+    assert_eq!(nous["connected"], true);
+    assert_eq!(nous["connectionSource"], "credential");
+    assert_eq!(nous["capability"], "rate_limit_headers_only");
+    assert_eq!(nous["status"], "headers_only");
+    assert!(
+        nous["capabilityNote"]
+            .as_str()
+            .is_some_and(|text| text.contains("portal.nousresearch.com")),
+        "{nous}"
+    );
+    assert_eq!(nous["rateLimit"]["requestsRemaining"], 59);
+    assert_eq!(nous["keys"][0]["credentialID"], "cred_nous");
+    assert!((nous["localUsage"]["day"]["costUsd"].as_f64().unwrap_or(0.0) - 0.42).abs() < 1e-6);
+    assert_eq!(
+        nous["localUsage"]["topModels"][0]["modelID"],
+        "google/gemini-4-hydrogen"
+    );
+}

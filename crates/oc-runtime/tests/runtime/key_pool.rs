@@ -106,16 +106,12 @@ async fn quota_on_the_active_key_rotates_to_the_backup_key() {
     );
 }
 
-/// Both keys spent: the chain advances exactly once, and the second model
-/// serves the turn.
+/// Both keys spent: both keys are attempted on the same model and the turn
+/// fails directly without switching to `models.chain`.
 #[tokio::test]
-async fn all_keys_exhausted_advances_the_chain_once() {
+async fn all_keys_exhausted_fails_without_model_fallback() {
     let harness = Harness::new(
-        vec![
-            quota_failure(),
-            quota_failure(),
-            text_script("beta served the turn"),
-        ],
+        vec![quota_failure(), quota_failure()],
         Arc::new(AllowAll),
         json!({"models": {
             "chain": ["test/alpha", "test/beta"],
@@ -128,26 +124,21 @@ async fn all_keys_exhausted_advances_the_chain_once() {
     seed_key(&harness, "cred_backup", "sk-backup", false).await;
 
     harness.prompt("hi").await;
+    harness.wait_for_event("session.execution.failed").await;
 
     let requests = harness.model.requests();
     assert_eq!(
         requests.len(),
-        3,
-        "two keys on alpha, then one chain advance to beta"
+        2,
+        "both keys on alpha attempted, no chain fallback"
     );
     assert_eq!(requests[0].model.model.model_id, "alpha");
     assert_eq!(requests[1].model.model.model_id, "alpha");
-    assert_eq!(requests[2].model.model.model_id, "beta");
     assert_eq!(
         harness.sink.count("session.model.fallback"),
-        1,
-        "exhausting the pool switches models exactly once: {:?}",
+        0,
+        "model fallback is disabled: {:?}",
         harness.sink.kinds()
-    );
-    assert_eq!(
-        harness.sink.data("session.model.fallback")[0]["kind"],
-        "quota",
-        "the switch records the class that exhausted the last key"
     );
 
     let messages = harness.messages().await;
@@ -155,8 +146,9 @@ async fn all_keys_exhausted_advances_the_chain_once() {
     assert_eq!(
         rows.len(),
         1,
-        "the row is rewritten for beta, not duplicated: {rows:?}"
+        "the exhausted pool fails on one assistant row: {rows:?}"
     );
+    assert!(rows[0].get("error").is_some(), "{}", rows[0]);
 }
 
 /// `auth` rotates the key but never the model: a revoked key says nothing about

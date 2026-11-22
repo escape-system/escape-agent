@@ -18,7 +18,12 @@ export function SessionAgentPanels(props: { sessionID: string }) {
   return (
     <>
       <SubagentTreePanel sessionID={props.sessionID} />
-      <ObserverRepairPanel sessionID={props.sessionID} live={events.repairs} escalation={events.escalation} />
+      <ObserverRepairPanel
+        sessionID={props.sessionID}
+        rootID={root()}
+        live={events.repairs}
+        escalation={events.escalation}
+      />
     </>
   )
 }

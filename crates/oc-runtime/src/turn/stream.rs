@@ -5,14 +5,13 @@ use oc_llm::{LlmMessage, LlmOptions, LlmRequest};
 use oc_store::NewMessage;
 use oc_types::message::{AssistantPart, FinishReason, StructuredError, ToolState};
 use oc_types::payload::{
-    SessionModelFallback, SessionStepEnded, SessionStepFailed, SessionStepStarted,
-    SessionStepStreamed, SessionTextDelta, SessionTextEnded, SessionTextStarted, SessionToolCalled,
-    SessionToolInputDelta, SessionToolInputEnded, SessionToolInputStarted, SessionUsageUpdated,
+    SessionStepEnded, SessionStepFailed, SessionStepStarted, SessionStepStreamed, SessionTextDelta,
+    SessionTextEnded, SessionTextStarted, SessionToolCalled, SessionToolInputDelta,
+    SessionToolInputEnded, SessionToolInputStarted, SessionUsageUpdated,
 };
 use oc_types::{MessageId, ModelRef, Tokens};
 
 use crate::runtime::{CancelToken, Runtime, RuntimeError};
-use crate::subagent::settings::{model_key, models_policy};
 
 use super::assistant::{AssistantState, ordinal_u32};
 use super::tools::strip_expectation;
@@ -20,20 +19,6 @@ use super::types::{
     PendingToolCall, ResolvedTurn, StepAttempt, StepRun, StreamFailure, finish_reason,
     tokens_from_usage,
 };
-
-/// Normalize a variant the way the UI does: absent, empty and `"default"` all
-/// select the same model; real variants remain distinct.
-fn normalized_variant(variant: Option<&str>) -> Option<&str> {
-    variant.filter(|value| !value.is_empty() && !value.eq_ignore_ascii_case("default"))
-}
-
-/// Whether a fallback candidate changes the effective (provider, id, variant).
-fn is_model_switch(previous: &ModelRef, next: &ModelRef) -> bool {
-    previous.provider_id != next.provider_id
-        || previous.id != next.id
-        || normalized_variant(previous.variant.as_deref())
-            != normalized_variant(next.variant.as_deref())
-}
 
 /// Turn a raw provider message into a typed failure when the text names a known
 /// class.
@@ -185,156 +170,49 @@ impl Runtime {
         Ok(())
     }
 
-    /// Stream one step, advancing `models.chain` on classifiable provider
-    /// failures before giving up.
-    ///
-    /// Only a classified [`oc_llm::LlmError::Failure`] can advance the chain:
-    /// [`oc_llm::FailureKind`] is the single place provider semantics are
-    /// classified, and an unclassifiable error keeps the historical
-    /// fail-then-error behavior. An in-band [`oc_llm::LlmEvent::ProviderError`]
-    /// is classified too ([`classified_provider_error`]), so a provider that
-    /// reports "model no longer available" mid-stream switches models instead of
-    /// killing the turn.
-    ///
-    /// [`crate::subagent::settings::FallbackPolicy::allows`] decides per class:
-    /// `model_unavailable` always advances (the model is gone; retrying it is
-    /// pointless), while the transport-ish classes additionally require
-    /// `is_retryable()` and an entry in `models.fallback.on`.
-    ///
-    /// The chain is the ordered candidate list, models already tried in this
-    /// step are skipped, and `models.fallback.max_hops` caps the number of
-    /// switches. When the chain is exhausted the ORIGINAL error is surfaced
-    /// unchanged.
+    /// Stream one step using only the resolved model (rotating healthy pool
+    /// keys on that same model via `stream_model_attempts`). Automatic fallback
+    /// to other models in `models.chain` is disabled so errors surface directly
+    /// to the caller/main agent.
     #[allow(clippy::too_many_lines)]
     pub(super) async fn stream_step(
         &self,
         session: &str,
-        turn: &mut ResolvedTurn,
+        turn: &ResolvedTurn,
         messages: &[LlmMessage],
         final_call: bool,
         cancel: &Arc<CancelToken>,
     ) -> Result<StepRun, RuntimeError> {
-        let policy = models_policy(&self.inner.config.config);
-        let chain = policy.chain_for(&turn.agent_id);
-        let mut model = turn.model.clone();
-        let mut model_ref = turn.model_ref.clone();
-        let mut tried = vec![model_key(&model_ref.to_reference())];
-        let mut hops: u32 = 0;
         let mut reuse: Option<AssistantState> = None;
-
-        loop {
-            // Credential rotation is strictly *inside* one model candidate: an
-            // exhausted or revoked key says nothing about whether the next key
-            // can serve the same model, so every usable key is tried before the
-            // chain is consulted (`docs/27-key-pool.md`, contract §3).
-            let attempt = self
-                .stream_model_attempts(
-                    session, turn, &model, &model_ref, messages, final_call, cancel, &mut reuse,
-                )
-                .await?;
-            let failure = match attempt {
-                StepAttempt::Done(run) => return Ok(run),
-                StepAttempt::Retry(failure) => failure,
-            };
-            let StreamFailure {
-                error,
-                state,
-                kind,
-                reusable,
-            } = failure;
-            // Remember the class against the model that just failed: the next
-            // spawn removes it from `available` instead of paying the same
-            // failed round trip (`ModelHealth` owns the per-class TTL and
-            // ignores request-scoped kinds). The raw provider text is kept, not
-            // the `Display` form, so the registry badge shows what the provider
-            // actually said.
-            let message = match &error {
-                oc_llm::LlmError::Failure { message, .. } => message.clone(),
-                other => other.to_string(),
-            };
-            self.model_health().mark(
-                &model_ref.to_reference(),
-                kind,
-                oc_types::now_millis(),
-                Some(message),
-            );
-            let original = RuntimeError::Llm(error);
-
-            let mut advanced = false;
-            if policy.fallback.allows(kind) && hops < policy.fallback.max_hops {
-                while let Some(next) = chain
-                    .iter()
-                    .find(|reference| !tried.contains(&model_key(reference.as_str())))
-                    .cloned()
-                {
-                    tried.push(model_key(&next));
-                    let Ok(resolved) = self
-                        .inner
-                        .config
-                        .client
-                        .resolve_model(&self.inner.config.catalog.current(), &next)
-                    else {
-                        // A chain entry the catalog cannot run is skipped rather
-                        // than fatal: it must not stall every later turn.
-                        continue;
-                    };
-                    let next_ref = ModelRef {
-                        id: resolved.model.model_id.clone(),
-                        provider_id: resolved.model.provider_id.clone(),
-                        variant: resolved.variant.as_ref().map(|variant| variant.id.clone()),
-                    };
-                    // A bare chain entry with no variant resolves to the same
-                    // effective model as the failed attempt; retry it, but do
-                    // not write a redundant session patch or emit switch events.
-                    // Genuine provider/id/variant changes still do both.
-                    if is_model_switch(&model_ref, &next_ref) {
-                        // One switch implementation: catalog guard + `patch_session`
-                        // + `session.model.selected` (`observer/repair_worker.rs`).
-                        self.observer_switch_model(session, &next).await?;
-                        self.emit(
-                            session,
-                            &turn.directory,
-                            SessionModelFallback {
-                                session_id: Runtime::session_id(session),
-                                from: model_ref.clone(),
-                                to: next_ref.clone(),
-                                kind: kind.as_str().to_owned(),
-                                attempt: Some(hops.saturating_add(1)),
-                            },
-                        )
-                        .await?;
-                    }
-                    hops = hops.saturating_add(1);
-                    turn.model = resolved.clone();
-                    turn.model_ref = next_ref.clone();
-                    if resolved.model.limit.context > 0 {
-                        turn.context_window = resolved.model.limit.context;
-                    }
-                    model = resolved;
-                    model_ref = next_ref;
-                    reuse = reusable.then(|| state.clone());
-                    advanced = true;
-                    break;
-                }
-            }
-            if !advanced {
-                let tokens = state.tokens.clone();
-                let cost = state.cost.unwrap_or(0.0);
-                let structured = original.structured();
-                self.fail_step(session, turn, state, structured, tokens, cost)
-                    .await?;
-                return Err(original);
-            }
-            if !reusable {
-                // Mid-stream output cannot be replayed into the next model, so
-                // the partial attempt stays durable as a failed row.
-                let tokens = state.tokens.clone();
-                let cost = state.cost.unwrap_or(0.0);
-                let structured = original.structured();
-                self.fail_step(session, turn, state, structured, tokens, cost)
-                    .await?;
-            }
-        }
+        let attempt = self
+            .stream_model_attempts(
+                session,
+                turn,
+                &turn.model,
+                &turn.model_ref,
+                messages,
+                final_call,
+                cancel,
+                &mut reuse,
+            )
+            .await?;
+        let failure = match attempt {
+            StepAttempt::Done(run) => return Ok(run),
+            StepAttempt::Retry(failure) => failure,
+        };
+        let StreamFailure {
+            error,
+            state,
+            kind: _,
+            reusable: _,
+        } = failure;
+        let original = RuntimeError::Llm(error);
+        let tokens = state.tokens.clone();
+        let cost = state.cost.unwrap_or(0.0);
+        let structured = original.structured();
+        self.fail_step(session, turn, state, structured, tokens, cost)
+            .await?;
+        Err(original)
     }
 
     /// One model candidate with credential rotation.

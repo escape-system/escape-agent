@@ -40,6 +40,7 @@ impl LlmClient {
     /// timeout, 900s chunk timeout).
     pub fn new() -> Result<Self, LlmError> {
         let http = Client::builder()
+            .user_agent(concat!("opencode/", env!("CARGO_PKG_VERSION")))
             .connect_timeout(Duration::from_secs(30))
             .tcp_keepalive(Duration::from_secs(30))
             .http2_keep_alive_interval(Some(Duration::from_secs(30)))

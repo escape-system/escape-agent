@@ -239,6 +239,11 @@ impl AntigravityService {
             .map_or_else(|_| DiscoveredModelCache::default(), |g| g.clone())
     }
 
+    /// Persist dirty thought signatures when `force` is true or the write interval has elapsed.
+    pub(crate) fn flush_signature_cache(&self, force: bool) {
+        flush_signature_cache_handle(&self.inner.signature_cache, force);
+    }
+
     /// Fetch the Hub auto-updater manifest and refresh quotas/models in background at startup.
     pub fn spawn_background_version_check(&self) {
         let check_manifest = self.config().auto_update;
@@ -304,8 +309,23 @@ impl AntigravityService {
                         tracing::debug!(error = %err, "antigravity: background quota refresh failed");
                     }
                 }
+                svc.flush_signature_cache(false);
             }
         });
         true
+    }
+}
+
+impl Drop for ServiceInner {
+    fn drop(&mut self) {
+        flush_signature_cache_handle(&self.signature_cache, true);
+    }
+}
+
+pub(crate) fn flush_signature_cache_handle(cache: &Arc<StdMutex<SignatureCache>>, force: bool) {
+    if let Ok(mut guard) = cache.lock()
+        && let Err(err) = guard.flush_if_due(now_ms(), force)
+    {
+        tracing::debug!(error = %err, "antigravity: failed to flush signature cache");
     }
 }

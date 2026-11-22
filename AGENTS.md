@@ -62,15 +62,7 @@ requested agent id is resolved (session rows, spawn targets, observer):
 `build` → `engineer`, `plan` → `architect`, `reviewer` → `review`. `steward` is a
 project template, never a builtin.
 
-Model policy: `models.chain` / `models.chains.<agent>` is a routing **preference
-order**, never an allowlist and never a visibility filter — it does not restrict
-what a caller may ask for and it never overrides an explicit `model:` argument,
-which always wins even when it is outside the chain. Chat-picker visibility is
-`!models.hidden[ref] && providerConnected`; the chain and `models.favorites` only
-reorder rows. `FailureKind::ModelUnavailable` always
-advances the chain regardless of `models.fallback.on`; every other class must be
-retryable and listed. `PUT /api/config/models` applies to the next spawn/turn
-without a restart; only an external edit of the config file needs one.
+Model policy: `models.chain` / `models.chains.<agent>` and `models.fallback` are kept in configuration and `PUT /api/config/models` for compatibility with the Models control-plane UI, while **automatic model fallback is disabled**: turns and compaction execute only their resolved model (same-model multi-key rotation via `KeyPool` stays active), and subagent spawns never advance across `models.chain` or silently override an explicit `model:` argument. Chat-picker visibility is `!models.hidden[ref] && providerConnected`; the chain and `models.favorites` only reorder picker rows. `PUT /api/config/models` applies to the next spawn/turn without a restart; only an external edit of the config file needs one.
 
 ## Build gates (run from `opencode-rust/`)
 

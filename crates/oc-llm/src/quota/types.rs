@@ -60,6 +60,12 @@ pub fn provider_quota_capability(provider_id: &str) -> (QuotaCapability, Option<
                 "Provider does not expose a public remaining-balance endpoint for standard API keys. Showing live rate-limit headers captured from requests and local tracked usage.",
             ),
         ),
+        "nous" => (
+            QuotaCapability::RateLimitHeadersOnly,
+            Some(
+                "Nous Research inference keys do not expose a wallet balance endpoint (manage credits at portal.nousresearch.com). Showing captured rate-limit headers and local tracked usage.",
+            ),
+        ),
         _ => (
             QuotaCapability::RateLimitHeadersOnly,
             Some(

@@ -524,24 +524,20 @@ table:
 Retryable = `EmptyResponse` | `Transport` | `RateLimit` | `Quota`; not
 retryable = `Auth` | `InvalidRequest` | `ModelUnavailable` | `Unknown`.
 
-`ModelUnavailable` (`model_unavailable`) is what always advances `models.chain`:
-a retired/decommissioned model cannot serve the request whatever
-`models.fallback.on` says, so the runtime special-cases it in
-`FallbackPolicy::allows` and never transport-retries it. Every other advancing
-class must be retryable AND listed in `models.fallback.on`; the default set is
-`[empty_response, transport, rate_limit, quota]` and excludes
-`model_unavailable` on purpose (listing it changes nothing). Config accepts all
-five spellings.
+Automatic turn model fallback is disabled: `FallbackPolicy::allows` always
+returns `false` and turns never switch models mid-step when a provider call
+fails after same-model key rotation. `models.fallback.on` and
+`models.fallback.max_hops` remain accepted in configuration and wire payloads
+for compatibility (`max_hops` defaults to `0`). `Http { status: 429 }` keeps its
+transport retry (including `"rate limit exceeded"` responses, while billing/quota
+messages remain non-retryable).
 
 `oc_llm::classify_provider_message(&str) -> FailureKind` turns an opaque provider
 message into one of these kinds (lowercase substring rules, first group wins:
 model unavailable → quota → rate limit → auth → invalid request → `unknown`), and
 the runtime raises `LlmError::Failure { kind, message }` instead of
-`LlmError::Provider` for a known kind. `Http { status: 429 }` keeps its retry.
-Before advancing, the failing reference is marked in `oc_llm::ModelHealth`
-(`Runtime::model_health()`, shared with `AppState::model_health()`); TTLs are
-24 h / 5 min / 60 s / 30 s for `model_unavailable` / `quota` / `rate_limit` /
-`transport`, and the other kinds are never marked.
+`LlmError::Provider` for a known kind. `oc_llm::ModelHealth` remains shared
+with `AppState::model_health()` for explicit control-plane reporting.
 
 ### `resolve_model_with` + `CandidateFilter` (`oc-subagents`)
 

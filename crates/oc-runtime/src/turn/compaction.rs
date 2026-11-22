@@ -261,7 +261,7 @@ impl Runtime {
             };
             attempted = attempted.saturating_add(1);
             let model_ref = ModelRef {
-                id: model.model.model_id.clone(),
+                id: model.model.id.clone(),
                 provider_id: model.model.provider_id.clone(),
                 variant: model.variant.as_ref().map(|variant| variant.id.clone()),
             };
@@ -322,26 +322,10 @@ impl Runtime {
                     ));
                 }
                 CompactionOutcome::Failed(failure) => {
-                    // Record against the model and key that actually failed, so
-                    // the next spawn skips the model and the next turn rotates
-                    // away from a dead key. Neither is a model switch.
+                    // Record against the key that failed so the next turn
+                    // rotates away from a dead key on the same model.
                     match failure.record {
-                        RecordPolicy::ModelAndKey => {
-                            if let oc_llm::LlmError::Failure { .. } = &failure.error {
-                                self.model_health().mark(
-                                    &model_ref.to_reference(),
-                                    failure.kind,
-                                    oc_types::now_millis(),
-                                    None,
-                                );
-                            }
-                            self.mark_compaction_key(
-                                &model.provider.id,
-                                failure.credential.as_ref(),
-                                &failure.error,
-                            );
-                        }
-                        RecordPolicy::KeyOnly => {
+                        RecordPolicy::ModelAndKey | RecordPolicy::KeyOnly => {
                             self.mark_compaction_key(
                                 &model.provider.id,
                                 failure.credential.as_ref(),
@@ -978,12 +962,9 @@ struct CompactionAttempt<'a> {
     cancel: &'a Arc<CancelToken>,
 }
 
-/// Maximum model candidates one compaction may attempt.
-///
-/// Compaction allows exactly ONE fallback hop (two attempts), not the turn
-/// loop's `models.fallback.max_hops` budget: it reuses one shortened request, so
-/// a longer walk would pay a full round trip per candidate for a single summary.
-const COMPACTION_MAX_ATTEMPTS: usize = 2;
+/// Maximum model candidates one compaction may attempt (automatic fallback
+/// between models is disabled).
+const COMPACTION_MAX_ATTEMPTS: usize = 1;
 
 /// What a compaction failure is recorded against.
 ///

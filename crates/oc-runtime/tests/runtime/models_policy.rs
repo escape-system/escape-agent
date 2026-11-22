@@ -39,12 +39,6 @@ fn spawn_input(background: bool) -> Value {
     })
 }
 
-fn rejected(metadata: &Value) -> &Vec<Value> {
-    metadata["rejectedModels"]
-        .as_array()
-        .unwrap_or_else(|| panic!("rejectedModels is reported: {metadata}"))
-}
-
 /// (g) No `models` section: the chooser keeps the historical resolution and the
 /// result carries the parent model with no quota/rejectedModels noise.
 #[tokio::test]
@@ -78,19 +72,16 @@ async fn no_models_config_keeps_the_historical_spawn_report() {
     );
 }
 
-/// A chain entry that wins reports `modelSource: "chain"`. The chain is a
-/// candidate in declared order: after an explicit call model and *before*
-/// `agents.<id>.model`, `subagents.default_model` and the inherited parent.
+/// `models.chain` does not override explicit `agents.<id>.model`,
+/// `subagents.default_model`, or `parent` when `model:` is omitted.
 #[tokio::test]
-async fn chain_entry_wins_and_reports_the_chain_source() {
+async fn chain_does_not_override_agent_or_parent_selection() {
     let harness = Harness::new(
         vec![text_script("child final")],
         Arc::new(AllowAll),
         json!({
-            "models": {"chain": ["test/beta"]},
-            // Every lower-precedence source names a runnable model, so picking
-            // `beta` proves the chain outranks all three of them.
-            "agents": {"general": {"model": "test/alpha"}},
+            "models": {"chain": ["test/retired"]},
+            "agents": {"general": {"model": "test/beta"}},
             "subagents": {"background_default": true, "default_model": "test/alpha"},
         }),
         None,
@@ -99,25 +90,18 @@ async fn chain_entry_wins_and_reports_the_chain_source() {
     let result = subagent_tool(&harness, "subagent")
         .execute(&tool_context(&harness, &harness.session), spawn_input(true))
         .await
-        .expect("a chain entry the catalog can run is spawned");
+        .expect("agent model wins without consulting models.chain");
     let metadata = result.metadata.expect("metadata");
     assert_eq!(metadata["model"]["id"], "beta");
-    assert_eq!(
-        metadata["modelSource"], "chain",
-        "the chain beats agents.<id>.model, subagents.default_model and the parent"
-    );
+    assert_eq!(metadata["modelSource"], "agent");
     assert!(
         metadata.get("rejectedModels").is_none(),
-        "nothing was skipped: {metadata}"
+        "retired chain entry is never evaluated: {metadata}"
     );
 }
 
-/// THE regression the contract exists for: an explicit call model must beat the
-/// configured chain, even when the chain's only entry is a retired model.
-///
-/// Before the fix `models.chain` was *prepended* to the candidate list, so the
-/// chain shadowed the caller's `model:` argument and every spawn died on the
-/// chain's provider.
+/// An explicit `model:` call argument always wins, even when a retired chain
+/// entry is present.
 #[tokio::test]
 async fn call_model_beats_a_chain_entry_the_catalog_cannot_run() {
     let harness = Harness::new(
@@ -145,11 +129,10 @@ async fn call_model_beats_a_chain_entry_the_catalog_cannot_run() {
     );
 }
 
-/// A chain whose first entry is unusable falls through to the next entry. The
-/// skipped reference is reported exactly once, with its typed reason and source,
-/// and nothing else is reported.
+/// When `model:` is omitted and `models.chain` contains retired entries, the
+/// spawn still resolves cleanly to `parent` without spurious chain skips.
 #[tokio::test]
-async fn chain_falls_through_a_retired_entry_and_reports_it() {
+async fn retired_chain_entry_is_ignored_when_model_is_omitted() {
     let harness = Harness::new(
         vec![text_script("child final")],
         Arc::new(AllowAll),
@@ -160,30 +143,19 @@ async fn chain_falls_through_a_retired_entry_and_reports_it() {
     let result = subagent_tool(&harness, "subagent")
         .execute(&tool_context(&harness, &harness.session), spawn_input(true))
         .await
-        .expect("the second chain entry is usable");
+        .expect("omitted model resolves to parent instead of chain");
     let metadata = result.metadata.expect("metadata");
-    assert_eq!(metadata["model"]["id"], "beta");
-    assert_eq!(metadata["modelSource"], "chain");
-    // The inherited parent (test/alpha) is a different, runnable model and is
-    // never reached, so the report holds exactly one entry.
-    assert_eq!(
-        rejected(&metadata),
-        &vec![json!({
-            "reference": "test/retired",
-            "source": "chain",
-            "reason": "not_available",
-        })],
-        "{metadata}"
-    );
+    assert_eq!(metadata["model"]["id"], "alpha");
+    assert_eq!(metadata["modelSource"], "parent");
+    assert!(metadata.get("rejectedModels").is_none(), "{metadata}");
 }
 
-/// A call model the catalog does not know is not fatal: resolution falls through
-/// to the chain instead of refusing the spawn, and the call reference is
-/// reported as a `call` source that was `not_available`.
+/// An explicit `model:` that the catalog does not know fails loudly instead of
+/// silently falling back to `models.chain`, `agent`, or `parent`.
 #[tokio::test]
-async fn unknown_call_model_falls_through_to_the_chain() {
+async fn unknown_call_model_fails_loudly_without_fallback() {
     let harness = Harness::new(
-        vec![text_script("child final")],
+        vec![],
         Arc::new(AllowAll),
         json!({"models": {"chain": ["test/beta"]}}),
         None,
@@ -191,26 +163,26 @@ async fn unknown_call_model_falls_through_to_the_chain() {
     .await;
     let mut input = spawn_input(true);
     input["model"] = json!("test/not-in-catalog");
-    let result = subagent_tool(&harness, "subagent")
+    let error = subagent_tool(&harness, "subagent")
         .execute(&tool_context(&harness, &harness.session), input)
         .await
-        .expect("a bad call model falls through to a usable chain entry");
-    let metadata = result.metadata.expect("metadata");
-    assert_eq!(metadata["model"]["id"], "beta");
-    assert_eq!(metadata["modelSource"], "chain");
-    let skipped = rejected(&metadata)
-        .iter()
-        .find(|skip| skip["reference"] == "test/not-in-catalog")
-        .unwrap_or_else(|| panic!("the call reference is named: {metadata}"));
-    assert_eq!(skipped["source"], "call");
-    assert_eq!(skipped["reason"], "not_available");
+        .expect_err("explicit unknown call model must not fall back");
+    assert!(
+        error.message.contains("test/not-in-catalog") && error.message.contains("not_available"),
+        "{}",
+        error.message
+    );
+    assert!(
+        child_sessions(&harness.store, &harness.session)
+            .await
+            .is_empty(),
+        "failed explicit call model must not spawn a child"
+    );
 }
 
-/// A retired-model provider message always advances the chain, even when
-/// `models.fallback.on` is explicitly empty (the model no longer exists;
-/// retrying it is pointless, switching is not).
+/// `model_unavailable` mid-turn does not automatically switch to `models.chain`.
 #[tokio::test]
-async fn model_unavailable_message_advances_the_chain_with_empty_fallback_on() {
+async fn model_unavailable_message_does_not_switch_models_mid_turn() {
     let message = "Claude Opus 4.6 is no longer available. Please switch to Claude Opus 5.5.";
     assert_eq!(
         oc_llm::classify_provider_message(message),
@@ -218,45 +190,30 @@ async fn model_unavailable_message_advances_the_chain_with_empty_fallback_on() {
         "the provider text classifies as a retired model"
     );
     let harness = Harness::new(
-        vec![
-            Script::Failure {
-                kind: oc_llm::FailureKind::ModelUnavailable,
-                message: message.to_owned(),
-            },
-            text_script("recovered on beta"),
-        ],
+        vec![Script::Failure {
+            kind: oc_llm::FailureKind::ModelUnavailable,
+            message: message.to_owned(),
+        }],
         Arc::new(AllowAll),
         json!({"models": {
             "chain": ["test/alpha", "test/beta"],
-            "fallback": {"on": []}
+            "fallback": {"on": ["empty_response", "transport"], "max_hops": 2}
         }}),
         None,
     )
     .await;
     harness.prompt("hi").await;
+    harness.wait_for_event("session.execution.failed").await;
 
-    assert!(
-        harness.sink.has("session.execution.succeeded"),
-        "{:?}",
-        harness.sink.kinds()
-    );
-    let requests = harness.model.requests();
-    assert_eq!(requests.len(), 2, "one attempt per candidate");
-    assert_eq!(requests[0].model.model.model_id, "alpha");
-    assert_eq!(requests[1].model.model.model_id, "beta");
-    let fallbacks = harness.sink.data("session.model.fallback");
-    assert_eq!(fallbacks.len(), 1, "{:?}", harness.sink.kinds());
-    assert_eq!(fallbacks[0]["kind"], "model_unavailable");
-    assert_eq!(fallbacks[0]["from"]["id"], "alpha");
-    assert_eq!(fallbacks[0]["to"]["id"], "beta");
+    assert_eq!(harness.model.calls(), 1, "no fallback attempt");
+    assert_eq!(harness.model.requests()[0].model.model.model_id, "alpha");
+    assert_eq!(harness.sink.count("session.model.fallback"), 0);
 }
 
-/// (d) A `models.chain` entry the catalog cannot run is skipped, not fatal: the
-/// resolver falls through to the inherited parent model. This used to be
-/// refused (the chain was a hard override); under the current contract the
-/// chain is only a preference order.
+/// Retired `models.chain` entries do not block or alter parent fallback-free
+/// selection.
 #[tokio::test]
-async fn unusable_chain_entry_falls_through_to_the_parent_model() {
+async fn unusable_chain_entry_still_lets_parent_model_win() {
     let harness = Harness::new(
         vec![text_script("child final")],
         Arc::new(AllowAll),
@@ -267,21 +224,14 @@ async fn unusable_chain_entry_falls_through_to_the_parent_model() {
     let result = subagent_tool(&harness, "subagent")
         .execute(&tool_context(&harness, &harness.session), spawn_input(true))
         .await
-        .expect("a bad chain entry falls through to the parent model");
+        .expect("parent model spawns cleanly");
     let metadata = result.metadata.expect("metadata");
     assert_eq!(metadata["modelSource"], "parent");
     assert_eq!(metadata["model"]["id"], "alpha");
-    let skipped = rejected(&metadata)
-        .iter()
-        .find(|skip| skip["reference"] == "test/missing")
-        .unwrap_or_else(|| panic!("test/missing is named: {metadata}"));
-    assert_eq!(skipped["source"], "chain");
-    assert_eq!(skipped["reason"], "not_available");
 }
 
-/// NO-USABLE-CANDIDATE: every candidate is denied, so the error names each
-/// skipped reference with its reason *and* the source it was proposed with
-/// (`reference (reason, source)`), and no child row exists.
+/// NO-USABLE-CANDIDATE: every active candidate is denied by quota, so the error
+/// names the denied candidate with its source (`test/alpha (denied, parent)`).
 #[tokio::test]
 async fn no_usable_candidate_names_every_skip() {
     let harness = Harness::new(
@@ -298,8 +248,6 @@ async fn no_usable_candidate_names_every_skip() {
         None,
     )
     .await;
-    // The parent model (`test/alpha`) is exhausted; the chain's only entry is
-    // absent from the catalog. Nothing is left to pick.
     seed_usage(&harness, "test", "alpha", 5.0).await;
 
     let error = subagent_tool(&harness, "subagent")
@@ -312,13 +260,6 @@ async fn no_usable_candidate_names_every_skip() {
     assert!(
         error.message.contains("test/alpha (denied, parent)"),
         "names the reference, reason and source: {}",
-        error.message
-    );
-    assert!(
-        error
-            .message
-            .contains("test/retired (not_available, chain)"),
-        "names every skip: {}",
         error.message
     );
     assert!(
@@ -626,256 +567,95 @@ async fn auth_failure_on_two_keys_does_not_advance_the_chain() {
     assert_ne!(rows[0]["finish"], "stop", "{}", rows[0]);
 }
 
-/// (h) A retryable `empty_response` advances the chain by one hop: the second
-/// candidate serves the retry, the single assistant row is attributed to it, and
-/// `session.model.fallback` records both ends of the switch plus the class.
-#[tokio::test]
-async fn empty_response_advances_the_chain_and_emits_the_fallback_event() {
+/// Helper asserting a provider failure never switches models mid-turn regardless
+/// of `models.chain` / `models.fallback`.
+async fn assert_turn_fails_without_fallback(
+    kind: oc_llm::FailureKind,
+    message: &str,
+    models_cfg: Value,
+) {
     let harness = Harness::new(
-        vec![
-            Script::Failure {
-                kind: oc_llm::FailureKind::EmptyResponse,
-                message: "alpha returned no output".to_owned(),
-            },
-            text_script("recovered on beta"),
-        ],
+        vec![Script::Failure {
+            kind,
+            message: message.to_owned(),
+        }],
         Arc::new(AllowAll),
-        json!({"models": {
-            "chain": ["test/alpha", "test/beta"],
-            "fallback": {"on": ["empty_response"], "max_hops": 1}
-        }}),
-        None,
-    )
-    .await;
-    harness.prompt("hi").await;
-
-    assert!(
-        harness.sink.has("session.execution.succeeded"),
-        "{:?}",
-        harness.sink.kinds()
-    );
-    // One attempt per model, in chain order: the retry went to the second one.
-    let requests = harness.model.requests();
-    assert_eq!(requests.len(), 2, "one attempt per candidate");
-    assert_eq!(requests[0].model.model.model_id, "alpha");
-    assert_eq!(requests[1].model.model.model_id, "beta");
-
-    // The durable fallback record names both ends of the switch and the class.
-    let fallbacks = harness.sink.data("session.model.fallback");
-    assert_eq!(fallbacks.len(), 1, "{:?}", harness.sink.kinds());
-    assert_eq!(fallbacks[0]["kind"], "empty_response");
-    assert_eq!(fallbacks[0]["attempt"], 1);
-    assert_eq!(fallbacks[0]["from"]["providerID"], "test");
-    assert_eq!(fallbacks[0]["from"]["id"], "alpha");
-    assert_eq!(fallbacks[0]["to"]["providerID"], "test");
-    assert_eq!(fallbacks[0]["to"]["id"], "beta");
-
-    // One assistant row, attributed to the model that actually answered.
-    let messages = harness.messages().await;
-    let assistants = assistants(&messages);
-    assert_eq!(assistants.len(), 1, "{messages:?}");
-    assert_eq!(assistants[0]["model"]["id"], "beta");
-    assert_eq!(assistants[0]["content"][0]["text"], "recovered on beta");
-    assert_eq!(assistants[0]["finish"], "stop");
-    assert!(assistants[0].get("error").is_none(), "{}", assistants[0]);
-}
-
-/// (i) `max_hops`, not the candidate count, bounds the attempts: one hop over a
-/// two-entry chain (plus the inherited session model, so three candidates) makes
-/// exactly two provider attempts, and the surfaced error is the classified
-/// provider failure that ended the run — never a synthesized "chain exhausted"
-/// message — with no success row.
-///
-/// `stream_step` rebuilds `original` from the failure of each attempt
-/// (`crates/oc-runtime/src/turn/stream.rs`), so the error that reaches
-/// `session.execution.failed` is the last attempted model's real failure; the
-/// earlier attempt's error is not retained anywhere. Pinning that keeps the
-/// "no synthesized error" contract honest instead of asserting the first
-/// message the implementation does not preserve.
-#[tokio::test]
-async fn two_transport_failures_stop_at_max_hops_and_keep_the_original_error() {
-    let harness = Harness::new(
-        vec![
-            Script::Failure {
-                kind: oc_llm::FailureKind::Transport,
-                message: "alpha transport boom".to_owned(),
-            },
-            Script::Failure {
-                kind: oc_llm::FailureKind::Transport,
-                message: "beta transport boom".to_owned(),
-            },
-            Script::Failure {
-                kind: oc_llm::FailureKind::Transport,
-                message: "gamma transport boom".to_owned(),
-            },
-        ],
-        Arc::new(AllowAll),
-        json!({"models": {
-            "chain": ["test/beta", "test/gamma"],
-            "fallback": {"on": ["transport"], "max_hops": 1}
-        }}),
+        json!({ "models": models_cfg }),
         None,
     )
     .await;
     harness.prompt("hi").await;
     harness.wait_for_event("session.execution.failed").await;
 
-    // 1 + max_hops attempts, not one per candidate (alpha + the two chain
-    // entries are three candidates; the third is never requested).
-    assert_eq!(harness.model.calls(), 2, "the cap is 1 + max_hops");
-    let requests = harness.model.requests();
-    assert_eq!(requests[0].model.model.model_id, "alpha");
-    assert_eq!(requests[1].model.model.model_id, "beta");
-    assert_eq!(harness.sink.count("session.model.fallback"), 1);
+    assert_eq!(harness.model.calls(), 1, "only the chosen model is tried");
+    assert_eq!(harness.model.requests()[0].model.model.model_id, "alpha");
+    assert_eq!(harness.sink.count("session.model.fallback"), 0);
+    assert!(!harness.sink.has("session.execution.succeeded"));
 
-    // The surfaced error is the provider failure that ended the run: typed,
-    // classified, and not a synthesized exhaustion sentence.
     let failures = harness.sink.data("session.execution.failed");
     assert_eq!(failures.len(), 1);
     assert_eq!(failures[0]["error"]["type"], "ProviderError");
-    let message = failures[0]["error"]["message"]
-        .as_str()
-        .expect("the failed execution carries a message");
-    assert!(
-        message.contains("provider failure (transport)"),
-        "{message}"
-    );
-    assert!(message.contains("beta transport boom"), "{message}");
-    assert!(!message.contains("chain"), "{message}");
+    let err_msg = failures[0]["error"]["message"].as_str().unwrap_or("");
+    assert!(err_msg.contains(message), "{err_msg}");
 
-    // No success row: no completed step, no answered assistant row.
-    assert!(!harness.sink.has("session.execution.succeeded"));
-    assert_eq!(harness.sink.count("session.step.ended"), 0);
     let messages = harness.messages().await;
-    let assistants = assistants(&messages);
-    assert_eq!(assistants.len(), 1, "{messages:?}");
-    assert!(assistants[0].get("error").is_some(), "{}", assistants[0]);
-    assert_ne!(assistants[0]["finish"], "stop");
+    let rows = assistants(&messages);
+    assert_eq!(rows.len(), 1, "{messages:?}");
+    assert!(rows[0].get("error").is_some(), "{}", rows[0]);
+    assert_ne!(rows[0]["finish"], "stop");
 }
 
-/// The live-config regression: `models.fallback.on = ["empty_response",
-/// "transport"]` — exactly the `on` list in the shipped config — used to make a
-/// quota failure kill the turn on the only model that was tried, because an
-/// explicit `on` was treated as the complete allowlist.
-///
-/// `Quota` and `RateLimit` are recovery classes: the chain exists to recover
-/// from them, so they advance regardless of `on`
-/// (`FallbackPolicy::allows`/`recovery_kinds`). This proves it end to end with
-/// the real document shape, not just at the unit level.
 #[tokio::test]
-async fn quota_advances_the_chain_even_when_on_omits_it() {
-    let harness = Harness::new(
-        vec![
-            Script::Failure {
-                kind: oc_llm::FailureKind::Quota,
-                message: "Resource has been exhausted (e.g. check quota).".to_owned(),
-            },
-            text_script("recovered on beta"),
-        ],
-        Arc::new(AllowAll),
-        json!({"models": {
+async fn empty_response_does_not_fallback_to_chain() {
+    assert_turn_fails_without_fallback(
+        oc_llm::FailureKind::EmptyResponse,
+        "alpha returned no output",
+        json!({
             "chain": ["test/alpha", "test/beta"],
-            "fallback": {"on": ["empty_response", "transport"]}
-        }}),
-        None,
+            "fallback": {"on": ["empty_response"], "max_hops": 2}
+        }),
     )
     .await;
-    harness.prompt("hi").await;
-    harness.wait_for_event("session.execution.succeeded").await;
-
-    let requests = harness.model.requests();
-    assert_eq!(requests.len(), 2, "one attempt per candidate: {requests:?}");
-    assert_eq!(requests[0].model.model.model_id, "alpha");
-    assert_eq!(requests[1].model.model.model_id, "beta");
-    assert_eq!(
-        harness.sink.count("session.model.fallback"),
-        1,
-        "quota advanced exactly one hop: {:?}",
-        harness.sink.kinds()
-    );
-    let fallbacks = harness.sink.data("session.model.fallback");
-    assert_eq!(fallbacks[0]["kind"], "quota");
-    assert_eq!(fallbacks[0]["from"]["id"], "alpha");
-    assert_eq!(fallbacks[0]["to"]["id"], "beta");
-
-    // The raw configured `on` list is never rewritten behind the user's back.
-    assert_eq!(
-        harness.config.config.merged()["models"]["fallback"]["on"],
-        json!(["empty_response", "transport"])
-    );
 }
 
-/// The same narrow `on` list with `rate_limit`: a throttled window also clears
-/// by moving to the next chain entry, so it must not be gated on `on` either.
 #[tokio::test]
-async fn rate_limit_advances_the_chain_with_the_same_narrow_on() {
-    let harness = Harness::new(
-        vec![
-            Script::Failure {
-                kind: oc_llm::FailureKind::RateLimit,
-                message: "429 Too Many Requests: rate limit reached".to_owned(),
-            },
-            text_script("recovered on beta"),
-        ],
-        Arc::new(AllowAll),
-        json!({"models": {
-            "chain": ["test/alpha", "test/beta"],
-            "fallback": {"on": ["empty_response", "transport"]}
-        }}),
-        None,
+async fn transport_failure_does_not_fallback_to_chain() {
+    assert_turn_fails_without_fallback(
+        oc_llm::FailureKind::Transport,
+        "alpha transport boom",
+        json!({
+            "chain": ["test/beta", "test/gamma"],
+            "fallback": {"on": ["transport"], "max_hops": 2}
+        }),
     )
     .await;
-    harness.prompt("hi").await;
-    harness.wait_for_event("session.execution.succeeded").await;
-
-    let requests = harness.model.requests();
-    assert_eq!(requests.len(), 2, "one attempt per candidate: {requests:?}");
-    assert_eq!(requests[1].model.model.model_id, "beta");
-    assert_eq!(
-        harness.sink.count("session.model.fallback"),
-        1,
-        "{:?}",
-        harness.sink.kinds()
-    );
-    assert_eq!(
-        harness.sink.data("session.model.fallback")[0]["kind"],
-        "rate_limit"
-    );
 }
 
-/// An `on = []` document (deliberate "never fall back" for the opt-in classes)
-/// still recovers from quota, which is the pre-existing behavior this file
-/// already pinned at the unit level.
 #[tokio::test]
-async fn empty_on_still_advances_on_quota() {
-    let harness = Harness::new(
-        vec![
-            Script::Failure {
-                kind: oc_llm::FailureKind::Quota,
-                message: "quota exceeded for this project".to_owned(),
-            },
-            text_script("recovered on beta"),
-        ],
-        Arc::new(AllowAll),
-        json!({"models": {
+async fn quota_failure_does_not_fallback_to_chain() {
+    assert_turn_fails_without_fallback(
+        oc_llm::FailureKind::Quota,
+        "Resource has been exhausted (e.g. check quota).",
+        json!({
             "chain": ["test/alpha", "test/beta"],
-            "fallback": {"on": []}
-        }}),
-        None,
+            "fallback": {"on": ["empty_response", "transport", "quota"], "max_hops": 2}
+        }),
     )
     .await;
-    harness.prompt("hi").await;
-    harness.wait_for_event("session.execution.succeeded").await;
-    assert_eq!(harness.sink.count("session.model.fallback"), 1);
-    assert_eq!(harness.model.requests()[1].model.model.model_id, "beta");
 }
 
-// ---------------------------------------------------------------------------
-// Compaction model resolution: `models.chains.compaction` (else `models.chain`)
-// with the turn model as the final fallback, exactly one fallback hop, and the
-// `session.compaction.ended` payload / completed row naming the model that
-// ACTUALLY produced the summary.
-// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn rate_limit_failure_does_not_fallback_to_chain() {
+    assert_turn_fails_without_fallback(
+        oc_llm::FailureKind::RateLimit,
+        "429 Too Many Requests: rate limit reached",
+        json!({
+            "chain": ["test/alpha", "test/beta"],
+            "fallback": {"on": ["rate_limit"], "max_hops": 2}
+        }),
+    )
+    .await;
+}
 
 /// Waits until the inbox row is consumed and every compaction row settled,
 /// returning the compaction rows.
@@ -931,20 +711,93 @@ async fn enqueue_compaction(harness: &Harness) {
         .expect("notify");
 }
 
-/// A quota failure on the first `models.chains.compaction` entry advances to the
-/// second one, and BOTH surfaces — the completed compaction row and the
-/// `session.compaction.ended` payload — name the model that actually produced
-/// the summary.
+/// Regression: models whose upstream `modelID` differs from `id` (or contains a
+/// provider slash, like `nous/google/gemini-4-hydrogen` or an aliased
+/// `nous/gemini-4-hydrogen`) must stay selectable by `subagent` and preserve
+/// their catalog `id` when persisted and resolved on child turns.
 #[tokio::test]
-async fn compaction_advances_on_quota() {
+async fn nous_slash_and_aliased_models_resolve_in_subagent_and_turn() {
     let harness = Harness::new(
         vec![
-            Script::Failure {
-                kind: oc_llm::FailureKind::Quota,
-                message: "Resource has been exhausted (e.g. check quota).".to_owned(),
-            },
-            text_script("## Objective\nsummarized on beta"),
+            text_script("aliased nous ok"),
+            text_script("direct nous ok"),
         ],
+        Arc::new(AllowAll),
+        json!({"subagents": {"background_default": false}}),
+        None,
+    )
+    .await;
+    let mut catalog = harness.config.catalog.current().as_ref().clone();
+    oc_llm::catalog::refresh::apply_builtin_providers(&mut catalog);
+    catalog
+        .apply_config(&json!({
+            "nous": {
+                "models": {
+                    "gemini-4-hydrogen": {
+                        "name": "Gemini 4 Hydrogen (via Nous)",
+                        "modelID": "google/gemini-4-hydrogen",
+                        "type": "chat",
+                        "package": "@ai-sdk/openai-compatible"
+                    }
+                }
+            }
+        }))
+        .expect("apply nous overlay");
+    harness.config.catalog.replace(catalog);
+
+    let tool = subagent_tool(&harness, "subagent");
+
+    let alias_result = tool
+        .execute(
+            &tool_context(&harness, &harness.session),
+            json!({
+                "agent": "general",
+                "description": "nous alias",
+                "prompt": "work",
+                "model": "nous/gemini-4-hydrogen",
+                "background": false,
+            }),
+        )
+        .await
+        .expect("aliased nous model spawns and completes");
+    let alias_meta = alias_result.metadata.expect("alias metadata");
+    assert_eq!(alias_meta["model"]["providerID"], "nous");
+    assert_eq!(alias_meta["model"]["id"], "gemini-4-hydrogen");
+
+    let direct_result = tool
+        .execute(
+            &tool_context(&harness, &harness.session),
+            json!({
+                "agent": "general",
+                "description": "nous direct",
+                "prompt": "work",
+                "model": "nous/google/gemini-4-hydrogen",
+                "background": false,
+            }),
+        )
+        .await
+        .expect("direct slash-id nous model spawns and completes");
+    let direct_meta = direct_result.metadata.expect("direct metadata");
+    assert_eq!(direct_meta["model"]["providerID"], "nous");
+    assert_eq!(direct_meta["model"]["id"], "google/gemini-4-hydrogen");
+
+    let requests = harness.model.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].model.model.id, "gemini-4-hydrogen");
+    assert_eq!(requests[0].model.model_id(), "google/gemini-4-hydrogen");
+    assert_eq!(requests[1].model.model.id, "google/gemini-4-hydrogen");
+    assert_eq!(requests[1].model.model_id(), "google/gemini-4-hydrogen");
+}
+
+/// No automatic compaction fallback: a failure on the first compaction
+/// candidate fails compaction without trying a second model.
+#[tokio::test]
+async fn compaction_does_not_fallback_on_quota() {
+    let harness = Harness::new(
+        vec![Script::Failure {
+            kind: oc_llm::FailureKind::Quota,
+            message: "Resource has been exhausted (e.g. check quota).".to_owned(),
+        }],
         Arc::new(AllowAll),
         json!({"models": {"chains": {"compaction": ["test/alpha", "test/beta"]}}}),
         None,
@@ -954,28 +807,13 @@ async fn compaction_advances_on_quota() {
     let rows = wait_compaction(&harness).await;
 
     assert_eq!(rows.len(), 1, "exactly one compaction row: {rows:?}");
-    assert_eq!(rows[0]["status"], "completed");
-    assert_eq!(
-        rows[0]["model"]["id"], "beta",
-        "the completed row names the model that produced the summary"
-    );
+    assert_eq!(rows[0]["status"], "failed");
     assert_eq!(
         harness.model.calls(),
-        2,
-        "alpha then beta, no third attempt"
+        1,
+        "no fallback candidate attempted in compaction"
     );
-
-    let ended = harness.sink.data("session.compaction.ended");
-    assert_eq!(ended.len(), 1, "one ended event: {ended:?}");
-    assert_eq!(
-        ended[0]["model"]["id"], "beta",
-        "the event reports the producing model, not the session's model: {ended:?}"
-    );
-    assert!(
-        !harness.sink.has("session.model.fallback"),
-        "a compaction hop is not a session model fallback"
-    );
-    // `session.model` is NOT rewritten by a compaction.
+    assert!(!harness.sink.has("session.model.fallback"));
     let session = harness
         .store
         .get_session(&harness.session)

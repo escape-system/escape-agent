@@ -78,6 +78,12 @@ pub(crate) async fn open_services(
     );
     let mut catalog =
         oc_server::catalog_from_config(config.as_ref()).context("load model catalog")?;
+    let has_nous_cache = apply_cached_nous_models(&mut catalog);
+    if has_nous_cache && let Some(providers) = config.merged().get("providers") {
+        catalog
+            .apply_config(providers)
+            .context("reapply providers over cached nous models")?;
+    }
     // `config_dir: None` is deliberate: Antigravity account, signature and
     // model-cache state is global (`resolve_config_dir()`), so every project
     // shares one account pool; only `antigravity.jsonc` discovery is per-project.
@@ -104,7 +110,9 @@ pub(crate) async fn open_services(
     // ignored, never served, so a truncated file cannot empty the picker.
     match oc_llm::catalog::refresh::read_cache(&oc_llm::catalog::refresh::cache_path()) {
         Some(Ok(body)) => match oc_llm::catalog::refresh::parse_live(&body) {
-            Ok(live) if oc_llm::catalog::refresh::is_plausible(&live) => {
+            Ok(mut live) if oc_llm::catalog::refresh::is_plausible(&live) => {
+                oc_llm::catalog::refresh::apply_builtin_providers(&mut live);
+                apply_cached_nous_models(&mut live);
                 catalog = live;
                 if let Some(providers) = config.merged().get("providers") {
                     catalog
@@ -339,6 +347,7 @@ pub(crate) fn start_background_tasks(
         tokio::spawn(async move { service::watch(path, id, shutdown).await });
     }
     if let Some(cell) = state.catalog_cell() {
+        spawn_nous_refresh_loop(std::sync::Arc::clone(cell), state.clone());
         // A published catalog is authoritative, so the swap rebuilds the whole
         // generation: parse, gate on plausibility, re-apply the same overlays the
         // boot path applies, then replace and announce. Dropping the handle
@@ -353,6 +362,8 @@ pub(crate) fn start_background_tasks(
                     live.models().len()
                 ));
             }
+            oc_llm::catalog::refresh::apply_builtin_providers(&mut live);
+            apply_cached_nous_models(&mut live);
             if let Some(config) = state.config()
                 && let Some(providers) = config.merged().get("providers")
             {
@@ -370,4 +381,63 @@ pub(crate) fn start_background_tasks(
         });
     }
     spawn_schedule_runner(state.clone(), shutdown.clone())
+}
+
+fn apply_cached_nous_models(catalog: &mut oc_llm::Catalog) -> bool {
+    let Some(Ok(body)) =
+        oc_llm::catalog::refresh::read_cache(&oc_llm::catalog::refresh::nous_cache_path())
+    else {
+        return false;
+    };
+    let Ok(models) = oc_llm::catalog::refresh::parse_nous_models(&body) else {
+        return false;
+    };
+    catalog.upsert_provider(oc_llm::catalog::refresh::default_nous_provider());
+    catalog.upsert_provider_models(models);
+    true
+}
+
+fn spawn_nous_refresh_loop(cell: Arc<oc_llm::CatalogCell>, state: AppState) {
+    tokio::spawn(async move {
+        let client = oc_llm::catalog::refresh::client();
+        let mut first = true;
+        loop {
+            let delay = if first {
+                oc_llm::catalog::refresh::BOOT_DELAY
+            } else {
+                oc_llm::catalog::refresh::REFRESH_INTERVAL
+            };
+            first = false;
+            tokio::time::sleep(delay).await;
+            match oc_llm::catalog::refresh::fetch_nous_models_now(&client).await {
+                Ok((body, models)) => {
+                    if let Err(error) = oc_llm::catalog::refresh::write_cache(
+                        &oc_llm::catalog::refresh::nous_cache_path(),
+                        &body,
+                    ) {
+                        tracing::debug!(%error, "nous catalog cache write failed");
+                    }
+                    let mut next = cell.current().as_ref().clone();
+                    next.upsert_provider(oc_llm::catalog::refresh::default_nous_provider());
+                    next.upsert_provider_models(models);
+                    if let Some(config) = state.config()
+                        && let Some(providers) = config.merged().get("providers")
+                        && let Err(error) = next.apply_config(providers)
+                    {
+                        tracing::warn!(%error, "nous catalog config reapply failed");
+                        continue;
+                    }
+                    if let Some(antigravity) = state.antigravity() {
+                        antigravity.overlay_catalog(&mut next);
+                    }
+                    cell.replace(next);
+                    state.publish(oc_types::EventEnvelope::now(
+                        "models-dev.refreshed",
+                        serde_json::json!({}),
+                    ));
+                }
+                Err(error) => tracing::debug!(%error, "nous model catalog refresh failed"),
+            }
+        }
+    });
 }

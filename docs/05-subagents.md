@@ -22,37 +22,32 @@ spawn_allowed, child_count, agent, model, status, title, location, project_id
 
 ## Model selection
 
-Resolution order, highest first (first usable hit wins):
+Resolution order, highest first:
 
-1. `Call` — the `subagent` tool call's `model` (`provider/id[#variant]`). An
-   explicit call model always wins, even when it is outside `models.chain`: the
-   chain is a routing preference order, never a visibility filter and not a gate.
-   Chat-picker visibility comes from `models.hidden` plus provider connectivity
-   ([13](13-ui.md)), not from chain membership.
-2. `Chain` — `models.chains.<agent>`, else `models.chain`, in declared order
-   ([14](14-config-permissions.md)).
-3. `Agent` — `agents.<id>.model`.
-4. `Agent` — `subagents.agents.<id>.model`.
-5. `Default` — `subagents.default_model`.
-6. `Parent` — the parent session's current model.
+1. `Call` — the `subagent` tool call's explicit `model` (`provider/id[#variant]`).
+   When `model` is specified, **only** that reference is evaluated: if it is
+   malformed, absent from the catalog, or denied by `models.quota`, the spawn
+   refuses loudly with `ModelUnavailableError` and never falls back to another
+   model. Chat-picker visibility comes from `models.hidden` plus provider
+   connectivity ([13](13-ui.md)), not from chain membership.
+2. When `model` is omitted: `Agent` (`agents.<id>.model`) → `Agent`
+   (`subagents.agents.<id>.model`) → `Default` (`subagents.default_model`) →
+   `Parent` (the parent session's current model). `models.chain` /
+   `models.chains.<agent>` does not override subagent spawns or perform fallback
+   hopping.
 
-`chain_for(role)` — the `Chain` step — also serves the standalone roles
-`scribe`, `observer` and `compaction`, so a `models.chains.<role>` entry applies
-to them too. `compaction` walks `models.chains.compaction` (else `models.chain`)
-in declared order and only then the turn's current model, with **exactly one**
-fallback hop (`COMPACTION_MAX_ATTEMPTS = 2`), not the turn loop's
-`models.fallback.max_hops`; the model it reports on the completed compaction row
-and in `session.compaction.ended` is the one that actually produced the summary
-(`crates/oc-runtime/src/turn/compaction.rs:418-430`).
+Standalone roles `scribe`, `observer`, and `compaction` still consult
+`chain_for(role)`. `compaction` resolves its configured `models.chains.compaction`
+(else `models.chain`) entry or the turn's current model with a single attempt
+(`COMPACTION_MAX_ATTEMPTS = 1`) and no automatic model fallback; the model it
+reports on the completed compaction row and in `session.compaction.ended` is
+the one that produced the summary (`crates/oc-runtime/src/turn/compaction.rs`).
 
-The merged list is deduplicated by exact reference (the first occurrence wins, so
-a chain entry that repeats the call reference cannot shadow it), then
-`CandidateFilter.deny` removes matching models variant-insensitively (quota is
-tracked per `provider/id`, so denying a model denies every variant of it).
-
-Selection never aborts on the first bad candidate: a malformed or catalog-absent
-entry is recorded as a skip and the next candidate is tried, so a typo in
-`models.chain` degrades to the next entry instead of failing the spawn.
+For omitted `model`, candidates are checked in hierarchy order with
+`CandidateFilter.deny` removing quota-denied models variant-insensitively (quota
+is tracked per `provider/id`, so denying a model denies every variant of it).
+When `model` is explicitly passed, no fallback to lower-precedence sources is
+attempted.
 
 Resolution is `oc_subagents::resolve_model_with(.., filter:
 Option<&CandidateFilter<'_>>)`; `CandidateFilter { chain, deny }` lets the runtime

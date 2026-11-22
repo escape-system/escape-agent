@@ -753,14 +753,22 @@ export function createTimelineVirtualizer(input: Input) {
     if (active()) input.setScrollRef(root)
     viewportObserver?.observe(root)
     settleColdBottom()
-    // The scrollbar thumb sits beside the viewport and stops its pointerdown from propagating, so
-    // listen on the ScrollView root in the capture phase: thumb drags are user scrolls too.
+    // The scrollbar thumb sits beside the viewport (either inside ScrollView or portaled into
+    // `visibleArea`) and stops its pointerdown from propagating, so listen in the capture phase.
     const scrollView = root.parentElement
 
     if (!scrollView) return
     scrollView.addEventListener("pointerdown", handleListPointerDown, { capture: true })
     onCleanup(() => scrollView.removeEventListener("pointerdown", handleListPointerDown, { capture: true }))
   }
+
+  createEffect(() => {
+    const track = visibleArea()
+
+    if (!track) return
+    track.addEventListener("pointerdown", handleListPointerDown, { capture: true })
+    onCleanup(() => track.removeEventListener("pointerdown", handleListPointerDown, { capture: true }))
+  })
 
   // Upward input is the one intent geometry cannot recover: nudging up while still a pixel from
   // the end must stop following, even though the resulting position still looks like the end.

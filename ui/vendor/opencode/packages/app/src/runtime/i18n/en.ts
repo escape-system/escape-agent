@@ -151,6 +151,7 @@ export const dict = {
   "dialog.provider.openai.note": "GPT models for fast, capable general AI tasks",
   "dialog.provider.google.note": "Gemini models for fast, structured responses",
   "dialog.provider.openrouter.note": "Access all supported models from one provider",
+  "dialog.provider.nous.note": "Access Hermes and frontier models via Nous Research",
   "dialog.provider.vercel.note": "Unified access to AI models with smart routing",
 
   "dialog.model.select.title": "Select model",
@@ -1512,6 +1513,10 @@ export const dict = {
     "This server is running without the lane service, so there is no live queue to show. Concurrency settings still apply once it is attached.",
   "session.agentPanels.tree.title": "Subagents",
   "session.agentPanels.tree.count": "{{count}} sessions",
+  "session.agentPanels.tree.filterAll": "All",
+  "session.agentPanels.tree.search": "Filter subagents…",
+  "session.agentPanels.tree.expandBranches": "Expand branches",
+  "session.agentPanels.tree.collapseBranches": "Collapse branches",
   "session.agentPanels.tree.expand": "Show the session tree",
   "session.agentPanels.tree.collapse": "Hide the session tree",
   "session.agentPanels.tree.open": "Open session {{title}}",

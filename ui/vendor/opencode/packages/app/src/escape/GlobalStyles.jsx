@@ -125,15 +125,14 @@ body {
 #root::before {
   content: "";
   position: fixed;
-  inset: -18%;
+  inset: 0;
   z-index: -1;
   pointer-events: none;
   background:
-    radial-gradient(closest-side at 50% 18%, rgb(212 175 55 / 0.34), transparent 72%),
-    radial-gradient(closest-side at 82% 36%, rgb(244 228 193 / 0.14), transparent 70%),
-    radial-gradient(closest-side at 12% 88%, rgb(205 127 50 / 0.11), transparent 70%);
-  filter: blur(72px);
-  opacity: 0.85;
+    radial-gradient(closest-side at 50% 18%, rgb(212 175 55 / 0.24), rgb(212 175 55 / 0.08) 44%, transparent 78%),
+    radial-gradient(closest-side at 82% 36%, rgb(244 228 193 / 0.10), transparent 74%),
+    radial-gradient(closest-side at 12% 88%, rgb(205 127 50 / 0.09), transparent 74%);
+  opacity: 0.9;
 }
 
 :root[data-color-scheme="light"] #root {
@@ -479,8 +478,32 @@ body {
     0 2px 10px rgb(0 0 0 / 0.22),
     inset 0 1px 0 rgb(255 255 255 / 0.10),
     inset 0 0 0 1px rgb(255 255 255 / 0.05);
+}
+[data-slot="home-panel"],
+[data-component="new-session"] {
   backdrop-filter: blur(46px) saturate(1.4);
   -webkit-backdrop-filter: blur(46px) saturate(1.4);
+}
+/* Avoid a full-viewport backdrop-filter blur over the virtualized timeline scroll container so scroll frames stay smooth. */
+[data-slot="session-chat-panel"] {
+  background-color: rgb(10 10 9 / 0.86);
+}
+:root[data-color-scheme="light"] [data-slot="session-chat-panel"] {
+  background-color: rgb(255 251 242 / 0.88);
+}
+[data-slot="session-timeline-visible"] .scroll-view__thumb[data-orientation="vertical"] {
+  width: 14px;
+}
+[data-slot="session-timeline-visible"] .scroll-view__thumb[data-orientation="vertical"]::after {
+  width: 5px;
+  background-color: rgb(var(--ea-gold-rgb) / 0.34);
+  backdrop-filter: none;
+  transition: background-color 150ms ease, width 150ms ease;
+}
+[data-slot="session-timeline-visible"] .scroll-view__thumb[data-orientation="vertical"]:hover::after,
+[data-slot="session-timeline-visible"] .scroll-view__thumb[data-orientation="vertical"][data-dragging="true"]::after {
+  width: 7px;
+  background-color: rgb(var(--ea-gold-rgb) / 0.65);
 }
 :root[data-color-scheme="light"] [data-slot="home-panel"],
 :root[data-color-scheme="light"] [data-slot="session-chat-panel"],

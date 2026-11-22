@@ -474,4 +474,14 @@ fn catalog_from_config_applies_the_providers_overlay() {
     assert!(catalog.model("custom-provider", "custom-model").is_some());
     // The embedded snapshot is still present.
     assert!(catalog.providers().len() > 1);
+
+    // Nous Research is registered natively with pricing and variants.
+    let nous = catalog.provider("nous").expect("builtin nous provider");
+    assert_eq!(nous.name, "Nous Research");
+    assert_eq!(nous.env, vec!["NOUS_API_KEY".to_owned()]);
+    let gemini = catalog
+        .resolve("nous/google/gemini-4-hydrogen")
+        .expect("builtin nous model resolves");
+    assert!(!gemini.model.cost.is_empty());
+    assert!((gemini.model.cost[0].input - 1.5).abs() < 1e-6);
 }

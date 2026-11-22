@@ -382,6 +382,10 @@ fn capability_table_matches_real_provider_ids() {
     let (deepseek, note) = provider_quota_capability("deepseek");
     assert_eq!(deepseek, QuotaCapability::LiveApi);
     assert!(note.is_none());
+
+    let (nous, note) = provider_quota_capability("nous");
+    assert_eq!(nous, QuotaCapability::RateLimitHeadersOnly);
+    assert!(note.is_some_and(|text| text.contains("portal.nousresearch.com")));
 }
 
 #[tokio::test]

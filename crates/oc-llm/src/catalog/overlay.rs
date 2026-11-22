@@ -237,6 +237,13 @@ impl Catalog {
         }
         if let Some(value) = object.get("cost") {
             model.cost = cost_from_config(value)?;
+        } else if model.cost.is_empty()
+            && !model.model_id.is_empty()
+            && model.model_id != model_id
+            && let Some(target) = self.model(provider_id, &model.model_id)
+            && !target.cost.is_empty()
+        {
+            model.cost.clone_from(&target.cost);
         }
         if let Some(value) = object.get("variants").and_then(Value::as_array) {
             for entry in value {
@@ -457,5 +464,37 @@ mod tests {
             serde_json::to_value(parsed).expect("serialize"),
             json!({"input": 1.25, "cacheRead": 0.3})
         );
+    }
+
+    #[test]
+    fn aliased_config_model_inherits_catalog_cost_when_cost_omitted() {
+        let mut catalog = Catalog::default();
+        let mut target = ModelInfo::default_for("nous", "google/gemini-4-hydrogen");
+        target.cost.push(Cost {
+            input: 1.5,
+            output: 7.5,
+            ..Cost::default()
+        });
+        catalog.upsert_provider_models(vec![target]);
+
+        catalog
+            .apply_config(&json!({
+                "nous": {
+                    "models": {
+                        "gemini-4-hydrogen": {
+                            "modelID": "google/gemini-4-hydrogen",
+                            "name": "Gemini 4 Hydrogen (via Nous)"
+                        }
+                    }
+                }
+            }))
+            .expect("apply config");
+
+        let alias = catalog
+            .model("nous", "gemini-4-hydrogen")
+            .expect("alias present");
+        assert_eq!(alias.cost.len(), 1);
+        assert_close(alias.cost[0].input, 1.5);
+        assert_close(alias.cost[0].output, 7.5);
     }
 }

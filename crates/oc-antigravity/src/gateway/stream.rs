@@ -4,14 +4,15 @@
 use crate::accounts::ModelFamily;
 use crate::constants::{HeaderStyle, headers_for_style};
 use crate::rotation::RateLimitReason;
-use crate::service::{ActiveCredentials, AntigravityService, now_ms};
+use crate::service::{ActiveCredentials, AntigravityService, flush_signature_cache_handle, now_ms};
+use crate::signature_cache::SignatureCache;
 use crate::stream::{CloudCodeSseDecoder, StreamDecodeFailure};
 use crate::transform::build_cloud_code_request;
 use bytes::Bytes;
 use futures_util::stream::{self, StreamExt};
 use oc_llm::{LlmError, LlmEvent, LlmRequest, LlmStream};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 
 use super::SingleAttempt;
 use super::validation::{format_reqwest_error, try_single_endpoint};
@@ -96,9 +97,10 @@ pub(super) async fn prime_decoder_stream(
     resp: reqwest::Response,
     family: ModelFamily,
     session_key: String,
-    sig_cache: Arc<std::sync::Mutex<crate::signature_cache::SignatureCache>>,
+    sig_cache: Arc<StdMutex<SignatureCache>>,
 ) -> SingleAttempt {
-    let mut decoder = CloudCodeSseDecoder::new(family, session_key, Some(sig_cache), now_ms());
+    let mut decoder =
+        CloudCodeSseDecoder::new(family, session_key, Some(Arc::clone(&sig_cache)), now_ms());
     let mut byte_stream: ByteStream = Box::pin(resp.bytes_stream());
     let mut initial_events: Vec<LlmEvent> = Vec::new();
     let mut eof = false;
@@ -126,7 +128,10 @@ pub(super) async fn prime_decoder_stream(
             None => {
                 eof = true;
                 match decoder.finish() {
-                    Ok(evts) => initial_events.extend(evts),
+                    Ok(evts) => {
+                        initial_events.extend(evts);
+                        flush_signature_cache_handle(&sig_cache, false);
+                    }
                     Err(failure) => {
                         tracing::debug!(
                             stage = "prime_eof",
@@ -142,7 +147,13 @@ pub(super) async fn prime_decoder_stream(
         }
     }
 
-    SingleAttempt::Ready(build_llm_stream(initial_events, eof, byte_stream, decoder))
+    SingleAttempt::Ready(build_llm_stream(
+        initial_events,
+        eof,
+        byte_stream,
+        decoder,
+        sig_cache,
+    ))
 }
 
 /// Stable log label for a decoder failure. Never includes the provider message.
@@ -185,7 +196,14 @@ fn in_band_or(failure: StreamDecodeFailure) -> SingleAttempt {
 struct TailState {
     bytes: ByteStream,
     decoder: CloudCodeSseDecoder,
+    sig_cache: Arc<StdMutex<SignatureCache>>,
     finished: bool,
+}
+
+impl Drop for TailState {
+    fn drop(&mut self) {
+        flush_signature_cache_handle(&self.sig_cache, false);
+    }
 }
 
 /// Provider-facing text for a decoder failure observed *after* the first event was emitted.
@@ -217,6 +235,7 @@ fn build_llm_stream(
     already_finished: bool,
     byte_stream: ByteStream,
     decoder: CloudCodeSseDecoder,
+    sig_cache: Arc<StdMutex<SignatureCache>>,
 ) -> LlmStream {
     let head = stream::iter(initial_events);
     if already_finished {
@@ -227,6 +246,7 @@ fn build_llm_stream(
         TailState {
             bytes: byte_stream,
             decoder,
+            sig_cache,
             finished: false,
         },
         |mut st| async move {
@@ -240,6 +260,7 @@ fn build_llm_stream(
                         Ok(evts) => return Some((stream::iter(evts), st)),
                         Err(err) => {
                             st.finished = true;
+                            flush_signature_cache_handle(&st.sig_cache, false);
                             let msg = mid_stream_error_message(err);
                             return Some((
                                 stream::iter(vec![LlmEvent::ProviderError { message: msg }]),
@@ -249,6 +270,7 @@ fn build_llm_stream(
                     },
                     Some(Err(err)) => {
                         st.finished = true;
+                        flush_signature_cache_handle(&st.sig_cache, false);
                         return Some((
                             stream::iter(vec![LlmEvent::ProviderError {
                                 message: format!(
@@ -269,6 +291,7 @@ fn build_llm_stream(
                                 }]
                             }
                         };
+                        flush_signature_cache_handle(&st.sig_cache, false);
                         return Some((stream::iter(final_evts), st));
                     }
                 }

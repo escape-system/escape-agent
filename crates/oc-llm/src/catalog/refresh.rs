@@ -18,9 +18,10 @@
 use std::path::{Path, PathBuf};
 
 use reqwest::Client;
-use serde_json::Value;
+use serde_json::{Map, Value};
 
-use super::{Catalog, ModelInfo};
+use super::variants::{ReasoningSupport, variants_for};
+use super::{Activation, Catalog, Cost, CostCache, ModelInfo, Protocol, ProviderInfo};
 use crate::error::LlmError;
 
 /// Public catalog endpoint, matching upstream's default.
@@ -40,6 +41,21 @@ pub const OPENCODE_GO_MODELS_URL: &str = "https://opencode.ai/zen/go/v1/models";
 
 /// Environment override for the `opencode-go` provider model list.
 pub const OPENCODE_GO_MODELS_URL_ENV: &str = "OPENCODE_GO_MODELS_URL";
+
+/// Built-in provider id for Nous Research.
+pub const NOUS_PROVIDER_ID: &str = "nous";
+
+/// Default inference base URL for Nous Research (`@ai-sdk/openai-compatible`).
+pub const NOUS_BASE_URL: &str = "https://inference-api.nousresearch.com/v1";
+
+/// Default live model-list URL for Nous Research.
+pub const NOUS_MODELS_URL: &str = "https://inference-api.nousresearch.com/v1/models";
+
+/// Environment override for the `nous` provider model list.
+pub const NOUS_MODELS_URL_ENV: &str = "NOUS_MODELS_URL";
+
+/// Cache file name for fetched Nous Research models inside the data directory.
+pub const NOUS_CACHE_FILE: &str = "nous-models-cache.json";
 
 /// Fetch timeout. A refresh that cannot answer in this budget is retried on the
 /// next tick instead of stalling shutdown.
@@ -74,11 +90,21 @@ pub fn models_url() -> String {
 /// including `hy4-flash-free`, without credentials (verified live 2026-11-20).
 #[must_use]
 pub fn opencode_go_models_url() -> String {
-    std::env::var(OPENCODE_GO_MODELS_URL_ENV)
+    env_url_or(OPENCODE_GO_MODELS_URL_ENV, OPENCODE_GO_MODELS_URL)
+}
+
+/// The `nous` (Nous Research) provider model-list URL.
+#[must_use]
+pub fn nous_models_url() -> String {
+    env_url_or(NOUS_MODELS_URL_ENV, NOUS_MODELS_URL)
+}
+
+fn env_url_or(env_name: &str, default: &str) -> String {
+    std::env::var(env_name)
         .ok()
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| OPENCODE_GO_MODELS_URL.to_owned())
+        .unwrap_or_else(|| default.to_owned())
 }
 
 /// Where the fetched catalog is cached between runs.
@@ -88,24 +114,36 @@ pub fn opencode_go_models_url() -> String {
 /// directory already holds the database, so the cache travels with it.
 #[must_use]
 pub fn cache_path() -> PathBuf {
-    if let Some(path) = std::env::var_os(CACHE_PATH_ENV) {
+    data_cache_path(Some(CACHE_PATH_ENV), CACHE_FILE)
+}
+
+/// Where the fetched Nous Research model list is cached between runs.
+#[must_use]
+pub fn nous_cache_path() -> PathBuf {
+    data_cache_path(None, NOUS_CACHE_FILE)
+}
+
+fn data_cache_path(override_env: Option<&str>, file_name: &str) -> PathBuf {
+    if let Some(env_name) = override_env
+        && let Some(path) = std::env::var_os(env_name)
+    {
         return PathBuf::from(path);
     }
     if let Some(dir) = std::env::var_os("ESCAPE_DATA_DIR") {
-        return PathBuf::from(dir).join(CACHE_FILE);
+        return PathBuf::from(dir).join(file_name);
     }
     if let Some(dir) = std::env::var_os("OPENCODE_DATA_DIR") {
-        return PathBuf::from(dir).join(CACHE_FILE);
+        return PathBuf::from(dir).join(file_name);
     }
     if let Some(dir) = std::env::var_os("XDG_DATA_HOME") {
-        return PathBuf::from(dir).join("escape-agent").join(CACHE_FILE);
+        return PathBuf::from(dir).join("escape-agent").join(file_name);
     }
     if let Some(home) = std::env::var_os("HOME") {
         return PathBuf::from(home)
             .join(".local/share/escape-agent")
-            .join(CACHE_FILE);
+            .join(file_name);
     }
-    std::env::temp_dir().join("escape-agent").join(CACHE_FILE)
+    std::env::temp_dir().join("escape-agent").join(file_name)
 }
 
 /// Read the cached catalog body, if any.
@@ -252,6 +290,376 @@ pub async fn fetch_opencode_go_models(
 /// read here so the parsing/fetch path stays testable with a fake server.
 pub async fn fetch_opencode_go_models_now(client: &Client) -> Result<Vec<ModelInfo>, LlmError> {
     fetch_opencode_go_models(client, &opencode_go_models_url()).await
+}
+
+/// Built-in `nous` (Nous Research) provider descriptor.
+#[must_use]
+pub fn default_nous_provider() -> ProviderInfo {
+    let mut settings = Map::new();
+    settings.insert(
+        "baseURL".to_owned(),
+        Value::String(NOUS_BASE_URL.to_owned()),
+    );
+    ProviderInfo {
+        id: NOUS_PROVIDER_ID.to_owned(),
+        canonical: Some(NOUS_PROVIDER_ID.to_owned()),
+        name: "Nous Research".to_owned(),
+        activation: Activation::Auto,
+        package: "@ai-sdk/openai-compatible".to_owned(),
+        compatibility: None,
+        settings: Some(settings),
+        headers: None,
+        body: None,
+        env: vec!["NOUS_API_KEY".to_owned()],
+    }
+}
+
+/// Starter offline model definitions for `nous` (Nous Research), used before
+/// a live fetch from [`NOUS_MODELS_URL`] populates the full catalog cache.
+#[must_use]
+pub fn default_nous_models() -> Vec<ModelInfo> {
+    vec![
+        starter_nous_model(&StarterNousModel {
+            id: "google/gemini-4-hydrogen",
+            name: "Google: Gemini 4 Hydrogen",
+            context: 1_048_576,
+            output: 943_718,
+            input_modalities: &["text", "image", "pdf", "audio", "video"],
+            cost: Cost {
+                input: 1.5,
+                output: 7.5,
+                cache: CostCache {
+                    read: 0.075,
+                    write: 0.0833,
+                },
+                ..Cost::default()
+            },
+            efforts: &["low", "medium", "high", "xhigh", "max"],
+        }),
+        starter_nous_model(&StarterNousModel {
+            id: "deepseek/deepseek-v4.1-flash-1017",
+            name: "DeepSeek: DeepSeek V4.1 Flash 1017",
+            context: 1_048_576,
+            output: 393_216,
+            input_modalities: &["text", "image"],
+            cost: Cost {
+                input: 0.15,
+                output: 0.60,
+                cache: CostCache {
+                    read: 0.003,
+                    write: 0.0,
+                },
+                ..Cost::default()
+            },
+            efforts: &["low", "medium", "high", "max"],
+        }),
+        starter_nous_model(&StarterNousModel {
+            id: "deepseek/deepseek-v4-pro",
+            name: "DeepSeek: DeepSeek V4 Pro 0423",
+            context: 1_048_576,
+            output: 393_216,
+            input_modalities: &["text"],
+            cost: Cost {
+                input: 0.94,
+                output: 1.89,
+                cache: CostCache {
+                    read: 0.08,
+                    write: 0.0,
+                },
+                ..Cost::default()
+            },
+            efforts: &["low", "medium", "high", "max"],
+        }),
+        starter_nous_model(&StarterNousModel {
+            id: "qwen/qwen4-max",
+            name: "Qwen: Qwen4 Max",
+            context: 1_000_000,
+            output: 131_072,
+            input_modalities: &["text", "image", "video"],
+            cost: Cost {
+                input: 1.425,
+                output: 4.275,
+                cache: CostCache {
+                    read: 0.0713,
+                    write: 1.7813,
+                },
+                ..Cost::default()
+            },
+            efforts: &["low", "medium", "high", "max"],
+        }),
+        starter_nous_model(&StarterNousModel {
+            id: "qwen/qwen4-max:free",
+            name: "Qwen: Qwen4 Max (free)",
+            context: 1_000_000,
+            output: 131_072,
+            input_modalities: &["text", "image", "video"],
+            cost: Cost::default(),
+            efforts: &["low", "medium", "high", "max"],
+        }),
+        starter_nous_model(&StarterNousModel {
+            id: "anthropic/claude-sonnet-5.5",
+            name: "Anthropic: Claude Sonnet 5.5",
+            context: 1_000_000,
+            output: 128_000,
+            input_modalities: &["text", "image"],
+            cost: Cost {
+                input: 2.0,
+                output: 10.0,
+                cache: CostCache {
+                    read: 0.1,
+                    write: 2.5,
+                },
+                ..Cost::default()
+            },
+            efforts: &["low", "medium", "high", "xhigh", "max"],
+        }),
+    ]
+}
+
+struct StarterNousModel<'a> {
+    id: &'a str,
+    name: &'a str,
+    context: u64,
+    output: u64,
+    input_modalities: &'a [&'a str],
+    cost: Cost,
+    efforts: &'a [&'a str],
+}
+
+fn starter_nous_model(spec: &StarterNousModel<'_>) -> ModelInfo {
+    let mut model = base_nous_model(spec.id, spec.name);
+    model.limit.context = spec.context;
+    model.limit.output = spec.output;
+    model.capabilities.input = spec
+        .input_modalities
+        .iter()
+        .map(|entry| (*entry).to_owned())
+        .collect();
+    model.capabilities.output = vec!["text".to_owned()];
+    model.capabilities.tools = true;
+    model.cost = vec![spec.cost];
+    let support = ReasoningSupport {
+        toggle: false,
+        effort: Some(
+            spec.efforts
+                .iter()
+                .map(|effort| (*effort).to_owned())
+                .collect(),
+        ),
+        budget: None,
+    };
+    model.variants = variants_for(&model, Protocol::OpenAiChat, &support);
+    model
+}
+
+fn base_nous_model(id: &str, name: &str) -> ModelInfo {
+    let mut settings = Map::new();
+    settings.insert(
+        "baseURL".to_owned(),
+        Value::String(NOUS_BASE_URL.to_owned()),
+    );
+    let mut model = ModelInfo::default_for(NOUS_PROVIDER_ID, id);
+    name.clone_into(&mut model.name);
+    model.package = Some("@ai-sdk/openai-compatible".to_owned());
+    model.protocol = Protocol::OpenAiChat;
+    model.settings = Some(settings);
+    model
+}
+
+/// Overlay built-in runtime providers (such as Nous Research) onto `catalog`
+/// before user configuration overlays run, so cold-start and offline tests keep
+/// full built-in provider definitions without network access.
+pub fn apply_builtin_providers(catalog: &mut Catalog) {
+    catalog.upsert_provider(default_nous_provider());
+    catalog.upsert_provider_models(default_nous_models());
+}
+
+/// Parse Nous Research's OpenRouter-compatible `/v1/models` payload into
+/// catalog models for [`NOUS_PROVIDER_ID`].
+///
+/// Prices published by Nous (`pricing.prompt`, `pricing.completion`,
+/// `pricing.input_cache_read`, `pricing.input_cache_write`) are denominated in
+/// USD per token and converted here to USD per 1M tokens for [`Cost`].
+pub fn parse_nous_models(body: &str) -> Result<Vec<ModelInfo>, LlmError> {
+    let value: Value = serde_json::from_str(body).map_err(|error| LlmError::Catalog {
+        message: format!("nous model list is not JSON: {error}"),
+    })?;
+    let Some(rows) = value.get("data").and_then(Value::as_array) else {
+        return Err(LlmError::Catalog {
+            message: "nous model list has no `data` array".to_owned(),
+        });
+    };
+    if rows.len() < MIN_PLAUSIBLE_PROVIDER_MODELS {
+        return Err(LlmError::Catalog {
+            message: format!(
+                "nous model list has {} models (< {MIN_PLAUSIBLE_PROVIDER_MODELS})",
+                rows.len()
+            ),
+        });
+    }
+    let models: Vec<ModelInfo> = rows.iter().filter_map(parse_nous_model).collect();
+    if models.is_empty() {
+        return Err(LlmError::Catalog {
+            message: "nous model list contained no usable ids".to_owned(),
+        });
+    }
+    Ok(models)
+}
+
+fn parse_nous_model(row: &Value) -> Option<ModelInfo> {
+    let id = row
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())?;
+    let name = row
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(id);
+    let mut model = base_nous_model(id, name);
+    model.canonical = row
+        .get("canonical_slug")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    if let Some(created) = row.get("created").and_then(Value::as_i64) {
+        model.time.released = created.saturating_mul(1000);
+    }
+    apply_nous_capabilities(&mut model, id, row);
+    if let Some(pricing) = row.get("pricing").and_then(Value::as_object)
+        && let Some(cost) = parse_nous_cost(pricing)
+    {
+        model.cost = vec![cost];
+    }
+    Some(model)
+}
+
+fn apply_nous_capabilities(model: &mut ModelInfo, id: &str, row: &Value) {
+    let arch = row.get("architecture");
+    if arch
+        .and_then(|a| a.get("modality"))
+        .and_then(Value::as_str)
+        .is_some_and(|modality| modality.contains("->embeddings"))
+    {
+        model.kind = Some("embedding".to_owned());
+    }
+    if let Some(inputs) = arch
+        .and_then(|a| a.get("input_modalities"))
+        .and_then(Value::as_array)
+    {
+        let parsed = normalize_nous_modalities(inputs);
+        if !parsed.is_empty() {
+            model.capabilities.input = parsed;
+        }
+    }
+    if let Some(outputs) = arch
+        .and_then(|a| a.get("output_modalities"))
+        .and_then(Value::as_array)
+    {
+        let parsed = normalize_nous_modalities(outputs);
+        if !parsed.is_empty() {
+            model.capabilities.output = parsed;
+        }
+    }
+    let top = row.get("top_provider");
+    if let Some(context) = row
+        .get("context_length")
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            top.and_then(|t| t.get("context_length"))
+                .and_then(Value::as_u64)
+        })
+    {
+        model.limit.context = context;
+    }
+    if let Some(output) = top
+        .and_then(|t| t.get("max_completion_tokens"))
+        .and_then(Value::as_u64)
+    {
+        model.limit.output = output;
+    }
+    if let Some(params) = row.get("supported_parameters").and_then(Value::as_array) {
+        let param_names: Vec<&str> = params.iter().filter_map(Value::as_str).collect();
+        model.capabilities.tools =
+            param_names.contains(&"tools") || param_names.contains(&"tool_choice");
+        if param_names.contains(&"reasoning") || param_names.contains(&"reasoning_effort") {
+            let efforts = if id.contains("gemini") || id.contains("claude") {
+                vec!["low", "medium", "high", "xhigh", "max"]
+            } else {
+                vec!["low", "medium", "high", "max"]
+            };
+            let support = ReasoningSupport {
+                toggle: false,
+                effort: Some(efforts.into_iter().map(str::to_owned).collect()),
+                budget: None,
+            };
+            model.variants = variants_for(model, Protocol::OpenAiChat, &support);
+        }
+    }
+}
+
+fn normalize_nous_modalities(entries: &[Value]) -> Vec<String> {
+    let mut out = Vec::new();
+    for entry in entries.iter().filter_map(Value::as_str) {
+        let normalized = match entry {
+            "file" => "pdf",
+            other => other,
+        };
+        if !normalized.is_empty() && !out.iter().any(|seen| seen == normalized) {
+            out.push(normalized.to_owned());
+        }
+    }
+    out
+}
+
+fn parse_nous_cost(pricing: &Map<String, Value>) -> Option<Cost> {
+    let input = price_per_million(pricing.get("prompt"));
+    let output = price_per_million(pricing.get("completion"));
+    let cache_read = price_per_million(pricing.get("input_cache_read"));
+    let cache_write = price_per_million(pricing.get("input_cache_write"));
+    if input.is_none() && output.is_none() && cache_read.is_none() && cache_write.is_none() {
+        return None;
+    }
+    Some(Cost {
+        input: input.unwrap_or(0.0),
+        output: output.unwrap_or(0.0),
+        cache: CostCache {
+            read: cache_read.unwrap_or(0.0),
+            write: cache_write.unwrap_or(0.0),
+        },
+        ..Cost::default()
+    })
+}
+
+fn price_per_million(raw: Option<&Value>) -> Option<f64> {
+    let per_token = match raw? {
+        Value::Number(number) => number.as_f64(),
+        Value::String(text) => text.trim().parse::<f64>().ok(),
+        _ => None,
+    }?;
+    (per_token.is_finite() && per_token >= 0.0).then_some(per_token * 1_000_000.0)
+}
+
+/// Fetch the live Nous Research model list, returning `(raw_body, models)` so
+/// callers can cache the payload alongside upserting into [`Catalog`].
+pub async fn fetch_nous_models_with_body(
+    client: &Client,
+    url: &str,
+) -> Result<(String, Vec<ModelInfo>), LlmError> {
+    let body = fetch_live(client, url).await?;
+    let models = parse_nous_models(&body)?;
+    Ok((body, models))
+}
+
+/// Fetch the live Nous Research model list from an explicit URL.
+pub async fn fetch_nous_models(client: &Client, url: &str) -> Result<Vec<ModelInfo>, LlmError> {
+    fetch_nous_models_with_body(client, url)
+        .await
+        .map(|(_, models)| models)
+}
+
+/// [`fetch_nous_models_with_body`] against [`nous_models_url`].
+pub async fn fetch_nous_models_now(client: &Client) -> Result<(String, Vec<ModelInfo>), LlmError> {
+    fetch_nous_models_with_body(client, &nous_models_url()).await
 }
 
 /// Whether a catalog is complete enough to replace the one being served.
@@ -565,5 +973,87 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
         assert!(read_cache(&cache).is_none());
+    }
+
+    const NOUS_MODELS: &str = r#"{
+      "data": [
+        {
+          "id": "google/gemini-4-hydrogen",
+          "canonical_slug": "google/gemini-4-hydrogen-202611",
+          "name": "Google: Gemini 4 Hydrogen",
+          "created": 1795000000,
+          "context_length": 1048576,
+          "architecture": {
+            "modality": "text+image+file->text",
+            "input_modalities": ["text", "image", "file"],
+            "output_modalities": ["text"]
+          },
+          "pricing": {
+            "prompt": "0.0000015000",
+            "completion": "0.0000075000",
+            "input_cache_read": "0.0000000750",
+            "input_cache_write": "0.0000000833"
+          },
+          "top_provider": {"context_length": 1048576, "max_completion_tokens": 943718},
+          "supported_parameters": ["reasoning", "reasoning_effort", "tools", "tool_choice"]
+        },
+        {
+          "id": "qwen/qwen4-max:free",
+          "name": "Qwen: Qwen4 Max (free)",
+          "context_length": 1000000,
+          "pricing": {"prompt": "0", "completion": "0"},
+          "supported_parameters": ["tools"]
+        },
+        {
+          "id": "perplexity/pplx-embed-v2-context-0.6b",
+          "name": "Embed",
+          "context_length": 32000,
+          "architecture": {"modality": "text->embeddings"},
+          "supported_parameters": []
+        }
+      ]
+    }"#;
+
+    #[test]
+    fn parse_nous_models_converts_pricing_modalities_and_reasoning() {
+        let models = parse_nous_models(NOUS_MODELS).unwrap();
+        assert_eq!(models.len(), 3);
+
+        let gemini = &models[0];
+        assert_eq!(gemini.provider_id, "nous");
+        assert_eq!(gemini.id, "google/gemini-4-hydrogen");
+        assert_eq!(gemini.model_id, "google/gemini-4-hydrogen");
+        assert_eq!(gemini.kind.as_deref(), Some("chat"));
+        assert_eq!(gemini.protocol, Protocol::OpenAiChat);
+        assert_eq!(gemini.limit.context, 1_048_576);
+        assert_eq!(gemini.limit.output, 943_718);
+        assert_eq!(gemini.capabilities.input, vec!["text", "image", "pdf"]);
+        assert!(gemini.capabilities.tools);
+        assert!(gemini.variants.iter().any(|v| v.id == "xhigh"));
+        assert_eq!(gemini.cost.len(), 1);
+        assert!((gemini.cost[0].input - 1.5).abs() < 1e-6);
+        assert!((gemini.cost[0].output - 7.5).abs() < 1e-6);
+        assert!((gemini.cost[0].cache.read - 0.075).abs() < 1e-6);
+
+        let free = &models[1];
+        assert_eq!(free.cost[0].input, 0.0);
+        assert!(free.variants.is_empty());
+
+        let embed = &models[2];
+        assert_eq!(embed.kind.as_deref(), Some("embedding"));
+        assert!(!embed.capabilities.tools);
+    }
+
+    #[test]
+    fn apply_builtin_providers_registers_nous_without_network() {
+        let mut catalog = Catalog::default();
+        apply_builtin_providers(&mut catalog);
+        let provider = catalog.provider("nous").expect("nous provider");
+        assert_eq!(provider.name, "Nous Research");
+        assert_eq!(provider.env, vec!["NOUS_API_KEY".to_owned()]);
+        let resolved = catalog.resolve("nous/google/gemini-4-hydrogen").unwrap();
+        assert_eq!(resolved.base_url, NOUS_BASE_URL);
+        assert_eq!(resolved.protocol, Protocol::OpenAiChat);
+        assert!((resolved.model.cost[0].input - 1.5).abs() < 1e-6);
     }
 }

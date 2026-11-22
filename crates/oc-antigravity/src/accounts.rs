@@ -453,6 +453,31 @@ impl AccountManager {
         (base + self.cursor_offset) % self.storage.accounts.len()
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn collect_eligible_indices(
+        &self,
+        family: ModelFamily,
+        style: HeaderStyle,
+        model: &str,
+        now_ms: i64,
+        excluded_indices: &[usize],
+        allow_verification_required: bool,
+        enforce_soft_quota: bool,
+    ) -> Vec<usize> {
+        (0..self.storage.accounts.len())
+            .filter(|&i| {
+                let acct = &self.storage.accounts[i];
+                acct.enabled
+                    && !acct.revoked
+                    && (allow_verification_required || !acct.verification_required)
+                    && !excluded_indices.contains(&i)
+                    && !self.is_rate_limited(i, family, style, Some(model), now_ms)
+                    && (!enforce_soft_quota
+                        || !self.is_soft_quota_exceeded(i, family, style, model, now_ms))
+            })
+            .collect()
+    }
+
     /// Select an eligible account for the given `family` / `style` / `model`.
     /// Returns `None` if all enabled non-revoked accounts are currently rate-limited or blocked.
     #[allow(clippy::too_many_lines)]
@@ -470,39 +495,60 @@ impl AccountManager {
         }
 
         let sticky = self.active_cursor(family);
-        let mut eligible: Vec<usize> = (0..self.storage.accounts.len())
-            .filter(|&i| {
-                let acct = &self.storage.accounts[i];
-                acct.enabled
-                    && !acct.revoked
-                    && !acct.verification_required
-                    && !excluded_indices.contains(&i)
-                    && !self.is_rate_limited(i, family, style, Some(model), now_ms)
-                    && !self.is_soft_quota_exceeded(i, family, style, model, now_ms)
-            })
-            .collect();
+        let all_require_verification = !self
+            .storage
+            .accounts
+            .iter()
+            .any(|a| a.enabled && !a.revoked && !a.verification_required);
+
+        let mut eligible = self.collect_eligible_indices(
+            family,
+            style,
+            model,
+            now_ms,
+            excluded_indices,
+            false,
+            true,
+        );
 
         // If every enabled, non-revoked account is flagged `verification_required`, still
         // allow one probe attempt per request: if the user has since completed the browser
         // verification link, `mark_success` clears the flag automatically; otherwise upstream
         // returns a fresh verification URL instead of a misleading "no usable accounts" error.
-        if eligible.is_empty()
-            && !self
-                .storage
-                .accounts
-                .iter()
-                .any(|a| a.enabled && !a.revoked && !a.verification_required)
-        {
-            eligible = (0..self.storage.accounts.len())
-                .filter(|&i| {
-                    let acct = &self.storage.accounts[i];
-                    acct.enabled
-                        && !acct.revoked
-                        && !excluded_indices.contains(&i)
-                        && !self.is_rate_limited(i, family, style, Some(model), now_ms)
-                        && !self.is_soft_quota_exceeded(i, family, style, model, now_ms)
-                })
-                .collect();
+        if eligible.is_empty() && all_require_verification {
+            eligible = self.collect_eligible_indices(
+                family,
+                style,
+                model,
+                now_ms,
+                excluded_indices,
+                true,
+                true,
+            );
+        }
+
+        // Soft-quota threshold is a routing preference to spare near-limit accounts when healthier
+        // accounts exist. Never lock out the pool while non-rate-limited accounts still have usable
+        // headroom below upstream 429.
+        if eligible.is_empty() {
+            let soft_fallback = self.collect_eligible_indices(
+                family,
+                style,
+                model,
+                now_ms,
+                excluded_indices,
+                all_require_verification,
+                false,
+            );
+            if !soft_fallback.is_empty() {
+                tracing::debug!(
+                    family = family.as_str(),
+                    style = style.as_str(),
+                    fallback_count = soft_fallback.len(),
+                    "antigravity: all non-rate-limited accounts exceed soft quota threshold; failing open"
+                );
+                eligible = soft_fallback;
+            }
         }
 
         if eligible.is_empty() {
@@ -969,5 +1015,102 @@ mod tests {
             )
             .expect("select argon on account 0");
         assert_eq!(argon.index, 0);
+    }
+
+    #[test]
+    fn soft_quota_spares_account_when_healthy_peer_exists_and_fails_open_otherwise() {
+        use crate::QuotaGroupSnapshot;
+        let cfg = AntigravityConfig {
+            account_selection_strategy: AccountSelectionStrategy::Sticky,
+            soft_quota_threshold_percent: 90,
+            soft_quota_cache_ttl_minutes: 10,
+            ..Default::default()
+        };
+        let mut mgr = AccountManager::from_storage(None, AccountStorageV4::default(), cfg);
+        mgr.upsert_account(sample_account("hot@ex.com", "t-hot"), true)
+            .expect("add hot");
+        mgr.upsert_account(sample_account("cool@ex.com", "t-cool"), false)
+            .expect("add cool");
+
+        let now = 1_700_000_000_000;
+        let mut hot_quota = CachedAccountQuota {
+            updated_at: now - 10_000,
+            ..CachedAccountQuota::default()
+        };
+        hot_quota.groups.insert(
+            "pool:gemini-4-hydrogen".to_owned(),
+            QuotaGroupSnapshot {
+                used_percent: Some(95.0),
+                remaining_fraction: Some(0.05),
+                reset_time_ms: None,
+                ..QuotaGroupSnapshot::default()
+            },
+        );
+        mgr.update_quota_snapshot(0, hot_quota, None)
+            .expect("hot quota");
+
+        let mut cool_quota = CachedAccountQuota {
+            updated_at: now - 10_000,
+            ..CachedAccountQuota::default()
+        };
+        cool_quota.groups.insert(
+            "pool:gemini-4-hydrogen".to_owned(),
+            QuotaGroupSnapshot {
+                used_percent: Some(20.0),
+                remaining_fraction: Some(0.80),
+                reset_time_ms: None,
+                ..QuotaGroupSnapshot::default()
+            },
+        );
+        mgr.update_quota_snapshot(1, cool_quota, None)
+            .expect("cool quota");
+
+        // With a healthy peer below soft-quota threshold, account 0 is spared.
+        let picked = mgr
+            .select_for_request(
+                ModelFamily::Gemini,
+                HeaderStyle::Antigravity,
+                "antigravity-gemini-4-hydrogen",
+                now,
+                &[],
+            )
+            .expect("cool peer selected");
+        assert_eq!(picked.index, 1);
+
+        // Once no fresh peer exists (rate-limited or single account), soft-quota fails open
+        // instead of locking out remaining upstream headroom.
+        mgr.mark_rate_limited(
+            1,
+            ModelFamily::Gemini,
+            HeaderStyle::Antigravity,
+            Some("antigravity-gemini-4-hydrogen"),
+            RateLimitReason::QuotaExhausted,
+            Some(30_000),
+            now,
+        )
+        .expect("limit cool");
+
+        let fallback = mgr
+            .select_for_request(
+                ModelFamily::Gemini,
+                HeaderStyle::Antigravity,
+                "antigravity-gemini-4-hydrogen",
+                now + 1000,
+                &[],
+            )
+            .expect("soft-quota account fails open when no fresh peer exists");
+        assert_eq!(fallback.index, 0);
+
+        // Excluded accounts and hard rate limits still block selection.
+        assert!(
+            mgr.select_for_request(
+                ModelFamily::Gemini,
+                HeaderStyle::Antigravity,
+                "antigravity-gemini-4-hydrogen",
+                now + 1000,
+                &[0],
+            )
+            .is_none()
+        );
     }
 }

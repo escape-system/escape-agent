@@ -130,7 +130,7 @@ impl Runtime {
                     .into_iter()
                     .next()
                     .map(|model| ModelRef {
-                        id: model.model_id,
+                        id: model.id,
                         provider_id: model.provider_id,
                         variant: None,
                     })

@@ -69,7 +69,7 @@ impl ModelsPolicy {
 }
 
 /// `models.fallback`: which failure classes advance the chain and how far.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct FallbackPolicy {
     /// Failure kinds that advance the chain (`models.fallback.on`).
     pub(crate) on: Vec<FailureKind>,
@@ -80,42 +80,13 @@ pub struct FallbackPolicy {
     pub(crate) configured: bool,
 }
 
-impl Default for FallbackPolicy {
-    fn default() -> Self {
-        Self {
-            on: retryable_kinds(),
-            max_hops: 2,
-            configured: false,
-        }
-    }
-}
-
 impl FallbackPolicy {
-    /// Whether `kind` should advance the chain.
-    ///
-    /// Two groups advance unconditionally, whatever `models.fallback.on` says:
-    ///
-    /// - [`FailureKind::ModelUnavailable`] — a retired or decommissioned model
-    ///   cannot serve the request, so an empty `on` must not pin a turn to a
-    ///   model that no longer exists.
-    /// - the recovery classes [`FailureKind::Quota`] and
-    ///   [`FailureKind::RateLimit`] — quota and rate limit are the two classes a
-    ///   chain exists to recover from, and until the Models tab has a per-class
-    ///   switch they cannot be configured off. Before this, an explicit
-    ///   `on = ["empty_response","transport"]` (the live config) made a quota
-    ///   failure kill the turn on the only model that was tried, which is fatal
-    ///   on a single-account provider.
-    ///
-    /// Every other class keeps the historical gate: `empty_response` and
-    /// `transport` are opt-in-by-config as soon as `on` is written, and
-    /// non-retryable classes are never eligible even when listed
-    /// (`auth`/`invalid_request` would fail identically on every model).
+    /// Automatic mid-turn model fallback is disabled: callers rotate keys on
+    /// the same model via [`oc_llm::KeyPool`], and model selection belongs to
+    /// the caller/main agent rather than a silent fallback hop.
     #[must_use]
-    pub fn allows(&self, kind: FailureKind) -> bool {
-        if kind == FailureKind::ModelUnavailable || recovery_kinds().contains(&kind) {
-            return true;
-        }
-        kind.is_retryable() && self.on.contains(&kind)
+    pub fn allows(&self, _kind: FailureKind) -> bool {
+        false
     }
 
     /// The classes an explicit `models.fallback.on` switched off.
@@ -156,21 +127,13 @@ impl FallbackPolicy {
     }
 }
 
-/// Classes that advance the chain no matter what `models.fallback.on` lists.
-///
-/// Quota and rate limit are the recovery classes: an exhausted window or a
-/// throttled key clears by moving to the next chain entry, so a config written
-/// before they existed must not disable recovery.
+/// Classes that advance the chain in raw config compatibility checks.
 pub(crate) fn recovery_kinds() -> [FailureKind; 2] {
     [FailureKind::Quota, FailureKind::RateLimit]
 }
 
 /// The four retryable failure classes, in event-payload order.
-///
-/// This is the *default* `models.fallback.on` set. `model_unavailable` is
-/// accepted in the config but deliberately absent here: it advances the chain
-/// unconditionally ([`FallbackPolicy::allows`]), so listing it changes nothing
-/// and leaving it out must not read as "never fall back".
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn retryable_kinds() -> Vec<FailureKind> {
     vec![
         FailureKind::EmptyResponse,
@@ -754,12 +717,9 @@ fn available_models_from_slice(source: &[ModelInfo]) -> Vec<String> {
         if !chat || !model.enabled {
             continue;
         }
-        models.push(format!("{}/{}", model.provider_id, model.model_id));
+        models.push(format!("{}/{}", model.provider_id, model.id));
         for variant in &model.variants {
-            models.push(format!(
-                "{}/{}#{}",
-                model.provider_id, model.model_id, variant.id
-            ));
+            models.push(format!("{}/{}#{}", model.provider_id, model.id, variant.id));
         }
     }
     models
@@ -811,7 +771,7 @@ pub(super) fn model_value(
         .resolve_model(catalog, reference)
         .map_err(|error| json_error(&error))?;
     let model_ref = ModelRef {
-        id: resolved.model.model_id.clone(),
+        id: resolved.model.id.clone(),
         provider_id: resolved.model.provider_id.clone(),
         variant: resolved.variant.as_ref().map(|variant| variant.id.clone()),
     };
@@ -836,7 +796,7 @@ mod tests {
 
     use super::{
         FallbackPolicy, ModelBudget, ModelsConfigError, ModelsPolicy, QuotaPolicy, model_key,
-        parse_models_policy, retryable_kinds,
+        parse_models_policy,
     };
 
     fn quota_of(parsed: &ModelsPolicy) -> QuotaPolicy {
@@ -899,8 +859,8 @@ mod tests {
         assert!(parsed.chains.is_empty());
         assert!(parsed.quota.is_none());
         let expected = FallbackPolicy {
-            on: retryable_kinds(),
-            max_hops: 2,
+            on: Vec::new(),
+            max_hops: 0,
             configured: false,
         };
         assert_eq!(parsed.fallback, expected);
@@ -1163,88 +1123,58 @@ mod tests {
         );
     }
 
-    /// The live-config regression: `on = ["empty_response","transport"]` used to
-    /// kill a turn on quota because an explicit `on` was the complete allowlist.
     #[test]
-    fn quota_and_rate_limit_advance_even_when_the_explicit_on_omits_them() {
+    fn fallback_allows_is_always_false_while_config_tracking_stays_honest() {
         let parsed = parse_models_policy(&json!({
-            "fallback": {"on": ["empty_response", "transport"]}
+            "fallback": {"on": ["empty_response", "transport"], "max_hops": 2}
         }));
         assert_eq!(parsed.error, None);
         assert!(parsed.fallback.configured);
-        // The raw configured list is untouched: a PUT round trip must not rewrite
-        // the document behind the user's back.
         assert_eq!(
             parsed.fallback.on,
             vec![FailureKind::EmptyResponse, FailureKind::Transport]
         );
-        // The recovery classes advance anyway.
-        assert!(parsed.fallback.allows(FailureKind::Quota));
-        assert!(parsed.fallback.allows(FailureKind::RateLimit));
-        assert!(parsed.fallback.allows(FailureKind::ModelUnavailable));
-        assert!(parsed.fallback.allows(FailureKind::EmptyResponse));
-        assert!(parsed.fallback.allows(FailureKind::Transport));
-        // A permanent class is still never eligible.
-        assert!(!parsed.fallback.allows(FailureKind::Auth));
-        assert!(!parsed.fallback.allows(FailureKind::InvalidRequest));
-        // Nothing is switched off by this document: both opt-in classes are on.
+        for kind in [
+            FailureKind::Quota,
+            FailureKind::RateLimit,
+            FailureKind::ModelUnavailable,
+            FailureKind::EmptyResponse,
+            FailureKind::Transport,
+            FailureKind::Auth,
+            FailureKind::InvalidRequest,
+        ] {
+            assert!(!parsed.fallback.allows(kind), "{kind:?}");
+        }
         assert!(parsed.fallback.disabled_by_config().is_empty());
     }
 
     #[test]
-    fn an_empty_on_still_advances_the_recovery_classes_but_not_the_opt_in_ones() {
-        let parsed = parse_models_policy(&json!({"fallback": {"on": []}}));
-        assert_eq!(parsed.error, None);
-        assert!(parsed.fallback.allows(FailureKind::Quota));
-        assert!(parsed.fallback.allows(FailureKind::RateLimit));
-        assert!(parsed.fallback.allows(FailureKind::ModelUnavailable));
-        // Opt-in classes are genuinely off when the user writes an explicit set.
-        assert!(!parsed.fallback.allows(FailureKind::EmptyResponse));
-        assert!(!parsed.fallback.allows(FailureKind::Transport));
-        assert!(!parsed.fallback.allows(FailureKind::Auth));
+    fn disabled_by_config_and_effective_on_report_raw_config_compat() {
+        let empty = parse_models_policy(&json!({"fallback": {"on": []}}));
+        assert_eq!(empty.error, None);
+        assert!(!empty.fallback.allows(FailureKind::Quota));
         assert_eq!(
-            parsed.fallback.disabled_by_config(),
+            empty.fallback.disabled_by_config(),
             vec!["empty_response", "transport"]
         );
-        // `effective_on` is the configured set plus the recovery classes only:
-        // `ModelUnavailable` advances through `allows` but is not part of the
-        // reported set, so listing it here would overstate what the user
-        // configured.
         assert_eq!(
-            parsed.fallback.effective_on(),
+            empty.fallback.effective_on(),
             vec![FailureKind::Quota, FailureKind::RateLimit]
         );
-        assert!(parsed.fallback.allows(FailureKind::ModelUnavailable));
-        assert!(
-            !parsed
-                .fallback
-                .effective_on()
-                .contains(&FailureKind::ModelUnavailable)
-        );
-    }
 
-    #[test]
-    fn disabled_by_config_names_only_the_classes_the_user_switched_off() {
-        // Absent `models.fallback`: the default set is complete, nothing to warn
-        // about.
         let default = parse_models_policy(&json!({}));
         assert!(default.fallback.disabled_by_config().is_empty());
-        assert_eq!(default.fallback.effective_on(), retryable_kinds());
 
-        // Only `transport` written: `empty_response` is the one switched off.
         let partial = parse_models_policy(&json!({"fallback": {"on": ["transport"]}}));
         assert_eq!(
             partial.fallback.disabled_by_config(),
             vec!["empty_response"]
         );
 
-        // The recovery classes are never reported as disabled, even though they
-        // are absent from the document.
         let recovery_only = parse_models_policy(&json!({"fallback": {"on": ["quota"]}}));
         assert_eq!(
             recovery_only.fallback.disabled_by_config(),
             vec!["empty_response", "transport"]
         );
-        assert!(recovery_only.fallback.allows(FailureKind::RateLimit));
     }
 }

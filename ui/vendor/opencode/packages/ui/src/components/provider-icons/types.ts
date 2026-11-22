@@ -41,6 +41,7 @@ export const iconNames = [
   "nvidia",
   "novita-ai",
   "nova",
+  "nous",
   "nebius",
   "nano-gpt",
   "morph",

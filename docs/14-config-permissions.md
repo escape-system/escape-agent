@@ -126,14 +126,14 @@ config only names providers and their environment variables
   restart; only the active flag is durable.
 - Rotation is bounded per candidate: `MAX_KEY_ATTEMPTS = 8` caps how many pool
   entries one model attempt will try, even if the store reports more keys
-  (`crates/oc-runtime/src/turn/stream.rs:51`, `:300`). Exhausting the pool is the
-  only thing that lets `models.fallback` advance the chain, exactly once.
+  (`crates/oc-runtime/src/turn/stream.rs:51`, `:300`). Model fallback is
+  disabled, so exhausting the pool surfaces the failing key's error directly on
+  that model without switching models.
 - Compaction cools but does not rotate: `mark_compaction_key` records the
   cooldown for the key it tried and stops there, so one compaction attempt uses
   one key and the *next* turn picks a different key
-  (`crates/oc-runtime/src/turn/compaction.rs:557`). A compaction may make two
-  attempts in total (one fallback hop, `COMPACTION_MAX_ATTEMPTS = 2`), each on a
-  different model candidate with a single key.
+  (`crates/oc-runtime/src/turn/compaction.rs:557`). Compaction makes one
+  attempt (`COMPACTION_MAX_ATTEMPTS = 1`) without switching models.
 - Secrets do not enter the config document as a turn credential: the runtime
   resolves the store's credential first, otherwise the provider's declared `env`
   names (`crates/oc-llm/src/client.rs:174-180`). A
@@ -166,10 +166,10 @@ One additive, namespaced top-level object (frozen schema v1; the wire shape is
 
 | Sub-key | Shape | Meaning |
 |---|---|---|
-| `chain` | `string[]` of `provider/model[#variant]` | ordered default fallback chain for the main agent; empty/absent ⇒ current single-model behavior |
-| `chains` | map `agentID -> string[]` | per-role **preference order** (`engineer`, `architect`, `coordinator`, …); it selects routing order only — never an allowlist and never a visibility filter — and wins over `chain` for that role |
-| `fallback.on` | `("empty_response"\|"transport"\|"rate_limit"\|"quota"\|"model_unavailable")[]` | failure kinds that advance the chain; absent ⇒ default set `[empty_response, transport, rate_limit, quota]`. `model_unavailable` is accepted here but always advances even when unlisted |
-| `fallback.max_hops` | integer | maximum model switches per turn; 0 disables fallback |
+| `chain` | `string[]` of `provider/model[#variant]` | ordered list for picker ordering and standalone roles (`scribe`, `observer`, `compaction`); does not override `subagent` spawns or trigger turn fallback |
+| `chains` | map `agentID -> string[]` | per-role list (`scribe`, `observer`, `compaction`, …) used for picker ordering and standalone role selection |
+| `fallback.on` | `("empty_response"\|"transport"\|"rate_limit"\|"quota"\|"model_unavailable")[]` | accepted in config/wire for compatibility; automatic runtime model fallback is disabled (`FallbackPolicy::allows` always returns `false`) |
+| `fallback.max_hops` | integer | accepted in config/wire for compatibility (0..=5); defaults to 0 and automatic runtime fallback is disabled |
 | `notes` | map `provider/model -> string` | free-text note shown next to the model in the Models tab |
 | `agent_notes` | map `agentID -> { provider/model -> string }` | legacy per-agent note. The Models tab does **not** edit it: it is read-only and renders as a badge ([13](13-ui.md)). The wire is not dead — `PUT /api/config/models` still accepts `agent_notes` and merges it (`crates/oc-server/src/data/models_registry.rs:1235-1236`) |
 | `hidden` | `provider/model[]` | models hidden from the pickers (`visible=false` on the wire). Picker visibility is exactly `!hidden[ref] && providerConnected`; the chain and `favorites` affect **order** only ([13](13-ui.md)) |
@@ -207,22 +207,19 @@ Rules:
   `!models.hidden[ref] && providerConnected`; the chain and `favorites` only
   order the list (favorites first, then chain index, then name). The live config
   had a one-entry chain, so treating the chain as a filter hid 690 of 692 models.
-- `models.chains.<role>` is the single per-role chain and `chain_for(role)` is the
-  single resolver (`crates/oc-runtime/src/subagent/settings.rs:53-61`): a role
-  without an entry inherits `models.chain`. Roles that resolve a model this way
-  are the spawn target and the live turn's agent id
-  (`crates/oc-runtime/src/subagent/spawn/prepare.rs:151`,
-  `crates/oc-runtime/src/turn/stream.rs:156`) plus the standalone roles `scribe`
+- `models.chains.<role>` is resolved via `chain_for(role)`
+  (`crates/oc-runtime/src/subagent/settings.rs:53-61`), where a role without an
+  entry inherits `models.chain`. Standalone roles `scribe`
   (`crates/oc-cli/src/scribe.rs:164`), `observer`
-  (`crates/oc-server/src/observer_host/mod.rs:158`) and `compaction`.
-  `compaction` resolves through `models.chains.compaction` (else `models.chain`)
-  in declared order, then falls back to the turn's current model, with **exactly
-  one** fallback hop (`COMPACTION_MAX_ATTEMPTS = 2`), fewer than the turn loop's
-  `models.fallback.max_hops` (`crates/oc-runtime/src/turn/compaction.rs:418-430`).
+  (`crates/oc-server/src/observer_host/mod.rs:158`) and `compaction` still read
+  their configured first usable entry (or the turn's current model for
+  `compaction`). Automatic mid-turn and mid-compaction model fallback is disabled
+  (`COMPACTION_MAX_ATTEMPTS = 1`, `FallbackPolicy::allows` always `false`): if
+  an explicit `subagent { model }` fails resolution or a turn fails after
+  same-model key rotation, the error is surfaced directly to the caller without
+  switching models (`session.model.fallback` is not emitted automatically).
   The completed compaction row and the `session.compaction.ended` payload name the
-  model that actually produced the summary — the chain candidate that answered,
-  not `turn.model_ref` when the chain advanced — and `session.model` is not
-  rewritten.
+  model that produced the summary, and `session.model` is not rewritten.
 - `models.notes[ref]` is the **only** editable note: one inline editor on the chain
    row plus the catalog note indicator, both writing `models.notes`
    ([13](13-ui.md)). `agent_notes` stays readable for compatibility and renders a

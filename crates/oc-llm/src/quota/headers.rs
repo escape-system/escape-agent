@@ -47,6 +47,7 @@ pub fn extract_rate_limit(
             "x-ratelimit-limit-requests",
             "anthropic-ratelimit-requests-limit",
             "x-ratelimit-requests-limit",
+            "ratelimit-limit",
         ],
     );
     let requests_remaining = header_u64(
@@ -55,6 +56,7 @@ pub fn extract_rate_limit(
             "x-ratelimit-remaining-requests",
             "anthropic-ratelimit-requests-remaining",
             "x-ratelimit-requests-remaining",
+            "ratelimit-remaining",
         ],
     );
     let requests_reset_raw = header_str(
@@ -63,6 +65,7 @@ pub fn extract_rate_limit(
             "x-ratelimit-reset-requests",
             "anthropic-ratelimit-requests-reset",
             "x-ratelimit-requests-reset",
+            "ratelimit-reset",
         ],
     );
     let requests_reset_at_ms = requests_reset_raw

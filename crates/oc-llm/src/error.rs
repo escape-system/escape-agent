@@ -336,7 +336,7 @@ impl LlmError {
                         || lower.contains("quota")
                         || lower.contains("credit")
                         || lower.contains("balance")
-                        || lower.contains("exceeded")
+                        || (lower.contains("exceeded") && !lower.contains("rate limit"))
                     {
                         return false;
                     }
@@ -441,6 +441,22 @@ mod tests {
         assert!(
             !LlmError::InvalidRequest {
                 message: "bad".to_owned()
+            }
+            .is_retryable()
+        );
+        assert!(
+            LlmError::Http {
+                status: 429,
+                message: "Rate limit exceeded. Please try again later.".to_owned(),
+                retry_after_ms: None,
+            }
+            .is_retryable()
+        );
+        assert!(
+            !LlmError::Http {
+                status: 429,
+                message: "Quota exceeded for this account.".to_owned(),
+                retry_after_ms: None,
             }
             .is_retryable()
         );
