@@ -120,6 +120,11 @@ export function useObserverRepairsQuery(sessionID: () => string | undefined) {
     refetchOnMount: false,
     staleTime: 30_000,
     retry: false,
+    // The panel lives in the timeline's sticky header. When the subagent tree
+    // resolves and `rootID` flips to the tree root, the query key changes. Without
+    // this, data blanks out, the panel unmounts, the header shrinks, and the
+    // virtualizer re-anchors — the visible "jump to earlier messages" loop.
+    placeholderData: (previous: Fetched<ObserverRepair[]> | undefined) => previous,
   }))
 }
 
