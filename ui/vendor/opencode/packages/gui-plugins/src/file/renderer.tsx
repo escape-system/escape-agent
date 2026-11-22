@@ -54,6 +54,17 @@ const OPEN = "open"
 
 const isLauncher = (id: string) => id === OPEN || id.startsWith(`${OPEN}:`)
 
+// `crypto.randomUUID` throws in insecure contexts (plain http://host), which would
+// abort the whole `layout.open` batch and leave the Dosya aç click silent. The
+// id only needs uniqueness within the strip, so fall back to Math.random there.
+const newLauncherId = () => {
+  try {
+    return crypto.randomUUID()
+  } catch {
+    return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`
+  }
+}
+
 const GROUP = "browser"
 
 const TABPANEL = "session-side-panel-file-browser-tabpanel"
@@ -167,7 +178,7 @@ const setup: Plugin.Setup<typeof File> = (ctx) => {
 
       if (selected || layout.narrow())
         layout.open(`file:${selected ?? OPEN}`, session, { tab: "preview", background: options?.background })
-      else layout.open(`file:${OPEN}:${crypto.randomUUID()}`, session, { tab: "select" })
+      else layout.open(`file:${OPEN}:${newLauncherId()}`, session, { tab: "select" })
 
       if (!options?.background && layout.narrow() && !layout.side.opened(session)) layout.side.toggle(session)
     })

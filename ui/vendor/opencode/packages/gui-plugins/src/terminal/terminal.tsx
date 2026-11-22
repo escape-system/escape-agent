@@ -246,18 +246,15 @@ export const Terminal = (props: TerminalProps) => {
   let drop: VoidFunction | undefined
   let reconn: ReturnType<typeof setTimeout> | undefined
   let tries = 0
-  let revealed = false
+  // Revealed drives the container's opacity through the style binding below. It must be a signal: writing
+  // `container.style.opacity` directly was undone by the reactive `style` object on the next theme/colour update, which
+  // left the terminal at opacity 0 — a mounted pane the user saw as a black rectangle while the shell ran fine.
+  const [revealed, setRevealed] = createSignal(false)
   // The opened terminal, for the quote toolbar.
   const [opened, setOpened] = createSignal<Term>()
   const [written, setWritten] = createSignal(0)
 
-  const reveal = () => {
-    if (revealed) return
-
-    if (!serializeAddon.serializeAsText({ trimWhitespace: true })) return
-    revealed = true
-    container.style.opacity = "1"
-  }
+  const reveal = () => setRevealed(true)
 
   const cleanup = () => {
     if (!cleanups.length) return
@@ -684,6 +681,9 @@ export const Terminal = (props: TerminalProps) => {
         const handleOpen = () => {
           if (disposed) return
           tries = 0
+          // The shell is attached now, so show the pane even when it has nothing to print yet (a bare prompt is
+          // written by the renderer, not sent as PTY output).
+          reveal()
           local.onConnect?.()
           scheduleSize(t.cols, t.rows)
 
@@ -721,7 +721,7 @@ export const Terminal = (props: TerminalProps) => {
           if (!data) return
           output?.push(data)
 
-          if (!revealed) output?.flush(reveal)
+          if (!revealed()) output?.flush(reveal)
           cursor += data.length
           seek = cursor
         }
@@ -818,7 +818,7 @@ export const Terminal = (props: TerminalProps) => {
           "background-color": terminalColors().background,
           "caret-color": "transparent",
           "font-family": appearance.font("mono"),
-          opacity: 0,
+          opacity: revealed() ? 1 : 0,
         }}
         classList={{
           ...local.classList,
