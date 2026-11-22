@@ -60,18 +60,33 @@ export function useSubagentTreeQuery(sessionID: () => string | undefined) {
       return tree ? { available: true, value: tree } : { available: false, reason: "malformed tree" }
     },
     enabled: !!sessionID() && sdk.connection.status() === "connected",
-    // A spawned child emits `session.created` and lifecycle transitions; we both
-    // refetch immediately on those SSE events below and keep a 2 s poll as a floor.
-    refetchInterval: 2_000,
+    // SSE events drive refreshes. An unconditional 2 s poll re-resolves tree.data
+    // twice a second, which re-renders the timeline's sticky header and makes the
+    // composer flicker while typing.
     refetchOnMount: true,
     staleTime: 1_000,
     retry: false,
   }))
 
   let refetchTimer: ReturnType<typeof setTimeout> | undefined
+  const eventSession = (raw: { data?: unknown }) => {
+    if (!raw.data || typeof raw.data !== "object") return undefined
+    const data = raw.data as { sessionID?: unknown; id?: unknown }
+
+    return typeof data.sessionID === "string"
+      ? data.sessionID
+      : typeof data.id === "string"
+        ? data.id
+        : undefined
+  }
   const stop = sdk.event.listen((event) => {
-    const raw = event as unknown as { type?: string }
-    if (!sessionID() || !raw.type) return
+    const raw = event as unknown as { type?: string; data?: unknown }
+    const current = sessionID()
+
+    if (!current || !raw.type) return
+    const source = eventSession(raw)
+
+    if (source && source !== current) return
     if (
       raw.type === "session.created" ||
       raw.type === "session.deleted" ||
@@ -80,11 +95,13 @@ export function useSubagentTreeQuery(sessionID: () => string | undefined) {
       raw.type === "session.status" ||
       raw.type.startsWith("session.execution.")
     ) {
-      if (refetchTimer !== undefined) return
+      // Trailing debounce: a steady stream of status/execution events must not
+      // refetch every 250 ms. Reset the timer on each matching event instead.
+      if (refetchTimer !== undefined) clearTimeout(refetchTimer)
       refetchTimer = setTimeout(() => {
         refetchTimer = undefined
         void query.refetch()
-      }, 250)
+      }, 600)
     }
   })
   onCleanup(() => {

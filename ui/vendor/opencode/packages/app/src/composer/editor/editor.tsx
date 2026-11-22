@@ -150,7 +150,12 @@ export function ComposerEditor(props: ComposerEditorProps) {
       scrollObserver.disconnect()
     })
   })
-  let localInput = false
+  // A single boolean is consumed by the first effect flush that follows a
+  // keystroke. Any second prompt write in the same tick then re-renders the
+  // contenteditable and destroys the caret. Track the latest local edit by
+  // generation instead, and let the DOM-equality guard skip harmless rewrites.
+  let localInputGeneration = 0
+  let appliedLocalInputGeneration = -1
 
   const updateCursor = () => {
     if (!editor || !window.getSelection()?.isCollapsed) return
@@ -170,8 +175,8 @@ export function ComposerEditor(props: ComposerEditorProps) {
 
     if (!editor) return
 
-    if (localInput) {
-      localInput = false
+    if (localInputGeneration !== appliedLocalInputGeneration) {
+      appliedLocalInputGeneration = localInputGeneration
 
       return
     }
@@ -309,7 +314,7 @@ export function ComposerEditor(props: ComposerEditorProps) {
                 const cursor = composerCursor(event.currentTarget)
                 const prompt = parseComposerEditor(event.currentTarget)
                 const attachments = props.controller.parts().filter(isAttachment)
-                localInput = true
+                localInputGeneration += 1
                 props.controller.onInput(
                   prompt.map((part) => part.content).join(""),
                   [...prompt, ...attachments],
