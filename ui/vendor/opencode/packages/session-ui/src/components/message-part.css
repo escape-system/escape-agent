@@ -1611,19 +1611,15 @@
   }
 
   /* A tool card's file name opens the file in the side panel; it must not look like the accordion toggle. */
-  button[data-slot="apply-patch-filename"] {
-    font: inherit;
-    letter-spacing: inherit;
-    background: none;
-    border: 0;
-    padding: 0;
-    text-align: start;
+  [data-slot="apply-patch-filename"][role="button"] {
     cursor: pointer;
+    text-decoration-color: transparent;
+    text-underline-offset: 2px;
+    transition: color 0.15s ease;
 
     &:hover {
       color: var(--v2-text-text-accent);
       text-decoration: underline;
-      text-underline-offset: 2px;
     }
 
     &:focus-visible {

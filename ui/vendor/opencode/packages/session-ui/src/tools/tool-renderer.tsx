@@ -1210,28 +1210,34 @@ function FileNameLink(props: { path: string; children?: JSX.Element; class?: str
       when={props.path && markdown?.openLocalFile ? markdown.openLocalFile : undefined}
       fallback={<span data-slot="apply-patch-filename">{props.children ?? getFilename(props.path)}</span>}
     >
-      {(open) => (
-        <button
-          type="button"
-          data-slot="apply-patch-filename"
-          class="clickable"
-          title={props.path}
-          onClick={(event) => {
-            // The header is a collapsible trigger (or the tool's own row): opening the file must not also toggle it.
-            event.stopPropagation()
-            event.preventDefault()
-            open()(props.path)
-          }}
-          onKeyDown={(event) => {
-            if (event.key !== "Enter" && event.key !== " ") return
-            event.stopPropagation()
-            event.preventDefault()
-            open()(props.path)
-          }}
-        >
-          {props.children ?? getFilename(props.path)}
-        </button>
-      )}
+      {(open) => {
+        const activate = () => open()(props.path)
+
+        return (
+          // A span, not a button: this sits inside the accordion's own <button>, and nesting interactive buttons is
+          // invalid HTML that swallows the inner click.
+          <span
+            data-slot="apply-patch-filename"
+            role="button"
+            tabIndex={0}
+            title={props.path}
+            onClick={(event) => {
+              // The header is a collapsible trigger: opening the file must not also toggle the diff.
+              event.stopPropagation()
+              event.preventDefault()
+              activate()
+            }}
+            onKeyDown={(event) => {
+              if (event.key !== "Enter" && event.key !== " ") return
+              event.stopPropagation()
+              event.preventDefault()
+              activate()
+            }}
+          >
+            {props.children ?? getFilename(props.path)}
+          </span>
+        )
+      }}
     </Show>
   )
 }
