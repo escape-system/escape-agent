@@ -493,10 +493,14 @@ const mentionParts = new WeakMap<HTMLElement, Exclude<ComposerPrompt[number], Co
 
 function renderComposerEditor(editor: HTMLDivElement, prompt: ComposerPrompt) {
   const active = document.activeElement === editor
+  // Remember the caret BEFORE replacing nodes. A status/event refresh can make
+  // parts() emit a new array while the user is mid-word; rewriting the DOM then
+  // resets the selection. Restoring the offset keeps typing and backspace in
+  // place instead of yanking the caret to the end of the prompt.
+  const preserved = active ? composerCursor(editor) : undefined
 
-  // A status/event refresh can re-create the prompt parts with identical text.
-  // Replacing the contenteditable children then drops the selection, which makes
-  // typing and backspace stutter. Skip a write that would produce the same DOM.
+  // A refresh can also re-create parts with identical text. Skip a write that
+  // would produce the same DOM so the native selection and undo stack survive.
   if (composerModel(editor) === promptModel(prompt)) return
   editor.replaceChildren(
     ...prompt.flatMap<Node>((part) => {
@@ -536,10 +540,41 @@ function renderComposerEditor(editor: HTMLDivElement, prompt: ComposerPrompt) {
   if (!active) return
   const selection = window.getSelection()
   const range = document.createRange()
+
+  if (preserved !== undefined && restoreComposerCursor(range, editor, preserved)) {
+    selection?.removeAllRanges()
+    selection?.addRange(range)
+
+    return
+  }
+
   range.selectNodeContents(editor)
   range.collapse(false)
   selection?.removeAllRanges()
   selection?.addRange(range)
+}
+
+/** Put the caret back at an absolute text offset after a full editor re-render. */
+function restoreComposerCursor(range: Range, editor: HTMLDivElement, offset: number) {
+  const walker = document.createTreeWalker(editor, NodeFilter.SHOW_TEXT)
+  let remaining = offset
+  let node = walker.nextNode()
+
+  while (node) {
+    const length = node.textContent?.length ?? 0
+
+    if (remaining <= length) {
+      range.setStart(node, remaining)
+      range.collapse(true)
+
+      return true
+    }
+
+    remaining -= length
+    node = walker.nextNode()
+  }
+
+  return false
 }
 
 function mentionKey(part: Exclude<ComposerPrompt[number], ComposerAttachment | { type: "text" }>) {
