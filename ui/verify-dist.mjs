@@ -62,7 +62,7 @@ for (const ref of refs) {
   checkFile(file, `asset referenced by index.html (${ref})`)
 }
 
-for (const required of ["sw.js", "site.webmanifest", "icons/dev/favicon.ico"]) {
+for (const required of ["sw.js", "site.webmanifest", "icons/dev/favicon.ico", "ghostty-vt.wasm"]) {
   checkFile(join(dist, required), required)
 }
 
