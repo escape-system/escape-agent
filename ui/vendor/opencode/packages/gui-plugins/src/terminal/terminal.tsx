@@ -6,7 +6,7 @@ import type { HexColor, ResolvedV2Theme } from "@opencode/ui/theme/types"
 import { showToast } from "@opencode/ui/toast"
 import { createPtyClient } from "@opencode/client/solid"
 import type { FitAddon, Terminal as Term } from "ghostty-web"
-import { Option, Predicate, Schema } from "effect"
+import { Predicate } from "effect"
 import { type ComponentProps, createMemo, createSignal, onCleanup, onMount, Show, splitProps } from "solid-js"
 import { createKeyed, usePlugin, type ServerRef } from "@opencode/plugin/gui"
 import type { TerminalModel } from "./model"
@@ -15,6 +15,7 @@ import { SerializeAddon } from "./serialize"
 import { disposeIfDisposable, getHoveredLinkText, setOptionIfSupported } from "./runtime-adapters"
 import { consumeTerminalMetaKey, terminalKeyInput } from "./terminal-key-event"
 import { terminalWriter } from "./writer"
+import { classifyPtyFrame } from "./frames"
 import { TerminalQuote, type TerminalQuoteTarget } from "./quote"
 
 // Serialization on unmount is a synchronous O(rows x cols) walk on the main thread and the
@@ -60,11 +61,6 @@ const DEFAULT_TERMINAL_COLORS = {
     selectionBackground: withAlpha("#d4d4d4", 0.25),
   },
 } as const satisfies Record<"light" | "dark", TerminalColors>
-
-// The server's binary control frames carry JSON such as the output cursor.
-const ControlFrame = Schema.fromJsonString(Schema.Struct({ cursor: Schema.optional(Schema.Number) }))
-
-const decodeControlFrame = Schema.decodeUnknownOption(ControlFrame)
 
 const isHexColor = (value: string): value is HexColor => value.startsWith("#")
 
@@ -693,36 +689,25 @@ export const Terminal = (props: TerminalProps) => {
         const handleMessage = (event: MessageEvent) => {
           if (disposed) return
 
-          if (event.data instanceof ArrayBuffer) {
-            const bytes = new Uint8Array(event.data)
+          // Binary frames are PTY output unless they carry the leading NUL that marks a control frame; treating every
+          // binary frame as a control frame dropped the whole shell output and left the pane black.
+          const frame = classifyPtyFrame(event.data, (bytes) => decoder.decode(bytes))
 
-            if (bytes[0] !== 0) return
-            const meta = decodeControlFrame(decoder.decode(bytes.subarray(1)))
-
-            if (Option.isNone(meta)) {
-              debugTerminal("invalid websocket control frame")
-
-              return
-            }
-
-            const next = meta.value.cursor
-
-            if (next !== undefined && Number.isSafeInteger(next) && next >= 0) {
-              cursor = next
-              seek = next
+          if (frame.type === "cursor") {
+            if (frame.cursor !== undefined) {
+              cursor = frame.cursor
+              seek = frame.cursor
             }
 
             return
           }
 
-          // The PTY client receives binary frames as ArrayBuffers, handled above; the rest are text.
-          const data = String(event.data)
+          if (frame.type === "ignore") return
 
-          if (!data) return
-          output?.push(data)
+          output?.push(frame.text)
 
           if (!revealed()) output?.flush(reveal)
-          cursor += data.length
+          cursor += frame.bytes
           seek = cursor
         }
 
