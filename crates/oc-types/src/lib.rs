@@ -54,12 +54,14 @@ pub use payload::{
     SessionInboxDelivered, SessionInboxDeliveryChanged, SessionInboxEnqueued,
     SessionMetadataUpdated, SessionModelFallback, SessionModelSelected, SessionMoved,
     SessionPermissions, SessionReasoningDelta, SessionReasoningEnded, SessionReasoningStarted,
-    SessionRenamed, SessionStatusUpdated, SessionStepEnded, SessionStepFailed, SessionStepStarted,
-    SessionStepStreamed, SessionSynthetic, SessionTextDelta, SessionTextEnded, SessionTextStarted,
-    SessionToolCalled, SessionToolFailed, SessionToolInputDelta, SessionToolInputEnded,
-    SessionToolInputStarted, SessionToolProgress, SessionToolSuccess, SessionUnarchived,
-    SessionUsageUpdated, SessionViewed, parse_step_limit, step_limit_reason,
+    SessionRenamed, SessionRequestEnvelope, SessionStatusUpdated, SessionStepEnded,
+    SessionStepFailed, SessionStepStarted, SessionStepStreamed, SessionSynthetic, SessionTextDelta,
+    SessionTextEnded, SessionTextStarted, SessionToolCalled, SessionToolFailed,
+    SessionToolInputDelta, SessionToolInputEnded, SessionToolInputStarted, SessionToolProgress,
+    SessionToolSuccess, SessionUnarchived, SessionUsageUpdated, SessionViewed, parse_step_limit,
+    step_limit_reason,
 };
+pub use payload::{RequestInjection, canonical_message, digest, digest_sequence};
 pub use permission::{
     Effect, PermissionReply, PermissionRequest, PermissionRule, PermissionSaved,
     PermissionSavedTime, PermissionSource, PermissionSourceKind,

@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use oc_llm::LlmMessage;
 use oc_types::MessageId;
-use oc_types::payload::SessionInboxDelivered;
+use oc_types::payload::{RequestInjection, SessionInboxDelivered};
 use serde_json::Value;
 
 use crate::prompt::{self, MAX_STEPS_PROMPT};
@@ -12,6 +12,7 @@ use crate::tokens;
 use super::SessionExecutionStepExtended;
 use super::assistant::assistant_text;
 use super::promote_inbox_row;
+use super::request_envelope::{self, RequestEnvelopeSeed};
 use super::stats::TurnStats;
 use super::stats::collect_tool_lines;
 use super::types::ExecutionOutcome;
@@ -90,12 +91,28 @@ impl Runtime {
         // `step_number += 1` below re-publishes at the top of the next
         // iteration, so the counter always names the request in flight.
         self.set_step(session, 0);
-        // The live step budget. It starts at the configured `agent.steps` and
-        // only grows through `budget::evaluate` grants at the limit; see
-        // `docs/24-step-budget.md`. `turn.max_steps` remains the initial cap the
-        // ceiling and the `StepLimited` count are expressed in.
-        let mut cap = turn.max_steps;
-        let mut grants: Vec<usize> = Vec::new();
+        // The live step budget. It starts at the configured `agent.steps` plus
+        // every grant the durable log already records for this session's open
+        // execution window ([`super::step_grants::replay`]), so the effective cap
+        // is a function of committed state rather than process memory: a restart
+        // rebuilds it from the `session.execution.step_extended` rows instead of
+        // silently resetting to `turn.max_steps`. `turn.max_steps` remains the
+        // initial cap the ceiling and the `StepLimited` count are expressed in.
+        let policy = budget::BudgetPolicy::from_merged(self.inner.config.config.merged());
+        let replayed = super::step_grants::replay(self, session, turn.max_steps, &policy).await?;
+        if replayed.dropped > 0 {
+            tracing::warn!(
+                session = %session,
+                dropped = replayed.dropped,
+                cap = replayed.cap,
+                "recorded step grants exceed the current step_budget policy; not inherited"
+            );
+        }
+        let mut cap = replayed.cap;
+        // Grants already committed to the log count against `max_extensions` and
+        // the ceiling, so a resumed turn cannot grant a second time for an
+        // extension the previous process already recorded.
+        let mut grants: Vec<usize> = replayed.steps;
         // Tool evidence for the whole turn, in execution order. It is
         // accumulated from the steps that actually ran tools because the
         // limit-reaching request is sent with tools disabled and the streamer
@@ -104,7 +121,6 @@ impl Runtime {
         let mut observations: Vec<budget::ToolObservation> = Vec::new();
         let compaction = self.compaction_config();
         let guard_armed = compaction.auto || compaction.ceiling_tokens.is_some();
-        let policy = budget::BudgetPolicy::from_merged(self.inner.config.config.merged());
 
         loop {
             // Recompute context ceiling/trigger from `turn.context_window` on every
@@ -272,47 +288,91 @@ impl Runtime {
             }
 
             let final_call = step_number >= cap;
+            // `base` is the request's pure function of the durable rows; every
+            // splice below is model-visible but not recomputable, so each one is
+            // recorded in `injections` and published with the request envelope.
+            let base = context.clone();
+            let mut injected: Vec<RequestInjection> = Vec::new();
             let mut messages = context.clone();
             if let Some(supplement) = &turn.memory_supplement {
                 messages.push(LlmMessage::user(supplement.clone()));
+                injected.push(RequestInjection::new(
+                    request_envelope::KIND_MEMORY_SUPPLEMENT,
+                    supplement.clone(),
+                ));
             }
             if pending_output_continuation {
                 messages.push(LlmMessage::user(prompt::CONTINUE_AFTER_OUTPUT_LIMIT_PROMPT));
+                injected.push(RequestInjection::new(
+                    request_envelope::KIND_OUTPUT_CONTINUATION,
+                    prompt::CONTINUE_AFTER_OUTPUT_LIMIT_PROMPT,
+                ));
             }
             if let Some(nudge) = pending_verify_nudge.take() {
-                messages.push(LlmMessage::user(nudge));
+                messages.push(LlmMessage::user(nudge.clone()));
+                injected.push(RequestInjection::new(
+                    request_envelope::KIND_VERIFY_NUDGE,
+                    nudge,
+                ));
             }
             if let Some(notice) = pending_stall_notice.take() {
-                messages.push(LlmMessage::user(notice));
+                messages.push(LlmMessage::user(notice.clone()));
+                injected.push(RequestInjection::new(
+                    request_envelope::KIND_STALL_NOTICE,
+                    notice,
+                ));
             }
             if let Some(notice) = context_pressure_notice {
-                messages.push(LlmMessage::user(notice));
+                messages.push(LlmMessage::user(notice.clone()));
+                injected.push(RequestInjection::new(
+                    request_envelope::KIND_CONTEXT_PRESSURE,
+                    notice,
+                ));
             }
             if final_call {
                 messages.push(LlmMessage::user(MAX_STEPS_PROMPT));
+                injected.push(RequestInjection::new(
+                    request_envelope::KIND_MAX_STEPS,
+                    MAX_STEPS_PROMPT,
+                ));
             } else if cap >= policy.min_cap {
                 let remaining = cap - step_number;
                 let can_auto_extend =
                     budget::can_extend_with_policy(&grants, turn.max_steps, cap, &policy);
                 if !can_auto_extend && remaining <= 5 {
-                    messages.push(LlmMessage::user(format!(
+                    let warning = format!(
                         "<system-reminder>\n{remaining} tool-enabled step(s) remain before the hard \
                          step limit ({}/{}). {}\n</system-reminder>",
                         step_number + 1,
                         cap,
                         prompt::STEP_BUDGET_WARNING
-                    )));
+                    );
+                    messages.push(LlmMessage::user(warning.clone()));
+                    injected.push(RequestInjection::new(
+                        request_envelope::KIND_STEP_BUDGET,
+                        warning,
+                    ));
                 } else if can_auto_extend && remaining <= 3 {
-                    messages.push(LlmMessage::user(format!(
+                    let checkpoint = format!(
                         "<system-reminder>\nCheckpoint: {remaining} tool-enabled step(s) remain in the \
                          current slice ({}/{cap}); automatic extension applies while tool progress \
                          continues. Keep investigating systematically.\n</system-reminder>",
                         step_number + 1,
-                    )));
+                    );
+                    messages.push(LlmMessage::user(checkpoint.clone()));
+                    injected.push(RequestInjection::new(
+                        request_envelope::KIND_STEP_BUDGET,
+                        checkpoint,
+                    ));
                 }
             }
+            let envelope = RequestEnvelopeSeed::new(
+                u32::try_from(step_number).unwrap_or(u32::MAX),
+                &base,
+                injected,
+            );
             let mut step = match self
-                .stream_step(session, turn, &messages, final_call, cancel)
+                .stream_step(session, turn, &messages, final_call, cancel, envelope)
                 .await
             {
                 Ok(step) => step,

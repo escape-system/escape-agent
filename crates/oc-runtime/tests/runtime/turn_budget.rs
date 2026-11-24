@@ -2,7 +2,7 @@
 //! over in-memory tool evidence and either grants extra steps (tools re-enabled,
 //! durable `session.execution.step_extended`) or leaves the legacy
 //! `StepLimited` path untouched (`session.execution.step_limit` once, canonical
-//! qualifier text). See `docs/24-step-budget.md`.
+//! qualifier text). See `docs/29-step-budget.md`.
 //!
 //! These are scenario tests over the published events and the durable rows; the
 //! policy itself is unit-tested in `src/turn/budget.rs`.
@@ -193,6 +193,83 @@ async fn progress_extensions_continue_the_turn() {
         .expect("session row")
         .expect("session exists");
     assert_eq!(session["outcome"], "succeeded");
+}
+
+#[tokio::test]
+async fn configured_extension_steps_override_reaches_the_policy() {
+    // `step_budget.extension_steps: 7` in the merged config must change the
+    // grant. Before configuration normalization copied the section, the runtime
+    // only ever saw `BudgetPolicy::default()` (15) and every documented override
+    // was inert. This test fails on that tree: the grant would be 15/25.
+    let mut scripts = reads(&["hello.txt"; 11]);
+    scripts.push(text_script("all done"));
+    let harness = Harness::new(
+        scripts,
+        Arc::new(AllowAll),
+        json!({
+            "agents": {"engineer": {"steps": 10}},
+            "step_budget": {"extension_steps": 7}
+        }),
+        None,
+    )
+    .await;
+    harness.prompt("keep going").await;
+
+    let extended = harness.sink.data("session.execution.step_extended");
+    assert_eq!(extended.len(), 1, "one grant: {extended:?}");
+    assert_eq!(
+        extended[0]["steps"], 7,
+        "the configured extension_steps, not the default 15: {}",
+        extended[0]
+    );
+    assert_eq!(
+        extended[0]["totalSteps"], 17,
+        "initial cap 10 plus the configured grant 7: {}",
+        extended[0]
+    );
+    assert_eq!(extended[0]["reason"], "recent tool progress");
+    assert_eq!(
+        harness.model.calls(),
+        12,
+        "11 successful reads + the final answer: the model finished inside the extended budget"
+    );
+}
+
+#[tokio::test]
+async fn a_partial_step_budget_override_keeps_the_other_keys_on_their_defaults() {
+    // Only `min_cap` is configured (8). With `steps: 8` that key alone decides
+    // whether the evaluator runs at all: on the default `min_cap` (10) a cap of
+    // 8 is below the floor and the turn ends step-limited with no grant. The
+    // grant it does emit proves `extension_steps` stayed on its default 15.
+    let mut scripts = reads(&["hello.txt"; 24]);
+    scripts.push(text_script("all done"));
+    let harness = Harness::new(
+        scripts,
+        Arc::new(AllowAll),
+        json!({
+            "agents": {"engineer": {"steps": 8}},
+            "step_budget": {"min_cap": 8}
+        }),
+        None,
+    )
+    .await;
+    harness.prompt("keep going").await;
+
+    let extended = harness.sink.data("session.execution.step_extended");
+    assert!(
+        !extended.is_empty(),
+        "a cap of 8 clears the configured min_cap of 8, so the evaluator runs"
+    );
+    assert_eq!(
+        extended[0]["steps"], 15,
+        "extension_steps was not configured, so the documented default applies: {}",
+        extended[0]
+    );
+    assert_eq!(
+        extended[0]["totalSteps"], 23,
+        "initial cap 8 plus the default grant 15: {}",
+        extended[0]
+    );
 }
 
 #[tokio::test]

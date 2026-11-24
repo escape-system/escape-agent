@@ -822,7 +822,7 @@ impl Runtime {
 }
 
 /// Build the compaction summary instruction, including the preservation
-/// guidance required by `docs/24-step-budget.md`.
+/// guidance required by `docs/29-step-budget.md`.
 ///
 /// A compaction must not silently drop the state the step-budget decision and
 /// the next turn depend on: the selected model/variant, tool state (pending and

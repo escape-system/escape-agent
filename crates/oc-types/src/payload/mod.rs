@@ -78,6 +78,7 @@ mod compaction;
 mod lifecycle;
 mod message;
 mod meta;
+mod request;
 mod step;
 mod trace;
 
@@ -98,6 +99,9 @@ pub use message::{
 pub use meta::{
     SessionAgentSelected, SessionMetadataUpdated, SessionModelFallback, SessionModelSelected,
     SessionPermissions, SessionSynthetic,
+};
+pub use request::{
+    RequestInjection, SessionRequestEnvelope, canonical_message, digest, digest_sequence,
 };
 pub use step::{
     SessionIdle, SessionStatusUpdated, SessionStepEnded, SessionStepFailed, SessionStepStarted,
@@ -251,6 +255,7 @@ mod tests {
         check!(SessionStepStreamed, "session.step.streamed", true);
         check!(SessionStepEnded, "session.step.ended", true);
         check!(SessionStepFailed, "session.step.failed", true);
+        check!(SessionRequestEnvelope, "session.request.envelope", true);
         check!(SessionStatusUpdated, "session.status", false);
         check!(SessionIdle, "session.idle", false);
         check!(SessionUsageUpdated, "session.usage.updated", false);

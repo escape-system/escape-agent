@@ -1,4 +1,4 @@
-# 24 — Step budget extension
+# 29 — Step budget extension
 
 A subagent at 49 of 50 steps with its tests unrun loses the whole turn; deciding
 whether to extend it by calling a model *in the stop path* would add a provider
@@ -132,14 +132,58 @@ decision depends on from being silently dropped across a compaction.
 
 ## Durability and replay
 
-`cap` is a `run_steps` local (`crates/oc-runtime/src/turn/mod.rs:314`), never
-persisted, so a grant cannot be replayed: a restart rebuilds the budget from
-`agent.steps`. The grant event is durable and goes out through `emit`, which
-appends the payload before broadcasting
-(`crates/oc-runtime/src/runtime/mod.rs:554-589`; store append, then
-`sink.publish` at `:587`), after `finish_step` committed
-the step's row (`crates/oc-runtime/src/turn/mod.rs:478`). The ceiling is enforced
-twice: rule 2 bounds the total, rule 1 the count.
+`session.execution.step_extended` is the durable projection of the grant, and
+`cap` is a pure function of the log at `run_steps` entry — not a process-local
+counter. `step_grants::replay` re-derives `{steps, cap, dropped}` from the
+committed `session.execution.step_extended` rows
+(`crates/oc-runtime/src/turn/step_grants.rs:70`, paging `Store::events_after`
+1000 events at a time, `crates/oc-store/src/event.rs:109`), and `run_steps`
+seeds both the cap and the grant list from it
+(`crates/oc-runtime/src/turn/run.rs:102-115`). The grant event goes out through
+`emit`, which appends the payload before broadcasting
+(`crates/oc-runtime/src/runtime/mod.rs:549-584`; store append, then
+`sink.publish` at `:582`), after `finish_step` committed the step's row
+(`crates/oc-runtime/src/turn/run.rs:429`; `stream.rs:938-954`).
+
+**The window.** The log holds every grant the session ever recorded, so replay
+honours only grants in the *open* execution window: the events after the
+session's last durable terminal
+(`session.execution.{succeeded,failed,interrupted}`,
+`crates/oc-runtime/src/turn/step_grants.rs:46-50`). A settled turn closes the
+window, so the next turn starts at `agent.steps` and inherits nothing; a process
+killed mid-turn never published a terminal, so its grants stay live and are
+honoured on resume. `session.execution.started` deliberately does **not** open
+the window: the turn loop publishes it before `run_steps` is called
+(`crates/oc-runtime/src/turn/mod.rs:109-127`, `:209`), so keying on it would
+erase exactly the grants a resumed execution must inherit.
+
+**No double-grant.** Pre-seeding `grants` from the log (`run.rs:115`) makes
+recorded grants count against `max_extensions` and the ceiling and keeps
+`grantIndex` continuous, so a resumed turn cannot grant a second time for an
+extension the previous process already recorded.
+
+**Clamp.** Recorded grants are re-applied under the *current* `BudgetPolicy`
+(`crates/oc-runtime/src/turn/step_grants.rs:127`), so a configuration that shrank
+between the grant and the replay narrows the budget instead of widening it;
+dropped grants are `tracing::warn`-ed (`run.rs:103-110`), never silent. The
+ceiling is enforced twice: rule 2 bounds the total, rule 1 the count.
+
+### Tests (replay landed 2026-11-23)
+
+`crates/oc-runtime/tests/runtime/step_grants.rs` (registered at
+`crates/oc-runtime/tests/runtime.rs:30-31`), all behavioural — asserted on the
+cap the turn ended at, the provider-call count and the number of durable grant
+events:
+
+- `a_grant_recorded_before_the_crash_still_budgets_the_resumed_turn` (:179)
+- `a_restart_does_not_resurrect_budget_past_the_logged_ceiling` (:225)
+- `a_recorded_grant_is_not_re_emitted_when_the_turn_resumes` (:268)
+- `a_settled_turn_does_not_lend_its_grant_to_the_next_turn` (:333) — the negative
+  control for the window rule.
+
+The arithmetic of the clamp lives in the `step_grants.rs` unit tests. Cost is
+one forward log scan per `run_steps` entry (one turn, not one step), bounded by
+the session log because `oc-store` has no reverse `seq` query.
 
 ## Failure modes
 
@@ -179,13 +223,29 @@ twice: rule 2 bounds the total, rule 1 the count.
   (`ui/vendor/opencode/packages/app/src/session/agent-panels/goal-chip.tsx:28-32`).
   Attributing a specific evidence id to a specific criterion would need a new
   column and is intentionally out of scope.
-- **Host wiring gaps are tracked by the implementation handoff, not by this
-  document.** The budget policy and the early-warning text are exposed as
-  deterministic runtime behavior; the points where the live step values and the
-  merged config reach them (the step-boundary call site and the root snapshot
-  mapping) are owned by the implementation wave and recorded in its handoff.
-  Any missing host wiring there is reported honestly as a gap, not claimed as
-  shipped by this document. This doc intentionally does not add an
+- **Host wiring: one gap open, one wired.** The step-boundary call site is
+  wired: `run_steps` evaluates `budget::evaluate_with_policy` before treating a
+  step as `final_call` (`crates/oc-runtime/src/turn/run.rs:255-288`), consumes
+  observer grants at the loop top (`run.rs:140-168`), and publishes the live cap
+  for the observer (`run.rs:174-175` → `Runtime::set_step_budget`,
+  `crates/oc-runtime/src/runtime/state.rs:39`), which `observer_pass` maps to
+  `RootContext.step_cap` / `steps_remaining`
+  (`crates/oc-runtime/src/observer/tick.rs:134-142`,
+  `crates/oc-observer/src/engine/snapshot.rs:74-76`).
+  **Still open (not fixed as of 2026-11-23, fix in flight in `oc-config`):** the
+  `step_budget.*` overrides in the policy table above never reach a live runtime.
+  `step_budget` is listed as handled
+  (`crates/oc-config/src/normalize/keys.rs:68`) and therefore *dropped* by the
+  unknown-key loop (`crates/oc-config/src/normalize/root.rs:107-112`), but the
+  `copy_object` list (`normalize/root.rs:93-103`) does not include it, so the
+  normalized document never carries the section and
+  `BudgetPolicy::from_merged` (`crates/oc-runtime/src/turn/budget.rs:45-69`)
+  always sees the defaults. Every override here is inert until that one line
+  lands; only the `budget.rs` unit test
+  (`merged_config_reads_step_budget_overrides`, `budget.rs:431`) exercises the
+  parser, from a raw JSON value. `crates/oc-runtime/tests/runtime/step_grants.rs`
+  documents the same caveat and pins its fixtures to the defaults.
+  This doc intentionally does not add an
   `ObserverAction` variant: `ObserverAction` and its dispatch are exhaustive in
   files outside the budget owner's scope, so the request channel is the
   existing `RepairKind::RequestBudgetExtension` on `ObserverAction::Repair`.

@@ -19,11 +19,13 @@ mod finalize;
 mod permissions;
 mod pressure;
 mod repetition;
+mod request_envelope;
 mod run;
 mod session;
 mod settle;
 mod stall;
 mod stats;
+mod step_grants;
 mod stream;
 mod tools;
 mod types;
@@ -42,7 +44,14 @@ use types::ExecutionOutcome;
 /// event is our observability for a turn that outlived `agent.steps`, so it
 /// must not pretend to be an upstream payload. `steps` is the size of this
 /// grant, `totalSteps` the cap after it, `grantIndex` the 1-based grant ordinal
-/// and `reason` the policy rule that granted it. See `docs/24-step-budget.md`.
+/// and `reason` the policy rule that granted it. See `docs/29-step-budget.md`.
+///
+/// This event is the durable projection of the grant: `steps` is what
+/// [`step_grants::replay`] sums back into the effective cap at `run_steps`
+/// entry, so a restart rebuilds the budget from the log instead of resetting it
+/// to `agent.steps`. It must stay a replayable record: `steps` is required and
+/// must be positive, and `totalSteps` is derivable from the initial cap plus the
+/// preceding grants.
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SessionExecutionStepExtended {

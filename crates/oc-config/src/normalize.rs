@@ -19,6 +19,7 @@ mod providers;
 mod resources;
 mod root;
 mod skills;
+mod step_budget;
 
 pub(crate) use model::{model_selection, model_string};
 pub(crate) use root::normalize;

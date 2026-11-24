@@ -19,6 +19,7 @@ use super::policies::normalize_policies;
 use super::providers::normalize_providers;
 use super::resources::{normalize_media, normalize_plugins, normalize_references};
 use super::skills::normalize_skills;
+use super::step_budget::normalize_step_budget;
 use crate::diagnostic::{Diagnostic, DiagnosticKind};
 
 /// Normalize one parsed document. Returns `None` when the root cannot be used.
@@ -89,6 +90,7 @@ pub(crate) fn normalize(source: Option<&str>, input: Value) -> (Option<Value>, V
     copy_bool_or_object(&input, "warming", &mut out, &mut ctx);
     normalize_providers(&input, &mut out, &mut ctx);
     normalize_experimental(&input, &mut out, &mut ctx);
+    normalize_step_budget(&input, &mut out, &mut ctx);
 
     for key in [
         "subagents",

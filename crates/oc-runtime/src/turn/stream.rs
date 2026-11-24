@@ -5,15 +5,16 @@ use oc_llm::{LlmMessage, LlmOptions, LlmRequest};
 use oc_store::NewMessage;
 use oc_types::message::{AssistantPart, FinishReason, StructuredError, ToolState};
 use oc_types::payload::{
-    SessionStepEnded, SessionStepFailed, SessionStepStarted, SessionStepStreamed, SessionTextDelta,
-    SessionTextEnded, SessionTextStarted, SessionToolCalled, SessionToolInputDelta,
-    SessionToolInputEnded, SessionToolInputStarted, SessionUsageUpdated,
+    SessionRequestEnvelope, SessionStepEnded, SessionStepFailed, SessionStepStarted,
+    SessionStepStreamed, SessionTextDelta, SessionTextEnded, SessionTextStarted, SessionToolCalled,
+    SessionToolInputDelta, SessionToolInputEnded, SessionToolInputStarted, SessionUsageUpdated,
 };
 use oc_types::{MessageId, ModelRef, Tokens};
 
 use crate::runtime::{CancelToken, Runtime, RuntimeError};
 
 use super::assistant::{AssistantState, ordinal_u32};
+use super::request_envelope::RequestEnvelopeSeed;
 use super::tools::strip_expectation;
 use super::types::{
     PendingToolCall, ResolvedTurn, StepAttempt, StepRun, StreamFailure, finish_reason,
@@ -88,6 +89,15 @@ fn classify_llm_error(error: oc_llm::LlmError) -> oc_llm::LlmError {
         }
         other => other,
     }
+}
+
+/// `true` when `base_request` is the tool-less final call of a step budget.
+///
+/// The turn loop expresses a final call by setting `tool_choice: "none"` on the
+/// request it hands down (see `run_steps`), so the request itself is the single
+/// source of truth for the mode — there is no second, driftable parameter.
+fn final_call(base_request: &LlmRequest) -> bool {
+    base_request.options.tool_choice.as_deref() == Some("none")
 }
 
 /// Upper bound on credential attempts for one model candidate.
@@ -182,6 +192,7 @@ impl Runtime {
         messages: &[LlmMessage],
         final_call: bool,
         cancel: &Arc<CancelToken>,
+        envelope: RequestEnvelopeSeed,
     ) -> Result<StepRun, RuntimeError> {
         let mut reuse: Option<AssistantState> = None;
         let attempt = self
@@ -194,6 +205,7 @@ impl Runtime {
                 final_call,
                 cancel,
                 &mut reuse,
+                envelope,
             )
             .await?;
         let failure = match attempt {
@@ -239,15 +251,33 @@ impl Runtime {
         final_call: bool,
         cancel: &Arc<CancelToken>,
         reuse: &mut Option<AssistantState>,
+        envelope: RequestEnvelopeSeed,
     ) -> Result<StepAttempt, RuntimeError> {
         let provider = model.provider.id.clone();
         let now_ms = oc_types::now_millis();
+        // The request is built once, here, so the transport-hook probe below and
+        // the dispatch in `stream_once` cannot disagree about it. The credential
+        // is the only field left to the pool/rotation loop, so the probe carries
+        // `api_key: None` — a hook that inspects `options`, `messages`, `tools`
+        // or `system` now sees exactly what dispatch will send.
+        let base_request = LlmRequest {
+            model: model.clone(),
+            system: turn.system.clone(),
+            messages: messages.to_vec(),
+            tools: turn.tools.clone(),
+            options: LlmOptions {
+                api_key: None,
+                tool_choice: final_call.then(|| "none".to_owned()),
+                cache_key: Some(session.to_owned()),
+                ..LlmOptions::default()
+            },
+        };
         let hook_owns_pool = self
             .inner
             .config
             .client
             .hook()
-            .is_some_and(|hook| hook.handles(&LlmRequest::new(model.clone())));
+            .is_some_and(|hook| hook.handles(&base_request));
         let pool = if hook_owns_pool {
             Vec::new()
         } else {
@@ -269,13 +299,12 @@ impl Runtime {
                 .stream_once(
                     session,
                     turn,
-                    model,
                     model_ref,
-                    messages,
-                    final_call,
+                    &base_request,
                     cancel,
                     reuse.take(),
                     api_key,
+                    envelope.clone(),
                 )
                 .await?;
             let failure = match attempt {
@@ -384,13 +413,12 @@ impl Runtime {
         &self,
         session: &str,
         turn: &ResolvedTurn,
-        model: &oc_llm::ResolvedModel,
         model_ref: &ModelRef,
-        messages: &[LlmMessage],
-        final_call: bool,
+        base_request: &LlmRequest,
         cancel: &Arc<CancelToken>,
         reuse: Option<AssistantState>,
         api_key: Option<String>,
+        envelope: RequestEnvelopeSeed,
     ) -> Result<StepAttempt, RuntimeError> {
         let created = oc_types::now_millis();
         // Nothing streamed on the previous attempt: the row is rewritten for
@@ -430,22 +458,46 @@ impl Runtime {
                 },
             )
             .await?;
+            // The row (and its `session.step.started`) is committed and the
+            // exact request is fully materialised. Record it before the first
+            // byte is requested, so a crash mid-stream still leaves the request
+            // recoverable from the log. `emit` appends durably before
+            // publishing. One envelope per assistant row: a key rotation reuses
+            // this row, so it does not record a second one.
+            self.emit(
+                session,
+                &turn.directory,
+                SessionRequestEnvelope {
+                    session_id: Runtime::session_id(session),
+                    assistant_message_id: state.id.clone(),
+                    step: envelope.step,
+                    provider: base_request.model.provider.id.clone(),
+                    model: base_request.model.model.id.clone(),
+                    tools: base_request
+                        .tools
+                        .iter()
+                        .map(|tool| tool.name.clone())
+                        .collect(),
+                    system_digest: oc_types::payload::digest_sequence(
+                        base_request.system.iter().map(String::as_str),
+                    ),
+                    base_messages: envelope.base_messages,
+                    base_digest: envelope.base_digest,
+                    injections: envelope.injections,
+                    created: oc_types::now_millis(),
+                },
+            )
+            .await?;
             state
         };
         let id = state.id.clone();
 
-        let options = LlmOptions {
-            api_key,
-            tool_choice: final_call.then(|| "none".to_owned()),
-            cache_key: Some(session.to_owned()),
-            ..LlmOptions::default()
-        };
         let request = LlmRequest {
-            model: model.clone(),
-            system: turn.system.clone(),
-            messages: messages.to_vec(),
-            tools: turn.tools.clone(),
-            options,
+            options: LlmOptions {
+                api_key,
+                ..base_request.options.clone()
+            },
+            ..base_request.clone()
         };
 
         let stream_result = tokio::select! {
@@ -583,7 +635,7 @@ impl Runtime {
                     .await?;
                 }
                 oc_llm::LlmEvent::ToolInputStart { id: call_id, name } => {
-                    if final_call {
+                    if final_call(base_request) {
                         continue;
                     }
                     self.close_reasoning(session, turn, &mut state).await?;
@@ -603,7 +655,7 @@ impl Runtime {
                     .await?;
                 }
                 oc_llm::LlmEvent::ToolInputDelta { id: call_id, delta } => {
-                    if final_call {
+                    if final_call(base_request) {
                         continue;
                     }
                     self.mark_streamed(session, turn, &mut state).await?;
@@ -621,7 +673,7 @@ impl Runtime {
                     .await?;
                 }
                 oc_llm::LlmEvent::ToolInputEnd { id: call_id, text } => {
-                    if final_call {
+                    if final_call(base_request) {
                         continue;
                     }
                     state.set_tool_streamed(&call_id, text.clone());
@@ -643,7 +695,7 @@ impl Runtime {
                     name,
                     input,
                 } => {
-                    if final_call {
+                    if final_call(base_request) {
                         continue;
                     }
                     self.close_reasoning(session, turn, &mut state).await?;
@@ -713,7 +765,7 @@ impl Runtime {
                     state.raw_finish = Some(reason);
                     let tokens = tokens_from_usage(&usage);
                     state.tokens = Some(tokens.clone());
-                    let cost = oc_llm::model_cost(&model.model, &usage);
+                    let cost = oc_llm::model_cost(&base_request.model.model, &usage);
                     state.cost = Some(cost);
                     self.inner
                         .config
@@ -805,6 +857,14 @@ impl Runtime {
         }))
     }
 
+    /// Publishes the durable `session.step.streamed` for this row.
+    ///
+    /// The event reports that the step produced model output, and its evidence is
+    /// the `time.streamed` stamp on the assistant row. A durable event must never
+    /// describe uncommitted state, so the stamp is persisted *first* and the
+    /// event only goes out once that write succeeded. Nothing is reordered on the
+    /// wire: the caller emits `session.text.started`/`session.text.delta`/… after
+    /// this returns, exactly as before.
     async fn mark_streamed(
         &self,
         session: &str,
@@ -815,6 +875,7 @@ impl Runtime {
             return Ok(());
         }
         state.streamed = Some(oc_types::now_millis());
+        self.persist_assistant(session, state).await?;
         self.emit(
             session,
             &turn.directory,

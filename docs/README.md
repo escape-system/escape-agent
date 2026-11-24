@@ -41,6 +41,8 @@ scope; the TUI must keep working against our server.
 | 25 | [context boxes](25-context-boxes.md) | Durable root-shared context, tool surface, expiry |
 | 26 | [Antigravity auth](26-antigravity-auth.md) | Native Google Antigravity OAuth, multi-account pool, Cloud Code gateway |
 | 27 | [key pool](27-key-pool.md) | Backup keys per provider, pool ordering, cooldowns, rotation seam |
+| 28 | [dsh alignment](28-dsh-alignment.md) | DeepSeek Harness invariant we adopted, mechanisms studied, what we declined |
+| 29 | [step budget](29-step-budget.md) | Deterministic step-budget extension policy, grants, observability |
 
 ## Rules that apply to every doc
 

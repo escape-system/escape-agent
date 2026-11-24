@@ -25,6 +25,10 @@ mod observer;
 mod observer_advice;
 #[path = "runtime/recovery.rs"]
 mod recovery;
+#[path = "runtime/request_envelope.rs"]
+mod request_envelope;
+#[path = "runtime/step_grants.rs"]
+mod step_grants;
 #[path = "runtime/stop.rs"]
 mod stop;
 #[path = "runtime/subagents.rs"]

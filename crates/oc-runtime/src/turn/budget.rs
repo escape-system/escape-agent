@@ -5,7 +5,7 @@
 //! No model call, no IO, no clock: the decision is a pure function of observed
 //! tool outcomes so it is reproducible and replay-safe.
 //!
-//! See `docs/24-step-budget.md` for the policy rationale and the observability
+//! See `docs/29-step-budget.md` for the policy rationale and the observability
 //! contract.
 
 use oc_types::message::{AssistantPart, ToolState};

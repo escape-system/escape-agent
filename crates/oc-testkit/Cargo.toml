@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "opencode-rust oc-testkit crate"
+description = "Offline test fixtures for opencode: a scripted OpenAI/Anthropic/Gemini SSE provider, a temp-tree `opencode serve` harness, HTTP/SSE helpers and the `oc-bench` performance gate"
 
 [dependencies]
 anyhow.workspace = true
@@ -19,6 +19,12 @@ reqwest.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
+
+[dev-dependencies]
+# Test-only: `tests/crash_recovery.rs` runs `PRAGMA quick_check` on the killed
+# database. Already in `Cargo.lock` (same `rusqlite` 0.41.1 the store uses), so
+# this adds no new resolution.
+rusqlite.workspace = true
 
 [[bin]]
 name = "oc-bench"
