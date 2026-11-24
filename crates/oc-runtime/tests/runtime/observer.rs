@@ -239,6 +239,7 @@ async fn repair_worker_interrupts_the_execution() {
     sender
         .send(RepairCommand::Interrupt {
             session_id: harness.session.clone(),
+            reply: None,
         })
         .expect("send interrupt");
     runtime
@@ -466,6 +467,7 @@ async fn cancel_tool_cancels_the_running_tool_without_interrupting_the_turn() {
     sender
         .send(RepairCommand::CancelTool {
             tool_call_id: "call_hang".to_owned(),
+            reply: None,
         })
         .expect("send cancel_tool");
 

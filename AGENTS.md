@@ -30,10 +30,11 @@ design is documented first; code follows the docs.
 
 | Crate | Phase | State |
 |---|---|---|
-| `oc-types` | 1/2 | wire model, typed event payloads, 35 tests |
+| `oc-types` | 1/2 | wire model, typed event payloads |
 | `oc-store` | 1 | SQLite schema/repos/event log/seq |
 | `oc-config` | 1 | discovery/JSONC/merge/permissions/agents |
 | `oc-llm` | 2 | catalog + OpenAI/Anthropic/Gemini streaming |
+| `oc-antigravity` | 3 | Antigravity OAuth, multi-account pool, Cloud Code gateway, transforms |
 | `oc-tools` | 2 | read/write/edit/patch/glob/grep/shell |
 | `oc-mcp` | 3 | stdio + streamable HTTP client, tools/resources |
 | `oc-lsp` | 3 | supervisor, diagnostics, tool operations |
@@ -41,10 +42,12 @@ design is documented first; code follows the docs.
 | `oc-runtime` | 2 | session actors, turn loop, prompt assembly |
 | `oc-observer` | 4 | expectations, observer, goals, repair |
 | `oc-memory` | 4 | SQLite+FTS memory, scribe |
+| `oc-subagents` | 4 | session-tree policy: spawn limits, sibling messages, model resolution |
+| `oc-lanes` | 4 | build-lane classifier, priority queues, semaphore concurrency |
 | `oc-server` | 1 | axum routes, SSE, auth, static |
 | `oc-cli` | 1 | `opencode serve`, service registration |
 | `oc-pty` | 3 | upstream `process-daemon` port |
-| `oc-testkit` | 1 | fixtures, harness, benches |
+| `oc-testkit` | 1 | fake SSE provider, server harness, HTTP/SSE helpers, `oc-bench` |
 
 ## Agents and model policy
 

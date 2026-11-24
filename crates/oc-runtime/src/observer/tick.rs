@@ -232,14 +232,16 @@ impl Runtime {
                 }
             },
             Some(ObserverRun::Repair { verdict, outcome }) => {
-                if outcome.detail.as_deref() == Some("budget_request") {
-                    self.apply_observer_budget_request(root, &verdict).await;
-                    return;
-                }
+                // Every repair arm, including `request_budget_extension`, is
+                // applied by the runtime repair worker, which answers with the
+                // real verdict: the engine only reaches this point with
+                // `applied: true`, and the grant (or the refusal) already
+                // happened before the receipt was sent.
                 tracing::debug!(
                     root = %root,
                     target = %verdict.target.unwrap_or_default(),
                     applied = outcome.applied,
+                    detail = outcome.detail.as_deref().unwrap_or_default(),
                     "observer repair dispatched"
                 );
             }
@@ -256,50 +258,6 @@ impl Runtime {
                 tracing::trace!(root = %root, reason = ?reason, "observer tick skipped");
             }
             None => {}
-        }
-    }
-
-    async fn apply_observer_budget_request(
-        &self,
-        root: &str,
-        verdict: &oc_observer::ObserverVerdict,
-    ) {
-        let target = verdict.target.as_deref().unwrap_or_default();
-        if target.is_empty() {
-            return;
-        }
-        let requested = verdict
-            .repair
-            .as_ref()
-            .and_then(|repair| repair.args.get("steps"))
-            .and_then(serde_json::Value::as_u64)
-            .and_then(|n| u32::try_from(n).ok())
-            .filter(|&n| n > 0)
-            .unwrap_or_else(|| {
-                let policy = crate::turn::budget::BudgetPolicy::from_merged(
-                    self.inner.config.config.merged(),
-                );
-                u32::try_from(policy.extension_steps).unwrap_or(15)
-            });
-        if self.grant_step_budget(target, requested) {
-            let notice = format!(
-                "Step budget extended (+{requested} steps requested by observer). \
-                 Continue deepening your investigation or verification methodically."
-            );
-            if let Err(error) = self.observer_synthetic(target, &notice, root).await {
-                tracing::warn!(
-                    root = %root,
-                    target = %target,
-                    error = %error,
-                    "observer budget grant notice failed"
-                );
-            }
-        } else {
-            tracing::debug!(
-                root = %root,
-                target = %target,
-                "observer budget extension skipped; target has no active actor"
-            );
         }
     }
 

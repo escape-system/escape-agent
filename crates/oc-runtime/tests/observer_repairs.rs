@@ -25,7 +25,7 @@ use oc_tools::ToolRegistry;
 use oc_types::{EventEnvelope, MessageId};
 use serde_json::{Value, json};
 use tempfile::TempDir;
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 const ROOT: &str = "ses_observer_root";
 const OTHER: &str = "ses_observer_other";
@@ -172,7 +172,12 @@ struct Harness {
     _root: TempDir,
     store: Arc<Store>,
     sink: TestSink,
-    sender: UnboundedSender<RepairCommand>,
+    /// Direct command sender for the legacy tests; `None` when the harness owns
+    /// the real [`oc_runtime::RepairChannel`] executor instead.
+    sender: Option<UnboundedSender<RepairCommand>>,
+    /// The runtime's own executor half, used by the receipt tests so `apply`
+    /// round-trips through the repair worker.
+    executor: Option<Arc<dyn RepairExecutor>>,
     runtime: Runtime,
 }
 
@@ -181,7 +186,41 @@ impl Harness {
         Self::with_model(config_content, Arc::new(EmptyModel)).await
     }
 
+    /// A harness that injects commands directly (no executor half).
     async fn with_model(config_content: Value, model: Arc<dyn oc_runtime::ModelClient>) -> Self {
+        let (sender, repairs) = tokio::sync::mpsc::unbounded_channel();
+        let harness = Self::build(config_content, model, repairs).await;
+        Self {
+            sender: Some(sender),
+            executor: None,
+            ..harness
+        }
+    }
+
+    /// A harness whose repair worker is fed by the real `RepairChannel`
+    /// executor, so `apply` waits for the runtime's receipt.
+    async fn with_receipts(config_content: Value) -> Self {
+        Self::with_receipts_model(config_content, Arc::new(EmptyModel)).await
+    }
+
+    async fn with_receipts_model(
+        config_content: Value,
+        model: Arc<dyn oc_runtime::ModelClient>,
+    ) -> Self {
+        let (executor, repairs) = oc_runtime::RepairChannel::new();
+        let harness = Self::build(config_content, model, repairs).await;
+        Self {
+            sender: None,
+            executor: Some(executor),
+            ..harness
+        }
+    }
+
+    async fn build(
+        config_content: Value,
+        model: Arc<dyn oc_runtime::ModelClient>,
+        repairs: UnboundedReceiver<RepairCommand>,
+    ) -> Self {
         let root = tempfile::tempdir().expect("temp dir");
         let work = root.path().join("work");
         std::fs::create_dir_all(&work).expect("work dir");
@@ -229,7 +268,6 @@ impl Harness {
             Arc::new(NeverExecutor),
             Arc::new(NoopNotifier),
         ));
-        let (sender, repairs) = tokio::sync::mpsc::unbounded_channel();
         let goals: Arc<dyn oc_observer::GoalStore> =
             Arc::new(StoreGoalStore::new(Arc::clone(&store)));
         let runtime = Runtime::new_with_model_client(config, model).with_observer(
@@ -244,13 +282,31 @@ impl Harness {
             _root: root,
             store,
             sink,
-            sender,
+            sender: None,
+            executor: None,
             runtime,
         }
     }
 
+    /// Apply one repair verdict through the runtime executor and return the
+    /// receipt it answered with.
+    async fn apply(
+        &self,
+        verdict: &oc_observer::ObserverVerdict,
+    ) -> Result<RepairOutcome, ObserverError> {
+        self.executor
+            .as_ref()
+            .expect("this harness owns the real repair channel")
+            .apply(verdict)
+            .await
+    }
+
     fn send(&self, command: RepairCommand) {
-        self.sender.send(command).expect("repair command");
+        self.sender
+            .as_ref()
+            .expect("this harness injects commands")
+            .send(command)
+            .expect("repair command");
     }
 }
 
@@ -419,6 +475,7 @@ async fn repost_without_text_replays_the_latest_user_prompt() {
     harness.send(RepairCommand::Repost {
         session_id: ROOT.to_owned(),
         text: String::new(),
+        reply: None,
     });
 
     let row = wait_for_observer_text(&harness.store, ROOT, "latest prompt").await;
@@ -435,12 +492,14 @@ async fn repost_does_not_duplicate_pending_input() {
     harness.send(RepairCommand::Repost {
         session_id: ROOT.to_owned(),
         text: String::new(),
+        reply: None,
     });
     // A later explicit switch on another session is the barrier that proves
     // the repost command was processed.
     harness.send(RepairCommand::SwitchModel {
         session_id: OTHER.to_owned(),
         model: "test/beta".to_owned(),
+        reply: None,
     });
     wait_for_model(&harness.store, OTHER, "beta").await;
 
@@ -465,12 +524,14 @@ async fn repost_is_skipped_while_a_turn_is_running() {
     harness.send(RepairCommand::Repost {
         session_id: ROOT.to_owned(),
         text: String::new(),
+        reply: None,
     });
     // The running prompt is no longer in the inbox, so only the idle check can
     // stop a duplicate execution.
     harness.send(RepairCommand::SwitchModel {
         session_id: OTHER.to_owned(),
         model: "test/beta".to_owned(),
+        reply: None,
     });
     wait_for_model(&harness.store, OTHER, "beta").await;
 
@@ -507,12 +568,14 @@ async fn switch_model_rejects_a_model_outside_the_catalog() {
     harness.send(RepairCommand::SwitchModel {
         session_id: ROOT.to_owned(),
         model: "test/ghost".to_owned(),
+        reply: None,
     });
     // A valid switch on another session is the barrier that proves the ghost
     // command was processed before we read ROOT.
     harness.send(RepairCommand::SwitchModel {
         session_id: OTHER.to_owned(),
         model: "test/beta".to_owned(),
+        reply: None,
     });
     wait_for_model(&harness.store, OTHER, "beta").await;
 
@@ -537,6 +600,7 @@ async fn restart_subagent_replays_the_child_prompt_with_the_note() {
     harness.send(RepairCommand::RestartSubagent {
         session_id: child.clone(),
         note: "the child stalled".to_owned(),
+        reply: None,
     });
 
     let expected = "please fix the build\n\n[observer restart] the child stalled";
@@ -554,6 +618,7 @@ async fn switch_model_without_a_model_uses_the_escalation_model() {
     harness.send(RepairCommand::SwitchModel {
         session_id: ROOT.to_owned(),
         model: String::new(),
+        reply: None,
     });
 
     wait_for_model(&harness.store, ROOT, "beta").await;
@@ -579,12 +644,14 @@ async fn switch_model_without_any_configured_model_changes_nothing() {
     harness.send(RepairCommand::SwitchModel {
         session_id: ROOT.to_owned(),
         model: String::new(),
+        reply: None,
     });
     // Barrier: an explicit switch on another session is applied after the
     // fallback failed on the first one.
     harness.send(RepairCommand::SwitchModel {
         session_id: OTHER.to_owned(),
         model: "test/beta".to_owned(),
+        reply: None,
     });
     wait_for_model(&harness.store, OTHER, "beta").await;
 
@@ -598,4 +665,356 @@ async fn switch_model_without_any_configured_model_changes_nothing() {
     let events = harness.sink.data("session.model.selected");
     assert_eq!(events.len(), 1, "only the explicit switch emitted an event");
     assert_eq!(events[0]["sessionID"], OTHER);
+}
+
+// ---------------------------------------------------------------------------
+// Receipts: the runtime's own verdicts, driven through `RepairChannel`.
+//
+// These assert the *producer* half of the repair contract that
+// `oc-observer/tests/repair_receipts.rs` consumes. Before the receipt landed,
+// `ChannelExecutor::apply` returned `applied: true` as soon as the command was
+// queued, so every one of these cases was reported to the observer as a repair
+// that happened.
+// ---------------------------------------------------------------------------
+
+/// A repair verdict shaped like the observer's, for one target.
+fn repair_verdict(
+    target: &str,
+    kind: oc_observer::RepairKind,
+    args: Value,
+) -> oc_observer::ObserverVerdict {
+    oc_observer::ObserverVerdict {
+        action: oc_observer::ObserverAction::Repair,
+        target: Some(target.to_owned()),
+        reason: "the target looks stuck".to_owned(),
+        message: None,
+        repair: Some(oc_observer::Repair {
+            kind: Some(kind),
+            args,
+        }),
+        goal_evidence: Vec::new(),
+    }
+}
+
+/// Assert the receipt is a refusal that names a reason.
+fn assert_refused(outcome: &RepairOutcome, because: &str) {
+    assert!(
+        !outcome.applied,
+        "a repair that did not happen must not report applied: true ({because}): {outcome:?}"
+    );
+    let detail = outcome
+        .detail
+        .as_deref()
+        .unwrap_or_else(|| panic!("a refusal must carry a reason ({because}): {outcome:?}"));
+    assert!(
+        !detail.trim().is_empty(),
+        "the refusal reason must not be blank ({because})"
+    );
+}
+
+/// R1: the exact defect from `docs/18-status.md:403-408`.
+///
+/// A `switch_model` naming a model the catalog cannot run is refused by the
+/// runtime. Before the receipt, `apply` answered `applied: true` for it while
+/// the model was correctly not persisted — the audit row and
+/// `observer.repaired` overstated success.
+#[tokio::test]
+async fn r1_a_catalog_unknown_switch_model_receipt_is_not_applied() {
+    let harness =
+        Harness::with_receipts(json!({"observer": {"escalation_model": "test/alpha"}})).await;
+
+    let outcome = harness
+        .apply(&repair_verdict(
+            ROOT,
+            oc_observer::RepairKind::SwitchModel,
+            json!({"model": "test/ghost"}),
+        ))
+        .await
+        .expect("the runtime answers a refusal, not an absent answer");
+
+    assert_refused(&outcome, "catalog-unknown model");
+    assert!(
+        outcome
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("not in the catalog")),
+        "the refusal must name the catalog rejection: {outcome:?}"
+    );
+    // The model was already correctly not persisted; the point is that the
+    // receipt now agrees with that.
+    let row = harness
+        .store
+        .get_session(ROOT)
+        .await
+        .expect("session")
+        .expect("root");
+    assert_eq!(row["model"]["id"], "alpha");
+}
+
+/// R2: `cancel_tool` with nothing to cancel.
+///
+/// The worker used to log the zero count and return success; the receipt must
+/// be `applied: false`.
+#[tokio::test]
+async fn r2_a_cancel_tool_that_cancelled_nothing_is_not_applied() {
+    let harness = Harness::with_receipts(json!({})).await;
+
+    let outcome = harness
+        .apply(&repair_verdict(
+            "call_never_started",
+            oc_observer::RepairKind::CancelTool,
+            json!({}),
+        ))
+        .await
+        .expect("the runtime answers a refusal");
+
+    assert_refused(&outcome, "nothing to cancel");
+    assert!(
+        outcome
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("found no running tool call")),
+        "the refusal must say no tool call matched: {outcome:?}"
+    );
+}
+
+/// R3a: `restart_subagent` on a child with no user prompt to replay.
+#[tokio::test]
+async fn r3a_a_restart_subagent_without_a_prompt_is_not_applied() {
+    let harness = Harness::with_receipts(json!({})).await;
+    let child = create_child(&harness, ROOT, "ses_receipt_child", ".").await;
+
+    let outcome = harness
+        .apply(&repair_verdict(
+            &child,
+            oc_observer::RepairKind::RestartSubagent,
+            json!({"note": "the child stalled"}),
+        ))
+        .await
+        .expect("the runtime answers a refusal");
+
+    assert_refused(&outcome, "no prompt to replay");
+    assert!(
+        outcome
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("no user prompt to replay")),
+        "the refusal must say why the restart was skipped: {outcome:?}"
+    );
+}
+
+/// R3b: `repost` with nothing to re-deliver.
+#[tokio::test]
+async fn r3b_a_repost_without_a_prompt_is_not_applied() {
+    let harness = Harness::with_receipts(json!({})).await;
+
+    let outcome = harness
+        .apply(&repair_verdict(
+            ROOT,
+            oc_observer::RepairKind::Repost,
+            json!({}),
+        ))
+        .await
+        .expect("the runtime answers a refusal");
+
+    assert_refused(&outcome, "no prompt to re-deliver");
+    assert!(
+        outcome
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("no user prompt to re-deliver")),
+        "the refusal must say why the repost was skipped: {outcome:?}"
+    );
+}
+
+/// R3c: `repost` while the session already has pending input.
+///
+/// A different skip path from R3b — the prompt exists, but delivering it would
+/// duplicate queued work.
+#[tokio::test]
+async fn r3c_a_repost_with_pending_input_is_not_applied() {
+    let harness = Harness::with_receipts(json!({})).await;
+    append_user(&harness, ROOT, "msg_receipt_pending", "latest prompt").await;
+    enqueue_user(&harness, ROOT, "already waiting").await;
+
+    let outcome = harness
+        .apply(&repair_verdict(
+            ROOT,
+            oc_observer::RepairKind::Repost,
+            json!({}),
+        ))
+        .await
+        .expect("the runtime answers a refusal");
+
+    assert_refused(&outcome, "pending input");
+    assert!(
+        outcome
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("already has pending input")),
+        "the refusal must say the session is not idle: {outcome:?}"
+    );
+}
+
+/// R4: a repair the runtime really performs still reports success.
+///
+/// `switch_model` to a catalog model is applied synchronously — the session row
+/// is patched and `session.model.selected` is published — so the receipt must
+/// stay `applied: true` and be backed by that committed state.
+#[tokio::test]
+async fn r4_an_applied_switch_model_still_reports_success() {
+    let harness = Harness::with_receipts(json!({})).await;
+
+    let outcome = harness
+        .apply(&repair_verdict(
+            ROOT,
+            oc_observer::RepairKind::SwitchModel,
+            json!({"model": "test/beta"}),
+        ))
+        .await
+        .expect("the runtime applied the switch");
+
+    assert!(
+        outcome.applied,
+        "a switch the runtime performed must report success: {outcome:?}"
+    );
+    assert!(
+        outcome
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("switched") && detail.contains("test/beta")),
+        "the success detail must name the switch: {outcome:?}"
+    );
+    wait_for_model(&harness.store, ROOT, "beta").await;
+    assert_eq!(
+        harness.sink.count("session.model.selected"),
+        1,
+        "the success receipt must be backed by the published event"
+    );
+}
+
+/// R4b: a queued compaction is still a success, and a duplicate is refused.
+///
+/// The runtime owns the durable `compaction` inbox row and the wake-up, so
+/// queueing one is a real repair; a second request while the first is queued
+/// cannot do anything and must be refused.
+#[tokio::test]
+async fn r4b_a_queued_compaction_is_applied_and_a_duplicate_is_not() {
+    let harness = Harness::with_receipts(json!({})).await;
+    // Pre-queue a compaction row without waking the actor, so the guard is
+    // observable instead of racing the runner.
+    harness
+        .store
+        .enqueue(NewInbox {
+            id: MessageId::new().into_inner(),
+            session_id: ROOT.to_owned(),
+            kind: "compaction".to_owned(),
+            payload: json!({"status": "pending", "reason": "observer"}),
+            delivery: Delivery::Queue,
+        })
+        .await
+        .expect("compaction row");
+
+    let outcome = harness
+        .apply(&repair_verdict(
+            ROOT,
+            oc_observer::RepairKind::CompactContext,
+            json!({}),
+        ))
+        .await
+        .expect("the runtime answers a refusal");
+
+    assert_refused(&outcome, "a compaction is already queued");
+    let queued = harness
+        .store
+        .list_inbox(ROOT)
+        .await
+        .expect("inbox")
+        .iter()
+        .filter(|row| row.get("type").and_then(Value::as_str) == Some("compaction"))
+        .count();
+    assert_eq!(queued, 1, "the refusal must not queue a second compaction");
+}
+
+/// R5: a consumer that drops the receipt without answering is a failure.
+///
+/// The receiver is dropped before the worker can answer, so `apply` must return
+/// `Err` — never a fabricated `applied: true`.
+#[tokio::test]
+async fn r5_a_dropped_receipt_is_an_executor_error() {
+    let (executor, mut repairs) = oc_runtime::RepairChannel::new();
+    // Stand in for a worker that dequeues and dies: drop every receipt.
+    let drain = tokio::spawn(async move {
+        while let Some(mut command) = repairs.recv().await {
+            drop(command.take_reply());
+        }
+    });
+
+    let outcome = executor
+        .apply(&repair_verdict(
+            ROOT,
+            oc_observer::RepairKind::CancelTool,
+            json!({"tool": "hang_probe"}),
+        ))
+        .await;
+
+    drain.abort();
+    let error = outcome.expect_err("a receipt that never arrives must not be a success");
+    assert!(
+        matches!(error, ObserverError::Executor(_)),
+        "a dropped receipt must surface as Executor: {error:?}"
+    );
+    assert!(
+        error.to_string().contains("without answering"),
+        "the error must say the worker never answered: {error}"
+    );
+}
+
+/// R5b: no worker at all (receiver dropped up front) is an executor error too.
+#[tokio::test]
+async fn r5b_a_stopped_worker_is_an_executor_error() {
+    let (executor, repairs) = oc_runtime::RepairChannel::new();
+    drop(repairs);
+
+    let outcome = executor
+        .apply(&repair_verdict(
+            ROOT,
+            oc_observer::RepairKind::CompactContext,
+            json!({}),
+        ))
+        .await;
+
+    let error = outcome.expect_err("a stopped worker cannot have applied a repair");
+    assert!(
+        error.to_string().contains("worker is stopped"),
+        "the error must say the worker is gone: {error}"
+    );
+}
+
+/// R6: `request_budget_extension` answers with the grant, not the request.
+///
+/// A session with no running turn cannot be extended, so the receipt is a
+/// refusal naming that — previously the executor's short-circuit answered
+/// `applied: true` with `detail: "budget_request"` for every request.
+#[tokio::test]
+async fn r6_a_budget_extension_without_a_running_turn_is_not_applied() {
+    let harness = Harness::with_receipts(json!({})).await;
+
+    let outcome = harness
+        .apply(&repair_verdict(
+            ROOT,
+            oc_observer::RepairKind::RequestBudgetExtension,
+            json!({"steps": 5}),
+        ))
+        .await
+        .expect("the runtime answers a refusal");
+
+    assert_refused(&outcome, "no running turn to extend");
+    assert!(
+        outcome
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("no running turn")),
+        "the refusal must name the missing turn: {outcome:?}"
+    );
 }

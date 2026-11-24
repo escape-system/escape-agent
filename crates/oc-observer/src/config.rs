@@ -44,6 +44,13 @@ pub struct ObserverConfig {
     pub budget_window_ms: i64,
     /// Minimum gap between `observer.unavailable` notices per root.
     pub unavailable_notice_interval_ms: i64,
+    /// How long a repair waits for the host's receipt before it is reported as
+    /// unconfirmed. `0` waits forever (a host that implements
+    /// [`crate::RepairExecutor`]'s contract always answers).
+    ///
+    /// A repair is never reported as performed because this deadline passed:
+    /// the outcome is "unknown", which is published as a failure.
+    pub repair_ack_timeout_ms: i64,
 }
 
 impl Default for ObserverConfig {
@@ -66,6 +73,7 @@ impl Default for ObserverConfig {
             compact_cooldown_ms: 600_000,
             budget_window_ms: 600_000,
             unavailable_notice_interval_ms: 300_000,
+            repair_ack_timeout_ms: 5_000,
         }
     }
 }

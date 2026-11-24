@@ -127,7 +127,7 @@ memory block (ours) → goal block (ours) → per-session entries
   store persists it for `interrupted` outcomes and for step-limit markers,
   whatever outcome records them; every other row keeps it `NULL` (`docs/03`).
   A turn that reaches its step budget is evaluated once against its in-memory
-  tool evidence before it is allowed to end ([24](24-step-budget.md)). The
+  tool evidence before it is allowed to end ([29](29-step-budget.md)). The
   evaluation is a pure function: no model call, no IO, no clock. A turn showing
   recent progress may receive a bounded extension, published as the durable
   `session.execution.step_extended`; otherwise it ends exactly as before with
@@ -138,7 +138,9 @@ memory block (ours) → goal block (ours) → per-session entries
 - Overflow before any output → one compaction recovery per step.
 - Transport failure with `retry-full` and no output → one fresh-transport retry.
 - Provider retries: exponential 2 s → 10 s, 10 attempts, jitter, honor
-  `retry-after` ≤ 15 min; transport timeout capped at 3 retries.
+  `retry-after` as a **floor**, capped at 60 s (`RetryPolicy::max_retry_after`,
+  was 15 min; see [17](17-interfaces.md#oc-llm)); transport timeout capped at
+  3 retries.
 - Timeouts: header 300 s, chunk 900 s (configurable per provider).
 
 ## Guards and finalization (Hermes Agent ports)

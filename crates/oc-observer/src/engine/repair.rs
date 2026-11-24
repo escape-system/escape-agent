@@ -1,12 +1,14 @@
 //! Repair reservation (budget) plus validation and execution of one repair.
 
+use std::time::Duration;
+
 use crate::input::TreeRow;
 use crate::registry::StripState;
 use crate::verdict::{ObserverVerdict, RepairKind};
 
 use super::ObserverEngine;
 use super::budget::budget_from;
-use super::notice::{ObserverNotice, ObserverRun};
+use super::notice::{ObserverNotice, ObserverRun, RepairOutcome};
 use super::state::prune_all;
 
 enum Reserve {
@@ -21,7 +23,89 @@ enum Reserve {
     },
 }
 
+/// What the host said about one repair.
+///
+/// A repair is only [`Receipt::Applied`] when the host confirmed it performed
+/// the command. Absence of an answer is [`Receipt::Unconfirmed`] — never
+/// success, because a success reported without a receipt is exactly the
+/// defect this type exists to remove.
+enum Receipt {
+    /// The host performed the repair.
+    Applied(RepairOutcome),
+    /// The host answered and refused (catalog-unknown model, nothing to
+    /// cancel, …).
+    Refused(String),
+    /// The host gave no usable answer: executor error, dropped reply channel
+    /// or a receipt that never arrived inside `repair_ack_timeout_ms`.
+    Unconfirmed(String),
+}
+
 impl ObserverEngine {
+    /// Ask the host to apply the repair and wait for its receipt.
+    ///
+    /// The wait is bounded by [`crate::ObserverConfig::repair_ack_timeout_ms`]
+    /// so a host that never answers cannot hang the observer tick, and it can
+    /// never be mistaken for success.
+    async fn repair_receipt(&self, verdict: &ObserverVerdict) -> Receipt {
+        let answer = self.executor.apply(verdict);
+        let timeout_ms = self.cfg.repair_ack_timeout_ms;
+        let answer = if timeout_ms > 0 {
+            let budget = Duration::from_millis(u64::try_from(timeout_ms).unwrap_or(u64::MAX));
+            match tokio::time::timeout(budget, answer).await {
+                Ok(answer) => answer,
+                Err(_elapsed) => {
+                    return Receipt::Unconfirmed(format!(
+                        "repair receipt timed out after {timeout_ms} ms; \
+                         the host never confirmed the repair"
+                    ));
+                }
+            }
+        } else {
+            answer.await
+        };
+        match answer {
+            Ok(outcome) if outcome.applied => Receipt::Applied(outcome),
+            Ok(outcome) => Receipt::Refused(outcome.detail.unwrap_or_else(|| {
+                "the host did not apply the repair and gave no reason".to_owned()
+            })),
+            Err(error) => Receipt::Unconfirmed(error.to_string()),
+        }
+    }
+
+    /// Return a reservation for a repair that was never performed.
+    ///
+    /// An unsupported or unanswered executor must not drain the budget and
+    /// escalate the root on its own, and a repair that did not happen must not
+    /// leave a compaction cooldown behind.
+    fn release_reservation(&self, root_id: &str, target: &str, kind: RepairKind, now: i64) {
+        self.with_root(root_id, |state| {
+            if let Some(position) = state.repairs.iter().rposition(|at| *at == now) {
+                state.repairs.remove(position);
+            }
+            if let Some(repairs) = state.target_repairs.get_mut(target)
+                && let Some(position) = repairs.iter().rposition(|at| *at == now)
+            {
+                repairs.remove(position);
+            }
+            if kind == RepairKind::CompactContext {
+                state.compacts.remove(target);
+            }
+        });
+    }
+
+    /// Drop the compaction cooldown for a compaction the host refused.
+    ///
+    /// The attempt stays charged (a repair the host will never accept must run
+    /// out of budget instead of being re-proposed on every tick), but nothing
+    /// was compacted, so the next real compaction must not be blocked.
+    fn clear_compact_cooldown(&self, root_id: &str, target: &str, kind: RepairKind) {
+        if kind == RepairKind::CompactContext {
+            self.with_root(root_id, |state| {
+                state.compacts.remove(target);
+            });
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
     pub(super) async fn apply_repair(
         &self,
@@ -102,8 +186,11 @@ impl ObserverEngine {
             }
         };
 
-        match self.executor.apply(verdict).await {
-            Ok(outcome) => {
+        match self.repair_receipt(verdict).await {
+            // The host confirmed it performed the repair: only now may the
+            // audit row and `observer.repaired` be published, because the host
+            // notifier writes them from this notice.
+            Receipt::Applied(outcome) => {
                 self.notifier.notify(ObserverNotice::Repaired {
                     root_id: root_id.to_owned(),
                     target,
@@ -117,24 +204,29 @@ impl ObserverEngine {
                     outcome,
                 }
             }
-            Err(error) => {
-                // Nothing was repaired, so the reservation is returned: an
-                // unsupported or failing executor must not drain the budget
-                // and escalate the root on its own.
-                self.with_root(root_id, |state| {
-                    if let Some(position) = state.repairs.iter().rposition(|at| *at == now) {
-                        state.repairs.remove(position);
-                    }
-                    if let Some(repairs) = state.target_repairs.get_mut(&target)
-                        && let Some(position) = repairs.iter().rposition(|at| *at == now)
-                    {
-                        repairs.remove(position);
-                    }
-                    if kind == RepairKind::CompactContext {
-                        state.compacts.remove(&target);
-                    }
+            // The host answered and refused. The attempt is still charged: a
+            // permanently impossible repair (for example a model the catalog
+            // cannot run) must run out of budget and escalate instead of being
+            // proposed on every tick forever. Nothing is published as repaired.
+            Receipt::Refused(reason) => {
+                // Nothing was compacted, so do not hold the cooldown.
+                self.clear_compact_cooldown(root_id, &target, kind);
+                self.notifier.notify(ObserverNotice::RepairFailed {
+                    root_id: root_id.to_owned(),
+                    target,
+                    kind,
+                    reason: reason.clone(),
                 });
-                let reason = error.to_string();
+                ObserverRun::Rejected {
+                    action: verdict.action,
+                    reason,
+                }
+            }
+            // No usable answer. Nothing was repaired and the reserve is
+            // returned, so an unavailable host cannot escalate the root on its
+            // own. This is reported as a failure, never as a repair.
+            Receipt::Unconfirmed(reason) => {
+                self.release_reservation(root_id, &target, kind, now);
                 self.notifier.notify(ObserverNotice::RepairFailed {
                     root_id: root_id.to_owned(),
                     target,

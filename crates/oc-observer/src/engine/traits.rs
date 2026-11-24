@@ -24,6 +24,26 @@ pub trait ObserverModel: Send + Sync {
 }
 
 /// Host-side execution of a validated repair command.
+///
+/// # Receipt contract
+///
+/// The future must not resolve until the host knows whether the repair was
+/// performed:
+///
+/// - [`RepairOutcome::applied`] `= true` means the repair happened. Only then
+///   does the engine publish `observer.repaired` (and the host write the
+///   `observer_repair` audit row).
+/// - `applied = false` means the host refused (unknown model, nothing to
+///   cancel, unimplemented kind, …). [`RepairOutcome::detail`] carries the
+///   reason. The engine publishes `ObserverNotice::RepairFailed` instead.
+/// - `Err(ObserverError::Executor)` means the attempt failed or cannot be
+///   implemented; the reason is published as a failure.
+///
+/// The engine bounds the wait with
+/// [`crate::ObserverConfig::repair_ack_timeout_ms`]; a future that has not
+/// resolved by then is treated as **unconfirmed**, which is a failure. A host
+/// that queues the command and resolves immediately is therefore no longer
+/// able to publish a success it cannot back up.
 pub trait RepairExecutor: Send + Sync {
     /// Apply the repair (re-run a tool, restart a child, compact, …).
     fn apply<'a>(

@@ -136,6 +136,45 @@ async fn slow() -> Response {
     sse(vec!["data: [DONE]\n\n".to_string()])
 }
 
+/// A canned failure response. `retry_after` is optional so the "no hint" case
+/// is byte-identical to a provider that omits `Retry-After`.
+fn canned(status: StatusCode, retry_after: Option<&'static str>) -> Response {
+    let mut response = Response::builder().status(status);
+    if let Some(value) = retry_after {
+        response = response.header(header::RETRY_AFTER, value);
+    }
+    response
+        .body(Body::from("canned failure"))
+        .expect("response")
+}
+
+async fn retry_hint_28() -> Response {
+    canned(StatusCode::TOO_MANY_REQUESTS, Some("28"))
+}
+
+async fn retry_hint_none() -> Response {
+    canned(StatusCode::SERVICE_UNAVAILABLE, None)
+}
+
+async fn retry_hint_banana() -> Response {
+    canned(StatusCode::TOO_MANY_REQUESTS, Some("banana"))
+}
+
+async fn retry_hint_absurd() -> Response {
+    canned(StatusCode::SERVICE_UNAVAILABLE, Some("100000"))
+}
+
+async fn retry_hint_date() -> Response {
+    canned(
+        StatusCode::SERVICE_UNAVAILABLE,
+        Some("Thu, 01 Jan 2099 00:00:00 GMT"),
+    )
+}
+
+async fn retry_hint_400() -> Response {
+    canned(StatusCode::BAD_REQUEST, Some("28"))
+}
+
 async fn stall() -> Response {
     let first = stream::iter(vec![Ok::<Bytes, Infallible>(Bytes::from(
         "data: {\"choices\":[{\"delta\":{\"content\":\"start\"}}]}\n\n",
@@ -165,6 +204,12 @@ async fn spawn() -> (String, tokio::task::JoinHandle<()>, Arc<Fake>) {
         .route("/slow/chat/completions", post(slow))
         .route("/stall/chat/completions", post(stall))
         .route("/bad/chat/completions", post(malformed))
+        .route("/hint28/chat/completions", post(retry_hint_28))
+        .route("/noheader/chat/completions", post(retry_hint_none))
+        .route("/banana/chat/completions", post(retry_hint_banana))
+        .route("/absurd/chat/completions", post(retry_hint_absurd))
+        .route("/date/chat/completions", post(retry_hint_date))
+        .route("/badreq/chat/completions", post(retry_hint_400))
         .with_state(fake.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -465,4 +510,111 @@ async fn total_timeout_closes_stream() {
         event,
         LlmEvent::ProviderError { message } if message.contains("total timeout")
     )));
+}
+
+/// A one-attempt policy: the client surfaces the error before any wait, so the
+/// test asserts on the computed delay instead of sleeping 28 s.
+fn no_retry() -> RetryPolicy {
+    RetryPolicy::fixed(Duration::from_millis(1), Duration::from_millis(2), 1)
+}
+
+/// `LlmStream` is not `Debug`, so `expect_err` cannot be used on it.
+async fn stream_error(client: &LlmClient, request: LlmRequest) -> oc_llm::LlmError {
+    match client.stream(request).await {
+        Ok(_) => panic!("expected the request to fail"),
+        Err(error) => error,
+    }
+}
+
+/// Test A: `Retry-After: 28` reaches the retry decision and yields >= 28 s.
+#[tokio::test(flavor = "multi_thread")]
+async fn retry_after_header_reaches_the_retry_decision() {
+    let (base, server, _) = spawn().await;
+    let client = LlmClient::new().unwrap().with_retry_policy(no_retry());
+    let error = stream_error(&client, request("test/alpha", format!("{base}/hint28"))).await;
+    server.abort();
+    assert!(error.is_retryable(), "{error}");
+    assert_eq!(error.retry_after_ms(), Some(28_000), "{error}");
+    let delay = client
+        .retry_policy()
+        .delay(1, error.retry_after_ms().map(Duration::from_millis));
+    assert!(delay >= Duration::from_secs(28), "{delay:?}");
+}
+
+/// Test B: a 503 without `Retry-After` carries no hint and falls back to
+/// exponential backoff.
+#[tokio::test(flavor = "multi_thread")]
+async fn missing_retry_after_header_yields_no_hint() {
+    let (base, server, _) = spawn().await;
+    let client = LlmClient::new().unwrap().with_retry_policy(no_retry());
+    let error = stream_error(&client, request("test/alpha", format!("{base}/noheader"))).await;
+    server.abort();
+    assert_eq!(error.retry_after_ms(), None, "{error}");
+    assert!(error.is_retryable(), "{error}");
+    assert_eq!(
+        client.retry_policy().delay(1, None),
+        Duration::from_millis(1)
+    );
+}
+
+/// Test C: `Retry-After: banana` is ignored, not zero, and does not panic.
+#[tokio::test(flavor = "multi_thread")]
+async fn malformed_retry_after_header_is_ignored_over_http() {
+    let (base, server, _) = spawn().await;
+    let client = LlmClient::new().unwrap().with_retry_policy(no_retry());
+    let error = stream_error(&client, request("test/alpha", format!("{base}/banana"))).await;
+    server.abort();
+    assert_eq!(error.retry_after_ms(), None, "{error}");
+    assert!(error.is_retryable(), "{error}");
+}
+
+/// Test D: `Retry-After: 100000` is parsed and then clamped to the 60 s cap.
+#[tokio::test(flavor = "multi_thread")]
+async fn absurd_retry_after_header_is_clamped_over_http() {
+    let (base, server, _) = spawn().await;
+    let client = LlmClient::new().unwrap().with_retry_policy(no_retry());
+    let error = stream_error(&client, request("test/alpha", format!("{base}/absurd"))).await;
+    server.abort();
+    assert_eq!(error.retry_after_ms(), Some(100_000_000), "{error}");
+    let delay = client
+        .retry_policy()
+        .delay(1, error.retry_after_ms().map(Duration::from_millis));
+    assert_eq!(delay, Duration::from_secs(60), "{delay:?}");
+}
+
+/// Test E: the HTTP-date form parses end to end and stays bounded by the cap.
+#[tokio::test(flavor = "multi_thread")]
+async fn http_date_retry_after_parses_over_http() {
+    let (base, server, _) = spawn().await;
+    let client = LlmClient::new().unwrap().with_retry_policy(no_retry());
+    let error = stream_error(&client, request("test/alpha", format!("{base}/date"))).await;
+    server.abort();
+    let hint = error
+        .retry_after_ms()
+        .unwrap_or_else(|| panic!("HTTP-date hint missing: {error}"));
+    assert!(hint > 60_000, "{hint} ms");
+    let delay = client
+        .retry_policy()
+        .delay(1, Some(Duration::from_millis(hint)));
+    assert_eq!(delay, Duration::from_secs(60), "{delay:?}");
+}
+
+/// Retryability classification is unchanged: a 400 is returned at once even
+/// when the server attaches a hint.
+#[tokio::test(flavor = "multi_thread")]
+async fn non_retryable_failure_is_returned_immediately() {
+    let (base, server, _) = spawn().await;
+    let client = LlmClient::new()
+        .unwrap()
+        .with_retry_policy(RetryPolicy::fixed(
+            Duration::from_millis(1),
+            Duration::from_millis(2),
+            10,
+        ));
+    let started = Instant::now();
+    let error = stream_error(&client, request("test/alpha", format!("{base}/badreq"))).await;
+    let elapsed = started.elapsed();
+    server.abort();
+    assert!(!error.is_retryable(), "{error}");
+    assert!(elapsed < Duration::from_secs(1), "{elapsed:?}");
 }

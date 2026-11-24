@@ -15,7 +15,11 @@ This document provides the technical status, architectural verification logs, an
 
 ## Snapshot
 
-**CI Gates are green.** `cargo fmt --all --check` and `cargo clippy --workspace --all-targets -- -D warnings` pass cleanly. This document records no workspace test total: run `cargo test --workspace` for the current count, which covers unit, integration, and end-to-end scenarios.
+**CI Gates are green.** `cargo fmt --all --check` and `cargo clippy --workspace --all-targets -- -D warnings` pass cleanly. This document records no current workspace test total: run `cargo test --workspace`
+for that, which covers unit, integration, and end-to-end scenarios. Historical
+per-wave snapshots do appear below, each with the date it was taken; they come
+from different commits, two of them disagree with each other, and none is a
+measurement of the current tree.
 
 The codebase adheres to strict modularity: large source and test files exceeding 1,000 lines were split into cohesive submodules behind clean facades, preserving public APIs, serde wire shapes, routes, and error envelopes (see [17 — Interfaces](17-interfaces.md#module-layout-oversized-file-split)).
 
@@ -27,14 +31,14 @@ Smoke verification passes on isolated ports and databases across core surfaces: 
 
 | Area | State |
 |---|---|
-| Workspace | 18 crates, edition 2024, `rust-version 1.90`; fmt/clippy clean, snapshot for this wave: 1232 passed (3 ignored doctests) / 91 test binaries / 0 failed, `oc-cli` builds |
+| Workspace | 18 crates, edition 2024, `rust-version 1.90`; fmt/clippy clean; last recorded snapshot (2026-11-14): 1232 passed (3 ignored doctests) / 91 test binaries / 0 failed — historical, not a current measurement; `oc-cli` builds |
 | `oc-types` | full wire model (session/message/inbox/permission/agent/file/config/location/info/error) + typed event payloads (`SessionViewed` included; fork/form/instruction/skill payloads are typed locally in the runtime/server) |
 | `oc-store` | SQLite WAL, writer thread + 4-connection read pool, sessions/messages/inbox/events, dense-seq projection, memory FTS, goals/observations/repairs, subagent tree, forms, schedules, snapshots, instruction entries, saved permissions, lane tickets, credentials, worktrees, projects; migrations `0001`–`0010`; `register_project` upserts the `LocationRef` project on `GET /api/location` |
 | `oc-store` (context boxes) | migration `0011_context_box` adds `context_box` keyed `(root_id, key)`: create-or-update writes with in-transaction append, soft delete, `stable`/`temporary` kinds, `time_expired` audit stamp with revival, revision bumping, paging; a deleted row is recreated with `revision = 1`. Six store tests (`crates/oc-store/tests/store_ext/boxes.rs`): tree sharing, revision/append, validation, expiry/revival, delete/recreate, paging. Store suite 21/21 |
 | `oc-config` | discovery/JSONC/V1 aliases, agents, permissions, skills, commands, AGENTS.md, rescan; the `explore` subagent can read-only `code_map` (`allow("code_map","*")`, `crates/oc-config/src/agents.rs:294`; regression `explore_toolset_allows_read_only_code_map_and_still_denies_edits`, `crates/oc-config/tests/config.rs:543`); 37 tests |
 | `oc-llm` | embedded models.dev snapshot, catalog/resolve/overlay (`upsert_provider`/`upsert_provider_models`), `LlmTransportHook` on `SharedLlmClient`/`LlmClient`, OpenAI/Anthropic/Gemini streaming, retries |
 | `oc-antigravity` | Native Google Antigravity OAuth 2.0 + PKCE + loopback listener (`127.0.0.1:51121`) / manual code fallback, single-flight token refresh + rotation, Cloud Code Assist onboarding (`loadCodeAssist`/`onboardUser`), V4 `antigravity-accounts.json` + V1–V3 migration, sticky/round-robin/hybrid rotation with health score & token bucket, dual quota pool & live model discovery, 4-phase schema cleaning + `to_gemini_schema`, cross-model & Claude transforms, thinking signature cache, Cloud Code SSE gateway (`LlmTransportHook`: in-band `RESOURCE_EXHAUSTED`/quota SSE frames and HTTP 429s rotate to the next account instead of failing the turn, variant-insensitive per-family quota keys, typed all-cooling errors), `GoogleSearchTool` (`google_search`); 50 tests |
-| `oc-runtime` | session actors, turn loop, tools + permissions, armed threshold compaction (`compaction.auto` defaults **false**, but the guard is armed when `auto` is true **or** `compaction.ceiling_tokens` is set and fires above `ceiling − buffer`; the internal reason is `guard` when `auto` is off and the wire reason stays `auto`; overflow recovery and manual `/compact`/`compact_context` unchanged; ceiling is `context_window − max(15%, 16k)` with `compaction.ceiling_tokens` able only to lower it; manual inbox `compaction` rows write `reason:"manual"` and a failed inbox delete stops the actor instead of re-dispatching), step budget (`session.execution.step_limit` v1 `{sessionID, steps}`, published after `session.execution.succeeded` and never as a terminal; parent metadata carries `stepLimit`/`steps`), `BoxTools` (`box_list`/`box_read`/`box_write`/`box_delete`/`compact_context`) with `box:read`/`box:write` mappings and key resources, `oc/boxes` prompt index pinned per actor epoch with tail supplements, temporary-box expiry after the `completed` row commits, mid-turn `steer` promotion at step boundaries (repost waits for idle; `switch_model` rejects a catalog-unknown target), cancellation/recovery, memory, observer strips, `ContextPressure`/`context_pressure()` with the host-side compaction adviser (`observer.advised`; the adviser lives in `oc-runtime`, not `oc-observer`), subagents (nested spawn for `general`, digest scoped to the caller's subtree with the child's full final answer and raw-answer cache honoring each caller's token budget, bounded watcher that cancels on timeout and delivers failed/timeout exactly once, parent cancellation interrupts a foreground child through `ToolContext.cancel`), `ToolProvider`, `GoalTools`/`SkillTools`/`LaneTools`, `ProcessLaneRunner`, lane events, pre-write snapshots, stored-credential key injection (active first, then any; per-provider key rotation inside one model attempt — `stream_model_attempts` retries the *same* model on the next key, `MAX_KEY_ATTEMPTS = 8`, publishes no `session.model.fallback`, and advances the chain only once the pool is spent; compaction cools a key without rotating); actor `Err` finalization: a drain-loop error repairs the rows the dead turn left open and then publishes `session.idle` + `session.execution.failed` through a per-item `TerminalState` guard so a settle that already ran is not duplicated, and the actor retires from the map and respawns when durable input is already waiting (`crates/oc-runtime/src/runtime/actor.rs:185`); regressions `actor_error_publishes_one_terminal_pair_and_closes_the_rows` (`crates/oc-runtime/tests/runtime/actor_error_terminal.rs`) and `crates/oc-runtime/tests/runtime/context_boxes.rs` (5 tests: tree sharing, `compact_context` enqueue, explore read-only / write-only agent, two-compaction survival with temporary expiry, cache-stable prefix with tail supplement); 91 runtime-scenario tests + 68 lib tests |
+| `oc-runtime` | session actors, turn loop, tools + permissions, armed threshold compaction (`compaction.auto` defaults **false**, but the guard is armed when `auto` is true **or** `compaction.ceiling_tokens` is set and fires above `ceiling − buffer`; the internal reason is `guard` when `auto` is off and the wire reason stays `auto`; overflow recovery and manual `/compact`/`compact_context` unchanged; ceiling is `context_window − max(15%, 16k)` with `compaction.ceiling_tokens` able only to lower it; manual inbox `compaction` rows write `reason:"manual"` and a failed inbox delete stops the actor instead of re-dispatching), step budget (`session.execution.step_limit` v1 `{sessionID, steps}`, published after `session.execution.succeeded` and never as a terminal; parent metadata carries `stepLimit`/`steps`), `BoxTools` (`box_list`/`box_read`/`box_write`/`box_delete`/`compact_context`) with `box:read`/`box:write` mappings and key resources, `oc/boxes` prompt index pinned per actor epoch with tail supplements, temporary-box expiry after the `completed` row commits, mid-turn `steer` promotion at step boundaries (repost waits for idle; `switch_model` rejects a catalog-unknown target), cancellation/recovery, memory, observer strips, `ContextPressure`/`context_pressure()` with the host-side compaction adviser (`observer.advised`; the adviser lives in `oc-runtime`, not `oc-observer`), subagents (nested spawn for `general`, digest scoped to the caller's subtree with the child's full final answer and raw-answer cache honoring each caller's token budget, bounded watcher that cancels on timeout and delivers failed/timeout exactly once, parent cancellation interrupts a foreground child through `ToolContext.cancel`), `ToolProvider`, `GoalTools`/`SkillTools`/`LaneTools`, `ProcessLaneRunner`, lane events, pre-write snapshots, stored-credential key injection (active first, then any; per-provider key rotation inside one model attempt — `stream_model_attempts` retries the *same* model on the next key, `MAX_KEY_ATTEMPTS = 8`, publishes no `session.model.fallback`, and never advances the chain — `FallbackPolicy::allows` always returns `false` (`crates/oc-runtime/src/subagent/settings.rs:88-90`); compaction cools a key without rotating); actor `Err` finalization: a drain-loop error repairs the rows the dead turn left open and then publishes `session.idle` + `session.execution.failed` through a per-item `TerminalState` guard so a settle that already ran is not duplicated, and the actor retires from the map and respawns when durable input is already waiting (`crates/oc-runtime/src/runtime/actor.rs:185`); regressions `actor_error_publishes_one_terminal_pair_and_closes_the_rows` (`crates/oc-runtime/tests/runtime/actor_error_terminal.rs`) and `crates/oc-runtime/tests/runtime/context_boxes.rs` (5 tests: tree sharing, `compact_context` enqueue, explore read-only / write-only agent, two-compaction survival with temporary expiry, cache-stable prefix with tail supplement); 91 runtime-scenario tests + 68 lib tests |
 | `oc-tools` | `code_map`, `read`, `write`, `edit`, `patch`, `glob`, `grep`, `shell`, `todowrite`, `webfetch`, `websearch` (72 tests); registry merge, `&str` names; `ToolContext.cancel` (`CancellationToken`) lets long-running tools stop detached helpers when the execution is interrupted; `code_map` `map` delegates to ripwire whenever the binary is found (mode-dependent argv: empty query `--max-tokens`/`--top-k`, query `--for`/`--token-budget`), captures stderr into `metadata.ripwire_stderr`, enforces a 30 s timeout (`OPENCODE_RIPWIRE_TIMEOUT_MS`) as a hard error, and discovers `RIPWIRE_PATH` → `$HOME/.local/bin/ripwire` → `PATH` requiring a regular executable file (`crates/oc-tools/src/code_map.rs`); hermetic delegation tests in `crates/oc-tools/tests/code_map_ripwire.rs` |
 | `oc-observer` | registry, terse input, strict verdicts, budgets, goal state machine, repairs; judge credentials resolved per request from the credential store or provider env (declared-but-unset env no longer disables it), failures publish `observer.unavailable`; goal verdicts persist to the store before `goal.updated`; switch_model falls back to `observer.escalation_model`, repost replays the last user prompt (with a pending-input guard), restart_subagent re-enqueues the original child prompt; the context-pressure adviser is host-side in `oc-runtime` (`observer/advice.rs`), not in this crate |
 | `oc-subagents` | session-tree policy, spawn limits, sibling/coordinator scope, write policy, model chain, budgets |
@@ -107,7 +111,7 @@ workspace total, and this document keeps no workspace total of its own.
 
 ### Wave: code_map graph engine (lazy ripwire MCP pool + cached native index)
 
-Workspace test suite in this wave: **1,140 passed, 0 failed, 3 ignored**
+Workspace test suite in that wave (snapshot 2026-11-13): **1,140 passed, 0 failed, 3 ignored**
 (1,137 unit/integration + 3 doctests passed; 3 pre-existing doctests ignored).
 
 - **`oc-tools` (`crates/oc-tools/src/code_map/`)**: Expanded `code_map` from 4
@@ -370,10 +374,76 @@ and the 4096 server were not modified except for read-only UI checks.
   Console noise is limited to the upstream goal RPC (404) and worktree refresh
   on non-git dirs.
 - **Route matrix**: every documented route group answered truthfully; the
-  remaining gaps 1–7 returned `501`/`503`/404 rather than faking success.
+  remaining gaps 1–8 returned `501`/`503`/404 rather than faking success.
   Docs corrected for pending-only form lists, required `projectID` on
   `GET /api/worktree`, and OAuth/command connect returning `400` for unknown
   catalog methods.
+
+## Hardening wave (2026-11-23)
+
+Crate-scoped verification for this wave; the workspace total above is untouched
+because no workspace-wide `cargo test` was run (parallel owners hold per-crate
+lanes).
+
+- **`oc-llm` retry defects (three, all proven before the fix).**
+  1. `parse_retry_after("1e300")` **panicked** in
+     `Duration::from_secs_f64`; now `Duration::try_from_secs_f64(..).ok()`
+     returns `None` (`crates/oc-llm/src/retry.rs:131-145`).
+  2. A past HTTP-date returned `Duration::MAX` instead of zero: the
+     `saturating_sub` clamped to `i64::MIN` and the `u64` conversion fell back
+     to `u64::MAX` (`18000000000000000000s` in the failing test). Now
+     `if seconds > now { seconds - now } else { 0 }`
+     (`crates/oc-llm/src/retry.rs:158-200`).
+  3. The provider hint was capped at 15 minutes; `Timeouts::total` is unset by
+     default, so one `stream()` could block for a quarter hour. The cap is now
+     60 s (`crates/oc-llm/src/retry.rs:37`) and the hint is a floor, not a
+     ceiling (`delay()`).
+  Five unit tests in `retry.rs` and five HTTP tests in `crates/oc-llm/tests/stream.rs`
+  (28 s honored in full, absent/malformed/absurd headers, HTTP-date, plus a
+  non-retryable guard); crate suite 83 lib + 8 catalog + 15 quota + 14 stream.
+  The premise that the header was unplumbed was wrong: it was parsed into
+  `LlmError::Http` already (`client.rs:315-347`). The ~2 s retry cadence in the
+  journal is one log per *observer tick* (`observer.tick_ms = 1000`,
+  `min_interval_ms = 2000`), a separate defect that needs `oc-runtime`.
+- **Observer repair receipts (both halves).** Engine:
+  `Receipt::{Applied,Refused,Unconfirmed}`, bounded by `repair_ack_timeout_ms`;
+  ten tests in `crates/oc-observer/tests/repair_receipts.rs`, of which three fail
+  against the unmodified engine (`4 passed; 3 failed`). Producer:
+  `RepairCommand` carries `reply: Option<RepairReply>` (a
+  `oneshot::Sender<Result<RepairOutcome, String>>`), `ChannelExecutor::apply`
+  awaits it, and `repair_worker.rs` answers with the runtime's real verdict; 17
+  tests in `crates/oc-runtime/tests/observer_repairs.rs` (`r1`–`r6`). See gap 8.
+- **Request reconstructability — landed and verified.** The payload
+  (`crates/oc-types/src/payload/request.rs`) and the emitter
+  (`crates/oc-runtime/src/turn/stream.rs:467-490`) both exist; four tests in
+  `crates/oc-runtime/tests/runtime/request_envelope.rs` prove durability, zero
+  added `session_message` rows, and replay equality. Contract:
+  [17](17-interfaces.md#event-sessionrequestenvelope-oc-types-oc-runtime).
+- **Real SIGKILL crash-recovery test: still absent.** Two separate things are
+  easy to confuse here.
+  - What *does* exist: `oc-testkit` sends a genuine `SIGKILL`
+    (`kill -KILL` on the child's process group, `harness.rs:374-386`) but only in
+    teardown (`stop`, `harness.rs:178-190`) and in one unit test that kills a
+    `sleep` (`kill_tree_terminates_process_group_children`,
+    `harness.rs:398-415`). No test kills the server and asserts recovery.
+  - `crates/oc-testkit/tests/` does not exist, and the crash-safety tests that
+    do exist inject stale rows and reopen SQLite (e.g.
+    `crates/oc-store/tests/agentic.rs:467` `agentic_rows_survive_reopen`;
+    `crash_recovery_repairs_rows_and_wakes_inbox`,
+    `crates/oc-runtime/tests/runtime/turn_core.rs:1342`;
+    `crash_recovery_settles_an_interrupted_background_child_once`,
+    `crates/oc-runtime/tests/runtime/recovery.rs:199`).
+  So `kill -9`-mid-turn recovery is exercised by a graceful `stop()`, not by a
+  hard kill, which does not satisfy the AGENTS.md rule. Reported, not faked.
+- **`session.execution.step_extended` is durable, the grant is not.** The event
+  (`crates/oc-runtime/src/turn/mod.rs:40-59`, `DURABLE = true`) says a grant
+  happened, but the grant itself lives only in the `run_steps` local
+  `let mut grants: Vec<usize>` (`crates/oc-runtime/src/turn/run.rs:99`), which is
+  never read back from the log. A restart rebuilds `cap` from `agent.steps`, so
+  the extension is lost even though its event survives; the ceiling arithmetic
+  (`budget::remaining_ceiling_with_policy(&grants, ..)`, `run.rs:128`) has no
+  replay input. [29](29-step-budget.md#durability-and-replay) documents this as
+  accepted rather than fixed. Not delivered; in flight in this wave.
 
 ## Remaining gaps (real, verified)
 
@@ -400,12 +470,30 @@ and the 4096 server were not modified except for read-only UI checks.
    spawn/turn; only an external edit of the config file needs a restart.
 7. **V1 import** — no upstream/V1 importer; `GET /api/experimental/migration/v1`
    answers `501`.
-8. **Observer repair audit precedes apply** — the CLI repair channel is
-   fire-and-forget: `RepairExecutor::apply` returns once the command is queued,
-   so the engine writes a repair row and publishes `observer.repaired` even when
-   the runtime rejects the repair (verified with a catalog-unknown
-   `switch_model`; the model is correctly not persisted, only the audit/event
-   overstate success). A reply channel on `RepairCommand` would close it.
+8. **Observer repair audit** — **CLOSED on both halves 2026-11-23.** Engine: the
+   engine waits for a receipt and publishes `observer.repaired` (and the
+   `observer_repair` row) only for `Ok(applied: true)`
+   (`crates/oc-observer/src/engine/repair.rs:49-73`). `applied: false` is a
+   refusal (`RepairFailed` notice, `ObserverRun::Rejected`); `Err` or no answer
+   within `observer.repair_ack_timeout_ms` (default 5000) is unconfirmed
+   (`RepairFailed`, `ObserverRun::Unavailable`). No answer is a failure, never a
+   success. Producer: `type RepairReply = oneshot::Sender<Result<RepairOutcome,
+   String>>` (`crates/oc-runtime/src/observer/repair.rs:16`), all seven
+   `RepairCommand` variants carry `reply: Option<RepairReply>` (`:28-90`), and
+   `ChannelExecutor::apply` (`:157-176`) sends the command, awaits the receiver,
+   and maps a dropped channel to `ObserverError::Executor` — it can no longer
+   answer `applied: true` at enqueue time. `observer_repair_loop`
+   (`crates/oc-runtime/src/observer/repair_worker.rs:200-220`) takes the receipt
+   and answers with `apply_repair_command`'s real verdict; `:226` documents that
+   every skip path returns `Ok(applied: false)`. Proven by 17 tests in
+   `crates/oc-runtime/tests/observer_repairs.rs` (`r1`–`r6` cover
+   unknown-model, nothing-cancelled, missing-prompt, dropped-receipt and
+   budget-without-turn refusals plus the confirmed success) and the 10 engine
+   tests in `crates/oc-observer/tests/repair_receipts.rs`.
+   Remaining, deliberately not invented: `RepairFailed` is still log-only in
+   `BusObserverNotifier` (no `observer.repair.failed` event and no row), so a
+   refused repair is visible in `observer/eval` rows and logs but not yet in the
+   repair audit UI.
 
 Snapshot capture is intentionally bounded, not a gap: only pre-write snapshots
 of files inside the session directory are kept, each file is capped at 5 MiB,
@@ -449,9 +537,13 @@ registered, websearch providers list is empty, usage limits are `null`, and
   (the plugin swallows it). Goals are served by `/api/experimental/goal` and the
   patched goal chip uses that route.
 - Observer `inspect` still does not generate a digest, and `retry_tool` /
-  `cancel_tool` remain typed no-ops (no per-tool cancellation token). The other
-  repair kinds now act: compact, switch_model (with escalation fallback),
-  repost (last user prompt + pending guard), restart_subagent (re-enqueue).
+  `cancel_tool` remain typed no-ops (no per-tool cancellation token); since
+  2026-11-23 a no-op or refused repair can no longer be published as
+  `observer.repaired` (see gap 8). The other repair kinds now act: compact,
+  switch_model (with escalation fallback), repost (last user prompt + pending
+  guard), restart_subagent (re-enqueue). `RepairFailed` is still log-only in
+  `BusObserverNotifier` — a refused/unconfirmed repair is visible in the
+  `observer/eval` rows and logs, not yet in the repair audit UI.
 - A subagent spawn does not publish `session.created`; the tree panel updates
   on remount/`staleTime` (30 s) rather than live.
 - `max_children_per_session` is enforced by policy plus the in-process spawn
@@ -476,7 +568,7 @@ registered, websearch providers list is empty, usage limits are `null`, and
 
 ## Code Intelligence, Partitioned Subagents & LSP Precision
 
-Verified workspace suite for this release wave: **1,155 passed, 0 failed, 3 ignored** (1,152 unit/integration + 3 doctests passed; 3 pre-existing doctests ignored; `oc-tools`: 100, `oc-runtime`: 274 + 1 doctest, `oc-config`: 42, `oc-subagents`: 22, `oc-server`: 254), expanding the earlier 12-operation `code_map` engine above to 18 operations plus atomic symbol editing:
+Verified workspace suite in that release wave (snapshot 2026-11-13, same commit `e8a2c1d6` as the 1,140 figure above; the two disagree and neither is current): **1,155 passed, 0 failed, 3 ignored** (1,152 unit/integration + 3 doctests passed; 3 pre-existing doctests ignored; `oc-tools`: 100, `oc-runtime`: 274 + 1 doctest, `oc-config`: 42, `oc-subagents`: 22, `oc-server`: 254), expanding the earlier 12-operation `code_map` engine above to 18 operations plus atomic symbol editing:
 
 - `symbol_edit` tool in `oc-tools` (`replace` | `insert_before` | `insert_after` | `preview`) via `ripwire --mcp` with pure-Rust AST-span fallback, BOM/CRLF preservation, and unified diffs in `metadata.files`; preview calls map to `read` permission and skip snapshot/mutation tracking, while edits map to `edit` permission (including `symbol_edit` → `edit` config normalization in `oc-config`).
 - Zero-noise post-edit radar (`oc_tools::code_map::collect_post_edit_radar`) and `oc_runtime::EditDiagnosticsHook` (`PostEditDiagnostics`) run on non-preview code mutations (`write`, `edit`, `patch`, `symbol_edit`) and append `<lsp_diagnostics>` / `<post_edit_radar>` only when actionable findings exist; `verify_on_stop` nudges include top radar blockers via `build_verification_nudge_with_radar`.

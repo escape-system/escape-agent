@@ -1,8 +1,12 @@
 //! Provider retry policy.
 //!
 //! Exponential 2 s → 10 s per gap, 10 attempts, optional jitter, and a
-//! provider-requested `retry-after` capped at 15 minutes. Timeout retries are
+//! provider-requested `retry-after` capped at 60 s. Timeout retries are
 //! counted separately because a timed-out attempt has already waited.
+//!
+//! A server hint is a floor, never a ceiling: the delay is
+//! `max(backoff, retry_after)`, so jitter can spread our own backoff but can
+//! never shorten the wait the provider asked for.
 
 use std::time::Duration;
 
@@ -26,7 +30,11 @@ impl Default for RetryPolicy {
             base: Duration::from_secs(2),
             max: Duration::from_secs(10),
             jitter: true,
-            max_retry_after: Duration::from_secs(15 * 60),
+            // One minute is long enough to honor every hint a live provider
+            // sends (the observed 429s ask for 1-28 s) while keeping a single
+            // `stream()` call from blocking for a quarter hour. `Timeouts::total`
+            // is unset by default, so this is the only bound on the wait.
+            max_retry_after: Duration::from_secs(60),
             max_timeout_retries: 3,
         }
     }
@@ -46,12 +54,18 @@ impl RetryPolicy {
     }
 
     /// Delay before retry number `attempt` (1 = the first retry).
+    ///
+    /// `retry_after` is the provider's own instruction. It is a floor: the
+    /// returned delay is never shorter than the hint (or than
+    /// `max_retry_after` when the hint exceeds it), and jitter is applied only
+    /// to our own exponential backoff, so spreading retries can never make us
+    /// hammer a provider that asked us to wait.
     #[must_use]
     pub fn delay(&self, attempt: u32, retry_after: Option<Duration>) -> Duration {
         let exponent = attempt.saturating_sub(1).min(20);
         let factor = 1u32.checked_shl(exponent).unwrap_or(u32::MAX);
         let base = self.base.saturating_mul(factor).min(self.max);
-        let mut delay = if self.jitter {
+        let backoff = if self.jitter {
             // ±25% keeps the exponential shape while spreading retries.
             let roll: f64 = rand::random();
             let scale = 0.75 + roll * 0.5;
@@ -59,10 +73,13 @@ impl RetryPolicy {
         } else {
             base
         };
-        if let Some(retry_after) = retry_after {
-            delay = delay.max(retry_after.min(self.max_retry_after));
-        }
-        delay.min(self.max.max(self.max_retry_after))
+        let Some(hint) = retry_after else {
+            return backoff;
+        };
+        // Clamp the hint before comparing so an absurd value can neither park
+        // the turn nor overflow the arithmetic below.
+        let hint = hint.min(self.max_retry_after);
+        backoff.max(hint).min(self.max.max(self.max_retry_after))
     }
 }
 
@@ -104,9 +121,17 @@ impl RetryState {
     }
 }
 
-/// Parse a `retry-after` header value. Supports delta seconds (including
-/// fractional values used by test servers) and bare milliseconds are not valid
-/// HTTP, so only seconds are accepted.
+/// Parse a `retry-after` header value.
+///
+/// Supports both forms RFC 9110 defines: `delta-seconds` (`28`) and an
+/// HTTP-date (`Sun, 06 Nov 1994 08:49:37 GMT`). Fractional seconds are
+/// tolerated because test servers use them to keep suites fast; a real
+/// provider never sends them.
+///
+/// Unparsable, negative, non-finite, and out-of-range values return `None` so
+/// the caller falls back to exponential backoff. This never panics: an
+/// overflowing delta (`1e300`) is rejected by [`Duration::try_from_secs_f64`]
+/// rather than handed to the panicking `Duration::from_secs_f64`.
 #[must_use]
 pub fn parse_retry_after(value: &str) -> Option<Duration> {
     let value = value.trim();
@@ -114,14 +139,23 @@ pub fn parse_retry_after(value: &str) -> Option<Duration> {
         if !seconds.is_finite() || seconds < 0.0 {
             return None;
         }
-        return Some(Duration::from_secs_f64(seconds));
+        // `from_secs_f64` panics when the value exceeds `Duration`'s range;
+        // the fallible constructor reports the same input as `None`.
+        return Duration::try_from_secs_f64(seconds).ok();
     }
-    parse_http_date(value)
+    parse_http_date(value).map(|deadline| {
+        // A date far in the future is a valid IMF-fixdate but an absurd wait;
+        // the policy caps it, and the wrap to zero cannot happen because the
+        // subtraction saturates at 0 for past dates.
+        Duration::from_secs(u64::try_from(deadline).unwrap_or(u64::MAX))
+    })
 }
 
-/// IMF-fixdate, e.g. `Sun, 06 Nov 1994 08:49:37 GMT`. A date in the past means
-/// "retry immediately" (zero delay).
-fn parse_http_date(value: &str) -> Option<Duration> {
+/// Seconds between `value` and the epoch, or `0` for a date in the past.
+///
+/// A past date means "retry immediately", so it yields zero rather than a
+/// negative duration.
+fn parse_http_date(value: &str) -> Option<i64> {
     let mut parts = value.split_whitespace();
     let _weekday = parts.next()?;
     let day = parts.next()?.parse::<i64>().ok()?;
@@ -160,9 +194,10 @@ fn parse_http_date(value: &str) -> Option<Duration> {
             .as_secs(),
     )
     .unwrap_or(i64::MAX);
-    Some(Duration::from_secs(
-        u64::try_from(seconds.saturating_sub(now)).unwrap_or(0),
-    ))
+    // A past date means "retry immediately". `saturating_sub` would clamp to
+    // `i64::MIN`, which then wraps to `u64::MAX` in the caller, so compare
+    // explicitly instead of relying on saturation.
+    Some(if seconds > now { seconds - now } else { 0 })
 }
 
 fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
@@ -195,15 +230,123 @@ mod tests {
             policy.delay(2, Some(Duration::from_millis(100))),
             Duration::from_millis(100)
         );
+        // The default cap is one minute: a one-hour hint is clamped, not slept.
         assert_eq!(
             policy.delay(2, Some(Duration::from_secs(3_600))),
-            Duration::from_secs(900)
+            Duration::from_secs(60)
         );
         assert_eq!(
             parse_retry_after("Sun, 06 Nov 1994 08:49:37 GMT"),
             Some(Duration::ZERO)
         );
         assert_eq!(parse_retry_after("0.05"), Some(Duration::from_millis(50)));
+    }
+
+    /// Test A: `Retry-After: 28` must produce a delay of at least 28 s, and the
+    /// jittered default policy must never undercut the server's instruction.
+    #[test]
+    fn retry_after_28_seconds_is_honored_in_full() {
+        let hint = parse_retry_after("28").expect("delta-seconds form parses");
+        assert_eq!(hint, Duration::from_secs(28));
+
+        let policy = RetryPolicy::fixed(Duration::from_millis(10), Duration::from_millis(50), 10);
+        assert_eq!(policy.delay(1, Some(hint)), Duration::from_secs(28));
+        assert_eq!(policy.delay(9, Some(hint)), Duration::from_secs(28));
+
+        // The shipped policy jitters its own backoff; the hint is a floor there
+        // too, so no roll can bring the wait below 28 s.
+        let jittered = RetryPolicy::default();
+        for _ in 0..200 {
+            assert!(
+                jittered.delay(1, Some(hint)) >= Duration::from_secs(28),
+                "jitter shortened a server hint"
+            );
+        }
+    }
+
+    /// Test B: without the header the delay is today's exponential backoff.
+    #[test]
+    fn missing_retry_after_falls_back_to_exponential() {
+        assert_eq!(parse_retry_after(""), None);
+        let policy = RetryPolicy::fixed(Duration::from_millis(10), Duration::from_secs(10), 10);
+        for (attempt, expected) in [(1, 10), (2, 20), (3, 40), (4, 80), (5, 160)] {
+            assert_eq!(
+                policy.delay(attempt, None),
+                Duration::from_millis(expected),
+                "attempt {attempt}"
+            );
+        }
+        // Exponential growth stops at `max`.
+        assert_eq!(policy.delay(30, None), Duration::from_secs(10));
+    }
+
+    /// Test C: a malformed or out-of-range hint is ignored, never a zero delay
+    /// and never a panic.
+    #[test]
+    fn malformed_retry_after_is_ignored() {
+        for value in [
+            "banana",
+            "",
+            "   ",
+            "-1",
+            "-0.5",
+            "NaN",
+            "inf",
+            "-inf",
+            "28 seconds",
+            "Sun, 06 Nov 1994",
+            "Thu, 32 Jan 2099 00:00:00 GMT",
+            "Thu, 01 Jan 2099 25:00:00 GMT",
+        ] {
+            assert_eq!(parse_retry_after(value), None, "value {value:?}");
+        }
+        // A finite-but-huge delta used to panic inside `Duration::from_secs_f64`.
+        // `try_from_secs_f64` reports it as an error, so the hint is ignored.
+        assert_eq!(parse_retry_after("1e300"), None);
+        // An ignored hint leaves the exponential fallback intact.
+        let policy = RetryPolicy::fixed(Duration::from_millis(10), Duration::from_millis(50), 10);
+        let ignored = parse_retry_after("banana");
+        assert_eq!(policy.delay(2, ignored), Duration::from_millis(20));
+    }
+
+    /// Test D: an absurd hint is clamped to `max_retry_after`, not slept and not
+    /// allowed to overflow.
+    #[test]
+    fn absurd_retry_after_is_clamped() {
+        let policy = RetryPolicy::fixed(Duration::from_millis(10), Duration::from_millis(50), 10);
+        let hint = parse_retry_after("100000").expect("100000 s parses");
+        assert_eq!(hint, Duration::from_secs(100_000));
+        assert_eq!(policy.delay(1, Some(hint)), Duration::from_secs(60));
+
+        // A 100000 s hint is beyond the retryable window (error.rs treats a
+        // >60 s 429 hint as "do not retry"), so verify the delay bound directly
+        // for a status that is always retryable.
+        assert_eq!(
+            policy.delay(1, Some(Duration::from_secs(100_000))),
+            Duration::from_secs(60)
+        );
+        assert!(policy.delay(1, Some(Duration::MAX)) <= Duration::from_secs(60));
+    }
+
+    /// Test E: the HTTP-date form parses and yields a bounded positive delay; a
+    /// date in the past means "retry now".
+    #[test]
+    fn http_date_form_is_bounded() {
+        let future =
+            parse_retry_after("Thu, 01 Jan 2099 00:00:00 GMT").expect("IMF-fixdate parses");
+        assert!(future > Duration::from_secs(60), "{future:?}");
+        let policy = RetryPolicy::fixed(Duration::from_millis(10), Duration::from_millis(50), 10);
+        assert_eq!(policy.delay(1, Some(future)), Duration::from_secs(60));
+
+        // Past date: zero, i.e. retry immediately; never a negative duration.
+        assert_eq!(
+            parse_retry_after("Sun, 06 Nov 1994 08:49:37 GMT"),
+            Some(Duration::ZERO)
+        );
+        assert!(
+            parse_retry_after("Fri, 01 Jan 2100 00:00:00 GMT")
+                .is_some_and(|delay| delay > Duration::ZERO)
+        );
     }
 
     #[test]
