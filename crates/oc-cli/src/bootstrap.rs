@@ -79,10 +79,13 @@ pub(crate) async fn open_services(
     let mut catalog =
         oc_server::catalog_from_config(config.as_ref()).context("load model catalog")?;
     let has_nous_cache = apply_cached_nous_models(&mut catalog);
-    if has_nous_cache && let Some(providers) = config.merged().get("providers") {
+    let has_go_cache = apply_cached_opencode_go_models(&mut catalog);
+    if (has_nous_cache || has_go_cache)
+        && let Some(providers) = config.merged().get("providers")
+    {
         catalog
             .apply_config(providers)
-            .context("reapply providers over cached nous models")?;
+            .context("reapply providers over cached provider models")?;
     }
     // `config_dir: None` is deliberate: Antigravity account, signature and
     // model-cache state is global (`resolve_config_dir()`), so every project
@@ -113,6 +116,7 @@ pub(crate) async fn open_services(
             Ok(mut live) if oc_llm::catalog::refresh::is_plausible(&live) => {
                 oc_llm::catalog::refresh::apply_builtin_providers(&mut live);
                 apply_cached_nous_models(&mut live);
+                apply_cached_opencode_go_models(&mut live);
                 catalog = live;
                 if let Some(providers) = config.merged().get("providers") {
                     catalog
@@ -348,6 +352,7 @@ pub(crate) fn start_background_tasks(
     }
     if let Some(cell) = state.catalog_cell() {
         spawn_nous_refresh_loop(std::sync::Arc::clone(cell), state.clone());
+        spawn_opencode_go_refresh_loop(std::sync::Arc::clone(cell), state.clone());
         // A published catalog is authoritative, so the swap rebuilds the whole
         // generation: parse, gate on plausibility, re-apply the same overlays the
         // boot path applies, then replace and announce. Dropping the handle
@@ -395,6 +400,89 @@ fn apply_cached_nous_models(catalog: &mut oc_llm::Catalog) -> bool {
     catalog.upsert_provider(oc_llm::catalog::refresh::default_nous_provider());
     catalog.upsert_provider_models(models);
     true
+}
+
+/// Apply the cached `opencode-go` provider list, so a model the subscription
+/// added since the last boot is served before the first network fetch.
+///
+/// Membership is part of the cache: a restarting process must also stop
+/// offering ids the provider dropped, which is why this goes through
+/// [`oc_llm::catalog::refresh::apply_provider_models`] instead of a bare
+/// upsert.
+fn apply_cached_opencode_go_models(catalog: &mut oc_llm::Catalog) -> bool {
+    let Some(Ok(body)) =
+        oc_llm::catalog::refresh::read_cache(&oc_llm::catalog::refresh::opencode_go_cache_path())
+    else {
+        return false;
+    };
+    let Ok(models) = oc_llm::catalog::refresh::parse_provider_models(
+        &body,
+        oc_llm::catalog::refresh::OPENCODE_GO_PROVIDER_ID,
+    ) else {
+        return false;
+    };
+    oc_llm::catalog::refresh::apply_provider_models(
+        catalog,
+        oc_llm::catalog::refresh::OPENCODE_GO_PROVIDER_ID,
+        models,
+    );
+    true
+}
+
+/// Refresh the `opencode-go` provider model list on the same cadence as the
+/// published catalog: 30 s after boot, then every 6 h.
+///
+/// This is what makes a newly released model appear without a rebuild or a
+/// manual `POST /api/model/refresh`. The provider list is authoritative for
+/// membership (verified live: `models.dev` still lists models the subscription
+/// no longer includes), so the loop applies upserts *and* withdrawals.
+fn spawn_opencode_go_refresh_loop(cell: Arc<oc_llm::CatalogCell>, state: AppState) {
+    tokio::spawn(async move {
+        let client = oc_llm::catalog::refresh::client();
+        let url = oc_llm::catalog::refresh::opencode_go_models_url();
+        let cache = oc_llm::catalog::refresh::opencode_go_cache_path();
+        let mut first = true;
+        loop {
+            let delay = if first {
+                oc_llm::catalog::refresh::BOOT_DELAY
+            } else {
+                oc_llm::catalog::refresh::REFRESH_INTERVAL
+            };
+            first = false;
+            tokio::time::sleep(delay).await;
+            match oc_llm::catalog::refresh::fetch_opencode_go_models_with_body(&client, &url).await
+            {
+                Ok((body, models)) => {
+                    if let Err(error) = oc_llm::catalog::refresh::write_cache(&cache, &body) {
+                        tracing::debug!(%error, "opencode-go model list cache write failed");
+                    }
+                    let mut next = cell.current().as_ref().clone();
+                    let (upserted, removed) = oc_llm::catalog::refresh::apply_provider_models(
+                        &mut next,
+                        oc_llm::catalog::refresh::OPENCODE_GO_PROVIDER_ID,
+                        models,
+                    );
+                    if let Some(config) = state.config()
+                        && let Some(providers) = config.merged().get("providers")
+                        && let Err(error) = next.apply_config(providers)
+                    {
+                        tracing::warn!(%error, "opencode-go catalog config reapply failed");
+                        continue;
+                    }
+                    if let Some(antigravity) = state.antigravity() {
+                        antigravity.overlay_catalog(&mut next);
+                    }
+                    cell.replace(next);
+                    tracing::info!(upserted, removed, "opencode-go model list refreshed");
+                    state.publish(oc_types::EventEnvelope::now(
+                        "models-dev.refreshed",
+                        serde_json::json!({}),
+                    ));
+                }
+                Err(error) => tracing::debug!(%error, "opencode-go model list refresh failed"),
+            }
+        }
+    });
 }
 
 fn spawn_nous_refresh_loop(cell: Arc<oc_llm::CatalogCell>, state: AppState) {

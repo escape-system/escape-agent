@@ -158,8 +158,23 @@ public surface; `cargo doc -p <crate> --no-deps` is the reference.
   public but only as `oc_llm::quota::*`.
 - `LlmEvent`/`LlmMessage`/`ToolDef`/`LlmOptions`/`Usage` in `event.rs`;
   `Protocol::Unsupported` for providers not yet implemented.
-- Retries 2s→10s, 10 attempts, `retry-after` ≤15 min; mid-stream failures emit
+- Retries 2s→10s, 10 attempts, jitter ±25% on the exponential term only;
+  `RetryPolicy::max_retry_after` defaults to **60 s** (was 15 min). The
+  provider's `retry-after` is a documented **floor**:
+  `delay() = max(backoff, min(hint, max_retry_after))` with a final
+  `.min(max(max, max_retry_after))` clamp (`crates/oc-llm/src/retry.rs:81-82`),
+  so jitter can spread our own backoff but never shortens the wait the provider
+  asked for. The outer clamp never binds with the shipped defaults
+  (`max` 10 s, `max_retry_after` 60 s): the inner term is already ≤ 60 s, so it
+  is a defensive ceiling, not a behaviour. Mid-stream failures emit
   `ProviderError` (no replay).
+- `oc_llm::parse_retry_after(&str) -> Option<Duration>` accepts `delta-seconds`
+  (fractional tolerated for test servers) and IMF-fixdate. It never panics:
+  unparsable, negative, non-finite or out-of-range input returns `None`, so the
+  caller falls back to exponential backoff. A past HTTP-date is `Some(ZERO)`
+  ("retry now"); a hint beyond the cap is clamped by the policy, not here.
+  Signature unchanged; `LlmError` stays `Debug`-only, so nothing new is
+  serialized.
 
 ### `oc-tools`
 - `Tool` trait (async, `name/description/schema/execute`), `ToolContext`,
@@ -190,6 +205,30 @@ public surface; `cargo doc -p <crate> --no-deps` is the reference.
   direct child (`kill_on_drop`); grandchildren are not tracked. Fake sidecar
   binary for tests. Unsupported live-object hooks (`aisdk.*`, `experimental.ws.*`)
   are rejected at load.
+
+### `oc-observer`
+- `ObserverEngine`, `ObserverModel`, `RepairExecutor`, `ObserverNotifier`,
+  `ObserverNotice`, `ObserverRun`, `RepairOutcome`, `SkipReason`,
+  `TargetBudget`; `GoalPolicy`/`GoalSnapshot`/`apply_verdict`.
+- `ObserverConfig` gains `repair_ack_timeout_ms: i64` (default `5000`; `0` =
+  wait forever). It is a **configuration-only** field: `#[serde(default)]` on
+  the struct, never wire-serialized by the server, so it is omitted rather
+  than sent as `null`.
+- `RepairExecutor::apply` signature is unchanged
+  (`fn apply<'a>(&'a self, verdict: &'a ObserverVerdict) -> BoxFuture<'a, Result<RepairOutcome, ObserverError>>`)
+  but its contract is now normative and documented on the trait: resolve only
+  when the outcome is known; `applied = true` means performed; `applied =
+  false` plus `detail` is a refusal (unknown model, nothing to cancel,
+  unimplemented kind); `Err(Executor)` is failed/unimplemented. The engine
+  bounds the wait by `repair_ack_timeout_ms` and treats **no answer as
+  failure, never success**. A host that queues and resolves immediately can no
+  longer publish a success it cannot back up.
+- `ObserverRun` records a refusal as `Rejected` and an unconfirmed repair as
+  `Unavailable`. Neither is serialized, and no wire field changed; the effect
+  is that repair rows flip from `ok` to `error` for both, which is the intended
+  truth. A refusal stays charged to the budget (an impossible repair must
+  escalate instead of being re-proposed every tick) but clears the compaction
+  cooldown; an unconfirmed one returns its reservation.
 
 ### `oc-runtime`
 - Primitives: `Expectation::{normalize,derived}`, `inject`, `extract`,
@@ -539,6 +578,75 @@ the runtime raises `LlmError::Failure { kind, message }` instead of
 `LlmError::Provider` for a known kind. `oc_llm::ModelHealth` remains shared
 with `AppState::model_health()` for explicit control-plane reporting.
 
+### Event `session.request.envelope` (`oc-types`, `oc-runtime`)
+
+Log-only durable event publishing the exact model request of one step. It
+exists because the request was **not** a pure function of the session log:
+`crates/oc-runtime/src/runtime/state.rs:209-215` derives base messages from
+`session_message` rows, but `crates/oc-runtime/src/turn/run.rs:275-353` then
+appends six model-visible splices that were unlogged before this wave (memory
+supplement, output-limit continuation, verify nudge, stall notice,
+context-pressure notice, step-budget warning / final call). Each splice now has
+a `RequestInjection` kind at the push site, so the uncomputable half of the
+request is recorded instead of lost.
+
+```rust
+// crates/oc-types/src/payload/request.rs
+pub struct SessionRequestEnvelope {
+    pub session_id: SessionId,
+    pub assistant_message_id: MessageId,
+    pub step: u32,
+    pub provider: String,
+    pub model: String,
+    pub tools: Vec<String>,          // exact order sent
+    pub system_digest: String,       // digest of joined system text; text not duplicated
+    pub base_messages: u32,          // count derived from session_message
+    pub base_digest: String,         // digest over base message texts, in order
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub injections: Vec<RequestInjection>,
+    pub created: i64,                // epoch ms
+}
+
+pub struct RequestInjection {
+    pub kind: String,   // memory-supplement | output-continuation | verify-nudge
+                        // | stall-notice | context-pressure | step-budget
+                        // | max-steps | final-call
+    pub text: String,   // the exact appended text
+}
+```
+
+Event type `session.request.envelope`, `DURABLE = true`, `VERSION = 1`;
+`injections` is omitted when empty, never `null`. It is **log-only**: it writes
+no `session_message` row, never enters the transcript, and does not affect
+`keepID`, token estimates or `last_user_text`. That is the whole point —
+persisting the splices as message rows would (a) inflate
+`estimate_turn_tokens` and cause premature compaction, (b) make each splice a
+`keepID` candidate so its text is replayed every turn, (c) corrupt
+`last_user_text` (`crates/oc-runtime/src/prompt/transcript.rs:256`) and hence
+`stats.user_text` and memory recall, and (d) perturb the length-based gates
+`context.len() >= 6` and `last_compacted_len`. Recording the request beside the
+transcript instead of in it makes the request reconstructable by replay (the
+splices, which are not recomputable) plus recomputation (the base messages,
+which are).
+
+**Status:** **landed and verified 2026-11-23.** The payload is
+`crates/oc-types/src/payload/request.rs`
+(`impl_event_payload!(SessionRequestEnvelope, "session.request.envelope", true, 1)`
+at `:169`), re-exported from `payload/mod.rs:104` and `lib.rs:57`. The emitter is
+`crates/oc-runtime/src/turn/request_envelope.rs` (the seed and the canonical
+renderer) plus `crates/oc-runtime/src/turn/stream.rs:467-490`, which emits the
+event after `session.step.started` and before the first byte is requested. Four
+tests in `crates/oc-runtime/tests/runtime/request_envelope.rs`:
+`request_envelope_is_durable_and_writes_no_message_row` (durable, zero
+`session_message` rows), `request_envelope_reconstructs_the_request_from_the_log`
+(an *independent* renderer recomputes `baseDigest` from the rows, and
+`base + injections` equals the request the provider actually received),
+`hook_probe_sees_the_real_request_and_owns_the_credential_pool`, and
+`step_streamed_is_published_only_after_the_stamp_is_committed`. The block above
+was re-checked against the landed struct: field names, `serde(rename_all =
+"camelCase")`, `skip_serializing_if = "Vec::is_empty"` on `injections`,
+`DURABLE = true` and `VERSION = 1` all match.
+
 ### `resolve_model_with` + `CandidateFilter` (`oc-subagents`)
 
 ```rust
@@ -867,33 +975,69 @@ rejected. A successful swap re-applies the same overlays the boot path uses
 **Provider-side `opencode-go` model discovery (issue #12).** Unlike the
 Antigravity client, the `opencode-go` provider does serve a public OpenAI-style
 model list: `GET https://opencode.ai/zen/go/v1/models` returned
-`{"object":"list","data":[…]}` with 28 models on 2026-11-20, including
-`hy4-flash-free` (canonical `tencent/hy4-flash`, context 1,048,576, $0/$0).
-The endpoint is unauthenticated; `/zen/go/v1/usage` is the authenticated quota
-sibling and is unrelated. New public helpers in `catalog::refresh`:
-`OPENCODE_GO_MODELS_URL`, `OPENCODE_GO_MODELS_URL_ENV` (`OPENCODE_GO_MODELS_URL`,
-an env-overridable URL), `MIN_PLAUSIBLE_PROVIDER_MODELS`,
-`opencode_go_models_url()`, and `parse_provider_models(body, provider_id) ->
-Result<Vec<ModelInfo>, LlmError>`, which copies only fields the feed actually
-publishes (`id`, `name`, `canonical_id`, `release_date`,
-`limit.context`/`limit.output`, `capabilities.tools.supported`) and rejects
-truncated/malformed lists. No new dependency: it reuses `reqwest`, `serde_json`
-and the existing `fetch_live` client.
+`{"object":"list","data":[…]}` with 37 models on 2026-11-24, including
+`hungerg-free` (canonical-free, context 1,000,000, $0/$0) and `hy4-flash-free`
+(canonical `tencent/hy4-flash`, context 1,048,576, $0/$0). The endpoint is
+unauthenticated; `/zen/go/v1/usage` is the authenticated quota sibling and is
+unrelated. Public helpers in `catalog::refresh`: `OPENCODE_GO_PROVIDER_ID`,
+`OPENCODE_GO_MODELS_URL`, `OPENCODE_GO_MODELS_URL_ENV`
+(`OPENCODE_GO_MODELS_URL`, an env-overridable URL),
+`OPENCODE_GO_CACHE_FILE`/`opencode_go_cache_path()`,
+`MIN_PLAUSIBLE_PROVIDER_MODELS`, `opencode_go_models_url()`,
+`parse_provider_models(body, provider_id) -> Result<Vec<ModelInfo>, LlmError>`,
+`fetch_opencode_go_models_with_body`, `apply_provider_models`,
+`provider_membership` and `is_plausible_provider_list`.
 
-**Honest status:** these helpers are *landed API only* — no caller polls the
-provider list yet. Wiring them into the background refresh loop, the
-`POST /api/model/refresh` overlay, and the catalog cell is deliberately left to
-the integration owner (out of this wave's file ownership). Until that wiring
-exists, the served `opencode-go` models still come from the models.dev snapshot
-plus overlays, and this doc does not claim full dynamic provider discovery.
+The feed rows are models.dev **v2** records, so `parse_provider_models` reshapes
+the `data` array into a v2 provider document and runs it through
+`Catalog::from_snapshot`. That is deliberate: an earlier hand-rolled field copy
+kept only `id`/`name`/`canonical_id`/`limit`/`tools`, which degraded every
+provider-discovered model to `Protocol::Unsupported` with an empty `cost` and no
+variants. Going through the shared converter keeps the wire route
+(`chat-completions` → OpenAI, `messages` → Anthropic, `generate-content` →
+Gemini), the price band(s), modality collapse and reasoning variants. Rows whose
+route this client cannot speak (`responses`, `systemone`, `images`,
+`embeddings`) are returned with `Protocol::Unsupported` rather than dropped; the
+transport rejects that protocol loudly and the registry keeps such rows out of
+the chat picker. `canonical_id` is carried across explicitly because the v2
+converter does not read it.
 
-A background loop refreshes 30 s after boot (startup stays offline, per
-`docs/15-performance.md`) and every 6 h. At startup the cached body replaces the
-embedded floor under the same plausibility gate, so an offline start serves the
-last fetched catalog. `refresh_now` is the one-shot form: it fetches an
-**explicit** URL (never mutating process environment), atomically caches the raw
-body and only then invokes `apply`; a failed fetch never calls `apply`. The
-background loop remains unchanged.
+**The provider list is authoritative for membership.** `models.dev` still lists
+models a Go subscription no longer includes, verified live on 2026-11-24:
+`space-bunny`, `minimax-m3.1-flash-free`, `step-5-preview-free` and
+`gemini-4-argon-contributor` answer `isn't included in OpenCode Go`, while
+`glm-5.2`, `minimax-m2.7`, `mimo-v2.5`, `crouton-alpha-free` and
+`longcat-2.5-free` answer `has been deprecated`. So the feed drives two
+operations, in this order: `Catalog::upsert_provider_models` (the published
+entries carry their own route and prices) and then
+`Catalog::retain_provider_models` (ids the subscription dropped are withdrawn,
+never offered). `apply_provider_models` is the single implementation of that
+pairing, shared by the boot path, the background loop and
+`POST /api/model/refresh`.
+
+Membership is gated **relatively**, not against the flat
+`MIN_PLAUSIBLE_PROVIDER_MODELS` (1): `is_plausible_provider_list(fetched,
+served)` requires `fetched * 2 >= served`, so a truncated answer still upserts
+what it published but withdraws nothing. Losing more than half a subscription
+on one fetch is a bad response, not a decision.
+
+There is no automatic model fallback and no hidden filtering here: a newly
+published model appears because the feed lists it, and disappears only when the
+feed stops listing it. `models.hidden` still governs picker visibility per
+`AGENTS.md`.
+
+A background loop refreshes the published catalog 30 s after boot (startup stays
+offline, per `docs/15-performance.md`) and every 6 h, and a **second** loop on
+the same cadence refreshes the `opencode-go` provider list
+(`spawn_opencode_go_refresh_loop`), caching the raw body in
+`opencode-go-models-cache.json`. Both loops re-apply the config `providers`
+overlay and Antigravity discovery before swapping the cell, then publish
+`models-dev.refreshed`. At startup the cached bodies are applied under the same
+gates, so an offline restart serves the last fetched membership *and* stops
+offering models withdrawn since the previous run. `refresh_now` is the one-shot
+form: it fetches an **explicit** URL (never mutating process environment),
+atomically caches the raw body and only then invokes `apply`; a failed fetch
+never calls `apply`.
 
 `POST /api/model/refresh` (oc-server, additive local route) invokes that
 one-shot path with `refresh::models_url()` and `refresh::cache_path()`. Its

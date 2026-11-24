@@ -42,6 +42,9 @@ pub const OPENCODE_GO_MODELS_URL: &str = "https://opencode.ai/zen/go/v1/models";
 /// Environment override for the `opencode-go` provider model list.
 pub const OPENCODE_GO_MODELS_URL_ENV: &str = "OPENCODE_GO_MODELS_URL";
 
+/// Built-in provider id for the `opencode-go` subscription.
+pub const OPENCODE_GO_PROVIDER_ID: &str = "opencode-go";
+
 /// Built-in provider id for Nous Research.
 pub const NOUS_PROVIDER_ID: &str = "nous";
 
@@ -56,6 +59,9 @@ pub const NOUS_MODELS_URL_ENV: &str = "NOUS_MODELS_URL";
 
 /// Cache file name for fetched Nous Research models inside the data directory.
 pub const NOUS_CACHE_FILE: &str = "nous-models-cache.json";
+
+/// Cache file name for the fetched `opencode-go` provider model list.
+pub const OPENCODE_GO_CACHE_FILE: &str = "opencode-go-models-cache.json";
 
 /// Fetch timeout. A refresh that cannot answer in this budget is retried on the
 /// next tick instead of stalling shutdown.
@@ -121,6 +127,12 @@ pub fn cache_path() -> PathBuf {
 #[must_use]
 pub fn nous_cache_path() -> PathBuf {
     data_cache_path(None, NOUS_CACHE_FILE)
+}
+
+/// Where the fetched `opencode-go` provider model list is cached between runs.
+#[must_use]
+pub fn opencode_go_cache_path() -> PathBuf {
+    data_cache_path(None, OPENCODE_GO_CACHE_FILE)
 }
 
 fn data_cache_path(override_env: Option<&str>, file_name: &str) -> PathBuf {
@@ -204,10 +216,24 @@ pub fn parse_live(body: &str) -> Result<Catalog, LlmError> {
 /// Parse an OpenAI-style `{object:"list", data:[{id, name, ...}]}` body into
 /// catalog models for one provider.
 ///
-/// Only fields the provider actually publishes are used: `id` (required),
-/// `name`, `canonical_id`, `release_date`, `limit.context`/`limit.output`, and
-/// `capabilities.tools.supported`. Unknown ids are skipped rather than faked.
-/// A truncated or structurally wrong body is an error, not an empty result.
+/// The `opencode.ai/zen/go/v1/models` rows are models.dev **v2** records: each
+/// one carries `api.{chat-completions,messages,generate-content,responses,…}`
+/// with a `sdk.aisdk`/`sdk.opencodeai` package, `cost.text.*`, `modalities`,
+/// `capabilities.{tools,reasoning}` and `limit`. Parsing therefore goes through
+/// the same conversion the published catalog uses
+/// ([`Catalog::from_snapshot`]), so a provider-discovered model keeps its wire
+/// route, price band(s) and reasoning variants instead of degrading to
+/// `Protocol::Unsupported` with an empty `cost` and no variants.
+///
+/// Rows whose route is not a protocol this client speaks (`responses`,
+/// `systemone`, `images`, `embeddings`) are still returned: they keep
+/// `Protocol::Unsupported`, which the transport rejects loudly, and the catalog
+/// registry keeps them out of the chat picker. Silently dropping them would
+/// hide a real membership decision from the operator.
+///
+/// `provider_id` overrides the feed's provider key so a caller can attach the
+/// list to the id the catalog actually serves. A truncated or structurally
+/// wrong body is an error, not an empty result.
 pub fn parse_provider_models(body: &str, provider_id: &str) -> Result<Vec<ModelInfo>, LlmError> {
     let value: Value = serde_json::from_str(body).map_err(|error| LlmError::Catalog {
         message: format!("provider model list is not JSON: {error}"),
@@ -225,49 +251,88 @@ pub fn parse_provider_models(body: &str, provider_id: &str) -> Result<Vec<ModelI
             ),
         });
     }
-    let mut models = Vec::with_capacity(rows.len());
+
+    // Reuse the published-catalog converter by reshaping the feed into the v2
+    // provider document it already knows how to read. Doing it this way keeps
+    // one implementation of route selection, modality mapping and price bands;
+    // a hand-rolled field copy is what previously dropped `api` and `cost`.
+    let mut models_by_id: Map<String, Value> = Map::new();
     for row in rows {
         let Some(id) = row.get("id").and_then(Value::as_str) else {
             continue;
         };
-        if id.is_empty() {
+        if id.is_empty() || models_by_id.contains_key(id) {
             continue;
         }
-        let mut model = ModelInfo::default_for(provider_id, id);
-        if let Some(name) = row.get("name").and_then(Value::as_str) {
-            name.clone_into(&mut model.name);
+        let mut model = row.clone();
+        if let Value::Object(map) = &mut model {
+            // The feed repeats the id inside the row; the snapshot converter
+            // reads it from the object value, and `from_snapshot` fills a
+            // missing one from the key, so keep whatever the feed sent.
+            map.entry("type".to_owned())
+                .or_insert_with(|| Value::String("chat".to_owned()));
         }
-        model.canonical = row
-            .get("canonical_id")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
-        let limit = row.get("limit");
-        if let Some(context) = limit.and_then(|l| l.get("context")).and_then(Value::as_u64) {
-            model.limit.context = context;
-        }
-        if let Some(output) = limit.and_then(|l| l.get("output")).and_then(Value::as_u64) {
-            model.limit.output = output;
-        }
-        if row
-            .get("capabilities")
-            .and_then(|c| c.get("tools"))
-            .and_then(|t| t.get("supported"))
-            .and_then(Value::as_bool)
-            == Some(false)
-        {
-            model.capabilities.tools = false;
-        }
-        if let Some(release) = row.get("release_date").and_then(Value::as_str) {
-            model.time.released = super::parse_release_date(release);
-        }
-        models.push(model);
+        models_by_id.insert(id.to_owned(), model);
     }
-    if models.is_empty() {
+    if models_by_id.is_empty() {
         return Err(LlmError::Catalog {
             message: "provider model list contained no usable ids".to_owned(),
         });
     }
+
+    let document = serde_json::json!({
+        provider_id: {
+            "id": provider_id,
+            "name": provider_id,
+            "models": Value::Object(models_by_id),
+        }
+    });
+    let catalog = Catalog::from_snapshot(&document.to_string())?;
+    let mut models = catalog.models();
+    if models.is_empty() {
+        return Err(LlmError::Catalog {
+            message: "provider model list produced no catalog models".to_owned(),
+        });
+    }
+    // The v2 snapshot converter does not read `canonical_id` (the published
+    // catalog carries it per model), so carry it across here: it is the only
+    // stable way to correlate a Go id with the canonical vendor id.
+    let canonical: std::collections::HashMap<String, String> = rows
+        .iter()
+        .filter_map(|row| {
+            let id = row.get("id").and_then(Value::as_str)?;
+            let value = row.get("canonical_id").and_then(Value::as_str)?;
+            Some((id.to_owned(), value.to_owned()))
+        })
+        .collect();
+    for model in &mut models {
+        provider_id.clone_into(&mut model.provider_id);
+        if let Some(value) = canonical.get(&model.id) {
+            model.canonical = Some(value.clone());
+        }
+    }
+    models.sort_by(|a, b| a.id.cmp(&b.id));
     Ok(models)
+}
+
+/// Whether a fetched provider model list may take over membership.
+///
+/// [`MIN_PLAUSIBLE_PROVIDER_MODELS`] (1) is only enough to prove the body is a
+/// list at all; taking membership from it on that basis would let a truncated
+/// answer withdraw most of a subscription. The gate is therefore **relative**:
+/// the fetched list must cover at least half of what the catalog currently
+/// serves for that provider. A genuine subscription shrink of more than half at
+/// once is not a thing the picker should absorb silently on one fetch.
+#[must_use]
+pub fn is_plausible_provider_list(fetched: usize, served: usize) -> bool {
+    fetched >= MIN_PLAUSIBLE_PROVIDER_MODELS && fetched.saturating_mul(2) >= served
+}
+
+/// Ids a provider model list claims, as the membership set for
+/// [`Catalog::retain_provider_models`].
+#[must_use]
+pub fn provider_membership(models: &[ModelInfo]) -> std::collections::HashSet<String> {
+    models.iter().map(|model| model.id.clone()).collect()
 }
 
 /// Fetch the live `opencode-go` model list and parse it into catalog models.
@@ -280,8 +345,23 @@ pub async fn fetch_opencode_go_models(
     client: &Client,
     url: &str,
 ) -> Result<Vec<ModelInfo>, LlmError> {
+    fetch_opencode_go_models_with_body(client, url)
+        .await
+        .map(|(_, models)| models)
+}
+
+/// Fetch the `opencode-go` model list and keep the raw body for caching.
+///
+/// The body is returned so the caller can persist exactly what the provider
+/// published; re-serializing the parsed models would write a lossy private
+/// format and make the cache unreadable by [`parse_provider_models`] later.
+pub async fn fetch_opencode_go_models_with_body(
+    client: &Client,
+    url: &str,
+) -> Result<(String, Vec<ModelInfo>), LlmError> {
     let body = fetch_live(client, url).await?;
-    parse_provider_models(&body, "opencode-go")
+    let models = parse_provider_models(&body, OPENCODE_GO_PROVIDER_ID)?;
+    Ok((body, models))
 }
 
 /// [`fetch_opencode_go_models`] against the configured live endpoint.
@@ -290,6 +370,44 @@ pub async fn fetch_opencode_go_models(
 /// read here so the parsing/fetch path stays testable with a fake server.
 pub async fn fetch_opencode_go_models_now(client: &Client) -> Result<Vec<ModelInfo>, LlmError> {
     fetch_opencode_go_models(client, &opencode_go_models_url()).await
+}
+
+/// Apply a fetched provider model list to `catalog`: upsert what the feed
+/// published, then withdraw what it stopped listing.
+///
+/// This is the single place that decides what a provider list *means*, so the
+/// boot path, the background loop and `POST /api/model/refresh` cannot drift
+/// apart. Ordering matters: the upsert first makes every published entry carry
+/// its own route and prices, then the membership prune removes ids the
+/// subscription dropped. The prune is gated on
+/// [`is_plausible_provider_list`], so a truncated answer changes nothing.
+///
+/// Returns `(upserted, removed)`; `removed == 0` when the gate rejected the
+/// list, which lets the caller log a skip instead of reporting a shrink.
+pub fn apply_provider_models(
+    catalog: &mut Catalog,
+    provider_id: &str,
+    models: Vec<ModelInfo>,
+) -> (usize, usize) {
+    let served = catalog
+        .models()
+        .iter()
+        .filter(|model| model.provider_id == provider_id)
+        .count();
+    let upserted = models.len();
+    let membership = provider_membership(&models);
+    catalog.upsert_provider_models(models);
+    if !is_plausible_provider_list(upserted, served) {
+        tracing::warn!(
+            provider = provider_id,
+            fetched = upserted,
+            served,
+            "provider model list looks truncated; keeping existing membership"
+        );
+        return (upserted, 0);
+    }
+    let removed = catalog.retain_provider_models(provider_id, &membership);
+    (upserted, removed)
 }
 
 /// Built-in `nous` (Nous Research) provider descriptor.
@@ -841,34 +959,139 @@ mod tests {
     }
 
     #[test]
-    fn provider_model_list_parses_only_published_fields() {
+    fn provider_model_list_keeps_route_cost_and_variants() {
+        // Rows shaped like the real `opencode.ai/zen/go/v1/models` feed, which
+        // publishes models.dev v2 records: a route with an SDK package, a
+        // `cost.text` band, modalities and reasoning support. A hand-rolled
+        // field copy used to drop `api` and `cost`, so every
+        // provider-discovered model landed as `Unsupported`, unpriced and with
+        // no variants.
         let body = r#"{
           "object": "list",
           "data": [
             {
-              "id": "hy4-flash-free", "name": "Hy4 flash Free",
+              "id": "hy4-flash-free", "type": "chat", "name": "Hy4 flash Free",
               "canonical_id": "tencent/hy4-flash", "release_date": "2026-11-16",
-              "capabilities": {"tools": {"supported": true}},
-              "limit": {"context": 1048576, "output": 65536}
+              "modalities": {"input": ["text", "image/png"], "output": ["text"]},
+              "capabilities": {
+                "tools": {"supported": true},
+                "reasoning": {"supported": true, "effort": ["none", "high"]}
+              },
+              "limit": {"context": 1048576, "output": 65536},
+              "cost": {"text": {"input": {"price": 0, "cache": {"read": 0}},
+                                "output": {"price": 0}}},
+              "api": {"chat-completions": {
+                "base_url": "https://opencode.ai/inference/go/openai/v1",
+                "sdk": {"aisdk": "@ai-sdk/openai-compatible"}
+              }}
             },
             {
-              "id": "no-tools", "name": "No Tools",
-              "capabilities": {"tools": {"supported": false}}
+              "id": "qwen4-max", "type": "chat", "name": "Qwen4 Max",
+              "limit": {"context": 1000000, "output": 262144},
+              "cost": {"text": {"input": {"price": 1.5}, "output": {"price": 4.5}}},
+              "api": {"messages": {
+                "base_url": "https://opencode.ai/inference/go/anthropic/v1",
+                "sdk": {"aisdk": "@ai-sdk/anthropic"}
+              }}
             },
-            {"name": "missing id"}
+            {"name": "missing id"},
+            {"id": "no-route", "name": "No Route"}
           ]
         }"#;
         let models = parse_provider_models(body, "opencode-go").unwrap();
-        assert_eq!(models.len(), 2, "rows without ids are skipped");
-        assert_eq!(models[0].id, "hy4-flash-free");
-        assert_eq!(models[0].model_id, "hy4-flash-free");
-        assert_eq!(models[0].provider_id, "opencode-go");
-        assert_eq!(models[0].name, "Hy4 flash Free");
-        assert_eq!(models[0].canonical.as_deref(), Some("tencent/hy4-flash"));
-        assert_eq!(models[0].limit.context, 1_048_576);
-        assert_eq!(models[0].limit.output, 65_536);
-        assert!(models[0].capabilities.tools);
-        assert!(!models[1].capabilities.tools);
+        assert_eq!(
+            models.len(),
+            2,
+            "rows without ids or without a route are skipped"
+        );
+        let hy4 = models
+            .iter()
+            .find(|model| model.id == "hy4-flash-free")
+            .expect("hy4-flash-free is published");
+        assert_eq!(hy4.model_id, "hy4-flash-free");
+        assert_eq!(hy4.provider_id, "opencode-go");
+        assert_eq!(hy4.name, "Hy4 flash Free");
+        assert_eq!(hy4.canonical.as_deref(), Some("tencent/hy4-flash"));
+        assert_eq!(hy4.limit.context, 1_048_576);
+        assert_eq!(hy4.limit.output, 65_536);
+        assert!(hy4.capabilities.tools);
+        // MIME modalities collapse to the broad kinds the picker understands.
+        assert_eq!(hy4.capabilities.input, vec!["text", "image"]);
+        // A free tier really is priced at zero, not merely missing a price.
+        assert_eq!(hy4.cost[0].input, 0.0);
+        assert_eq!(hy4.cost[0].output, 0.0);
+        // Reasoning efforts become pickable variants.
+        assert_eq!(
+            hy4.variants
+                .iter()
+                .map(|variant| variant.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["none", "high"]
+        );
+        // The Anthropic-routed model keeps its Messages protocol and price.
+        let qwen = models
+            .iter()
+            .find(|model| model.id == "qwen4-max")
+            .expect("qwen4-max is published");
+        assert_eq!(qwen.protocol, Protocol::AnthropicMessages);
+        assert_eq!(qwen.cost[0].input, 1.5);
+        assert_eq!(qwen.cost[0].output, 4.5);
+    }
+
+    #[test]
+    fn membership_prune_withdraws_only_unlisted_ids() {
+        let mut catalog = Catalog::default();
+        for id in ["kept-a", "kept-b", "dropped", "kept-c"] {
+            catalog.upsert_provider_models(vec![ModelInfo::default_for("opencode-go", id)]);
+        }
+        catalog.upsert_provider_models(vec![ModelInfo::default_for("other", "untouched")]);
+
+        let feed = feed_models(&["kept-a", "kept-b", "kept-c"]);
+        let (upserted, removed) = apply_provider_models(&mut catalog, "opencode-go", feed);
+
+        assert_eq!(upserted, 3);
+        assert_eq!(removed, 1);
+        assert!(catalog.model("opencode-go", "dropped").is_none());
+        assert!(catalog.model("opencode-go", "kept-a").is_some());
+        // Another provider's models are never touched by this prune.
+        assert!(catalog.model("other", "untouched").is_some());
+    }
+
+    #[test]
+    fn a_truncated_provider_list_never_prunes() {
+        let mut catalog = Catalog::default();
+        for index in 0..10 {
+            catalog.upsert_provider_models(vec![ModelInfo::default_for(
+                "opencode-go",
+                &format!("m{index}"),
+            )]);
+        }
+
+        let feed = feed_models(&["m0", "m1"]);
+        let (upserted, removed) = apply_provider_models(&mut catalog, "opencode-go", feed);
+
+        // The entries it did publish are still upserted, but membership is
+        // unchanged: half the subscription disappearing on one fetch is a bad
+        // response, not a decision.
+        assert_eq!(upserted, 2);
+        assert_eq!(removed, 0);
+        assert!(catalog.model("opencode-go", "m9").is_some());
+    }
+
+    #[test]
+    fn provider_list_plausibility_is_relative_to_what_is_served() {
+        assert!(is_plausible_provider_list(5, 10), "half is enough");
+        assert!(is_plausible_provider_list(10, 10));
+        assert!(!is_plausible_provider_list(4, 10));
+        // An empty catalog cannot regress, but an empty fetch is still rejected.
+        assert!(is_plausible_provider_list(1, 0));
+        assert!(!is_plausible_provider_list(0, 0));
+    }
+
+    fn feed_models(ids: &[&str]) -> Vec<ModelInfo> {
+        ids.iter()
+            .map(|id| ModelInfo::default_for("opencode-go", id))
+            .collect()
     }
 
     #[test]
@@ -876,6 +1099,8 @@ mod tests {
         assert!(parse_provider_models("{}", "opencode-go").is_err());
         assert!(parse_provider_models(r#"{"data":[]}"#, "opencode-go").is_err());
         assert!(parse_provider_models("not json", "opencode-go").is_err());
+        // Ids that yield no usable route are not a list this client can serve.
+        assert!(parse_provider_models(r#"{"data":[{"id":"route-less"}]}"#, "opencode-go").is_err());
     }
 
     #[tokio::test]
@@ -906,12 +1131,24 @@ mod tests {
       "object": "list",
       "data": [
         {
-          "id": "hy4-flash-free", "name": "Hy4 flash Free",
+          "id": "hy4-flash-free", "type": "chat", "name": "Hy4 flash Free",
           "canonical_id": "tencent/hy4-flash", "release_date": "2026-11-16",
+          "modalities": {"input": ["text", "image/png"], "output": ["text"]},
           "capabilities": {"tools": {"supported": true}},
-          "limit": {"context": 1048576, "output": 65536}
+          "limit": {"context": 1048576, "output": 65536},
+          "cost": {"text": {"input": {"price": 0}, "output": {"price": 0}}},
+          "api": {"chat-completions": {
+            "base_url": "https://opencode.ai/inference/go/openai/v1",
+            "sdk": {"aisdk": "@ai-sdk/openai-compatible"}
+          }}
         },
-        {"id": "another-go-model", "name": "Another"}
+        {
+          "id": "another-go-model", "type": "chat", "name": "Another",
+          "api": {"chat-completions": {
+            "base_url": "https://opencode.ai/inference/go/openai/v1",
+            "sdk": {"aisdk": "@ai-sdk/openai-compatible"}
+          }}
+        }
       ]
     }"#;
 
@@ -927,10 +1164,13 @@ mod tests {
         server.abort();
 
         assert_eq!(models.len(), 2);
-        assert_eq!(models[0].id, "hy4-flash-free");
-        assert_eq!(models[0].provider_id, "opencode-go");
-        assert_eq!(models[0].canonical.as_deref(), Some("tencent/hy4-flash"));
-        assert_eq!(models[0].limit.context, 1_048_576);
+        let hy4 = models
+            .iter()
+            .find(|model| model.id == "hy4-flash-free")
+            .expect("hy4-flash-free is published");
+        assert_eq!(hy4.provider_id, "opencode-go");
+        assert_eq!(hy4.canonical.as_deref(), Some("tencent/hy4-flash"));
+        assert_eq!(hy4.limit.context, 1_048_576);
     }
 
     #[tokio::test]

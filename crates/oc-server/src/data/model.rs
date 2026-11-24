@@ -351,12 +351,18 @@ pub async fn refresh_models(
     let url = refresh::models_url();
     let cache = refresh::cache_path();
     let client = refresh::client();
+    let go_url = refresh::opencode_go_models_url();
     let (opencode_go_result, nous_result) = tokio::join!(
-        refresh::fetch_opencode_go_models_now(&client),
+        refresh::fetch_opencode_go_models_with_body(&client, &go_url),
         refresh::fetch_nous_models_now(&client),
     );
-    let opencode_go_models = match opencode_go_result {
-        Ok(models) => Some(models),
+    let opencode_go = match opencode_go_result {
+        Ok((raw, models)) => {
+            if let Err(error) = refresh::write_cache(&refresh::opencode_go_cache_path(), &raw) {
+                tracing::debug!(%error, "opencode-go model list cache write skipped");
+            }
+            Some(models)
+        }
         Err(error) => {
             tracing::debug!(%error, "live opencode-go model list refresh skipped");
             None
@@ -385,8 +391,13 @@ pub async fn refresh_models(
             ));
         }
         refresh::apply_builtin_providers(&mut live);
-        if let Some(models) = &opencode_go_models {
-            live.upsert_provider_models(models.clone());
+        if let Some(models) = &opencode_go {
+            let (upserted, removed) = refresh::apply_provider_models(
+                &mut live,
+                refresh::OPENCODE_GO_PROVIDER_ID,
+                models.clone(),
+            );
+            tracing::debug!(upserted, removed, "opencode-go membership applied");
         }
         if let Some(models) = &nous_models {
             live.upsert_provider_models(models.clone());

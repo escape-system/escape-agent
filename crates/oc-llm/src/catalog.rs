@@ -115,4 +115,28 @@ impl Catalog {
             }
         }
     }
+
+    /// Drop every model of `provider_id` whose id is absent from `keep`.
+    ///
+    /// A provider that publishes its own model list is authoritative for
+    /// **membership**: a model the subscription no longer includes must stop
+    /// being offered, even though `models.dev` still lists it (verified live:
+    /// `space-bunny` answers `isn't included in OpenCode Go`, `glm-5.2` answers
+    /// `has been deprecated`). Callers gate this on
+    /// [`refresh::is_plausible_provider_list`] so a truncated response never
+    /// empties the provider. Returns the number of models removed.
+    pub fn retain_provider_models(
+        &mut self,
+        provider_id: &str,
+        keep: &std::collections::HashSet<String>,
+    ) -> usize {
+        let before = self.models.len();
+        self.models
+            .retain(|model| model.provider_id != provider_id || keep.contains(&model.id));
+        let removed = before - self.models.len();
+        if removed > 0 {
+            self.reindex();
+        }
+        removed
+    }
 }
