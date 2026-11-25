@@ -125,8 +125,16 @@ async fn initialize_handshake_answers_server_requests() {
     assert!(client.capabilities()["hoverProvider"].as_bool().unwrap());
     assert!(client.supports_pull_diagnostics());
 
-    let trace = fixture
+    fixture
         .wait_trace("response folders", Duration::from_secs(5))
+        .await;
+    // `workspace/didChangeConfiguration` and `response folders` flush on
+    // independent client tasks, so wait for both before asserting every line.
+    let trace = fixture
+        .wait_trace(
+            "notification workspace/didChangeConfiguration",
+            Duration::from_secs(5),
+        )
         .await;
     for expected in [
         "notification initialized",
