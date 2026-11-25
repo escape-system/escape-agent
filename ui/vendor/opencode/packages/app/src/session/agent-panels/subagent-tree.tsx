@@ -35,8 +35,8 @@ export function SubagentTreePanel(props: { sessionID: string; inline?: boolean }
   const tree = useSubagentTreeQuery(() => props.sessionID)
 
   // The desktop header is the only surface that lists every subagent, so the strip starts open
-  // there. An explicit collapse is remembered; a stored collapse from the previous key version is
-  // upgraded into the new one, so a user who closed it stays closed.
+  // there. Only an explicit collapse under the current key is remembered; the previous key's value
+  // is ignored because that release wrote collapsed as its default (see `subagent-tree-state.ts`).
   const [collapsed, setCollapsed] = createSignal(readSubagentTreeCollapsed())
   const [filter, setFilter] = createSignal<FilterMode>("all")
   const [search, setSearch] = createSignal("")
@@ -214,7 +214,10 @@ export function SubagentTreePanel(props: { sessionID: string; inline?: boolean }
           </div>
         )}
       </Show>
-      <Show when={tree.data?.available && nodes().length > 1}>
+      {/* Reachability must match the mobile sheet (`agent-drawer.tsx`): the strip is gated on the rows it
+          has, never on `available` alone. A false `available` means the read was refused or failed — the
+          error line above already explains that — and it must not remove a list this tab can still show. */}
+      <Show when={nodes().length > 1}>
         <div
           data-component="session-agent-tree"
           class="relative border-b border-v2-border-border-base bg-v2-background-bg-base"

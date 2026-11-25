@@ -15,26 +15,25 @@ import type { Fetched } from "./agent-queries"
 export const SUBAGENT_TREE_STORAGE_KEY = "opencode.session.subagent-tree.v3.collapsed"
 
 /**
- * The key the previous version wrote. It only ever held an explicit choice (the old code wrote
- * on toggle, never on mount), so reading it keeps a user who collapsed the strip collapsed
- * without forcing everyone else back to collapsed.
+ * The key the version before this one wrote, kept only so a migration can be reasoned about (and
+ * tested). It is deliberately NOT read: that release defaulted the strip to collapsed and wrote
+ * `"true"` without the user asking, so a stored `"true"` is the old implicit default rather than a
+ * choice. Honouring it kept the desktop strip a 41px pill forever — the reported bug — because a
+ * collapsed strip only shows its header row.
  */
 export const LEGACY_SUBAGENT_TREE_STORAGE_KEY = "opencode.session.subagent-tree.v2.collapsed"
 
 /**
- * Whether the strip starts closed. Absent any stored choice it starts OPEN: the desktop header
- * is the only place that lists every subagent, and a collapsed strip there is the reported bug.
+ * Whether the strip starts closed. Only the current key's explicit value is honoured; absent one
+ * (including the legacy key on its own) the strip starts OPEN: the desktop header is the only place
+ * that lists every subagent, and a collapsed strip there is the reported bug.
  */
 export function readSubagentTreeCollapsed(
   storage: Pick<Storage, "getItem"> | undefined = typeof localStorage === "undefined" ? undefined : localStorage,
 ): boolean {
   if (!storage) return false
-  const current = storage.getItem(SUBAGENT_TREE_STORAGE_KEY)
-  if (current !== null) return current === "true"
-  const legacy = storage.getItem(LEGACY_SUBAGENT_TREE_STORAGE_KEY)
-  if (legacy !== null) return legacy === "true"
 
-  return false
+  return storage.getItem(SUBAGENT_TREE_STORAGE_KEY) === "true"
 }
 
 /** Records an explicit choice so it survives the next mount. */
