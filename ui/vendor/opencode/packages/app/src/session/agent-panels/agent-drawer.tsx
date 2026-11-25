@@ -5,6 +5,7 @@ import { createAgentEvents } from "./agent-events"
 import { useSubagentTreeQuery } from "./agent-queries"
 import { ObserverRepairPanel } from "./observer-repairs"
 import { SubagentTreePanel } from "./subagent-tree"
+import { subagentCount, subagentCountIn } from "./subagent-tree-state"
 
 const MobilePanelDrawer = lazy(async () => {
   const { MobilePanelDrawer } = await import("@/shell/mobile-panel-drawer")
@@ -48,10 +49,13 @@ export function SessionAgentPanelsMobile(props: { sessionID: string }): JSX.Elem
   }
 
   const nodes = () => (tree.data?.available ? tree.data.value.nodes : [])
-  const busy = () => nodes().filter((node) => node.state === "busy").length
+  const rootID = () => (tree.data?.available ? tree.data.value.root : undefined)
+  // Same total as the desktop pill: every node except the family root, which is the session itself.
+  const total = () => subagentCount(nodes(), rootID())
+  const busy = () => subagentCountIn(nodes(), ["busy"], rootID())
   const available = () => tree.data?.available === true
   // A lone session is the routed one; the trigger would open an empty sheet.
-  const visible = () => available() && (nodes().length > 1 || events.repairs().length > 0 || !!events.escalation())
+  const visible = () => available() && (total() > 0 || events.repairs().length > 0 || !!events.escalation())
 
   return (
     <Show when={visible()}>

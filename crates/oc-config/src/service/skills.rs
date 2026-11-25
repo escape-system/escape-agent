@@ -108,7 +108,7 @@ impl ConfigService {
         cache.clear();
     }
 
-    fn skill_roots(&self) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    pub(super) fn skill_roots(&self) -> (Vec<PathBuf>, Vec<PathBuf>) {
         let mut diagnostics = Vec::new();
         collect_skill_roots(
             &self.entries,

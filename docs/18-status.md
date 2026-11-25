@@ -536,20 +536,28 @@ registered, websearch providers list is empty, usage limits are `null`, and
   server has no `opencode.goal` RPC namespace, so that request is a JSON 404
   (the plugin swallows it). Goals are served by `/api/experimental/goal` and the
   patched goal chip uses that route.
-- Observer `inspect` still does not generate a digest, and `retry_tool` /
-  `cancel_tool` remain typed no-ops (no per-tool cancellation token); since
-  2026-11-23 a no-op or refused repair can no longer be published as
-  `observer.repaired` (see gap 8). The other repair kinds now act: compact,
-  switch_model (with escalation fallback), repost (last user prompt + pending
-  guard), restart_subagent (re-enqueue). `RepairFailed` is still log-only in
-  `BusObserverNotifier` — a refused/unconfirmed repair is visible in the
-  `observer/eval` rows and logs, not yet in the repair audit UI.
+- Observer `inspect` still does not generate a digest and `retry_tool` is still
+  a typed no-op. `cancel_tool` now acts: the runtime keeps a cancellation token
+  per running tool call (`crates/oc-runtime/src/runtime/mod.rs:337-354`,
+  `cancel_tool_call`) and the repair cancels exactly the targeted call(s),
+  refusing when none is running. Cancelling a tool does **not** interrupt the
+  turn or the other calls in the step, and it injects no synthetic message —
+  the model sees the tool's own error result. Since 2026-11-23 a refused or
+  unconfirmed repair can no longer be published as `observer.repaired` (see gap
+  8). The other repair kinds act: compact, switch_model (with escalation
+  fallback), repost (last user prompt + pending guard), restart_subagent
+  (re-enqueue). `RepairFailed` is still log-only in `BusObserverNotifier` — a
+  refused/unconfirmed repair is visible in the `observer/eval` rows and logs,
+  not yet in the repair audit UI.
 - A subagent spawn does not publish `session.created`; the tree panel updates
   on remount/`staleTime` (30 s) rather than live.
 - `max_children_per_session` is enforced by policy plus the in-process spawn
   budget; the store insert itself is not a cross-process transaction.
 - A sibling message storm is a hard `SiblingBudget` error, not a queue.
-  `request_reply` is stored but no reply correlation notifies the sender.
+  Reply correlation exists: `talk` takes an optional `reply_to` message id and
+  the peer row carries `metadata.replyTo`, which the timeline uses to pair an
+  answer with its question. `request_reply` stays an advisory flag — nothing
+  notifies the sender when the answer is written.
 - `oc-types::SessionInfo.location` is `SessionLocation {directory, workspaceID?}`
   (exact wire) rather than `LocationInfo {directory, project, subpath?}`. Both
   are exported; the server uses the wire one.

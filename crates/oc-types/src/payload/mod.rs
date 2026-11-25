@@ -83,9 +83,9 @@ mod step;
 mod trace;
 
 pub use compaction::{
-    SessionCompactionEnded, SessionCompactionFailed, SessionCompactionStarted,
-    SessionInboxCancelled, SessionInboxDelivered, SessionInboxDeliveryChanged,
-    SessionInboxEnqueued,
+    CompactionTrigger, SessionCompactionEnded, SessionCompactionFailed, SessionCompactionStarted,
+    SessionCompactionSuggested, SessionInboxCancelled, SessionInboxDelivered,
+    SessionInboxDeliveryChanged, SessionInboxEnqueued,
 };
 pub use lifecycle::{
     InterruptReason, SessionArchived, SessionCreated, SessionDeleted, SessionExecutionFailed,
@@ -220,6 +220,11 @@ mod tests {
         check!(SessionCompactionStarted, "session.compaction.started", true);
         check!(SessionCompactionEnded, "session.compaction.ended", true);
         check!(SessionCompactionFailed, "session.compaction.failed", true);
+        check!(
+            SessionCompactionSuggested,
+            "session.compaction.suggested",
+            true
+        );
         check!(SessionInboxEnqueued, "session.inbox.enqueued", true);
         check!(SessionInboxDelivered, "session.inbox.delivered", true);
         check!(SessionInboxCancelled, "session.inbox.cancelled", true);

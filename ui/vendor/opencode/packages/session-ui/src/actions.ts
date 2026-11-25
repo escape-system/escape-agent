@@ -39,6 +39,8 @@ export type SessionUserActions = {
   /** Opens the model picker, which a budget notice offers when a budget pauses the model in use. */
   chooseModel?: () => void
   revert?: (input: { sessionID: string; messageID: string }) => Promise<void> | void
+  /** Starts a compaction now; the advisory compaction row offers it. */
+  compact?: (input: { sessionID: string }) => Promise<void> | void
   /** Starts a new session with the history before this message and its prompt in the composer. */
   fork?: (input: { sessionID: string; messageID: string }) => Promise<void> | void
   /**
@@ -48,6 +50,7 @@ export type SessionUserActions = {
   pending?: {
     status: (messageID: string) => "starting" | "steering" | "stranded" | "queued" | undefined
     queue: (input: { sessionID: string; messageID: string }) => Promise<void>
+    steer?: (input: { sessionID: string; messageID: string }) => Promise<void>
     remove: (input: { sessionID: string; messageID: string }) => Promise<void>
   }
 }

@@ -283,6 +283,10 @@ export function createActiveSessionRegion(input: {
       server.api.session.inbox
         .update({ sessionID, inboxID: messageID, delivery: "queue" })
         .then(() => undefined, notifyFailed),
+    steer: ({ sessionID, messageID }) =>
+      server.api.session.inbox
+        .update({ sessionID, inboxID: messageID, delivery: "steer" })
+        .then(() => undefined, notifyFailed),
     remove: ({ sessionID, messageID }) =>
       server.api.session.inbox.cancel({ sessionID, inboxID: messageID }).then(() => undefined, notifyFailed),
   }
@@ -388,9 +392,14 @@ export function createActiveSessionRegion(input: {
           return forkMessage
         },
         get pending() {
-          if (input.session.data.isChild()) return
-
           return pendingSteer
+        },
+        // The advisory compaction row posts the same route as /compact; no separate endpoint.
+        get compact() {
+          const sessionID = input.session.identity.params.id
+          if (!sessionID) return
+
+          return () => data.session.compact({ sessionID }).then(() => undefined, notifyFailed)
         },
         get chooseModel() {
           if (input.session.data.isChild()) return
@@ -575,7 +584,8 @@ export function ActiveSessionComposerRegion(props: {
                 peer={{
                   count: peerFeed.unread,
                   queued: () => peerFeed.queued().length,
-                  onOpen: () => setPeersOpen(true),
+                  open: peersOpen,
+                  onOpen: () => setPeersOpen((value) => !value),
                 }}
               />
             )}
@@ -606,9 +616,6 @@ export function ActiveSessionComposerRegion(props: {
                 </Show>
                 <SessionPluginPills session={props.view()} screen={props.screen} alignment={alignment} />
               </SessionComposerLane>
-              <SessionQueuePanel queue={props.model.queue} hidden={props.model.region.state.blocked()} />
-            </Show>
-            <Show when={!missing() && props.session.data.isChild()}>
               <SessionQueuePanel queue={props.model.queue} hidden={props.model.region.state.blocked()} />
             </Show>
           </>

@@ -223,11 +223,32 @@ pub(super) fn auth_outcome(failure: AuthFailure, call: PendingToolCall) -> ToolO
     }
 }
 
+#[cfg(test)]
 pub(super) fn tool_content(
     result: &oc_tools::ToolResult,
     directory: &str,
     call_id: &str,
 ) -> (Vec<ToolContent>, Option<Map<String, Value>>) {
+    tool_content_with_limit(result, directory, call_id, None)
+}
+
+pub(super) fn tool_content_with_limit(
+    result: &oc_tools::ToolResult,
+    directory: &str,
+    call_id: &str,
+    max_bytes: Option<usize>,
+) -> (Vec<ToolContent>, Option<Map<String, Value>>) {
+    let max_inline_chars = max_bytes
+        .filter(|v| *v > 0)
+        .unwrap_or(MAX_INLINE_TOOL_OUTPUT_CHARS);
+    let (head_chars, tail_chars) = if max_inline_chars < SPILL_HEAD_CHARS + SPILL_TAIL_CHARS {
+        (
+            ((max_inline_chars * 2) / 5).max(1),
+            (max_inline_chars / 5).max(1),
+        )
+    } else {
+        (SPILL_HEAD_CHARS, SPILL_TAIL_CHARS)
+    };
     let mut content = result
         .content
         .as_ref()
@@ -248,11 +269,11 @@ pub(super) fn tool_content(
         let ToolContent::Text { text } = part else {
             continue;
         };
-        if text.len() <= MAX_INLINE_TOOL_OUTPUT_CHARS {
+        if text.len() <= max_inline_chars {
             continue;
         }
         let total_chars = text.chars().count();
-        if total_chars <= MAX_INLINE_TOOL_OUTPUT_CHARS {
+        if total_chars <= max_inline_chars {
             continue;
         }
         let spill_id = if part_index == 0 {
@@ -261,9 +282,9 @@ pub(super) fn tool_content(
             format!("{call_id}-{part_index}")
         };
         let spill_path = spill_tool_output(directory, &spill_id, text);
-        let head_end = char_boundary_end(text, SPILL_HEAD_CHARS);
-        let tail_start = char_boundary_tail(text, SPILL_TAIL_CHARS);
-        let omitted = total_chars.saturating_sub(SPILL_HEAD_CHARS + SPILL_TAIL_CHARS);
+        let head_end = char_boundary_end(text, head_chars);
+        let tail_start = char_boundary_tail(text, tail_chars);
+        let omitted = total_chars.saturating_sub(head_chars + tail_chars);
         let location_note = match &spill_path {
             Some(path) => format!(
                 "Full untruncated output saved to `{path}` — use `read` with `offset`/`limit` or `grep` on that file to inspect the middle section."

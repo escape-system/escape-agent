@@ -279,37 +279,42 @@ test("subagent peer messages stay visible in child history and transition from q
   const scroller = timelineScroller(page)
   await expect(scroller.locator("[data-timeline-virtual-content]")).toBeVisible()
 
-  // Delivered peer message renders as a full multi-line peer notice in the child timeline.
-  const sentNotice = scroller.locator('[data-slot="session-timeline-notice"][data-type="peer"]').first()
-  await expect(sentNotice).toBeVisible()
-  await expect(sentNotice).toContainText("Line one from user")
-  await expect(sentNotice).toContainText("Line two detail")
+  // Delivered peer message renders as a right-aligned Q&A prompt row in the child timeline.
+  const sentPeer = scroller.locator('[data-component="peer-message"][data-message-id="msg_vqd_peer_sent"]')
+  await expect(sentPeer).toBeVisible()
+  await expect(sentPeer).toContainText("Line one from user")
+  await expect(sentPeer).toContainText("Line two detail")
 
-  // While queued, the queued peer message stays in the child queue surfaces, not prematurely in timeline.
+  // While queued, the queued peer message stays visible in the child timeline (Q&A flow) with Steer/Cancel
+  // controls and on the SubagentBar badge, without a duplicate floating queue panel.
   await expect(page.getByTestId("session-peer-queued")).toContainText("1")
-  await expect(page.locator('[data-component="session-queue-panel"]')).toContainText("waiting peer instruction")
-  await expect(
-    scroller.locator('[data-slot="session-timeline-notice"][data-type="peer"]', {
-      hasText: "waiting peer instruction",
-    }),
-  ).toHaveCount(0)
+  await expect(page.locator('[data-component="session-queue-panel"]')).toHaveCount(0)
+  const queuedPeerRow = scroller.locator(
+    `[data-component="peer-message"][data-message-id="${queuedPeerID}"][data-queued="true"]`,
+  )
+  await expect(queuedPeerRow).toBeVisible()
+  await expect(queuedPeerRow).toContainText("waiting peer instruction")
+  await expect(queuedPeerRow.getByRole("button", { name: "Send now" })).toBeVisible()
+  await expect(queuedPeerRow.getByRole("button", { name: "Cancel" })).toBeVisible()
 
-  // Opening the peer drawer shows separate Queued (with Steer/Cancel actions) and Delivered history sections.
+  // Opening the peer drawer shows chronological Q&A (task + assistant reply + delivered peer) above Queued.
   await page.getByRole("button", { name: "Open peer messages" }).click()
   const drawer = page.locator('[data-component="session-peer-drawer"]')
   await expect(drawer).toBeVisible()
+  await expect(drawer.locator('[data-peer-section="delivered"]')).toContainText("working on child")
+  await expect(drawer.locator('[data-peer-section="delivered"]')).toContainText("Line one from user")
   await expect(drawer.locator('[data-peer-section="queued"]')).toContainText("waiting peer instruction")
   await expect(drawer.locator('[data-peer-section="queued"]').getByRole("button", { name: "Steer" })).toBeVisible()
   await expect(drawer.locator('[data-peer-section="queued"]').getByRole("button", { name: "Cancel" })).toBeVisible()
-  await expect(drawer.locator('[data-peer-section="delivered"]')).toContainText("Line one from user")
 
-  // Promoting delivery removes it from the queued section and reveals it chronologically in the timeline.
+  // Promoting delivery transitions the row in place from queued to delivered in both timeline and drawer.
   await prepared.pushEvents([inboxDelivered({ sessionID: childID, inboxID: queuedPeerID })])
   await expect(drawer.locator('[data-peer-section="queued"]')).toHaveCount(0)
   await expect(drawer.locator('[data-peer-section="delivered"]')).toContainText("waiting peer instruction")
   await expect(
-    scroller.locator('[data-slot="session-timeline-notice"][data-type="peer"]', {
-      hasText: "waiting peer instruction",
-    }),
-  ).toHaveCount(1)
+    scroller.locator(`[data-component="peer-message"][data-message-id="${queuedPeerID}"]`),
+  ).toBeVisible()
+  await expect(
+    scroller.locator(`[data-component="peer-message"][data-message-id="${queuedPeerID}"][data-queued="true"]`),
+  ).toHaveCount(0)
 })

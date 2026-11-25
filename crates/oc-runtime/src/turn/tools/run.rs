@@ -11,7 +11,7 @@ use crate::turn::permissions::authorize_tool_call;
 use crate::turn::types::{PendingToolCall, ResolvedTurn, ToolOutcome};
 
 use super::StripStartContext;
-use super::outcome::{auth_outcome, metadata_map, tool_content};
+use super::outcome::{auth_outcome, metadata_map, tool_content_with_limit};
 
 #[allow(clippy::too_many_lines)]
 pub(super) async fn run_tool(
@@ -122,6 +122,26 @@ pub(super) async fn run_tool(
         &turn.directory,
     )
     .await;
+    let mut shell_env = std::collections::BTreeMap::new();
+    if let Some(environment) = turn
+        .info
+        .metadata
+        .as_ref()
+        .and_then(|meta| meta.get("environment"))
+        .and_then(Value::as_object)
+    {
+        for (key, value) in environment {
+            if let Some(text) = value.as_str() {
+                shell_env.insert(key.clone(), text.to_owned());
+            }
+        }
+    }
+    let shell_cfg = oc_tools::shell::ShellRunConfig {
+        env: shell_env,
+        max_lines: turn.tool_output.max_lines,
+        max_bytes: turn.tool_output.max_bytes,
+    };
+
     let result = tokio::select! {
         biased;
         () = cancel.cancelled() => return ToolOutcome::Cancelled,
@@ -144,15 +164,26 @@ pub(super) async fn run_tool(
                 executed: true,
             };
         }
-        result = oc_tools::code_map::with_semantic_oracle(
-            runtime.semantic_oracle(),
-            oc_tools::key_health::with_key_health_source(
-                Some(runtime.key_health_source()),
-                tool.execute(&context, input),
+        result = oc_tools::shell::with_shell_config(
+            shell_cfg,
+            oc_tools::code_map::with_semantic_oracle(
+                runtime.semantic_oracle(),
+                oc_tools::key_health::with_key_health_source(
+                    Some(runtime.key_health_source()),
+                    tool.execute(&context, input),
+                ),
             ),
         ) => result,
     };
-    if tool_token.is_cancelled() && !cancel.is_cancelled() {
+    // A cancel that lands after the tool future already resolved must not
+    // rewrite a produced success into a cancellation: the side effects of an
+    // `Ok` result already happened. Only an `Err` that raced the cancel is
+    // reported as cancelled; success always wins.
+    if cancelled_after_completion(
+        result.is_err(),
+        tool_token.is_cancelled(),
+        cancel.is_cancelled(),
+    ) {
         return ToolOutcome::Failed {
             index: call.index,
             input: call.input,
@@ -170,8 +201,12 @@ pub(super) async fn run_tool(
     }
     match result {
         Ok(result) => {
-            let (mut tool_parts, mut tool_metadata) =
-                tool_content(&result, &turn.directory, &call.id);
+            let (mut tool_parts, mut tool_metadata) = tool_content_with_limit(
+                &result,
+                &turn.directory,
+                &call.id,
+                turn.tool_output.max_bytes,
+            );
             maybe_attach_post_edit_intelligence(
                 &runtime,
                 &turn.directory,
@@ -198,6 +233,20 @@ pub(super) async fn run_tool(
             executed: true,
         },
     }
+}
+
+/// True when a cancel raced a tool future that already resolved.
+///
+/// Only an `Err` result may be rewritten as a cancellation: a produced `Ok`
+/// already performed its side effects, so it is never reported as cancelled.
+/// The `tokio::select!` cancelled arm stays the sole cancel reporter for calls
+/// that never produced a result.
+fn cancelled_after_completion(
+    result_is_err: bool,
+    tool_cancelled: bool,
+    turn_cancelled: bool,
+) -> bool {
+    result_is_err && tool_cancelled && !turn_cancelled
 }
 
 async fn maybe_attach_post_edit_intelligence(
@@ -335,5 +384,32 @@ fn append_tool_supplement(parts: &mut Vec<ToolContent>, supplement: &str) {
         parts.push(ToolContent::Text {
             text: supplement.to_owned(),
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cancelled_after_completion;
+
+    /// A completed `Ok` tool result must never be rewritten as cancelled, even
+    /// when the per-call token was cancelled in the microseconds after the
+    /// future resolved: its side effects already happened.
+    #[test]
+    fn a_completed_ok_result_is_never_converted_to_cancelled() {
+        assert!(!cancelled_after_completion(false, true, false));
+        assert!(!cancelled_after_completion(false, false, false));
+    }
+
+    /// An `Err` that raced an observer cancel is still reported as cancelled.
+    #[test]
+    fn an_error_that_raced_a_cancel_is_reported_as_cancelled() {
+        assert!(cancelled_after_completion(true, true, false));
+    }
+
+    /// A whole-turn cancel keeps `ToolOutcome::Cancelled` from the select arm;
+    /// the post-completion guard never re-labels it.
+    #[test]
+    fn a_turn_cancel_is_not_reported_as_observer_repair() {
+        assert!(!cancelled_after_completion(true, true, true));
     }
 }

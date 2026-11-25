@@ -6,7 +6,7 @@ import { For, Show, createEffect, createSignal, onCleanup } from "solid-js"
 import { useLanguage } from "@/runtime/i18n/language"
 import { useServer } from "@/runtime/server/current"
 import { isConfigObject, serverMessage, useAgenticRequest } from "@/settings/agentic/config"
-import type { PeerFeed, PeerRow } from "./agent-events"
+import type { PeerFeed, PeerRow, PeerThreadRow } from "./agent-events"
 import { asText, type PeerMessage } from "./agent-wire"
 
 type Delivery = "steer" | "queue"
@@ -46,10 +46,16 @@ export function SessionPeerDrawer(props: { sessionID: string; feed: PeerFeed; op
     }
   })
 
+  const threadItems = (): PeerThreadRow[] =>
+    props.feed.thread?.() ??
+    props.feed.messages().map((item) => ({ ...item, role: "question" as const, origin: "peer" as const }))
+
+  const deliveredThread = () => threadItems().filter((item) => item.role === "answer" || item.status !== "queued")
+
   // Opening the drawer (and arriving messages while it stays open) marks them read
   // so the badge clears instead of counting own sends or open-drawer arrivals.
   createEffect(() => {
-    const rows = props.feed.messages()
+    const rows = threadItems()
     if (!props.open) return
     props.feed.markRead()
     if (rows.length > 0) queueMicrotask(() => list?.scrollTo({ top: list.scrollHeight }))
@@ -127,7 +133,7 @@ export function SessionPeerDrawer(props: { sessionID: string; feed: PeerFeed; op
         text,
         created: Date.now(),
       }
-      props.feed.add(message)
+      props.feed.add(message, delivery)
       setDraft("")
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause))
@@ -149,16 +155,53 @@ export function SessionPeerDrawer(props: { sessionID: string; feed: PeerFeed; op
     }
   }
 
-  const row = (message: PeerRow) => {
+  const answerRow = (answer: Extract<PeerThreadRow, { role: "answer" }>) => (
+    <li
+      data-peer-answer={answer.id}
+      data-peer-role="answer"
+      class="mr-auto w-fit max-w-[92%] rounded-lg border border-v2-border-border-base/70 bg-v2-background-bg-layer-01/70 p-2.5"
+    >
+      <div class="mb-1 flex items-center gap-1.5 text-11-regular text-v2-text-text-muted">
+        <span class="rounded-full bg-v2-background-bg-layer-02 px-1.5 py-px font-[530] text-v2-text-text-base">
+          {language.t("session.peer.answer")}
+        </span>
+        <Show when={answer.agent}>
+          {(agent) => <span class="capitalize text-v2-text-text-faint">{agent()}</span>}
+        </Show>
+        <Show when={answer.streaming}>
+          <span class="text-v2-text-text-accent">{language.t("session.peer.answerStreaming")}</span>
+        </Show>
+      </div>
+      <Show when={answer.text}>
+        <div
+          class="whitespace-pre-wrap break-words text-12-regular leading-5"
+          classList={{
+            "text-v2-state-fg-danger": !!answer.error,
+            "text-v2-text-text-base": !answer.error,
+          }}
+          dir="auto"
+        >
+          {answer.text}
+        </div>
+      </Show>
+    </li>
+  )
+
+  const row = (message: PeerRow & { origin?: "user" | "peer" }) => {
     const rowBusy = () => busyID() === message.id
     return (
       <li
         data-peer-message={message.id}
+        data-peer-role="question"
         aria-busy={rowBusy() || undefined}
-        class="rounded-lg border p-2.5 transition-colors"
+        class="ml-auto w-fit max-w-[92%] rounded-lg border p-2.5 transition-colors"
         classList={{
-          "border-v2-border-border-focus/50 bg-v2-background-bg-layer-01/80": message.status === "queued",
-          "border-v2-border-border-base bg-v2-background-bg-base": message.status !== "queued",
+          "border-dashed border-v2-border-border-focus/60 bg-v2-background-bg-layer-01/80":
+            message.status === "queued",
+          "border-v2-border-border-base bg-v2-background-bg-layer-02/70":
+            message.status !== "queued" && (message.own || message.origin === "user"),
+          "border-v2-border-border-base bg-v2-background-bg-base":
+            message.status !== "queued" && !message.own && message.origin !== "user",
           "opacity-60": rowBusy(),
         }}
       >
@@ -166,16 +209,18 @@ export function SessionPeerDrawer(props: { sessionID: string; feed: PeerFeed; op
           <span
             class="shrink-0 rounded-full px-1.5 py-px text-11-regular"
             classList={{
-              "bg-v2-background-bg-layer-02 text-v2-text-text-accent": !message.own,
-              "bg-v2-surface-surface-muted text-v2-text-text-muted": message.own,
+              "bg-v2-background-bg-layer-02 text-v2-text-text-accent": !message.own && message.origin !== "user",
+              "bg-v2-surface-surface-muted text-v2-text-text-muted": message.own || message.origin === "user",
             }}
           >
-            {language.t(message.own ? "session.peer.you" : "session.peer.badge")}
+            {message.origin === "user"
+              ? language.t("session.peer.initialPrompt")
+              : language.t(message.own ? "session.peer.you" : "session.peer.badge")}
           </span>
           <span class="min-w-0 flex-1 truncate text-11-regular text-v2-text-text-faint" dir="auto">
             {sender(message)}
           </span>
-          <Show when={message.status}>
+          <Show when={message.origin !== "user" && message.status}>
             {(status) => (
               <span
                 data-peer-status={status()}
@@ -284,22 +329,22 @@ export function SessionPeerDrawer(props: { sessionID: string; feed: PeerFeed; op
 
         <div ref={list} class="min-h-0 flex-1 overflow-y-auto overscroll-contain px-3 py-2">
           <Show
-            when={props.feed.messages().length > 0}
+            when={deliveredThread().length > 0 || props.feed.queued().length > 0}
             fallback={<div class="text-11-regular text-v2-text-text-faint">{language.t("session.peer.empty")}</div>}
           >
+            <ol data-peer-section="delivered" class="flex flex-col gap-2">
+              <For each={deliveredThread()}>
+                {(entry) => (entry.role === "answer" ? answerRow(entry) : row(entry))}
+              </For>
+            </ol>
             <Show when={props.feed.queued().length > 0}>
-              <div class="mb-1 text-11-regular font-medium uppercase tracking-wide text-v2-text-text-faint">
+              <div class="mt-3 mb-1 text-11-regular font-medium uppercase tracking-wide text-v2-text-text-faint">
                 {language.t("session.peer.queuedSection")}
               </div>
-              <ol data-peer-section="queued" class="mb-3 flex flex-col gap-2">
+              <ol data-peer-section="queued" class="flex flex-col gap-2">
                 <For each={props.feed.queued()}>{(message) => row(message)}</For>
               </ol>
             </Show>
-            <ol data-peer-section="delivered" class="flex flex-col gap-2">
-              <For each={props.feed.messages().filter((message) => message.status !== "queued")}>
-                {(message) => row(message)}
-              </For>
-            </ol>
           </Show>
         </div>
 

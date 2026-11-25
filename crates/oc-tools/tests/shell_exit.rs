@@ -123,3 +123,32 @@ async fn shell_without_pipefail_still_runs_commands() {
     assert_eq!(result.output.unwrap().trim(), "ses_test");
     assert_eq!(result.metadata.unwrap()["exit"].as_i64(), Some(0));
 }
+
+#[tokio::test]
+async fn shell_run_config_applies_env_and_output_limits() {
+    let dir = TempDir::new().unwrap();
+    let mut env = std::collections::BTreeMap::new();
+    env.insert("CUSTOM_SESSION_TOKEN".to_owned(), "token_42".to_owned());
+    let config = oc_tools::shell::ShellRunConfig {
+        env,
+        max_lines: Some(2),
+        max_bytes: Some(4096),
+    };
+    let result = oc_tools::shell::with_shell_config(
+        config,
+        ShellTool.execute(
+            &ctx(dir.path()),
+            json!({
+                "command": "printf 'line1\\nline2\\n%s\\n' \"$CUSTOM_SESSION_TOKEN\"",
+                "timeout": 30_000
+            }),
+        ),
+    )
+    .await
+    .unwrap();
+    let output = result.output.unwrap();
+    assert!(output.contains("line2"), "{output}");
+    assert!(output.contains("token_42"), "{output}");
+    assert!(!output.contains("line1"), "{output}");
+    assert_eq!(result.metadata.unwrap()["truncated"].as_bool(), Some(true));
+}

@@ -69,6 +69,18 @@ pub(crate) fn request(request: &LlmRequest) -> WireRequest {
     if let Some(effort) = settings.get("reasoningEffort").and_then(Value::as_str) {
         object.insert("reasoning_effort".to_string(), json!(effort));
     }
+    if let Some(thinking) = settings.get("thinking") {
+        object.insert("thinking".to_string(), thinking.clone());
+    }
+    if let Some(reasoning) = settings.get("reasoning") {
+        object.insert("reasoning".to_string(), reasoning.clone());
+    }
+    if let Some(enable) = settings.get("enableThinking") {
+        object.insert("enable_thinking".to_string(), enable.clone());
+    }
+    if let Some(budget) = settings.get("thinkingBudget") {
+        object.insert("thinking_budget".to_string(), budget.clone());
+    }
     if let Some(cache_key) = &request.options.cache_key
         && !cache_key.is_empty()
         && (model.provider.id == "openai"

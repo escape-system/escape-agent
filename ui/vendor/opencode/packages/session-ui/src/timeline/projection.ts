@@ -16,13 +16,16 @@ import {
   currentToolHasLoadedFiles,
 } from "../message/current-tool-state"
 import { TimelineRow, type PartGroup, type PartRef, type TimelineRowMap } from "./timeline-row"
-import { timelineCategory, timelineNoticePlacement, timelineNoticeRequired, type TimelineDetail } from "./detail"
+import { isPeerNotice, timelineCategory, timelineNoticePlacement, timelineNoticeRequired, type TimelineDetail } from "./detail"
+import { compactionInFlight, emptyCompaction, foldCompaction, type CompactionState } from "./compaction-state"
 
 export { TimelineRow, type PartGroup, type PartRef, type TimelineRowMap }
 
 export type ReasoningMode = "hidden" | "compact" | "full"
 
 type Notice = Exclude<SessionMessageInfo, { type: "user" | "assistant" | "shell" | "idle" }>
+
+type Peer = Extract<SessionMessageInfo, { type: "synthetic" }>
 
 type FailedIdle = SessionMessageIdle & {
   outcome: "failed"
@@ -80,12 +83,23 @@ export type TimelineProjectionInput = {
   timelineDetail?: TimelineDetail
   pendingInputIDs?: ReadonlySet<string>
   queuedCompactionIDs?: readonly string[]
+  /** The session's folded compaction record; the timeline renders at most one row from it. */
+  compaction?: CompactionState
   turnDiffs?: boolean
   previousRows?: TimelineRow.TimelineRow[]
 }
 
+/**
+ * A queued-only record for callers that still pass raw inbox IDs. Folding them keeps one
+ * code path, so a duplicate ID can never mint a second row.
+ */
+export function queuedCompactionState(ids: readonly string[]): CompactionState {
+  return ids.reduce((state, inboxID, index) => foldCompaction(state, { type: "queued", at: index + 1, inboxID }), emptyCompaction)
+}
+
 export function createTimelineProjection(input: TimelineProjectionInput) {
   const sessionMessageByID = new Map(input.sessionMessages.map((message) => [message.id, message] as const))
+  const compaction = input.compaction ?? queuedCompactionState(input.queuedCompactionIDs ?? [])
 
   const projection = Timeline.constructSessionMessageRows(
     input.sessionMessages,
@@ -98,6 +112,7 @@ export function createTimelineProjection(input: TimelineProjectionInput) {
     input.timelineDetail,
     input.queuedCompactionIDs,
     input.turnDiffs,
+    compaction,
   )
 
   const rows = reuseTimelineRows(input.previousRows, projection.rows)
@@ -136,6 +151,7 @@ export function createReactiveTimelineProjection(input: {
   timelineDetail?: Accessor<TimelineDetail>
   pendingInputIDs?: Accessor<ReadonlySet<string>>
   queuedCompactionIDs?: Accessor<readonly string[]>
+  compaction?: Accessor<CompactionState>
   /** Summarize each finished turn's changed files after it. */
   turnDiffs?: Accessor<boolean>
 }) {
@@ -176,6 +192,7 @@ export function createReactiveTimelineProjection(input: {
       input.timelineDetail?.(),
       input.queuedCompactionIDs?.(),
       input.turnDiffs?.(),
+      input.compaction?.() ?? queuedCompactionState(input.queuedCompactionIDs?.() ?? []),
     ),
   )
 
@@ -239,11 +256,16 @@ export namespace Timeline {
     detail?: TimelineDetail,
     queuedCompactionIDs: readonly string[] = [],
     turnDiffs = false,
+    compaction?: CompactionState,
   ) {
     type Turn = {
       id: string
       time: { created: number }
       user?: SessionMessageUser
+      peer?: Peer
+      /** A peer row that replies to an earlier question: it never opens a Q&A pair. */
+      answer?: boolean
+      replyTo?: string
       shell?: SessionMessageShell
       entries: Entry[]
     }
@@ -255,7 +277,38 @@ export namespace Timeline {
     // Everything since the last idle marker is one turn, including prompts steered in meanwhile.
     let execution: { opener: string; turn: Turn; files: Set<string> } | undefined
 
-    messages.forEach((message) => {
+    // A live compaction owns the session's single compaction row, so its running message must not
+    // also render as a notice: that duplication is what showed "queued" and "running" together.
+    // A caller that still passes raw inbox IDs folds them here, so every path shares one row.
+    const record = compaction ?? queuedCompactionState(queuedCompactionIDs)
+    const liveCompaction = compactionInFlight(record) ? record : undefined
+    const source = liveCompaction
+      ? messages.filter((message) => !(message.type === "compaction" && message.status === "running"))
+      : messages
+
+    source.forEach((message) => {
+      if (message.type === "synthetic" && isPeerNotice(message)) {
+        if (turnByUserID.has(message.id)) return
+        const replyTo = peerReplyTo(message)
+        const turn: Turn = {
+          id: message.id,
+          time: message.time,
+          peer: message,
+          entries: [],
+          ...(message.metadata?.kind === "answer" ? { answer: true } : {}),
+          ...(replyTo ? { replyTo } : {}),
+        }
+        turns.push(turn)
+        turnByUserID.set(message.id, turn)
+        current = turn
+
+        // Undelivered input has not joined the turn yet.
+        if (!pendingInputIDs?.has(message.id))
+          execution = { opener: execution?.opener ?? message.id, turn, files: execution?.files ?? new Set() }
+
+        return
+      }
+
       if (isNotice(message)) {
         if (current) current.entries.push({ type: "notice", message })
 
@@ -305,16 +358,16 @@ export namespace Timeline {
 
       if (message.type !== "assistant") return
       message.snapshot?.files?.forEach((file) => execution?.files.add(file))
-      const existing = current?.user ? current : undefined
+      const existing = current?.user || current?.peer ? current : undefined
 
-      if (existing?.user) {
+      if (existing) {
         existing.entries.push({ type: "assistant", message })
         current = existing
 
         return
       }
 
-      if (current && !current.user && !current.shell) {
+      if (current && !current.user && !current.peer && !current.shell) {
         current.entries.push({ type: "assistant", message })
 
         return
@@ -324,6 +377,22 @@ export namespace Timeline {
       turns.push(turn)
       current = turn
     })
+
+    // A peer answer follows the question it replies to, so the pair reads in order even when the
+    // answer reaches this client first. Answers with no resolvable question keep their place.
+    const orderedTurns = (() => {
+      if (!turns.some((turn) => turn.answer)) return turns
+      const ordered: Turn[] = []
+      const answers: Turn[] = []
+      turns.forEach((turn) => (turn.answer && turn.replyTo ? answers.push(turn) : ordered.push(turn)))
+      answers.forEach((answer) => {
+        const at = ordered.findIndex((turn) => turn.id === answer.replyTo)
+        if (at < 0) ordered.push(answer)
+        else ordered.splice(at + 1, 0, answer)
+      })
+
+      return ordered
+    })()
 
     function appendIdle(message: SessionMessageIdle) {
       if (!isFailedIdle(message)) return
@@ -353,12 +422,13 @@ export namespace Timeline {
     }
 
     const activeMessageID =
-      turns.findLast((turn) => !pendingInputIDs?.has(turn.id) || turn.entries.some((entry) => entry.type === "idle"))
-        ?.id ?? turns.at(-1)?.id
+      orderedTurns.findLast(
+        (turn) => !pendingInputIDs?.has(turn.id) || turn.entries.some((entry) => entry.type === "idle"),
+      )?.id ?? orderedTurns.at(-1)?.id
 
     const commentary = new Set(
       detail && detail.commentary.placement !== "separate"
-        ? turns.flatMap((turn) =>
+        ? orderedTurns.flatMap((turn) =>
             turnCommentary(turn.entries, turn.id !== activeMessageID || status.type === "idle", (content) =>
               isRenderable(content, showReasoning, detail),
             ),
@@ -374,8 +444,8 @@ export namespace Timeline {
       !isNoopModelSwitch(message) && (!detail || timelineNoticePlacement(message, detail) !== "hidden")
 
     const visibleTurns = detail
-      ? turns.filter((turn) => {
-          if (turn.user) return true
+      ? orderedTurns.filter((turn) => {
+          if (turn.user || turn.peer) return true
 
           if (turn.shell && (detail.shell.placement !== "hidden" || shellFailed(turn.shell))) return true
 
@@ -389,12 +459,12 @@ export namespace Timeline {
                 entry.message.content.some((content) => visible(content, showReasoning, detail)),
           )
         })
-      : turns
+      : orderedTurns
 
     const rows: TimelineRow.TimelineRow[] = [
       ...leading.flatMap((message) =>
         visibleNotice(message)
-          ? [new TimelineRow.Notice({ userMessageID: turns[0]?.id ?? message.id, messageID: message.id })]
+          ? [new TimelineRow.Notice({ userMessageID: orderedTurns[0]?.id ?? message.id, messageID: message.id })]
           : [],
       ),
       ...visibleTurns.flatMap((turn, index) => {
@@ -412,7 +482,7 @@ export namespace Timeline {
           ]
 
         return constructMessageRows(
-          turn.user,
+          turn.user ?? turn.peer,
           turn.id,
           turn.entries,
           index,
@@ -429,23 +499,36 @@ export namespace Timeline {
     ]
 
     // Like the TUI, a queued compaction waits after the active turn and ahead of every undelivered input:
-    // steers, which own turns, and synthetic notices, which ride at the end of the active one.
+    // steers and peer turns, which own turns, and synthetic notices, which ride at the end of the active one.
     const pendingAt = rows.findIndex(
       (row) =>
         pendingInputIDs?.has(row.userMessageID) ||
-        (Predicate.isTagged(row, "Notice") && pendingInputIDs?.has(row.messageID)),
+        ((Predicate.isTagged(row, "Notice") || Predicate.isTagged(row, "PeerMessage")) &&
+          pendingInputIDs?.has(row.messageID)),
     )
+
+    const compactionRows: TimelineRow.TimelineRow[] = liveCompaction
+      ? [
+          new TimelineRow.CompactionQueued({
+            userMessageID: activeMessageID ?? liveCompaction.inboxID ?? "compaction",
+            phase: liveCompaction.phase as "suggested" | "queued" | "running",
+            ...(liveCompaction.inboxID !== undefined ? { inboxID: liveCompaction.inboxID } : {}),
+            ...(liveCompaction.trigger !== undefined ? { trigger: liveCompaction.trigger } : {}),
+            ...(liveCompaction.estimateTokens !== undefined ? { estimateTokens: liveCompaction.estimateTokens } : {}),
+            ...(liveCompaction.triggerTokens !== undefined ? { triggerTokens: liveCompaction.triggerTokens } : {}),
+            ...(liveCompaction.ceilingTokens !== undefined ? { ceilingTokens: liveCompaction.ceilingTokens } : {}),
+          }),
+        ]
+      : []
 
     rows.splice(
       pendingAt < 0 ? rows.length : pendingAt,
       0,
       // Live status ends the work the model has seen, so it stays above everything still waiting for delivery.
-      ...(status.type !== "idle" && activeMessageID && (pendingAt >= 0 || queuedCompactionIDs.length > 0)
+      ...(status.type !== "idle" && activeMessageID && (pendingAt >= 0 || compactionRows.length > 0)
         ? [new TimelineRow.Activity({ userMessageID: activeMessageID })]
         : []),
-      ...queuedCompactionIDs.map(
-        (inboxID) => new TimelineRow.CompactionQueued({ userMessageID: activeMessageID ?? inboxID, inboxID }),
-      ),
+      ...compactionRows,
     )
 
     return {
@@ -455,7 +538,7 @@ export namespace Timeline {
             rows,
             detail,
             new Set(
-              messages.flatMap((message) =>
+              source.flatMap((message) =>
                 message.type === "compaction" ||
                 message.type === "model-switched" ||
                 message.type === "location-switched" ||
@@ -470,7 +553,7 @@ export namespace Timeline {
   }
 
   export function constructMessageRows(
-    userMessage: SessionMessageUser | undefined,
+    userMessage: SessionMessageUser | Peer | undefined,
     turnID: string,
     entries: Entry[],
     index: number,
@@ -507,7 +590,17 @@ export namespace Timeline {
 
     if (previousUserMessage) rows.push(new TimelineRow.TurnGap({ userMessageID: turnID }))
 
-    if (userMessage) rows.push(new TimelineRow.UserMessage({ userMessageID: turnID }))
+    if (userMessage?.type === "user") rows.push(new TimelineRow.UserMessage({ userMessageID: turnID }))
+    if (userMessage?.type === "synthetic")
+      rows.push(
+        new TimelineRow.PeerMessage({
+          userMessageID: turnID,
+          messageID: userMessage.id,
+          ...(userMessage.metadata?.kind === "answer" ? { answer: true } : {}),
+          ...(peerReplyTo(userMessage) ? { replyTo: peerReplyTo(userMessage)! } : {}),
+          ...(userMessage.metadata?.cancelled === true ? { cancelled: true } : {}),
+        }),
+      )
 
     let assistantGroupIndex = 0
     let previousAssistantTool = false
@@ -842,6 +935,13 @@ function indexUserContext(messages: SessionMessageInfo[]) {
       })
     }
 
+    if (message.type === "synthetic" && isPeerNotice(message)) {
+      userID = message.id
+      const peerAgent = Predicate.isString(message.metadata?.agent) && message.metadata.agent ? message.metadata.agent : ""
+
+      result.set(message.id, { agent: peerAgent || agent, model })
+    }
+
     if (message.type === "shell") userID = undefined
 
     if (message.type !== "assistant") return
@@ -859,7 +959,7 @@ function indexAssistantMessages(messages: SessionMessageInfo[]) {
   let userID: string | undefined
 
   messages.forEach((message) => {
-    if (message.type === "user") userID = message.id
+    if (message.type === "user" || (message.type === "synthetic" && isPeerNotice(message))) userID = message.id
 
     if (message.type === "shell") userID = undefined
 
@@ -1141,11 +1241,21 @@ export function unwrapErrorMessage(message: string) {
   return Option.getOrUndefined(decodeString(envelope.error)) || message
 }
 
+/** `metadata.replyTo`: the peer message a Q&A answer replies to. */
+function peerReplyTo(message: SessionMessageInfo): string | undefined {
+  if (message.type !== "synthetic") return undefined
+  const value = message.metadata?.replyTo
+
+  return typeof value === "string" && value ? value : undefined
+}
+
 function isNotice(message: SessionMessageInfo): message is Notice {
   if (message.type === "user" || message.type === "assistant" || message.type === "shell" || message.type === "idle")
     return false
 
   if (message.type !== "synthetic") return true
+
+  if (isPeerNotice(message)) return false
 
   return !!message.description?.trim() || timelineNoticeRequired(message)
 }

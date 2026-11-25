@@ -376,3 +376,167 @@ fn errors_have_no_candidate_panic_on_empty() {
     let error = catalog.resolve("missing/x").unwrap_err();
     assert!(matches!(error, LlmError::UnknownProvider { .. }));
 }
+
+const UPSTREAM_VARIANT_FIXTURE: &str = r#"{
+  "deepseek": {
+    "id": "deepseek",
+    "name": "DeepSeek",
+    "env": ["DEEPSEEK_API_KEY"],
+    "models": {
+      "deepseek-v4-pro": {
+        "id": "deepseek-v4-pro",
+        "type": "chat",
+        "name": "DeepSeek V4 Pro",
+        "release_date": "2026-01-01",
+        "capabilities": {
+          "tools": {"supported": true},
+          "reasoning": {"supported": true, "toggle": true, "effort": ["low", "high", "max"]}
+        },
+        "limit": {"context": 128000, "output": 32000},
+        "api": {
+          "chat-completions": {
+            "base_url": "https://api.deepseek.com/v1",
+            "sdk": {"aisdk": "@ai-sdk/openai-compatible", "opencodeai": "@opencode/ai/providers/deepseek"}
+          }
+        }
+      }
+    }
+  },
+  "zai": {
+    "id": "zai",
+    "name": "Z.AI",
+    "env": ["ZHIPU_API_KEY"],
+    "models": {
+      "glm-4.5": {
+        "id": "glm-4.5",
+        "type": "chat",
+        "name": "GLM 4.5",
+        "release_date": "2025-08-01",
+        "capabilities": {
+          "tools": {"supported": true},
+          "reasoning": {"supported": true, "toggle": true}
+        },
+        "limit": {"context": 128000, "output": 32000},
+        "api": {
+          "chat-completions": {
+            "base_url": "https://open.bigmodel.cn/api/paas/v4",
+            "sdk": {"aisdk": "@ai-sdk/openai-compatible", "opencodeai": "@opencode/ai/providers/zai/chat"}
+          }
+        }
+      }
+    }
+  },
+  "openrouter": {
+    "id": "openrouter",
+    "name": "OpenRouter",
+    "env": ["OPENROUTER_API_KEY"],
+    "models": {
+      "reasoner": {
+        "id": "reasoner",
+        "type": "chat",
+        "name": "Reasoner",
+        "release_date": "2026-01-01",
+        "capabilities": {
+          "tools": {"supported": true},
+          "reasoning": {"supported": true, "toggle": true, "effort": ["default", "low", "high"]}
+        },
+        "limit": {"context": 128000, "output": 32000},
+        "api": {
+          "chat-completions": {
+            "base_url": "https://openrouter.ai/api/v1",
+            "sdk": {"aisdk": "@openrouter/ai-sdk-provider", "opencodeai": "@opencode/ai/providers/openrouter"}
+          }
+        }
+      }
+    }
+  },
+  "anthropic": {
+    "id": "anthropic",
+    "name": "Anthropic",
+    "env": ["ANTHROPIC_API_KEY"],
+    "models": {
+      "claude-haiku-5-5": {
+        "id": "claude-haiku-5-5",
+        "type": "chat",
+        "name": "Claude Haiku 5.5",
+        "release_date": "2026-02-01",
+        "capabilities": {
+          "tools": {"supported": true},
+          "reasoning": {"supported": true, "toggle": true, "effort": ["low", "medium", "high"]}
+        },
+        "limit": {"context": 200000, "output": 64000},
+        "api": {
+          "messages": {
+            "base_url": "https://api.anthropic.com/v1",
+            "sdk": {"aisdk": "@ai-sdk/anthropic", "opencodeai": "@opencode/ai/providers/anthropic"}
+          }
+        }
+      },
+      "custom-messages": {
+        "id": "custom-messages",
+        "type": "chat",
+        "name": "Custom Messages",
+        "release_date": "2026-02-01",
+        "capabilities": {
+          "tools": {"supported": true},
+          "reasoning": {"supported": true, "effort": ["low", "high"]}
+        },
+        "limit": {"context": 128000, "output": 32000},
+        "api": {
+          "messages": {
+            "base_url": "http://unused.invalid",
+            "sdk": {"aisdk": "@ai-sdk/anthropic", "opencodeai": "@opencode/ai/providers/anthropic-compatible"}
+          }
+        }
+      }
+    }
+  }
+}"#;
+
+#[test]
+fn upstream_standardized_thinking_variants_and_wire_payloads() {
+    let catalog = Catalog::from_snapshot(UPSTREAM_VARIANT_FIXTURE).unwrap();
+
+    // toggle + effort combines `none` before effort tiers for providers that define toggle.
+    let ds = catalog.resolve("deepseek/deepseek-v4-pro").unwrap();
+    let ds_ids: Vec<&str> = ds.model.variants.iter().map(|v| v.id.as_str()).collect();
+    assert_eq!(ds_ids, vec!["none", "low", "high", "max"]);
+    assert_eq!(
+        catalog
+            .resolve("deepseek/deepseek-v4-pro#high")
+            .unwrap()
+            .body()["thinking"]["type"],
+        "enabled"
+    );
+    assert_eq!(
+        catalog
+            .resolve("deepseek/deepseek-v4-pro#none")
+            .unwrap()
+            .body()["thinking"]["type"],
+        "disabled"
+    );
+
+    // Z.AI toggle models synthesize `none` + `thinking` rather than empty variants.
+    let glm = catalog.resolve("zai/glm-4.5#thinking").unwrap();
+    assert_eq!(glm.settings()["thinking"]["type"], "enabled");
+    assert_eq!(glm.settings()["thinking"]["clear_thinking"], false);
+
+    // `default` in `effort` is stripped while OpenRouter emits nested `reasoning` settings.
+    let or = catalog.resolve("openrouter/reasoner").unwrap();
+    let or_ids: Vec<&str> = or.model.variants.iter().map(|v| v.id.as_str()).collect();
+    assert_eq!(or_ids, vec!["none", "low", "high"]);
+    assert_eq!(
+        catalog
+            .resolve("openrouter/reasoner#high")
+            .unwrap()
+            .settings()["reasoning"]["effort"],
+        "high"
+    );
+
+    // Claude with toggle+effort preserves `none` before efforts; non-Claude Messages preserves `effort`.
+    let haiku = catalog.resolve("anthropic/claude-haiku-5-5").unwrap();
+    let haiku_ids: Vec<&str> = haiku.model.variants.iter().map(|v| v.id.as_str()).collect();
+    assert_eq!(haiku_ids, vec!["none", "low", "medium", "high"]);
+    let custom = catalog.resolve("anthropic/custom-messages#high").unwrap();
+    assert_eq!(custom.settings()["effort"], "high");
+}

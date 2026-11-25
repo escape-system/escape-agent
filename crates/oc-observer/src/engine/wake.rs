@@ -18,10 +18,13 @@ pub(super) fn is_strip_overdue(strip: &FlightStrip, tree: &[TreeRow], now: Engin
     if !strip.is_overdue(now.mono_ms) {
         return false;
     }
-    if strip.tool == "subagent"
-        && tree.iter().any(|row| {
-            row.parent.as_deref() == Some(strip.session_id.as_str()) && row.state == "busy"
-        })
+    // Waiting on live work is not a hang: when a direct child of the strip's
+    // session is busy, the call is blocked on the child regardless of which
+    // tool is waiting (`subagent`, `roster` with `wait_seconds`, `lane wait`).
+    // Any other strip shape keeps the monotonic deadline untouched.
+    if tree
+        .iter()
+        .any(|row| row.parent.as_deref() == Some(strip.session_id.as_str()) && row.state == "busy")
     {
         return false;
     }

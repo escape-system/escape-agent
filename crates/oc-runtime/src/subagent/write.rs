@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 
 use crate::runtime::Runtime;
 
+use super::protocol::SubagentPeerMessage;
 use super::settings::settings_for_session;
 use super::tree::{
     budget_error, load_info, load_node, load_tree, optional_bool, optional_str, required_str,
@@ -110,17 +111,43 @@ impl Tool for WriteSessionTool {
                 .map_err(|error| runtime_error(&error))?;
         }
         let item_id = MessageId::new().into_inner();
+        // Materialised at admission (same as `talk`), so a queued write is
+        // readable in the target's history before it is delivered.
         runtime
-            .enqueue_and_emit(NewInbox {
+            .enqueue_materialized(NewInbox {
                 id: item_id.clone(),
                 session_id: to.clone(),
                 kind: "synthetic".to_owned(),
                 payload: json!({
                     "text": text,
-                    "metadata": { "source": "peer", "from": caller },
+                    "metadata": {
+                        "source": "peer",
+                        "from": caller,
+                        "agent": from_node.agent,
+                        "kind": "note",
+                    },
                 }),
                 delivery,
             })
+            .await
+            .map_err(|error| runtime_error(&error))?;
+        // Same ephemeral notification `talk` publishes, so a write is not
+        // second-class in the drawer.
+        let peer_info = load_info(runtime, &to).await?;
+        runtime
+            .emit(
+                &to,
+                &peer_info.location.directory,
+                SubagentPeerMessage {
+                    session_id: to.clone(),
+                    from: caller.clone(),
+                    agent: from_node.agent.clone(),
+                    kind: "note".to_owned(),
+                    text: text.clone(),
+                    request_reply: false,
+                    message_id: item_id.clone(),
+                },
+            )
             .await
             .map_err(|error| runtime_error(&error))?;
         // Always wake the target actor after enqueueing so `queue` deliveries reach

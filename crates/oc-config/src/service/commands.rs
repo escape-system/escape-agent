@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::ConfigService;
-use crate::commands::CommandInfo;
+use crate::commands::{self, CommandInfo};
 use crate::discovery;
 use crate::instructions::{self, InstructionFile};
 
@@ -28,6 +28,69 @@ impl ConfigService {
     #[must_use]
     pub fn command(&self, name: &str) -> Option<&CommandInfo> {
         self.commands.iter().find(|command| command.name == name)
+    }
+
+    /// Slash commands visible from `directory`, using the same global/project
+    /// scoping as [`ConfigService::skills_for`].
+    #[must_use]
+    pub fn commands_for(&self, directory: &Path) -> Arc<Vec<CommandInfo>> {
+        if directory.as_os_str().is_empty() {
+            return Arc::new(self.commands.clone());
+        }
+        let resolved = if directory.is_absolute() {
+            directory.to_path_buf()
+        } else {
+            self.discovery.location.join(directory)
+        };
+        let resolved = std::path::absolute(&resolved).unwrap_or(resolved);
+        let key = discovery::path_key(&resolved);
+        if key == discovery::path_key(&self.discovery.location) {
+            return Arc::new(self.commands.clone());
+        }
+        if let Some(cached) = self.cached_commands(&key) {
+            return cached;
+        }
+
+        let mut diagnostics = Vec::new();
+        let (config_roots, _) = self.skill_roots();
+        let found = Arc::new(commands::discover_for(
+            &config_roots,
+            &self.discovery,
+            &resolved,
+            &mut diagnostics,
+        ));
+        drop(diagnostics);
+        self.cache_commands(key, Arc::clone(&found));
+        found
+    }
+
+    /// Drop every cached per-directory command set, keeping the load-time
+    /// snapshot.
+    pub fn invalidate_commands(&self) {
+        let mut cache = self
+            .command_cache
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cache.clear();
+    }
+
+    fn cached_commands(&self, key: &str) -> Option<Arc<Vec<CommandInfo>>> {
+        let cache = self
+            .command_cache
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cache.get(key).cloned()
+    }
+
+    fn cache_commands(&self, key: String, commands: Arc<Vec<CommandInfo>>) {
+        let mut cache = self
+            .command_cache
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if cache.len() >= MAX_INSTRUCTION_CACHE && !cache.contains_key(&key) {
+            cache.clear();
+        }
+        cache.insert(key, commands);
     }
 
     /// `AGENTS.md`/`CLAUDE.md`/`.opencode/AGENTS.md` from the location upward,

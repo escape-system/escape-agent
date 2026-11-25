@@ -97,6 +97,7 @@ impl ConfigService {
             instructions,
             instruction_cache: RwLock::new(HashMap::new()),
             skill_cache: RwLock::new(HashMap::new()),
+            command_cache: RwLock::new(HashMap::new()),
             mcp_servers,
             shell,
             model,

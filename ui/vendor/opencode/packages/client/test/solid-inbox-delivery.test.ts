@@ -306,3 +306,114 @@ test("a completed pending key still hydrates on demand", async () => {
     setup.dispose()
   }
 })
+
+test("a delivered queued peer row repositions chronologically after output generated while queued", () => {
+  const setup = fixture(async () => Response.json({ data: [], cursor: {} }))
+  try {
+    setup.emit({
+      id: "evt_peer_enqueue",
+      type: "session.inbox.enqueued",
+      created: 1,
+      durable: { aggregateID: SESSION, seq: 1, version: 1 },
+      data: {
+        sessionID: SESSION,
+        inboxID: "msg_queued_peer",
+        item: {
+          type: "synthetic",
+          delivery: "queue",
+          payload: { text: "queued question", metadata: { source: "peer", from: "user" } },
+        },
+      },
+    } as unknown as OpenCodeEvent)
+    expect(setup.data.session.pending.status(SESSION, "msg_queued_peer")).toBe("queued")
+    expect(setup.data.session.message.list(SESSION).map((item) => item.id)).toEqual(["msg_queued_peer"])
+
+    // Assistant output arrives while the peer item waits in the queue.
+    setup.emit({
+      id: "evt_mid_assistant",
+      type: "session.synthetic",
+      created: 2,
+      durable: { aggregateID: SESSION, seq: 2, version: 1 },
+      data: { sessionID: SESSION, text: "Earlier turn output" },
+    } as unknown as OpenCodeEvent)
+    expect(setup.data.session.message.list(SESSION).map((item) => item.id)).toEqual([
+      "msg_queued_peer",
+      "msg_mid_assistant",
+    ])
+
+    // Promotion assigns a new delivery timestamp after the work completed while waiting.
+    setup.emit(delivered("msg_queued_peer", 5))
+    const rows = setup.data.session.message.list(SESSION)
+    expect(rows.map((item) => item.id)).toEqual(["msg_mid_assistant", "msg_queued_peer"])
+    expect(rows[1]?.time.created).toBe(5)
+    expect(setup.data.session.pending.status(SESSION, "msg_queued_peer")).toBeUndefined()
+  } finally {
+    setup.dispose()
+  }
+})
+
+test("pending.status tracks synthetic peer inputs and message.hydrate bypasses session.created completion", async () => {
+  const requests: string[] = []
+  const setup = fixture(async (input) => {
+    const path = new URL(input instanceof Request ? input.url : input).pathname
+    requests.push(path)
+    if (path.endsWith("/message")) {
+      return Response.json({
+        data: [
+          {
+            id: "msg_hydrated_init",
+            type: "user",
+            text: "Hydrated prompt",
+            time: { created: 10 },
+          },
+        ],
+        cursor: {},
+      })
+    }
+    return Response.json({ data: [], cursor: {} })
+  })
+  try {
+    setup.emit({
+      id: "evt_created",
+      type: "session.created",
+      created: 1,
+      durable: { aggregateID: SESSION, seq: 1, version: 1 },
+      data: { sessionID: SESSION, info: { id: SESSION, title: "Child", directory: "/project" } },
+    } as unknown as OpenCodeEvent)
+    await Bun.sleep(10)
+
+    await setup.data.session.message.sync(SESSION)
+    expect(requests.filter((path) => path.endsWith("/message"))).toHaveLength(0)
+
+    await setup.data.session.message.hydrate(SESSION)
+    expect(requests.filter((path) => path.endsWith("/message"))).toHaveLength(1)
+    expect(setup.data.session.message.list(SESSION).map((item) => item.id)).toEqual(["msg_hydrated_init"])
+
+    // Active turn with delivered user message -> peer steer reports "steering"
+    setup.emit({
+      id: "evt_started",
+      type: "session.execution.started",
+      created: 11,
+      durable: { aggregateID: SESSION, seq: 2, version: 1 },
+      data: { sessionID: SESSION },
+    } as unknown as OpenCodeEvent)
+    setup.emit({
+      id: "evt_peer_steer",
+      type: "session.inbox.enqueued",
+      created: 12,
+      durable: { aggregateID: SESSION, seq: 3, version: 1 },
+      data: {
+        sessionID: SESSION,
+        inboxID: "syn_steer_peer",
+        item: {
+          type: "synthetic",
+          delivery: "steer",
+          payload: { text: "check this", metadata: { source: "peer", from: "user" } },
+        },
+      },
+    } as unknown as OpenCodeEvent)
+    expect(setup.data.session.pending.status(SESSION, "syn_steer_peer")).toBe("steering")
+  } finally {
+    setup.dispose()
+  }
+})

@@ -1,7 +1,9 @@
 //! `shell` tool: foreground command execution with combined, file-backed output.
 
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::fs::{self, File};
+use std::future::Future;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
@@ -19,6 +21,30 @@ pub const MAX_LINES: usize = 2_000;
 pub const MAX_BYTES: usize = 50 * 1024;
 #[cfg(unix)]
 const KILL_GRACE: Duration = Duration::from_secs(3);
+
+/// Per-call runtime overrides for [`ShellTool`] (session `metadata.environment` and `tool_output` bounds).
+#[derive(Debug, Clone, Default)]
+pub struct ShellRunConfig {
+    pub env: BTreeMap<String, String>,
+    pub max_lines: Option<usize>,
+    pub max_bytes: Option<usize>,
+}
+
+tokio::task_local! {
+    static SHELL_RUN_CONFIG: ShellRunConfig;
+}
+
+/// Bind session environment variables and `tool_output` bounds for one [`ShellTool`] execution.
+pub async fn with_shell_config<F, T>(config: ShellRunConfig, fut: F) -> T
+where
+    F: Future<Output = T>,
+{
+    SHELL_RUN_CONFIG.scope(config, fut).await
+}
+
+fn current_shell_config() -> ShellRunConfig {
+    SHELL_RUN_CONFIG.try_with(Clone::clone).unwrap_or_default()
+}
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ShellTool;
@@ -159,11 +185,16 @@ impl Tool for ShellTool {
                 }
             }
         }
+        let run_cfg = current_shell_config();
         process
             .current_dir(&workdir)
             .stdin(Stdio::null())
             .stdout(Stdio::from(stdout))
-            .stderr(Stdio::from(stderr))
+            .stderr(Stdio::from(stderr));
+        for (key, value) in &run_cfg.env {
+            process.env(key, value);
+        }
+        process
             .env("TERM", "xterm-256color")
             .env("OPENCODE_TERMINAL", "1")
             .env("OPENCODE", "1")
@@ -212,7 +243,9 @@ impl Tool for ShellTool {
         #[cfg(unix)]
         drop(pg_guard);
 
-        let (text, truncated, total, shown) = capture_tail(&output_path)
+        let max_lines = run_cfg.max_lines.filter(|v| *v > 0).unwrap_or(MAX_LINES);
+        let max_bytes = run_cfg.max_bytes.filter(|v| *v > 0).unwrap_or(MAX_BYTES);
+        let (text, truncated, total, shown) = capture_tail(&output_path, max_lines, max_bytes)
             .map_err(|error| ToolError::new(format!("Unable to read shell output: {error}")))?;
 
         let exit = status.code();
@@ -281,10 +314,14 @@ impl Tool for ShellTool {
     }
 }
 
-fn capture_tail(path: &Path) -> io::Result<(String, bool, usize, usize)> {
+fn capture_tail(
+    path: &Path,
+    max_lines: usize,
+    max_bytes: usize,
+) -> io::Result<(String, bool, usize, usize)> {
     let length = fs::metadata(path)?.len();
     let mut file = File::open(path)?;
-    let start = length.saturating_sub(MAX_BYTES as u64);
+    let start = length.saturating_sub(max_bytes as u64);
     file.seek(SeekFrom::Start(start))?;
     let mut buffer = Vec::new();
     file.read_to_end(&mut buffer)?;
@@ -294,10 +331,10 @@ fn capture_tail(path: &Path) -> io::Result<(String, bool, usize, usize)> {
         lines.pop();
     }
     let total = util::count_lines(path)?;
-    let shown = lines.len().min(MAX_LINES);
-    let truncated = length > MAX_BYTES as u64 || total > MAX_LINES;
-    let text = if lines.len() > MAX_LINES {
-        lines[lines.len() - MAX_LINES..].join("\n")
+    let shown = lines.len().min(max_lines);
+    let truncated = length > max_bytes as u64 || total > max_lines;
+    let text = if lines.len() > max_lines {
+        lines[lines.len() - max_lines..].join("\n")
     } else {
         tail
     };

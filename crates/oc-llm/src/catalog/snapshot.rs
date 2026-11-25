@@ -127,6 +127,7 @@ impl Catalog {
                 );
                 let mut variants = variants_for(
                     &info,
+                    &route.package,
                     route.protocol,
                     &ReasoningSupport::from_source(&source_model.capabilities.reasoning),
                 );

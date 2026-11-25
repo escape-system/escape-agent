@@ -112,8 +112,12 @@ impl Tool for TalkTool {
         }
 
         let message_id = MessageId::new().into_inner();
+        // Materialised at admission: the inbox doorbell and the `synthetic`
+        // transcript row commit in one transaction, so the peer message is
+        // already readable in history (with `metadata.delivered = false`) before
+        // any turn promotes it.
         runtime
-            .enqueue_and_emit(NewInbox {
+            .enqueue_materialized(NewInbox {
                 id: message_id.clone(),
                 session_id: to.clone(),
                 kind: "synthetic".to_owned(),

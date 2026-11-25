@@ -202,8 +202,8 @@ pub async fn skills(
     let Query(params) = params.map_err(|error| ErrorResponse::from(query_error(error)))?;
     let config = require_config(&state)?;
     let resolved = location::resolve(&state, &headers, None, params.directory.as_deref());
-    let skills: Vec<Value> = config
-        .skills()
+    let scoped_skills = config.skills_for(&resolved.path());
+    let skills: Vec<Value> = scoped_skills
         .iter()
         .map(|skill| {
             let mut map = Map::new();
@@ -235,8 +235,8 @@ pub async fn commands(
     let Query(params) = params.map_err(|error| ErrorResponse::from(query_error(error)))?;
     let config = require_config(&state)?;
     let resolved = location::resolve(&state, &headers, None, params.directory.as_deref());
-    let mut commands: Vec<Value> = config
-        .commands()
+    let scoped_commands = config.commands_for(&resolved.path());
+    let mut commands: Vec<Value> = scoped_commands
         .iter()
         .map(|command| {
             let mut map = Map::new();
@@ -261,8 +261,7 @@ pub async fn commands(
     // Builtin alias of the upstream `/compact` command. It uses only the
     // documented `Command.Info` fields (`name`, `description`); a markdown
     // command named `compress` overrides it in `POST /command`.
-    if !config
-        .commands()
+    if !scoped_commands
         .iter()
         .any(|command| command.name.eq_ignore_ascii_case("compress"))
     {
@@ -281,8 +280,7 @@ pub async fn commands(
             "Switch session to basic single-level subagent mode (max_depth = 1)",
         ),
     ] {
-        if !config
-            .commands()
+        if !scoped_commands
             .iter()
             .any(|command| command.name.eq_ignore_ascii_case(name))
         {

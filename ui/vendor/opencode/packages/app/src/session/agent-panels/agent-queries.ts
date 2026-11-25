@@ -27,13 +27,26 @@ type Request = (path: string, init?: RequestInit) => Promise<Response>
 type ReadResult = { kind: "unavailable"; reason: string } | { kind: "data"; value: unknown }
 
 /**
+ * Statuses that mean "this surface cannot be read right now", not "the request failed".
+ * `503` is a detached subsystem; `401`/`403` are a server this tab is not authorized for yet
+ * (the live server is auth-gated, so a desktop strip answered with 401 used to vanish with no
+ * message at all). Both become an inline, explainable `unavailable`.
+ */
+const unavailableStatuses = new Set([401, 403, 503])
+
+/**
  * Reads one experimental route. Every route here answers `{data: …}`, so the
  * envelope is unwrapped once: a body without it is a malformed response, not an
  * empty list.
  */
-async function read(request: Request, path: string, signal: AbortSignal | undefined): Promise<ReadResult> {
+export async function readExperimental(
+  request: Request,
+  path: string,
+  signal: AbortSignal | undefined,
+): Promise<ReadResult> {
   const response = await request(path, { signal })
-  if (response.status === 503) return { kind: "unavailable", reason: await serverMessage(response) }
+  if (unavailableStatuses.has(response.status))
+    return { kind: "unavailable", reason: await serverMessage(response) }
   if (!response.ok) throw new Error(await serverMessage(response))
 
   const body: unknown = await response.json()
@@ -55,7 +68,11 @@ export function useSubagentTreeQuery(sessionID: () => string | undefined) {
       const id = sessionID()
       if (!id) return { available: false, reason: "no session" }
 
-      const result = await read(request, `/api/experimental/subagent/tree?sessionID=${encodeURIComponent(id)}`, signal)
+      const result = await readExperimental(
+        request,
+        `/api/experimental/subagent/tree?sessionID=${encodeURIComponent(id)}`,
+        signal,
+      )
       if (result.kind === "unavailable") return { available: false, reason: result.reason }
       const tree = parseSubagentTree(result.value)
 
@@ -173,7 +190,7 @@ export function useObserverRepairsQuery(sessionID: () => string | undefined) {
       const id = sessionID()
       if (!id) return { available: false, reason: "no session" }
 
-      const result = await read(
+      const result = await readExperimental(
         request,
         `/api/experimental/observer/repairs?sessionID=${encodeURIComponent(id)}&limit=20`,
         signal,
@@ -206,7 +223,7 @@ export function useObserverStateQuery(sessionID: () => string | undefined) {
       const id = sessionID()
       if (!id) return { available: false, reason: "no session" }
 
-      const result = await read(request, `/api/experimental/observer?sessionID=${encodeURIComponent(id)}`, signal)
+      const result = await readExperimental(request, `/api/experimental/observer?sessionID=${encodeURIComponent(id)}`, signal)
       if (result.kind === "unavailable") return { available: false, reason: result.reason }
 
       return { available: true, value: parseObserverState(result.value) }
@@ -231,7 +248,7 @@ export function useSessionGoalQuery(sessionID: () => string | undefined) {
       const id = sessionID()
       if (!id) return { available: false, reason: "no session" }
 
-      const result = await read(request, `/api/experimental/goal?sessionID=${encodeURIComponent(id)}`, signal)
+      const result = await readExperimental(request, `/api/experimental/goal?sessionID=${encodeURIComponent(id)}`, signal)
       if (result.kind === "unavailable") return { available: false, reason: result.reason }
 
       return { available: true, value: parseGoal(result.value) }
@@ -251,7 +268,7 @@ export function useLaneSnapshotQuery() {
   return useQuery(() => ({
     queryKey: [sdk.scope, "agent-panels", "lanes"],
     queryFn: async ({ signal }): Promise<Fetched<LaneStatus[]>> => {
-      const result = await read(request, "/api/experimental/lane", signal)
+      const result = await readExperimental(request, "/api/experimental/lane", signal)
       if (result.kind === "unavailable") return { available: false, reason: result.reason }
 
       return { available: true, value: parseLaneStatuses(result.value) }

@@ -5,12 +5,14 @@
 //! and the frontmatter carries `description`/`agent`/`model`/`subtask` (with
 //! `subagent` accepted as the upstream alias).
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 use serde_json::Value;
 
 use crate::diagnostic::{Diagnostic, DiagnosticKind};
+use crate::discovery::{self, Discovery};
 use crate::markdown;
 use crate::normalize;
 use crate::scan;
@@ -37,6 +39,48 @@ pub(crate) fn discover(roots: &[PathBuf], diagnostics: &mut Vec<Diagnostic>) -> 
     }
     commands.sort_by(|left, right| left.name.cmp(&right.name));
     commands
+}
+
+/// Discover commands visible from `location` rather than the load directory,
+/// mirroring [`crate::skills::discover_for`]: global config roots stay
+/// visible while project `.opencode/command{,s}` roots follow `location`.
+pub(crate) fn discover_for(
+    config_roots: &[PathBuf],
+    discovery: &Discovery,
+    location: &Path,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Vec<CommandInfo> {
+    let mut targets: Vec<PathBuf> = Vec::new();
+    for root in config_roots {
+        let is_project = discovery
+            .project
+            .iter()
+            .any(|project| discovery::is_under(root, project));
+        let shares_tree =
+            discovery::is_under(location, root) || discovery::is_under(root, location);
+        if !is_project || shares_tree {
+            targets.push(root.clone());
+        }
+    }
+
+    let mut ancestors = discovery::ancestors(location);
+    ancestors.reverse();
+    for directory in &ancestors {
+        let candidate = directory.join(".opencode");
+        if candidate.is_dir() {
+            targets.push(candidate);
+        }
+    }
+
+    let mut seen = HashSet::new();
+    let mut deduped: Vec<PathBuf> = Vec::new();
+    for root in targets.into_iter().rev() {
+        if seen.insert(discovery::path_key(&root)) {
+            deduped.push(root);
+        }
+    }
+    deduped.reverse();
+    discover(&deduped, diagnostics)
 }
 
 fn scan_directory(

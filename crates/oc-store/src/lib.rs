@@ -75,7 +75,7 @@ pub use db::Store;
 pub use error::StoreError;
 pub use event::{NewEvent, StoredEvent};
 pub use form::NewForm;
-pub use inbox::{Delivery, NewInbox};
+pub use inbox::{Delivery, InboxRow, NewInbox};
 pub use memory::{MemoryHit, MemoryQuery, NewMemory};
 pub use message::{MessagePage, MessageQuery, NewMessage};
 pub use project::ProjectPatch;

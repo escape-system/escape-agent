@@ -57,11 +57,20 @@ impl Expectation {
     /// Defaults by tool class when a provider omits the field entirely.
     #[must_use]
     pub fn derived(tool: &str) -> Self {
+        // Invariant: `intervene_after_seconds` (expect + GRACE_SECONDS) must be
+        // at least the tool's own maximum blocking duration plus grace, so a
+        // wait the tool was explicitly allowed to perform never looks overdue.
         let (expect, why) = match tool {
-            "read" | "glob" | "grep" | "lsp" | "lsp_diagnostics" | "code_map" | "roster"
-            | "digest" | "box_list" | "box_read" | "box_search" => {
+            "read" | "glob" | "grep" | "lsp" | "lsp_diagnostics" | "code_map" | "digest"
+            | "box_list" | "box_read" | "box_search" => {
                 (10, "inspect the workspace and return a compact result")
             }
+            // Blocking wait-class tools: `roster`'s `wait_seconds` is capped at
+            // MAX_ROSTER_WAIT_SECONDS = 300, so the derived window must cover it.
+            "roster" => (
+                300,
+                "wait for a running child to settle or a peer message before returning",
+            ),
             "skill" | "skill_lint" => (10, "inspect a skill and return its content"),
             "write" | "edit" | "patch" | "symbol_edit" | "memory_write" | "box_write"
             | "box_edit" | "box_meta" | "box_delete" => {
@@ -317,6 +326,41 @@ mod tests {
         assert_eq!(Expectation::derived("skill_lint").expect_seconds, 10);
         assert_eq!(Expectation::derived("skill_write").expect_seconds, 30);
         assert_eq!(Expectation::derived("lane").expect_seconds, 600);
+    }
+
+    /// A blocking wait must never be derived below the tool's own maximum wait.
+    #[test]
+    fn roster_derived_window_covers_its_maximum_wait() {
+        let derived = Expectation::derived("roster");
+        assert_eq!(derived.expect_seconds, 300);
+        assert_eq!(derived.intervene_after_seconds, 302);
+        assert_eq!(
+            derived.why,
+            "wait for a running child to settle or a peer message before returning"
+        );
+    }
+
+    /// The invariant behind the derived table: the intervention deadline is at
+    /// least the tool's own maximum blocking duration plus the grace, otherwise
+    /// a wait the tool was allowed to perform is reported as a hang.
+    #[test]
+    fn wait_style_tools_cover_their_maximum_blocking_duration() {
+        // (tool, maximum blocking seconds the tool itself accepts by default)
+        // `roster`: MAX_ROSTER_WAIT_SECONDS = 300.
+        // `lane`: DEFAULT_TIMEOUT_MS = 300_000 and the derived class is 600.
+        // Deviations, left as-is on purpose: `shell` accepts `timeout: 0`
+        // (unbounded) and `subagent` can run 3600 s under `/complex`; while a
+        // direct child is busy the observer exempts the strip instead of
+        // cancelling it, so those two stay soft bounds.
+        let wait_style = [("roster", 300_u32), ("lane", 300_u32)];
+        for (tool, max_blocking) in wait_style {
+            let derived = Expectation::derived(tool);
+            assert!(
+                derived.intervene_after_seconds >= max_blocking.saturating_add(GRACE_SECONDS),
+                "{tool}: derived intervene {} must be >= max blocking {max_blocking} + {GRACE_SECONDS}",
+                derived.intervene_after_seconds
+            );
+        }
     }
 
     #[test]

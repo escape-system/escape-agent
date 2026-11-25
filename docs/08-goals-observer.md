@@ -24,13 +24,44 @@ Rules:
   tools alike). For MCP, the object is stripped before dispatch.
 - `why` ≤ 160 chars, one sentence, action + expected outcome. No secrets.
 - `1 ≤ expect_seconds ≤ 3600`.
-- `intervene_after_seconds ≥ expect_seconds + 2`, capped at 3600. Violations are
-  corrected and flagged (`synthetic_expectation=true`), never fatal.
+- `intervene_after_seconds ≥ expect_seconds + 2`, capped at 3600. A too-short
+  window is clamped up to `expect_seconds + 2` and a clock above 3600 is
+  clamped down; clamping is silent and is not a distinct strip state.
 - If a provider omits the field anyway, the runtime derives defaults per tool
-  class (read/glob/grep 10 s, edit/write 20 s, shell 300 s, subagent 600 s) and
-  marks the strip as derived.
+  class and marks the strip as derived. The invariant for those defaults is
+  **a tool's derived `intervene_after_seconds` must be ≥ that tool's own
+  maximum blocking duration + `GRACE_SECONDS` (2 s)**, otherwise the observer is
+  asked to look while the call is still guaranteed to be inside its normal
+  runtime and every such call is reported overdue. Concretely: `roster`
+  300 s (`MAX_ROSTER_WAIT_SECONDS`) → intervene 302 s; `shell` 300 s → 302 s
+  (its default foreground timeout is 120 s, `timeout: 0` disables it — a
+  caller that disables the timeout must supply its own expectation);
+  `subagent`/`talk`/`session_write` 600 s → 602 s; `lane` 600 s → 602 s (its
+  `timeout_ms` defaults to 300 s and `0` waits until the ticket is terminal);
+  `code_map` 30 s (ripwire timeout) → 32 s; `webfetch` 120 s (the request
+  timeout cap) → 122 s; `websearch` 60 s (the timeout cap) → 62 s. Reads,
+  globs, greps, `skill*`, `box_*` and `lsp*` stay at 10 s, writes/edits at
+  20 s, `skill_write`/goal tools at 30 s. This is the effective contract, not
+  the historical table: `Expectation::derived` in
+  `crates/oc-runtime/src/expectation.rs` still groups `roster`, `code_map` and
+  the web tools with the 10 s read class, which is the violation above. Until
+  those rows are re-derived, the invariant is the rule and the table below is
+  what it must produce; the `derived_table_matches_the_documented_classes` unit
+  test is where the two are pinned together.
 - The same tool call may be retried by the observer; the retry keeps the
   original `why` and gets a new strip with `retry_of`.
+
+Two-stage semantics — a deadline is not a cancellation:
+
+- `expect_seconds` is the agent's own estimate. Nothing acts on it.
+- Exceeding `intervene_after_seconds` does **not** cancel, truncate or fail the
+  tool call. It marks the strip `overdue` and wakes the observer, which may then
+  choose `nudge`, `inspect`, `repair.cancel_tool` or nothing. The tool keeps
+  running until it finishes or something explicitly cancels it.
+- A strip that is waiting on a live (busy) direct child is **not** treated as
+  overdue, for any waiting tool — not just `subagent`. Otherwise a parent that
+  is correctly waiting for its own child would be flagged on every tick of the
+  child's work.
 
 Why a schema field rather than a side channel: standard function-calling
 providers cannot emit out-of-band metadata reliably, and MCP schemas can be
@@ -225,12 +256,24 @@ Every repair writes, in one transaction:
 
 1. `observer_repair` row (kind, target, reason, args hash, attempt).
 2. `observer.repaired` event `{rootID, target, kind, reason, attempt, budgetLeft}`.
-3. A synthetic message into the affected session:
-   `<observer repair="restart_subagent">…reason…</observer>`.
-4. A one-line synthetic into the root session (unless target == root).
+3. A synthetic message into the affected session **only when the repair has
+   something to say to that session's model**: `<observer repair="restart_subagent">…reason…</observer>`
+   for `restart_subagent`, `repost` and `request_budget_extension` (and for a
+   `nudge`, which is a synthetic by definition).
+4. A one-line synthetic into the root session (unless target == root), on the
+   same condition.
 
-The UI renders repair rows on the timeline and in the observer panel. Nothing
-is silent.
+The repairs that act on runtime state rather than on the prompt inject nothing:
+`repair.cancel_tool` and `repair.switch_model`, and `repair.compact_context`
+(which queues a compaction and returns "queued"). For `cancel_tool` the model
+sees the tool's own error result — the accurate signal — and that is all.
+Cancelling a tool does not interrupt the turn: it cancels one call through that
+call's cancellation token, and the remaining tool calls and the step continue.
+
+The UI renders repair rows on the timeline and in the observer panel. A repair
+that could not be performed is not published as `observer.repaired`; it is a
+refusal (`applied = false`) or an unconfirmed receipt, and both are recorded as
+`error` on the repair row.
 
 ## 7. Goal system
 

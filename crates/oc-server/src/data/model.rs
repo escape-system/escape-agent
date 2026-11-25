@@ -158,6 +158,15 @@ pub(crate) async fn available_provider_ids(
     available_provider_ids_with_credentials(state, catalog, &credentials)
 }
 
+fn has_non_empty_env(
+    names: &[String],
+    lookup: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> bool {
+    names
+        .iter()
+        .any(|name| lookup(name).is_some_and(|value| !value.is_empty()))
+}
+
 pub(crate) fn available_provider_ids_with_credentials(
     state: &AppState,
     catalog: &Catalog,
@@ -196,11 +205,7 @@ pub(crate) fn available_provider_ids_with_credentials(
         if provider.activation == Activation::Disabled {
             continue;
         }
-        if provider
-            .env
-            .iter()
-            .any(|name| std::env::var_os(name).is_some())
-        {
+        if has_non_empty_env(&provider.env, |name| std::env::var_os(name)) {
             available.insert(provider.id);
         }
     }
@@ -290,7 +295,7 @@ pub(crate) fn active_provider_ids_with_credentials(
         if provider
             .env
             .iter()
-            .any(|name| std::env::var_os(name).is_some())
+            .any(|name| std::env::var_os(name).is_some_and(|value| !value.is_empty()))
         {
             active.insert(provider.id);
         }
@@ -336,12 +341,7 @@ pub(crate) fn has_direct_google_access_with_credentials(
     }
     catalog
         .provider(ANTIGRAVITY_PROVIDER_ID)
-        .is_some_and(|provider| {
-            provider
-                .env
-                .iter()
-                .any(|name| std::env::var_os(name).is_some())
-        })
+        .is_some_and(|provider| has_non_empty_env(&provider.env, |name| std::env::var_os(name)))
 }
 
 pub(crate) fn filtered_catalog_models(
@@ -698,5 +698,25 @@ fn resolve_error(error: &LlmError) -> ApiError {
             model_not_found(provider, "", error.to_string())
         }
         _ => model_not_found("", "", error.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsString;
+
+    use super::has_non_empty_env;
+
+    #[test]
+    fn empty_env_var_does_not_mark_provider_available() {
+        let envs = vec!["EMPTY_KEY".to_owned(), "MISSING_KEY".to_owned()];
+        assert!(!has_non_empty_env(&envs, |name| match name {
+            "EMPTY_KEY" => Some(OsString::from("")),
+            _ => None,
+        }));
+        assert!(has_non_empty_env(&envs, |name| match name {
+            "MISSING_KEY" => Some(OsString::from("sk-live")),
+            _ => None,
+        }));
     }
 }

@@ -652,3 +652,34 @@ fn instructions_for_falls_back_to_the_load_snapshot_without_a_directory() {
         "an empty session directory keeps the historical snapshot"
     );
 }
+
+#[test]
+fn commands_for_scopes_discovery_and_invalidates() {
+    let fixture = Fixture::new();
+    let server = fixture.make_dir("server");
+    let project = fixture.make_dir("project/sub");
+    fixture.write("server/.opencode/command/server_cmd.md", "server only\n");
+    fixture.write("project/.opencode/commands/proj_cmd.md", "project root\n");
+
+    let service = fixture.load(&server);
+    let names = |list: &[oc_config::CommandInfo]| -> Vec<String> {
+        list.iter().map(|cmd| cmd.name.clone()).collect()
+    };
+
+    assert_eq!(names(service.commands()), vec!["server_cmd"]);
+    assert_eq!(names(&service.commands_for(&project)), vec!["proj_cmd"]);
+
+    let cached = service.commands_for(&project);
+    let again = service.commands_for(&project.join("."));
+    assert!(std::sync::Arc::ptr_eq(&cached, &again));
+
+    fixture.write(
+        "project/sub/.opencode/command/late_cmd.md",
+        "late command\n",
+    );
+    service.invalidate_commands();
+    assert_eq!(
+        names(&service.commands_for(&project)),
+        vec!["late_cmd", "proj_cmd"]
+    );
+}

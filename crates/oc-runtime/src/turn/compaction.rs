@@ -6,13 +6,15 @@ use oc_llm::{LlmMessage, LlmOptions, LlmRequest};
 use oc_store::NewMessage;
 use oc_types::message::StructuredError;
 use oc_types::payload::{
-    SessionCompactionEnded, SessionCompactionFailed, SessionCompactionStarted,
+    CompactionTrigger, SessionCompactionEnded, SessionCompactionFailed, SessionCompactionStarted,
+    SessionStatusUpdated,
 };
-use oc_types::{MessageId, ModelRef};
+use oc_types::{MessageId, ModelRef, SessionStatus};
 use serde_json::{Value, json};
 
 use crate::runtime::{CancelToken, Runtime, RuntimeError};
 use crate::subagent::settings::models_policy;
+use crate::tokens;
 
 use super::types::ResolvedTurn;
 
@@ -20,8 +22,12 @@ impl Runtime {
     /// Runs one `compaction` inbox row: resolve the session turn, load the
     /// context and call [`Runtime::compact`].
     ///
-    /// The inbox row is consumed after the attempt succeeds, fails or is
-    /// cancelled, so a broken compaction cannot spin the actor. Turn-level
+    /// The inbox row is consumed durably BEFORE the attempt, so a crash, an
+    /// error or a cancellation cannot replay the same compaction forever: the
+    /// actor's drain loop treats a surviving row as fresh work and
+    /// `runtime/actor.rs` respawns on a drain error. Consumption errors are
+    /// logged and never propagated (they used to kill the actor); the row is
+    /// retried once after the attempt as a best-effort cleanup. Turn-level
     /// failures are already persisted as a failed compaction message; they are
     /// logged here and reported as a clean outcome because the actor must keep
     /// serving the session.
@@ -43,19 +49,59 @@ impl Runtime {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .unwrap_or("manual");
-        let outcome = self
-            .compact_from_inbox(session, reason, note.as_deref(), cancel)
-            .await;
-        if let Some(inbox_id) = item.get("id").and_then(Value::as_str) {
-            // Consume the row before reporting success. If the delete fails the
-            // row would still be the next deliverable and the actor would run
-            // the same compaction again without backoff, so surface the error
-            // instead of pretending the row is gone.
-            self.inner
-                .config
-                .store
-                .cancel_inbox(session, inbox_id)
-                .await?;
+        let trigger = trigger_for_reason(reason).unwrap_or(CompactionTrigger::Manual);
+        let inbox_id = item.get("id").and_then(Value::as_str).map(str::to_owned);
+        let store = &self.inner.config.store;
+        if let Some(id) = &inbox_id {
+            match store.consume_inbox(session, id).await {
+                Ok(true) => {
+                    // The badge retires on the same `inboxID` the compaction
+                    // event will name, so a client can correlate the two.
+                    if let Some(directory) = self.session_directory(session).await
+                        && let Err(error) = self
+                            .emit(
+                                session,
+                                &directory,
+                                oc_types::payload::SessionInboxDelivered {
+                                    session_id: Runtime::session_id(session),
+                                    inbox_id: MessageId::from_wire(id.clone()),
+                                },
+                            )
+                            .await
+                    {
+                        tracing::warn!(
+                            session = %session,
+                            inbox_id = %id,
+                            error = %error,
+                            "could not publish session.inbox.delivered for a consumed compaction row"
+                        );
+                    }
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        session = %session,
+                        inbox_id = %id,
+                        error = %error,
+                        "could not consume the compaction inbox row before running it"
+                    );
+                }
+            }
+        }
+        let request = CompactionRequest::new(trigger)
+            .with_note(note.as_deref())
+            .with_inbox(inbox_id.as_deref());
+        let outcome = self.compact_from_inbox(session, request, cancel).await;
+        if let Some(id) = &inbox_id {
+            match store.consume_inbox(session, id).await {
+                Ok(_) => {}
+                Err(error) => tracing::warn!(
+                    session = %session,
+                    inbox_id = %id,
+                    error = %error,
+                    "could not retire the compaction inbox row after the attempt"
+                ),
+            }
         }
         match outcome {
             Ok(()) => {
@@ -78,8 +124,7 @@ impl Runtime {
     async fn compact_from_inbox(
         &self,
         session: &str,
-        reason: &str,
-        note: Option<&str>,
+        mut request: CompactionRequest<'_>,
         cancel: &Arc<CancelToken>,
     ) -> Result<(), RuntimeError> {
         let info_value = self
@@ -115,8 +160,22 @@ impl Runtime {
             );
         }
         let context = self.load_context(session).await?;
-        self.compact_with_note(session, &turn, &context, cancel, reason, note)
-            .await
+        // Explain the decision with the numbers the turn loop would have used:
+        // an inbox-triggered compaction otherwise carries no token evidence.
+        if request.estimate_tokens.is_none() && turn.context_window > 0 {
+            let estimate = self.estimate_turn_tokens(session, &turn, &context).await?;
+            let compaction = self.compaction_config();
+            let ceiling = tokens::ceiling(turn.context_window, compaction.ceiling_tokens);
+            let trigger = tokens::trigger(ceiling, turn.context_window, compaction.buffer);
+            request = request.with_pressure(estimate, trigger, Some(ceiling));
+        }
+        let owns_status = self.begin_compaction_activity(session, &directory).await;
+        let outcome = self
+            .compact_with_note(session, &turn, &context, cancel, request)
+            .await;
+        self.end_compaction_activity(session, &directory, owns_status)
+            .await;
+        outcome
     }
 
     pub(super) async fn compact(
@@ -125,10 +184,106 @@ impl Runtime {
         turn: &ResolvedTurn,
         context: &[LlmMessage],
         cancel: &Arc<CancelToken>,
-        reason: &str,
+        request: CompactionRequest<'_>,
     ) -> Result<(), RuntimeError> {
-        self.compact_with_note(session, turn, context, cancel, reason, None)
+        self.compact_with_note(session, turn, context, cancel, request)
             .await
+    }
+
+    /// Marks the session busy for the whole compaction when no execution owns
+    /// the status, so the UI cannot show `idle` while a manual/observer
+    /// compaction runs. Returns whether this call owns the status.
+    ///
+    /// `time_compacting` has no store writer today; `time_busy`/`time_idle` are
+    /// the durable pair the wire status is derived from, so a compaction that
+    /// starts from an idle session marks itself busy and clears it after.
+    async fn begin_compaction_activity(&self, session: &str, directory: &str) -> bool {
+        let store = &self.inner.config.store;
+        let value = match store.get_session(session).await {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::warn!(session = %session, error = %error, "could not read the session before compaction");
+                return false;
+            }
+        };
+        let busy = value
+            .as_ref()
+            .and_then(|value| value.pointer("/time/busy"))
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        let idle = value
+            .as_ref()
+            .and_then(|value| value.pointer("/time/idle"))
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        if busy > idle {
+            return false;
+        }
+        if let Err(error) = store
+            .mark_session_busy(session, oc_types::now_millis())
+            .await
+        {
+            tracing::warn!(session = %session, error = %error, "could not mark the session busy for compaction");
+            return false;
+        }
+        if let Err(error) = self
+            .emit(
+                session,
+                directory,
+                SessionStatusUpdated {
+                    session_id: Runtime::session_id(session),
+                    status: SessionStatus::Busy,
+                },
+            )
+            .await
+        {
+            tracing::warn!(session = %session, error = %error, "could not publish busy status for compaction");
+        }
+        true
+    }
+
+    /// Clears the busy state a manual/observer compaction owned.
+    async fn end_compaction_activity(&self, session: &str, directory: &str, owns: bool) {
+        if !owns {
+            return;
+        }
+        let store = &self.inner.config.store;
+        if let Err(error) = store
+            .mark_session_idle(session, oc_types::now_millis(), "succeeded")
+            .await
+        {
+            tracing::warn!(session = %session, error = %error, "could not clear the compaction busy state");
+            return;
+        }
+        if let Err(error) = self
+            .emit(
+                session,
+                directory,
+                SessionStatusUpdated {
+                    session_id: Runtime::session_id(session),
+                    status: SessionStatus::Idle,
+                },
+            )
+            .await
+        {
+            tracing::warn!(session = %session, error = %error, "could not publish idle status after compaction");
+        }
+    }
+
+    async fn session_directory(&self, session: &str) -> Option<String> {
+        self.inner
+            .config
+            .store
+            .get_session(session)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|value| {
+                value
+                    .pointer("/location/directory")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
     }
 
     /// Summarize `context` and persist the compaction.
@@ -141,6 +296,12 @@ impl Runtime {
     /// compaction does not rewrite `session.model`, so the observer/repair path
     /// must read the configured model from the session row and use the
     /// compaction's `model` only to describe the summary's author.
+    ///
+    /// `request` carries the true cause ([`CompactionTrigger`]), the admitting
+    /// inbox row (so `session.compaction.started` names the same id
+    /// `session.inbox.delivered` retired) and the token evidence behind the
+    /// decision. `reason` is derived from the trigger and kept for upstream
+    /// compatibility only.
     #[allow(clippy::too_many_lines)]
     async fn compact_with_note(
         &self,
@@ -148,9 +309,17 @@ impl Runtime {
         turn: &ResolvedTurn,
         context: &[LlmMessage],
         cancel: &Arc<CancelToken>,
-        reason: &str,
-        note: Option<&str>,
+        request: CompactionRequest<'_>,
     ) -> Result<(), RuntimeError> {
+        let CompactionRequest {
+            trigger,
+            note,
+            inbox_id,
+            estimate_tokens,
+            trigger_tokens,
+            ceiling_tokens,
+        } = request;
+        let reason = event_reason(trigger);
         let created = oc_types::now_millis();
         let id = MessageId::new();
         let keep_tokens = self.compaction_keep_tokens();
@@ -158,11 +327,24 @@ impl Runtime {
         let mut running = json!({
             "time": {"created": created},
             "status": "running",
-            "reason": event_reason(reason),
+            "reason": reason,
+            "trigger": trigger,
             "summary": ""
         });
         if let Some(keep_id) = &keep_id {
             running["keepID"] = json!(keep_id);
+        }
+        if let Some(inbox_id) = inbox_id {
+            running["inboxID"] = json!(inbox_id);
+        }
+        if let Some(estimate) = estimate_tokens {
+            running["estimateTokens"] = json!(estimate);
+        }
+        if let Some(trigger_tokens) = trigger_tokens {
+            running["triggerTokens"] = json!(trigger_tokens);
+        }
+        if let Some(ceiling_tokens) = ceiling_tokens {
+            running["ceilingTokens"] = json!(ceiling_tokens);
         }
         self.inner
             .config
@@ -180,8 +362,13 @@ impl Runtime {
             &turn.directory,
             SessionCompactionStarted {
                 session_id: Runtime::session_id(session),
-                reason: event_reason(reason).to_owned(),
+                reason: reason.to_owned(),
                 input_id: Some(id.clone()),
+                inbox_id: inbox_id.map(|id| MessageId::from_wire(id.to_owned())),
+                trigger: Some(trigger),
+                estimate_tokens,
+                trigger_tokens,
+                ceiling_tokens,
             },
         )
         .await?;
@@ -221,7 +408,7 @@ impl Runtime {
         };
         let summary_instruction = compaction_summary_instruction_with_note(
             keep_id.as_deref(),
-            reason,
+            trigger_wire(trigger),
             keep_tokens,
             &box_index,
             note,
@@ -282,9 +469,9 @@ impl Runtime {
                     self.fail_compaction(
                         session,
                         &turn.directory,
+                        request,
                         &id,
                         created,
-                        reason,
                         "compaction was cancelled",
                     )
                     .await?;
@@ -310,9 +497,9 @@ impl Runtime {
                     self.fail_compaction(
                         session,
                         &turn.directory,
+                        request,
                         &id,
                         created,
-                        reason,
                         "the summary was empty",
                     )
                     .await?;
@@ -337,9 +524,9 @@ impl Runtime {
                         self.fail_compaction(
                             session,
                             &turn.directory,
+                            request,
                             &id,
                             created,
-                            reason,
                             &failure.message,
                         )
                         .await?;
@@ -358,9 +545,9 @@ impl Runtime {
             self.fail_compaction(
                 session,
                 &turn.directory,
+                request,
                 &id,
                 created,
-                reason,
                 "no compaction model candidate could be attempted",
             )
             .await?;
@@ -376,12 +563,25 @@ impl Runtime {
         let mut completed = json!({
             "time": {"created": created},
             "status": "completed",
-            "reason": event_reason(reason),
+            "reason": reason,
+            "trigger": trigger,
             "model": model_ref,
             "summary": summary
         });
         if let Some(keep_id) = &keep_id {
             completed["keepID"] = json!(keep_id);
+        }
+        if let Some(inbox_id) = inbox_id {
+            completed["inboxID"] = json!(inbox_id);
+        }
+        if let Some(estimate) = estimate_tokens {
+            completed["estimateTokens"] = json!(estimate);
+        }
+        if let Some(trigger_tokens) = trigger_tokens {
+            completed["triggerTokens"] = json!(trigger_tokens);
+        }
+        if let Some(ceiling_tokens) = ceiling_tokens {
+            completed["ceilingTokens"] = json!(ceiling_tokens);
         }
         self.inner
             .config
@@ -415,16 +615,41 @@ impl Runtime {
             &turn.directory,
             SessionCompactionEnded {
                 session_id: Runtime::session_id(session),
-                reason: event_reason(reason).to_owned(),
+                reason: reason.to_owned(),
                 model: Some(model_ref.clone()),
                 native: None,
                 text: summary,
                 cost: usage.as_ref().and_then(|usage| usage.cost),
                 tokens,
+                inbox_id: inbox_id.map(|id| MessageId::from_wire(id.to_owned())),
+                trigger: Some(trigger),
+                before_tokens: estimate_tokens,
+                after_tokens: self
+                    .post_compaction_estimate(session, turn, estimate_tokens)
+                    .await,
             },
         )
         .await?;
         Ok(())
+    }
+
+    /// Token estimate after the completed compaction row is durable.
+    ///
+    /// `before_tokens` is the pre-compaction estimate that crossed the trigger;
+    /// this reads the transcript the next request will actually use and reports
+    /// the honest post state, so the pair explains the reduction instead of
+    /// restating the input.
+    async fn post_compaction_estimate(
+        &self,
+        session: &str,
+        turn: &ResolvedTurn,
+        before: Option<u64>,
+    ) -> Option<u64> {
+        before?;
+        let context = self.load_context(session).await.ok()?;
+        self.estimate_turn_tokens(session, turn, &context)
+            .await
+            .ok()
     }
 
     /// Ordered model references for one compaction.
@@ -785,20 +1010,28 @@ impl Runtime {
         &self,
         session: &str,
         directory: &str,
+        request: CompactionRequest<'_>,
         id: &MessageId,
         created: i64,
-        reason: &str,
         message: &str,
     ) -> Result<(), RuntimeError> {
-        let failed = json!({
+        let CompactionRequest {
+            trigger, inbox_id, ..
+        } = request;
+        let reason = event_reason(trigger);
+        let mut failed = json!({
             "time": {"created": created},
             "status": "failed",
-            "reason": event_reason(reason),
+            "reason": reason,
+            "trigger": trigger,
             "error": {
                 "type": "CompactionError",
                 "message": message
             }
         });
+        if let Some(inbox_id) = inbox_id {
+            failed["inboxID"] = json!(inbox_id);
+        }
         self.inner
             .config
             .store
@@ -809,11 +1042,13 @@ impl Runtime {
             directory,
             SessionCompactionFailed {
                 session_id: Runtime::session_id(session),
-                reason: event_reason(reason).to_owned(),
+                reason: reason.to_owned(),
                 error: StructuredError::new("CompactionError", message),
                 input_id: Some(id.clone()),
                 cost: None,
                 tokens: None,
+                inbox_id: inbox_id.map(|id| MessageId::from_wire(id.to_owned())),
+                trigger: Some(trigger),
             },
         )
         .await?;
@@ -1032,12 +1267,98 @@ fn failure_kind(error: &oc_llm::LlmError) -> oc_llm::FailureKind {
     }
 }
 
-/// Map the stored compaction `reason` to the wire literal. Upstream defines
-/// only `auto` and `manual`; a context-overflow compaction is automatic.
-fn event_reason(reason: &str) -> &str {
-    match reason {
-        "manual" => "manual",
-        _ => "auto",
+/// Compaction `reason` for one trigger.
+///
+/// `reason` keeps the upstream `auto`/`manual` vocabulary for compatibility
+/// while [`trigger`](CompactionTrigger) names the true cause. `manual` and
+/// `command` are user intent, everything the guard/overflow path raises is
+/// `auto`; the distinction between guard, overflow and observer now lives in
+/// `trigger` instead of being collapsed away.
+fn trigger_wire(trigger: CompactionTrigger) -> &'static str {
+    match trigger {
+        CompactionTrigger::Guard => "guard",
+        CompactionTrigger::Overflow => "overflow",
+        CompactionTrigger::Manual => "manual",
+        CompactionTrigger::Observer => "observer",
+        CompactionTrigger::Command => "command",
+    }
+}
+
+fn event_reason(trigger: CompactionTrigger) -> &'static str {
+    match trigger {
+        CompactionTrigger::Manual | CompactionTrigger::Command => "manual",
+        CompactionTrigger::Guard | CompactionTrigger::Overflow | CompactionTrigger::Observer => {
+            "auto"
+        }
+    }
+}
+
+/// The trigger a stored inbox `reason` names, if it names one.
+///
+/// Queue rows are written by several owners (`/compact`, the tool, the
+/// observer, `/compress`); an unknown or absent reason is a manual request,
+/// which is what every legacy row meant.
+fn trigger_for_reason(reason: &str) -> Option<CompactionTrigger> {
+    CompactionTrigger::from_reason(reason)
+}
+
+/// Everything one compaction run needs besides the context it summarizes.
+///
+/// Grouped so the trigger, the admitting inbox row and the token evidence
+/// travel together: the started/ended/failed payloads must name the same
+/// `inboxID` the client's queued badge is keyed by, and `before_tokens` must be
+/// the estimate that crossed the trigger rather than re-derived later.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct CompactionRequest<'a> {
+    /// True cause of this compaction.
+    pub(super) trigger: CompactionTrigger,
+    /// Optional focused handoff note.
+    pub(super) note: Option<&'a str>,
+    /// Inbox row that admitted this run, when there is one.
+    pub(super) inbox_id: Option<&'a str>,
+    /// Token estimate that crossed the trigger.
+    pub(super) estimate_tokens: Option<u64>,
+    /// Trigger threshold in force.
+    pub(super) trigger_tokens: Option<u64>,
+    /// Configured hard ceiling, when one applied.
+    pub(super) ceiling_tokens: Option<u64>,
+}
+
+impl<'a> CompactionRequest<'a> {
+    pub(super) fn new(trigger: CompactionTrigger) -> Self {
+        Self {
+            trigger,
+            note: None,
+            inbox_id: None,
+            estimate_tokens: None,
+            trigger_tokens: None,
+            ceiling_tokens: None,
+        }
+    }
+
+    pub(super) fn with_note(mut self, note: Option<&'a str>) -> Self {
+        self.note = note;
+        self
+    }
+
+    pub(super) fn with_inbox(mut self, inbox_id: Option<&'a str>) -> Self {
+        self.inbox_id = inbox_id;
+        self
+    }
+
+    /// Attach the token evidence behind the decision. `ceiling` is `None` when
+    /// the model has no bounded window, so the optional field is omitted rather
+    /// than serialized as a meaningless number.
+    pub(super) fn with_pressure(
+        mut self,
+        estimate: u64,
+        trigger: u64,
+        ceiling: Option<u64>,
+    ) -> Self {
+        self.estimate_tokens = Some(estimate);
+        self.trigger_tokens = Some(trigger);
+        self.ceiling_tokens = ceiling;
+        self
     }
 }
 

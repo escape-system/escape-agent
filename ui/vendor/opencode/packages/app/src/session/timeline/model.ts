@@ -20,7 +20,13 @@ export function createTimelineModel(input: { session: Pick<SessionModel, "identi
     async (id) => {
       if (!id) return
       const owner = input.session.ownership.capture()
-      await Promise.all([data.session.message.sync(id), data.session.pending.sync(id)])
+      const child = !!data.session.get(id)?.parentID
+      const messageHydrate = (data.session.message as { hydrate?: (sessionID: string) => Promise<void> }).hydrate
+      const pendingHydrate = (data.session.pending as { hydrate?: (sessionID: string) => Promise<void> }).hydrate
+      await Promise.all([
+        child && messageHydrate ? messageHydrate(id) : data.session.message.sync(id),
+        child && pendingHydrate ? pendingHydrate(id) : data.session.pending.sync(id),
+      ])
       await enrichLeadingTurn({
         current: owner.current,
         messages: () => data.session.message.list(id),
@@ -124,7 +130,13 @@ function leadingTurnNeedsParent(messages: SessionMessageInfo[], id: string) {
   const assistant = messages.findIndex((message) => message.id === id)
 
   if (assistant === -1) return false
-  const boundary = messages.findIndex((message) => message.type === "user" || message.type === "shell")
+  const boundary = messages.findIndex(
+    (message) =>
+      message.type === "user" ||
+      message.type === "shell" ||
+      (message.type === "synthetic" &&
+        (message.metadata?.source === "peer" || (message as { peer?: boolean }).peer === true)),
+  )
 
   return boundary === -1 || assistant < boundary
 }

@@ -1,11 +1,16 @@
 //! Prompt admission: `/prompt`, `/synthetic`, `/compact` and `/command`.
 
+use std::path::PathBuf;
+
 use axum::Json;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, State};
 use axum::response::Response;
 use oc_store::{Delivery, NewInbox, NewMessage, SessionPatch};
-use oc_types::{ApiError, MessageId, now_millis};
+use oc_types::{
+    ApiError, EventPayload, MessageId, ModelRef, SessionAgentSelected, SessionId,
+    SessionModelSelected, now_millis,
+};
 use serde_json::{Map, Value, json};
 
 use super::bodies::{CommandBody, CompactBody, PromptBody, SyntheticBody};
@@ -183,22 +188,7 @@ pub async fn prompt(
                 }
             })));
         }
-        let mut extra = Map::new();
-        if let Some(files) = body.files {
-            extra.insert(
-                "files".to_owned(),
-                Value::Array(normalize_prompt_files(files)),
-            );
-        }
-        if let Some(agents) = body.agents {
-            extra.insert("agents".to_owned(), Value::Array(agents));
-        }
-        if let Some(skills) = body.skills {
-            extra.insert("skills".to_owned(), Value::Array(skills));
-        }
-        if let Some(metadata) = body.metadata {
-            extra.insert("metadata".to_owned(), Value::Object(metadata));
-        }
+        let extra = build_prompt_extra(body.files, body.agents, body.skills, body.metadata);
         let item = admit(
             &state,
             &session_id,
@@ -210,22 +200,7 @@ pub async fn prompt(
         .await?;
         return Ok(Json(json!({ "data": item })));
     }
-    let mut extra = Map::new();
-    if let Some(files) = body.files {
-        extra.insert(
-            "files".to_owned(),
-            Value::Array(normalize_prompt_files(files)),
-        );
-    }
-    if let Some(agents) = body.agents {
-        extra.insert("agents".to_owned(), Value::Array(agents));
-    }
-    if let Some(skills) = body.skills {
-        extra.insert("skills".to_owned(), Value::Array(skills));
-    }
-    if let Some(metadata) = body.metadata {
-        extra.insert("metadata".to_owned(), Value::Object(metadata));
-    }
+    let extra = build_prompt_extra(body.files, body.agents, body.skills, body.metadata);
     let item = admit(
         &state,
         &session_id,
@@ -510,6 +485,31 @@ pub async fn compact(
     Ok(Json(json!({ "data": item })))
 }
 
+fn build_prompt_extra(
+    files: Option<Vec<Value>>,
+    agents: Option<Vec<Value>>,
+    skills: Option<Vec<Value>>,
+    metadata: Option<Map<String, Value>>,
+) -> Map<String, Value> {
+    let mut extra = Map::new();
+    if let Some(files) = files {
+        extra.insert(
+            "files".to_owned(),
+            Value::Array(normalize_prompt_files(files)),
+        );
+    }
+    if let Some(agents) = agents {
+        extra.insert("agents".to_owned(), Value::Array(agents));
+    }
+    if let Some(skills) = skills {
+        extra.insert("skills".to_owned(), Value::Array(skills));
+    }
+    if let Some(metadata) = metadata {
+        extra.insert("metadata".to_owned(), Value::Object(metadata));
+    }
+    extra
+}
+
 /// `POST /api/session/:sid/command`
 pub async fn command(
     Path(session_id): Path<String>,
@@ -520,15 +520,30 @@ pub async fn command(
     let Some(name) = body.name.filter(|name| !name.trim().is_empty()) else {
         return Err(ApiError::new(400, "BadRequestError", "name must not be empty").into());
     };
+    let store = require_store(&state)?;
+    let session = store
+        .get_session(&session_id)
+        .await?
+        .ok_or_else(|| session_not_found(&session_id))?;
+    let directory = session
+        .pointer("/location/directory")
+        .and_then(Value::as_str)
+        .filter(|dir| !dir.is_empty())
+        .map_or_else(|| state.directory().to_path_buf(), PathBuf::from);
     let config = require_config(&state)?;
+    let scoped_commands = config.commands_for(&directory);
+    let found = scoped_commands
+        .iter()
+        .find(|command| command.name == name)
+        .cloned();
     // Builtin `/compress` (upstream calls the same operation `/compact`).
     // A markdown command named `compress` keeps precedence.
-    if name.eq_ignore_ascii_case("compress") && config.command(&name).is_none() {
+    if name.eq_ignore_ascii_case("compress") && found.is_none() {
         admit_compaction(&state, &session_id, None, body.delivery).await?;
         return Ok(no_content());
     }
     if (name.eq_ignore_ascii_case("complex") || name.eq_ignore_ascii_case("basic"))
-        && config.command(&name).is_none()
+        && found.is_none()
     {
         let mode = if name.eq_ignore_ascii_case("complex") {
             "complex"
@@ -543,19 +558,7 @@ pub async fn command(
         }
         apply_subagent_mode(&state, &session_id, mode, depth_override).await?;
         if !arguments.trim().is_empty() {
-            let mut extra = Map::new();
-            if let Some(files) = body.files {
-                extra.insert(
-                    "files".to_owned(),
-                    Value::Array(normalize_prompt_files(files)),
-                );
-            }
-            if let Some(agents) = body.agents {
-                extra.insert("agents".to_owned(), Value::Array(agents));
-            }
-            if let Some(skills) = body.skills {
-                extra.insert("skills".to_owned(), Value::Array(skills));
-            }
+            let extra = build_prompt_extra(body.files, body.agents, body.skills, None);
             admit(
                 &state,
                 &session_id,
@@ -568,7 +571,7 @@ pub async fn command(
         }
         return Ok(no_content());
     }
-    let Some(command) = config.command(&name) else {
+    let Some(command) = found else {
         return Err(ApiError::not_found(
             "CommandNotFoundError",
             format!("Command not found: {name}"),
@@ -576,6 +579,7 @@ pub async fn command(
         .with("command", json!(name))
         .into());
     };
+    apply_command_selection(&state, config, store, &session_id, &session, &command).await?;
     let arguments = body.text.unwrap_or_default();
     let text = if command.template.contains("$ARGUMENTS") {
         command.template.replace("$ARGUMENTS", &arguments)
@@ -587,19 +591,92 @@ pub async fn command(
     if text.trim().is_empty() {
         return Err(ApiError::new(400, "BadRequestError", "text must not be empty").into());
     }
-    let mut extra = Map::new();
-    if let Some(files) = body.files {
-        extra.insert(
-            "files".to_owned(),
-            Value::Array(normalize_prompt_files(files)),
-        );
-    }
-    if let Some(agents) = body.agents {
-        extra.insert("agents".to_owned(), Value::Array(agents));
-    }
-    if let Some(skills) = body.skills {
-        extra.insert("skills".to_owned(), Value::Array(skills));
-    }
+    let extra = build_prompt_extra(body.files, body.agents, body.skills, None);
     admit(&state, &session_id, None, text, extra, body.delivery).await?;
     Ok(no_content())
+}
+
+async fn apply_command_selection(
+    state: &AppState,
+    config: &oc_config::ConfigService,
+    store: &oc_store::Store,
+    session_id: &str,
+    session: &Value,
+    command: &oc_config::CommandInfo,
+) -> Result<(), ErrorResponse> {
+    let mut patch = SessionPatch::default();
+    let mut events: Vec<(&'static str, Value, u32)> = Vec::new();
+
+    if let Some(raw_agent) = command
+        .agent
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let agent = oc_config::normalize_agent_id(raw_agent).to_owned();
+        if config.agent(&agent).is_some() {
+            let previous = session
+                .get("agent")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            if previous.as_deref() != Some(agent.as_str()) {
+                patch.agent = Some(agent.clone());
+                let payload = SessionAgentSelected {
+                    session_id: SessionId::from_wire(session_id),
+                    agent,
+                    previous,
+                };
+                events.push((
+                    SessionAgentSelected::TYPE,
+                    payload.data(),
+                    SessionAgentSelected::VERSION,
+                ));
+            }
+        }
+    }
+
+    if let Some(raw_model) = command
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        && let Ok(parsed) = oc_llm::parse_reference(raw_model)
+    {
+        let usable = state
+            .catalog()
+            .is_none_or(|catalog| catalog.model(&parsed.provider, &parsed.id).is_some());
+        if usable {
+            let model = ModelRef {
+                id: parsed.id,
+                provider_id: parsed.provider,
+                variant: parsed
+                    .variant
+                    .filter(|v| !v.eq_ignore_ascii_case("default")),
+            };
+            let previous = session
+                .get("model")
+                .and_then(|v| serde_json::from_value::<ModelRef>(v.clone()).ok());
+            if previous.as_ref() != Some(&model) {
+                patch.model = Some(json!(&model));
+                let payload = SessionModelSelected {
+                    session_id: SessionId::from_wire(session_id),
+                    model,
+                    previous,
+                };
+                events.push((
+                    SessionModelSelected::TYPE,
+                    payload.data(),
+                    SessionModelSelected::VERSION,
+                ));
+            }
+        }
+    }
+
+    if patch.agent.is_some() || patch.model.is_some() {
+        store.patch_session(session_id, patch).await?;
+        for (kind, data, version) in events {
+            publish_durable(state, session_id, kind, data, version).await?;
+        }
+    }
+    Ok(())
 }

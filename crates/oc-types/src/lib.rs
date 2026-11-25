@@ -47,19 +47,19 @@ pub use message::{
     ToolContent, ToolPart, ToolState, ToolTime, UserMessage,
 };
 pub use payload::{
-    EventPayload, InterruptReason, STEP_LIMIT_PREFIX, SessionAgentSelected, SessionArchived,
-    SessionCompactionEnded, SessionCompactionFailed, SessionCompactionStarted, SessionCreated,
-    SessionDeleted, SessionExecutionFailed, SessionExecutionInterrupted, SessionExecutionStarted,
-    SessionExecutionStepLimit, SessionExecutionSucceeded, SessionIdle, SessionInboxCancelled,
-    SessionInboxDelivered, SessionInboxDeliveryChanged, SessionInboxEnqueued,
-    SessionMetadataUpdated, SessionModelFallback, SessionModelSelected, SessionMoved,
-    SessionPermissions, SessionReasoningDelta, SessionReasoningEnded, SessionReasoningStarted,
-    SessionRenamed, SessionRequestEnvelope, SessionStatusUpdated, SessionStepEnded,
-    SessionStepFailed, SessionStepStarted, SessionStepStreamed, SessionSynthetic, SessionTextDelta,
-    SessionTextEnded, SessionTextStarted, SessionToolCalled, SessionToolFailed,
-    SessionToolInputDelta, SessionToolInputEnded, SessionToolInputStarted, SessionToolProgress,
-    SessionToolSuccess, SessionUnarchived, SessionUsageUpdated, SessionViewed, parse_step_limit,
-    step_limit_reason,
+    CompactionTrigger, EventPayload, InterruptReason, STEP_LIMIT_PREFIX, SessionAgentSelected,
+    SessionArchived, SessionCompactionEnded, SessionCompactionFailed, SessionCompactionStarted,
+    SessionCompactionSuggested, SessionCreated, SessionDeleted, SessionExecutionFailed,
+    SessionExecutionInterrupted, SessionExecutionStarted, SessionExecutionStepLimit,
+    SessionExecutionSucceeded, SessionIdle, SessionInboxCancelled, SessionInboxDelivered,
+    SessionInboxDeliveryChanged, SessionInboxEnqueued, SessionMetadataUpdated,
+    SessionModelFallback, SessionModelSelected, SessionMoved, SessionPermissions,
+    SessionReasoningDelta, SessionReasoningEnded, SessionReasoningStarted, SessionRenamed,
+    SessionRequestEnvelope, SessionStatusUpdated, SessionStepEnded, SessionStepFailed,
+    SessionStepStarted, SessionStepStreamed, SessionSynthetic, SessionTextDelta, SessionTextEnded,
+    SessionTextStarted, SessionToolCalled, SessionToolFailed, SessionToolInputDelta,
+    SessionToolInputEnded, SessionToolInputStarted, SessionToolProgress, SessionToolSuccess,
+    SessionUnarchived, SessionUsageUpdated, SessionViewed, parse_step_limit, step_limit_reason,
 };
 pub use payload::{RequestInjection, canonical_message, digest, digest_sequence};
 pub use permission::{

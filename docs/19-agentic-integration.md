@@ -116,8 +116,9 @@ Known typed gaps:
 - `inspect` (digest): the `digest` tool is landed in `oc-runtime`, but the
   observer does not call it yet;
 - `retry_tool` has no runtime command (the executor returns a typed error);
-- `cancel_tool` cannot cancel one tool call (the runtime cancels whole
-  executions) and logs a typed no-op;
+- `cancel_tool` cancels one tool call through its per-call cancellation token
+  (`cancel_tool_call`), never a whole execution; it refuses when no matching
+  call is running, and the turn continues;
 - `restart_subagent` interrupts the child but cannot re-spawn it until the
   subagent spawn API exists.
 

@@ -315,10 +315,15 @@ for (const factory of [createTimelineProjection, createReactiveTimelineProjectio
             metadata: { source: "peer", from: "user" },
             time: { created: 3 },
           },
+          assistant("ans_peer_2", [{ type: "text", text: "Answered peer" }]),
         ])
         verify()
         const peerRows = projection.rows()
-        expect(peerRows.some((row) => row._tag === "Notice" && row.messageID === "syn_peer")).toBe(true)
+        expect(peerRows.some((row) => row._tag === "PeerMessage" && row.messageID === "syn_peer")).toBe(true)
+        expect(peerRows.some((row) => row._tag === "TurnGap" && row.userMessageID === "syn_peer")).toBe(true)
+        expect(projection.assistantMessagesByParent().get("syn_peer")?.map((message) => message.id)).toEqual([
+          "ans_peer_2",
+        ])
         dispose()
       })
     })

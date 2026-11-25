@@ -97,9 +97,8 @@ struct WatchConfig {
 
 /// `POST /api/location/reload`
 ///
-/// The configuration is an immutable snapshot, so the best truthful action is
-/// to rediscover skills; instructions cannot be reloaded through the current
-/// [`oc_config::ConfigService`] API. A missing configuration service is the
+/// Re-runs skill discovery and invalidates cached per-directory skills,
+/// slash commands, and instruction files. A missing configuration service is the
 /// documented `503` rather than a fake `204`.
 async fn reload_location(State(state): State<AppState>) -> Result<Response, ErrorResponse> {
     let config = state.config().ok_or_else(|| {
@@ -108,6 +107,9 @@ async fn reload_location(State(state): State<AppState>) -> Result<Response, Erro
         ))
     })?;
     let _skills = config.rescan_skills();
+    config.invalidate_skills();
+    config.invalidate_commands();
+    config.invalidate_instructions();
     Ok(no_content())
 }
 

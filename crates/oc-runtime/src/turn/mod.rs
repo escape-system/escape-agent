@@ -27,6 +27,7 @@ mod stall;
 mod stats;
 mod step_grants;
 mod stream;
+mod title;
 mod tools;
 mod types;
 mod verify;
@@ -134,14 +135,16 @@ async fn promote_inbox_row(
     id: &str,
 ) -> Result<Option<Value>, RuntimeError> {
     if store.get_message(session, id).await?.is_some() {
-        store.cancel_inbox(session, id).await?;
+        // The message exists, so the inbox row is only a doorbell: consume it.
+        // `cancel_inbox` would paint a delivered peer message as cancelled.
+        store.consume_inbox(session, id).await?;
         Ok(Some(Value::Null))
     } else {
         match store.promote_inbox(session, id).await {
             Ok(promoted) => Ok(promoted),
             Err(error) => {
                 if store.get_message(session, id).await?.is_some() {
-                    store.cancel_inbox(session, id).await?;
+                    store.consume_inbox(session, id).await?;
                     Ok(Some(Value::Null))
                 } else {
                     Err(error.into())
@@ -220,6 +223,15 @@ pub(crate) async fn run_execution(
         ExecutionOutcome::Succeeded | ExecutionOutcome::StepLimited { .. }
     );
     if answered {
+        title::maybe_generate(
+            runtime,
+            &info,
+            &turn.model_ref,
+            &turn.model,
+            &directory,
+            cancel,
+        )
+        .await;
         runtime.touch_memory(&turn.memory_ids).await;
     }
     runtime

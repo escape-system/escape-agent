@@ -825,7 +825,9 @@ export function createTimelineVirtualizer(input: Input) {
           )
         : -1
 
-      const promptIndex = rows().findIndex((row) => Predicate.isTagged(row, "UserMessage") && row.userMessageID === id)
+      const promptIndex = rows().findIndex(
+        (row) => (Predicate.isTagged(row, "UserMessage") || Predicate.isTagged(row, "PeerMessage")) && row.userMessageID === id,
+      )
 
       const index =
         partIndex >= 0 ? partIndex : promptIndex >= 0 ? promptIndex : input.projection.messageRowIndex().get(id)
@@ -1248,7 +1250,7 @@ export function createTimelineVirtualizer(input: Input) {
               element = value
 
               if (
-                !Predicate.isTagged(row(), "UserMessage") ||
+                (!Predicate.isTagged(row(), "UserMessage") && !Predicate.isTagged(row(), "PeerMessage")) ||
                 !addedKeys.has(rowProps.rowKey) ||
                 !input.pinned() ||
                 coldPending

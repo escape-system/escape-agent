@@ -219,6 +219,12 @@ function MessageTimelineView(
         )
       }
 
+      if (Predicate.isTagged(row, "PeerMessage")) {
+        const message = messageByID().get(row.messageID)
+
+        return message?.type === "synthetic" && message.text.length <= 1024
+      }
+
       if (Predicate.isTagged(row, "UserMessage")) {
         const message = messageByID().get(row.userMessageID)
 

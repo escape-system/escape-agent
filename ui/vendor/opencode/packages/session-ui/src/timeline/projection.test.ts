@@ -14,6 +14,8 @@ import {
   TimelineRow,
   type PartGroup,
 } from "./projection"
+import { timelinePresets } from "./detail"
+import { compactionFrom } from "./compaction-state"
 
 const context = (key: string, partIDs: string[], identity: { userMessageID?: string; messageID?: string } = {}) =>
   new TimelineRow.AssistantPart({
@@ -367,6 +369,249 @@ describe("createTimelineProjection", () => {
       "assistant-1",
       "assistant-2",
     ])
+  })
+
+  test("projects peer messages as Q&A turn openers without collapsing prior turn answers", () => {
+    const messages = [
+      { id: "user-1", type: "user", text: "initial task", time: { created: 1 } },
+      {
+        id: "assistant-1",
+        type: "assistant",
+        agent: "explore",
+        model: { id: "model", providerID: "provider" },
+        content: [{ type: "text", text: "initial answer" }],
+        time: { created: 2, completed: 3 },
+      },
+      {
+        id: "syn-peer-1",
+        type: "synthetic",
+        text: "peer follow-up question",
+        metadata: { source: "peer", from: "user" },
+        time: { created: 4 },
+      },
+      {
+        id: "assistant-2",
+        type: "assistant",
+        agent: "explore",
+        model: { id: "model", providerID: "provider" },
+        content: [
+          {
+            type: "tool",
+            id: "tool-1",
+            name: "read",
+            state: {
+              status: "completed",
+              input: { filePath: "a.ts" },
+              content: [{ type: "text", text: "code" }],
+              metadata: {},
+            },
+            time: { created: 5, completed: 6 },
+          },
+          { type: "text", text: "peer answer" },
+        ],
+        time: { created: 5, completed: 7 },
+      },
+      {
+        id: "syn-peer-queued",
+        type: "synthetic",
+        text: "queued peer question",
+        metadata: { source: "peer", from: "user" },
+        time: { created: 8 },
+      },
+    ] satisfies SessionMessageInfo[]
+
+    const result = createTimelineProjection({
+      sessionMessages: messages,
+      status: { type: "busy" },
+      reasoningMode: "compact",
+      timelineDetail: timelinePresets[2].value,
+      pendingInputIDs: new Set(["syn-peer-queued"]),
+    })
+
+    expect(result.activeMessageID).toBe("syn-peer-1")
+    expect(result.assistantMessagesByParent.get("syn-peer-1")?.map((m) => m.id)).toEqual(["assistant-2"])
+    expect(result.rows.map((row) => row._tag)).toEqual([
+      "UserMessage",
+      "AssistantPart",
+      "TurnGap",
+      "PeerMessage",
+      "AssistantPart",
+      "AssistantPart",
+      "Activity",
+      "TurnGap",
+      "PeerMessage",
+    ])
+  })
+
+  test("renders exactly one compaction row when a pending row and a running message both exist", () => {
+    const messages = [
+      { id: "user-1", type: "user", text: "first", time: { created: 1 } },
+      {
+        id: "assistant-1",
+        type: "assistant",
+        agent: "build",
+        model: { id: "model", providerID: "provider" },
+        content: [{ type: "text", text: "answer" }],
+        time: { created: 2 },
+      },
+      { id: "msg_compaction", type: "compaction", status: "running", reason: "auto", summary: "", time: { created: 3 } },
+    ] satisfies SessionMessageInfo[]
+
+    const compaction = compactionFrom([
+      { type: "queued", at: 3, inboxID: "inb_compaction", trigger: "guard", estimateTokens: 190_000, ceilingTokens: 200_000 },
+      { type: "started", at: 4, inboxID: "inb_compaction", trigger: "guard", estimateTokens: 190_000, ceilingTokens: 200_000 },
+    ])
+
+    const result = createTimelineProjection({
+      sessionMessages: messages,
+      status: { type: "busy" },
+      reasoningMode: "compact",
+      timelineDetail: timelinePresets[2].value,
+      compaction,
+    })
+
+    const compactionRows = result.rows.filter((row) => row._tag === "CompactionQueued")
+    expect(compactionRows).toHaveLength(1)
+    expect(compactionRows[0]).toMatchObject({
+      phase: "running",
+      inboxID: "inb_compaction",
+      trigger: "guard",
+      estimateTokens: 190_000,
+      ceilingTokens: 200_000,
+    })
+    // The running compaction message does not also render as a notice beside the row.
+    expect(result.rows.filter((row) => row._tag === "Notice")).toHaveLength(0)
+    // One row, keyed by phase, so a replayed event cannot mint a second identity.
+    expect(TimelineRow.key(compactionRows[0]!)).toBe("compaction:running")
+  })
+
+  test("renders the suggested row with its trigger until queueing supersedes it", () => {
+    const messages = [{ id: "user-1", type: "user", text: "first", time: { created: 1 } }] satisfies SessionMessageInfo[]
+    const suggested = compactionFrom([
+      {
+        type: "suggested",
+        at: 2,
+        trigger: "observer",
+        estimateTokens: 175_000,
+        triggerTokens: 160_000,
+        ceilingTokens: 200_000,
+      },
+    ])
+
+    const result = createTimelineProjection({
+      sessionMessages: messages,
+      status: { type: "busy" },
+      reasoningMode: "compact",
+      compaction: suggested,
+    })
+
+    expect(result.rows.filter((row) => row._tag === "CompactionQueued")).toHaveLength(1)
+    expect(result.rows.find((row) => row._tag === "CompactionQueued")).toMatchObject({ phase: "suggested", trigger: "observer" })
+
+    // A running record replaces the suggestion instead of adding a row beside it.
+    const queued = compactionFrom([...[], { type: "queued", at: 3, inboxID: "inb_s", trigger: "observer" }], suggested)
+    const queuedRows = createTimelineProjection({
+      sessionMessages: messages,
+      status: { type: "busy" },
+      reasoningMode: "compact",
+      compaction: queued,
+    }).rows.filter((row) => row._tag === "CompactionQueued")
+
+    expect(queuedRows).toHaveLength(1)
+    expect(queuedRows[0]).toMatchObject({ phase: "queued" })
+  })
+
+  test("a finished compaction leaves no live row behind", () => {
+    const messages = [
+      { id: "user-1", type: "user", text: "first", time: { created: 1 } },
+      {
+        id: "msg_compaction",
+        type: "compaction",
+        status: "completed",
+        reason: "auto",
+        summary: "summary",
+        time: { created: 3 },
+      },
+    ] satisfies SessionMessageInfo[]
+
+    const compaction = compactionFrom([
+      { type: "started", at: 3, inboxID: "inb_done" },
+      { type: "ended", at: 4, inboxID: "inb_done" },
+    ])
+
+    const result = createTimelineProjection({
+      sessionMessages: messages,
+      status: { type: "idle" },
+      reasoningMode: "compact",
+      compaction,
+    })
+
+    expect(result.rows.filter((row) => row._tag === "CompactionQueued")).toHaveLength(0)
+    // The durable completion notice is the only compaction row left.
+    expect(result.rows.filter((row) => row._tag === "Notice")).toHaveLength(1)
+  })
+
+  test("pairs a peer answer to its question through replyTo", () => {
+    const messages = [
+      { id: "user-1", type: "user", text: "initial task", time: { created: 1 } },
+      {
+        id: "syn-question",
+        type: "synthetic",
+        text: "which file?",
+        metadata: { source: "peer", from: "ses_parent", kind: "question" },
+        time: { created: 2 },
+      },
+      {
+        id: "syn-answer",
+        type: "synthetic",
+        text: "src/app.ts",
+        metadata: { source: "peer", from: "ses_parent", kind: "answer", replyTo: "syn-question" },
+        time: { created: 3 },
+      },
+    ] satisfies SessionMessageInfo[]
+
+    const result = createTimelineProjection({
+      sessionMessages: messages,
+      status: { type: "idle" },
+      reasoningMode: "compact",
+    })
+
+    const peerRows = result.rows.filter((row) => row._tag === "PeerMessage")
+    expect(peerRows).toHaveLength(2)
+    expect(peerRows[0]).toMatchObject({ messageID: "syn-question" })
+    expect(peerRows[0]).not.toMatchObject({ answer: true })
+    expect(peerRows[1]).toMatchObject({ messageID: "syn-answer", answer: true, replyTo: "syn-question" })
+    // The answer keeps its chronological place after the question it replies to.
+    expect(result.rows.map((row) => [row._tag, row.userMessageID])).toEqual([
+      ["UserMessage", "user-1"],
+      ["TurnGap", "syn-question"],
+      ["PeerMessage", "syn-question"],
+      ["TurnGap", "syn-answer"],
+      ["PeerMessage", "syn-answer"],
+    ])
+  })
+
+  test("keeps a cancelled peer row visible with its chip flag and no queued state", () => {
+    const messages = [
+      { id: "user-1", type: "user", text: "task", time: { created: 1 } },
+      {
+        id: "syn-cancelled",
+        type: "synthetic",
+        text: "abandoned instruction",
+        metadata: { source: "peer", from: "ses_parent", cancelled: true },
+        time: { created: 2 },
+      },
+    ] satisfies SessionMessageInfo[]
+
+    const result = createTimelineProjection({
+      sessionMessages: messages,
+      status: { type: "idle" },
+      reasoningMode: "compact",
+    })
+
+    const row = result.rows.find((value) => value._tag === "PeerMessage")
+    expect(row).toMatchObject({ messageID: "syn-cancelled", cancelled: true })
+    expect(result.activeMessageID).toBe("syn-cancelled")
   })
 })
 

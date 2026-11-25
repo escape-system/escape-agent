@@ -400,4 +400,62 @@ describe("peer feed", () => {
       peer.dispose()
     }
   })
+
+  test("projects chronological Q&A thread with assistant replies, preserves delivery on add, and skips self-unread", () => {
+    state = fakeStore()
+    server = fakeServer()
+    const assistantMsg = {
+      id: "msg_a1",
+      type: "assistant",
+      agent: "explore",
+      model: { id: "m", providerID: "p" },
+      content: [{ type: "text", text: "Found 2 matches" }],
+      time: { created: 2 },
+    }
+    state.setMessages("ses_child", [
+      { id: "msg_u1", type: "user", text: "Check repo", time: { created: 1 } },
+      assistantMsg,
+      delivered("msg_p1", "Focus on auth", 4),
+      {
+        id: "msg_a2",
+        type: "assistant",
+        agent: "explore",
+        model: { id: "m", providerID: "p" },
+        content: [{ type: "text", text: "Auth uses JWT" }],
+        time: { created: 5, completed: 6 },
+      },
+    ])
+    const peer = feed()
+    try {
+      expect(peer.thread?.()).toEqual([
+        expect.objectContaining({ id: "msg_u1", role: "question", origin: "user", text: "Check repo" }),
+        expect.objectContaining({ id: "msg_a1", role: "answer", text: "Found 2 matches", streaming: true }),
+        expect.objectContaining({ id: "msg_p1", role: "question", origin: "peer", text: "Focus on auth", status: "sent" }),
+        expect.objectContaining({ id: "msg_a2", role: "answer", text: "Auth uses JWT", streaming: false }),
+      ])
+
+      // In-place mutation of assistant content invalidates the cache without changing array identity/length.
+      assistantMsg.content = [{ type: "text", text: "Found 2 matches (done)" }]
+      assistantMsg.time = { created: 2, completed: 3 } as { created: number; completed?: number }
+      expect(peer.thread?.()[1]).toMatchObject({
+        id: "msg_a1",
+        text: "Found 2 matches (done)",
+        streaming: false,
+      })
+
+      // Own sends preserve `delivery: "steer"` and never bump `unread`.
+      peer.add({ id: "msg_own_steer", from: "you", own: true, text: "Hurry up", created: 10 }, "steer")
+      expect(peer.unread()).toBe(0)
+      expect(peer.queued()[0]).toMatchObject({ id: "msg_own_steer", delivery: "steer", status: "queued" })
+      expect(peer.thread?.().at(-1)).toMatchObject({
+        id: "msg_own_steer",
+        role: "question",
+        origin: "peer",
+        delivery: "steer",
+        status: "queued",
+      })
+    } finally {
+      peer.dispose()
+    }
+  })
 })

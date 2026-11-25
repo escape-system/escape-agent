@@ -471,7 +471,13 @@ fn project_inbox_delivered(
         "DELETE FROM session_inbox WHERE id = ?1 AND session_id = ?2",
         params![inbox_id, session_id],
     )?;
-    if kind != "move" && kind != "compaction" {
+    // A row admitted through `enqueue_materialized` already owns its message;
+    // replaying this event must flip its delivery marker instead of inserting a
+    // second transcript row (which would also re-allocate `seq`).
+    if crate::inbox::mark_delivered_materialized(transaction, session_id, inbox_id)?.is_none()
+        && kind != "move"
+        && kind != "compaction"
+    {
         let kind = crate::inbox::message_kind(&kind);
         let payload: Value = db::decode_json(&payload)?;
         let body = message::body_with_time(&payload, created)?;
@@ -495,6 +501,9 @@ fn project_inbox_cancelled(transaction: &Transaction<'_>, data: &Value) -> Resul
         "DELETE FROM session_inbox WHERE id = ?1 AND session_id = ?2",
         params![inbox_id, session_id],
     )?;
+    // Replaying the cancellation keeps a peer message with a cancelled marker,
+    // exactly like `Store::cancel_inbox`; other kinds keep delete-only history.
+    crate::inbox::cancel_peer_message(transaction, session_id, inbox_id, true)?;
     Ok(())
 }
 

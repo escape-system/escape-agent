@@ -54,13 +54,18 @@ Both paths run the same code: `verify` executes `cargo fmt --all --check`,
 tag version, packages, and publishes.
 
 `permissions: contents: write` is granted to the workflow; no third-party
-release action is used, only `gh release create`. Re-running on an existing tag
-replaces the release (`gh release delete --yes` then create).
+release action is used, only the `gh` CLI. Re-running on an existing tag does
+**not** delete the release: the publish step checks `gh release view` and, when
+the release exists, uploads the fresh assets with `--clobber`
+(`.github/workflows/release.yml:145-147`), which replaces same-named assets and
+keeps the release body, notes and other assets intact. Only a run whose tag has
+no release yet takes the `gh release create --generate-notes --verify-tag`
+branch.
 
 ## The version-must-match rule
 
 The tag must equal `[workspace.package] version` in `Cargo.toml` (currently
-`0.3.23`) exactly, minus the leading `v`. The workflow fails before building if
+`0.3.26`) exactly, minus the leading `v`. The workflow fails before building if
 they differ:
 
 ```

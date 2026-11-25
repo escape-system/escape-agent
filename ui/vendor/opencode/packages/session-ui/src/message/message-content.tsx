@@ -1000,13 +1000,95 @@ function SessionReferenceText(props: { text: string }) {
   return root
 }
 
-/** A compaction the server admitted but has not started, drawn as the divider a started one opens with. */
-export function SessionCompactionQueued() {
+const COMPACTION_LABELS = {
+  suggested: "ui.messagePart.compaction.suggested",
+  queued: "ui.messagePart.compaction.queued",
+  running: "ui.messagePart.compaction.running",
+} as const
+
+const COMPACTION_WHY = {
+  guard: "ui.messagePart.compaction.why.guard",
+  overflow: "ui.messagePart.compaction.why.overflow",
+  manual: "ui.messagePart.compaction.why.manual",
+  observer: "ui.messagePart.compaction.why.observer",
+  command: "ui.messagePart.compaction.why.command",
+} as const
+
+/**
+ * The session's one compaction row. It names the phase, says why the compaction runs, shows the
+ * token pressure when the server reported it, and offers "Compact now" while the row is only a
+ * suggestion. `phase` comes from the folded record, never from a second source.
+ */
+export function SessionCompactionQueued(props: {
+  phase: "suggested" | "queued" | "running"
+  trigger?: keyof typeof COMPACTION_WHY
+  estimateTokens?: number
+  triggerTokens?: number
+  ceilingTokens?: number
+  onCompact?: () => void
+}) {
   const i18n = useI18n()
+  const [starting, setStarting] = createSignal(false)
+  const compact = createMemo(
+    () => new Intl.NumberFormat(i18n.locale(), { notation: "compact", maximumFractionDigits: 1 }),
+  )
+
+  const why = () =>
+    i18n.t(props.trigger ? COMPACTION_WHY[props.trigger] : "ui.messagePart.compaction.why.unknown")
+
+  // `triggerTokens` is where this compaction fires and `ceilingTokens` where the context is full.
+  // A suggestion that only knows its estimate still reports the size it saw.
+  const tokens = () => {
+    const used = props.estimateTokens ?? props.triggerTokens
+    if (used === undefined) return ""
+    if (props.ceilingTokens === undefined)
+      return i18n.t("ui.messagePart.compaction.tokensOnly", { used: compact().format(used) })
+
+    return i18n.t("ui.messagePart.compaction.tokens", {
+      used: compact().format(used),
+      limit: compact().format(props.ceilingTokens),
+    })
+  }
+
+  const start = async () => {
+    if (!props.onCompact || starting()) return
+    setStarting(true)
+    try {
+      await props.onCompact()
+    } finally {
+      setStarting(false)
+    }
+  }
 
   return (
-    <div data-component="session-compaction-message">
-      <CompactionDivider label={i18n.t("ui.messagePart.compaction.queued")} />
+    <div
+      data-component="session-compaction-message"
+      data-slot="session-compaction-row"
+      data-phase={props.phase}
+      data-trigger={props.trigger}
+    >
+      <CompactionDivider label={i18n.t(COMPACTION_LABELS[props.phase])} />
+      <div class="-mt-1 flex flex-wrap items-center justify-center gap-x-2 gap-y-1 pb-2 text-11-regular text-v2-text-text-faint">
+        <span data-slot="session-compaction-why">{why()}</span>
+        <Show when={tokens()}>
+          {(value) => (
+            <span data-slot="session-compaction-tokens" class="tabular-nums">
+              {value()}
+            </span>
+          )}
+        </Show>
+        <Show when={props.phase === "suggested" && props.onCompact}>
+          <button
+            type="button"
+            data-slot="session-compaction-compact-now"
+            disabled={starting()}
+            onClick={() => void start()}
+            class="inline-flex h-6 items-center rounded-md border border-v2-border-border-base bg-v2-background-bg-layer-02 px-2 text-11-regular font-[530] text-v2-text-text-base hover:bg-v2-background-bg-layer-03 disabled:opacity-50"
+          >
+            {i18n.t("ui.messagePart.compaction.compactNow")}
+          </button>
+        </Show>
+      </div>
     </div>
   )
 }

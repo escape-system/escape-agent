@@ -737,6 +737,56 @@ async fn subagent_strip_is_not_overdue_while_child_session_is_busy() {
 }
 
 #[tokio::test]
+async fn roster_strip_is_not_overdue_while_child_session_is_busy() {
+    let h = harness(ObserverConfig::default(), vec![Ok(nudge())]);
+    let mut roster_strip = strip("tc_roster", 0, 302);
+    roster_strip.tool = "roster".to_owned();
+    h.engine.observe_start(roster_strip);
+
+    h.clock.set(30_000);
+    let busy_tree = vec![
+        TreeRow {
+            sid: "ses_root".to_owned(),
+            parent: None,
+            agent: "engineer".to_owned(),
+            state: "busy".to_owned(),
+            depth: 0,
+            idle_reason: None,
+        },
+        TreeRow {
+            sid: "ses_child".to_owned(),
+            parent: Some("ses_root".to_owned()),
+            agent: "general".to_owned(),
+            state: "busy".to_owned(),
+            depth: 1,
+            idle_reason: None,
+        },
+    ];
+    assert!(
+        h.engine.tick("ses_root", busy_tree, None).await.is_none(),
+        "roster wait must not wake the observer while a direct child is busy"
+    );
+    assert_eq!(h.model.calls(), 0);
+}
+
+#[tokio::test]
+async fn roster_strip_without_a_busy_child_still_becomes_overdue() {
+    let h = harness(ObserverConfig::default(), vec![Ok(cancel_repair())]);
+    let mut roster_strip = strip("tc_roster", 0, 302);
+    roster_strip.tool = "roster".to_owned();
+    h.engine.observe_start(roster_strip);
+
+    // No child row at all: the strip is genuinely past its derived deadline.
+    h.clock.set(302_000);
+    let run = h.engine.tick("ses_root", tree(), None).await;
+    assert!(
+        matches!(run, Some(ObserverRun::Repair { .. })),
+        "a roster strip with no busy child must become overdue at its deadline, got {run:?}"
+    );
+    assert_eq!(h.model.calls(), 1);
+}
+
+#[tokio::test]
 async fn cancel_tool_accepts_session_id_of_running_strip() {
     let verdict = serde_json::json!({
         "action": "repair",

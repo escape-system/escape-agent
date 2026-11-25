@@ -135,7 +135,11 @@ fn insert_single_discovered_model(
     });
     let output = info.max_output_tokens.unwrap_or(64_000);
     let reasoning = if info.supports_thinking {
-        json!({ "supported": true, "effort": ["low", "high"] })
+        if family == "claude" {
+            json!({ "supported": true, "effort": ["low", "medium", "high"] })
+        } else {
+            json!({ "supported": true, "effort": ["low", "high"] })
+        }
     } else {
         json!({ "supported": false })
     };

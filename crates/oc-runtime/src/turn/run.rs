@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use oc_llm::LlmMessage;
 use oc_types::MessageId;
-use oc_types::payload::{RequestInjection, SessionInboxDelivered};
+use oc_types::payload::{CompactionTrigger, RequestInjection, SessionInboxDelivered};
 use serde_json::Value;
 
 use crate::prompt::{self, MAX_STEPS_PROMPT};
@@ -18,6 +18,10 @@ use super::stats::collect_tool_lines;
 use super::types::ExecutionOutcome;
 use super::types::ResolvedTurn;
 use super::{budget, compaction, repetition, stall, verify};
+
+/// Automatic compactions one turn may run, threshold and overflow combined
+/// (`docs/04-agent-runtime.md`: "at most 3 auto-compactions per turn").
+const MAX_AUTO_COMPACTIONS_PER_TURN: usize = 3;
 
 impl Runtime {
     /// Promotes the pending `steer` rows that can become conversation
@@ -78,9 +82,15 @@ impl Runtime {
     ) -> Result<ExecutionOutcome, RuntimeError> {
         let mut context = self.load_context(session).await?;
         stats.user_text = prompt::last_user_text(&context);
-        let mut last_compacted_len: Option<usize> = None;
+        // Re-trigger key of the last automatic compaction: the token estimate
+        // observed immediately after it finished. A compaction that fails to
+        // shrink the prompt must not run again for the same pressure, so the
+        // guard fires only when the estimate grows past that post state. A
+        // context-length key could not express that: a swap of equal-length
+        // messages re-armed it, and a genuinely larger prompt could match an
+        // older length.
+        let mut compacted_at_estimate: Option<u64> = None;
         let mut auto_compactions = 0_usize;
-        let mut overflow_compacted = false;
         let mut length_continuations = 0_usize;
         let mut pending_output_continuation = false;
         let mut pending_verify_nudge: Option<String> = None;
@@ -187,27 +197,33 @@ impl Runtime {
             if step_number > 0 && self.promote_steers(session, &turn.directory).await? {
                 context = self.load_context(session).await?;
             }
-            if auto_compactions < 3 && guard_armed && last_compacted_len != Some(context.len()) {
+            if auto_compactions < MAX_AUTO_COMPACTIONS_PER_TURN && guard_armed {
                 let estimate = self.estimate_turn_tokens(session, turn, &context).await?;
-                if estimate > trigger {
-                    // `guard` is only reachable with an explicit ceiling and
-                    // `auto=false`; everything else keeps the historical
-                    // `auto` reason. The wire reason stays `auto` for both
-                    // (`event_reason`).
-                    let reason = if compaction.auto { "auto" } else { "guard" };
+                let grew_since_compaction =
+                    compacted_at_estimate.is_none_or(|previous| estimate > previous);
+                if estimate > trigger && grew_since_compaction {
+                    // `guard` names the ceiling path even when `compaction.auto`
+                    // armed it: the trigger explains the decision, and the wire
+                    // `reason` stays `auto` for compatibility.
                     tracing::info!(
                         session = %session,
                         estimate,
                         trigger,
                         ceiling,
-                        reason,
                         "threshold compaction"
                     );
-                    match self.compact(session, turn, &context, cancel, reason).await {
+                    let request =
+                        super::compaction::CompactionRequest::new(CompactionTrigger::Guard)
+                            .with_pressure(
+                                estimate,
+                                trigger,
+                                (ceiling != u64::MAX).then_some(ceiling),
+                            );
+                    match self.compact(session, turn, &context, cancel, request).await {
                         Ok(()) => {
                             context = self.load_context(session).await?;
                             auto_compactions += 1;
-                            last_compacted_len = Some(context.len());
+                            compacted_at_estimate = Some(estimate);
                         }
                         Err(RuntimeError::Cancelled) => {
                             return Ok(ExecutionOutcome::Interrupted(cancel.reason()));
@@ -218,7 +234,7 @@ impl Runtime {
                                 %error,
                                 "auto-compaction failed; continuing turn without wedging"
                             );
-                            last_compacted_len = Some(context.len());
+                            compacted_at_estimate = Some(estimate);
                         }
                     }
                 }
@@ -380,17 +396,19 @@ impl Runtime {
                     return Ok(ExecutionOutcome::Interrupted(cancel.reason()));
                 }
                 Err(error)
-                    if !overflow_compacted
+                    if auto_compactions < MAX_AUTO_COMPACTIONS_PER_TURN
                         && compaction::is_context_overflow_message(&error.to_string()) =>
                 {
-                    match self
-                        .compact(session, turn, &context, cancel, "overflow")
-                        .await
-                    {
+                    // A provider overflow is the same automatic budget as the
+                    // threshold guard: one turn can compact at most
+                    // `MAX_AUTO_COMPACTIONS_PER_TURN` times in total, so a loop
+                    // of overflows cannot bypass the documented cap.
+                    let request = compaction::CompactionRequest::new(CompactionTrigger::Overflow);
+                    match self.compact(session, turn, &context, cancel, request).await {
                         Ok(()) => {
-                            overflow_compacted = true;
+                            auto_compactions += 1;
                             context = self.load_context(session).await?;
-                            last_compacted_len = Some(context.len());
+                            compacted_at_estimate = None;
                             continue;
                         }
                         Err(RuntimeError::Cancelled) => {

@@ -25,9 +25,13 @@ public surface; `cargo doc -p <crate> --no-deps` is the reference.
   `data()`, `into_envelope(location)`).
 - Compaction lifecycle payloads are durable v1 events published after the
   matching commit: `SessionCompactionStarted`/`Ended`/`Failed`
-  (`session.compaction.started|ended|failed`); ephemeral
-  `session.compaction.delta` is not implemented, though the vendored UI still
-  carries a dead handler for it.
+  (`session.compaction.started|ended|failed`), plus the advisory
+  `SessionCompactionSuggested` (`session.compaction.suggested`, durable v1);
+  ephemeral `session.compaction.delta` is not implemented, though the vendored
+  UI still carries a dead handler for it. `CompactionTrigger`
+  (`guard|overflow|manual|observer|command`) is the authoritative cause; the
+  legacy `reason` string stays for compatibility and no longer carries the
+  trigger (see *Peer messages and deterministic compaction* below).
 - `Tokens.input` is **non-cached**; `Tokens::prompt_tokens()`
   (`input + cache.read + cache.write`) is the inclusive prompt size used for
   context/compaction math (a fully cached step can report `input == 0`).
@@ -49,11 +53,21 @@ public surface; `cargo doc -p <crate> --no-deps` is the reference.
   permissions/directory/path/revert/archived`.
 - Messages: `append_message`, `get_message`, `list_messages`,
   `update_message`; `MessageQuery::new`.
-- Inbox: `enqueue`, `enqueue_steer`, `list_inbox`, `promote_inbox`,
-  `cancel_inbox`, `set_delivery`; duplicate id → `Conflict`. `enqueue_steer`
-  is additive: one transaction commits the `steer` inbox row and its message
-  row (payload + `time.created`), so a failed admission leaves no executable
-  row behind; `queue` delivery and unknown kinds are `Invalid`.
+- Inbox: `enqueue`, `enqueue_steer`, `enqueue_materialized`,
+  `list_inbox`, `promote_inbox`, `cancel_inbox`, `consume_inbox`,
+  `mark_peer_cancelled`, `set_delivery`; duplicate id → `Conflict`.
+  `enqueue_steer` is additive: one transaction commits the `steer` inbox row
+  and its message row (payload + `time.created`), so a failed admission leaves
+  no executable row behind; `queue` delivery and unknown kinds are `Invalid`.
+  `enqueue_materialized(&NewInbox) -> (InboxRow, MessageId)` does the same for
+  any materialisable kind (`peer`/`observer`/`user`/`synthetic`): inbox row and
+  `synthetic` transcript row commit in one transaction, the message carries
+  `metadata.inboxID` plus the merged peer metadata, and the message `seq` comes
+  from the normal session sequence at admission time. Control kinds (`move`,
+  `compaction`) have no transcript row and are `Invalid`.
+  `consume_inbox(session_id, id)` deletes only the pending row (doorbell case,
+  never touches `session_message`); `mark_peer_cancelled(session_id, id)` sets
+  `metadata.cancelled` on an existing peer row and never deletes it.
 - Inbox wire types: `peer` and `observer` are additive inbox kinds promoted
   (and reported by `list_inbox`/`enqueue_steer`) as `synthetic`, because the
   message union carries no such type; the sender identity stays in the payload
@@ -62,8 +76,12 @@ public surface; `cargo doc -p <crate> --no-deps` is the reference.
   unchanged.
 - Events: `append_event` (persists + projects + dense seq in one transaction),
   `events_after`.
-- `promote_inbox` allocates a fresh seq, deletes the inbox row, inserts the
-  message, returns it; `None` for absent/control items.
+- `promote_inbox` promotes two row shapes: a plain `enqueue` row gets a fresh
+  `seq`, the inbox row is deleted and the message inserted; an already
+  materialised row (`metadata.inboxID` present on the message) is flipped in
+  place instead — `metadata.delivered = true` (+ `deliveredAt`) on the existing
+  message, inbox row removed, original `seq`/`time_created` kept. Returns the
+  message; `None` for absent/control items.
 - `create_session` auto-creates the owning `project` row.
 - Memory API: `write_memory`, `search_memories`, `list_memories`,
   `forget_memory`, `touch_memories` (FTS5 backfill + triggers).
@@ -523,6 +541,89 @@ entry whose link target is missing (or is not a file/directory) is skipped.
 - Interactive chat exposes the same pool through `/ag` (alias
   `/antigravity`): `status`, `quota [cached]`, `use|enable|disable <account>`,
   `models [refresh]`.
+
+## Peer messages and deterministic compaction
+
+Additive only: no event type, payload field, route or store method above was
+renamed or narrowed. Optional fields are **omitted, never `null`**; timestamps
+are epoch ms.
+
+### Event `session.compaction.suggested` (`oc-types`)
+
+```rust
+// crates/oc-types/src/payload/compaction.rs
+pub struct SessionCompactionSuggested { session_id, trigger: CompactionTrigger,
+                                        estimate_tokens: u64, trigger_tokens: u64,
+                                        ceiling_tokens: Option<u64> }
+impl_event_payload!(SessionCompactionSuggested, "session.compaction.suggested", true, 1);
+```
+
+Payload fields: `sessionID`, `trigger` (`observer` today), `estimateTokens`,
+`triggerTokens`, `ceilingTokens?`. Durable v1, published when the host-side
+compaction adviser recommends a compaction — before its advisory inbox row is
+delivered. It is advice, not a command: it reserves no turn and consumes no
+tokens, and the UI renders it as one advisory row with a **Compact now**
+action. `ceilingTokens` is omitted when no ceiling can be computed.
+
+### New optional fields on the existing compaction events
+
+| Event | Added (all optional, omitted when absent) |
+|---|---|
+| `session.compaction.started` | `inboxID`, `trigger`, `estimateTokens`, `triggerTokens`, `ceilingTokens` |
+| `session.compaction.ended` | `inboxID`, `trigger`, `beforeTokens`, `afterTokens` |
+| `session.compaction.failed` | `inboxID`, `trigger` |
+
+- `inboxID` is the **inbox row id** that admitted the compaction, i.e. the
+  `session_inbox.id` the client already holds from `session.inbox.enqueued`.
+  It is **not** the compaction message id that `inputID` carries. Clients retire
+  a queued badge by matching `inboxID`; matching `inputID` against a pending row
+  is what produced a permanent "queued + running" row before this change.
+- `trigger` is the authoritative cause
+  (`guard|overflow|manual|observer|command`, `CompactionTrigger` in
+  `oc-types`). `reason` is retained for compatibility and **must not** be used
+  to infer the cause: the legacy encoder collapsed every non-manual run into
+  `auto`, which is exactly the information loss this field fixes.
+  `CompactionTrigger::from_reason` maps a legacy string when available and
+  returns `None` for `auto`/unknown, so a caller holding an old value supplies
+  the real cause instead of inheriting the collapse.
+- `beforeTokens`/`afterTokens` are the runtime's own context estimates around
+  the run; `estimateTokens`/`triggerTokens`/`ceilingTokens` are the values that
+  crossed the threshold at admission. They are measurements, never budgets.
+
+### `session.inbox.delivered` for a consumed compaction row
+
+`session.inbox.delivered` (`{sessionID, inboxID}`, durable v1) is now also
+published when the runtime consumes a queued **`compaction`** inbox row, not
+only for `user`/`synthetic` promotion. A client can therefore retire the queued
+badge deterministically from the event stream alone, instead of inferring it
+from a vanished snapshot entry. `session.inbox.cancelled` remains the
+cancellation counter-event, and `session.compaction.started` carrying the same
+`inboxID` retires the badge too.
+
+Recovery honours the same contract: `repair_compaction` commits the failed
+compaction row and publishes `session.compaction.failed` after that commit, so a
+kill -9 during a compaction leaves a terminal event rather than a row that
+silently flips to `failed` on the next boot.
+
+Coalescing: admitting a compaction (`POST /compact`, `POST /compress`, the
+`compact_context` tool) is idempotent per session. While a pending `compaction`
+inbox row exists, the admission returns that same `inboxID` and emits nothing
+new.
+
+### Peer tool parity (`oc-runtime`)
+
+- `talk` input adds optional `reply_to` (message id of the peer message being
+  answered). It is echoed into the payload metadata as `metadata.replyTo`.
+- `session_write` input adds optional `kind` (`note|question|answer`, default
+  `note`) and now emits the ephemeral `subagent.peer.message` notification like
+  `talk`, so a write is no longer second-class in the drawer.
+- Both persist through `Store::enqueue_materialized` at **enqueue** time: one
+  `synthetic` transcript row per peer message carrying
+  `metadata.source = "peer"`, `metadata.inboxID`, `metadata.delivered`
+  (`false` until promotion flips it), `metadata.cancelled` (set instead of
+  deleting the row) and `metadata.replyTo` when a reply target exists. A queued
+  peer message is therefore visible in history before it is delivered, and a
+  cancelled one stays visible as cancelled.
 
 ## Model control plane
 

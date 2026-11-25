@@ -73,6 +73,7 @@ export function visibleTimelineMessages(
   messages: SessionMessageInfo[],
   pending: SessionInboxInfo[],
   revertMessageID?: string,
+  options?: { includeQueued?: boolean },
 ) {
   const queued = new Set(
     pending.flatMap((item) =>
@@ -90,19 +91,27 @@ export function visibleTimelineMessages(
 
   if (queued.size === 0 && inputs.size === 0 && !revertMessageID) return messages
 
+  const includeQueued = options?.includeQueued ?? false
   const visible = messages.filter(
-    (message) => !queued.has(message.id) && (!revertMessageID || message.id < revertMessageID),
+    (message) => (includeQueued || !queued.has(message.id)) && (!revertMessageID || message.id < revertMessageID),
   )
 
-  if (inputs.size === 0) return visible
+  const queuedVisible = includeQueued && queued.size > 0
+  if (inputs.size === 0 && !queuedVisible) return visible
+
+  const tailSet = new Set([...inputs, ...(queuedVisible ? queued : [])])
+  const withoutTail = visible.filter((message) => !tailSet.has(message.id))
+  const steerRows = visible.filter((message) => inputs.has(message.id))
+  const queuedRows = queuedVisible ? visible.filter((message) => queued.has(message.id) && !inputs.has(message.id)) : []
 
   // Undelivered inputs do not own assistant work, so they stay below the active work like the TUI.
   // They keep admission order: the server delivers steers in that order, so delivery moves nothing.
+  // Queued subagent inputs wait below active work and steers until the current turn settles.
   // A pre-promotion failure ends in a failed idle marker with no assistant work, so keep that marker
   // after the input that triggered it.
-  const tail = visible.at(-1)
+  const tail = withoutTail.at(-1)
 
-  if (tail?.type === "idle" && tail.outcome === "failed") {
+  if (tail?.type === "idle" && tail.outcome === "failed" && steerRows.length > 0) {
     const start = visible.slice(0, -1).findLastIndex((message) => message.type === "idle") + 1
 
     if (
@@ -112,17 +121,15 @@ export function visibleTimelineMessages(
       const rest = visible.slice(0, -1)
 
       return [
-        ...rest.filter((message) => !inputs.has(message.id)),
+        ...rest.filter((message) => !tailSet.has(message.id)),
         ...rest.filter((message) => inputs.has(message.id)),
         tail,
+        ...queuedRows,
       ]
     }
   }
 
-  return [
-    ...visible.filter((message) => !inputs.has(message.id)),
-    ...visible.filter((message) => inputs.has(message.id)),
-  ]
+  return [...withoutTail, ...steerRows, ...queuedRows]
 }
 
 export function timelineChildTitle(input: {

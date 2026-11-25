@@ -27,6 +27,8 @@ mod observer_advice;
 mod recovery;
 #[path = "runtime/request_envelope.rs"]
 mod request_envelope;
+#[path = "runtime/session_title_and_config.rs"]
+mod session_title_and_config;
 #[path = "runtime/step_grants.rs"]
 mod step_grants;
 #[path = "runtime/stop.rs"]

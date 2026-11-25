@@ -379,3 +379,148 @@ async fn mode_slash_command_keeps_user_spacing() {
     let (_, body) = call(&app, Method::GET, &format!("/api/session/{sid}"), None).await;
     assert_eq!(body.unwrap()["data"]["metadata"]["maxDepth"], 3);
 }
+
+#[tokio::test]
+async fn scoped_skills_and_commands_follow_directory() {
+    let harness = harness().await;
+    let app = router(harness.state.clone());
+
+    let project_b = tempfile::tempdir().unwrap();
+    let skill_dir = project_b.path().join(".opencode/skill/proj-b");
+    std::fs::create_dir_all(&skill_dir).unwrap();
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: ProjB\ndescription: project B skill\n---\nSkill from B.\n",
+    )
+    .unwrap();
+    let cmd_dir = project_b.path().join(".opencode/command");
+    std::fs::create_dir_all(&cmd_dir).unwrap();
+    std::fs::write(
+        cmd_dir.join("architect-plan.md"),
+        "---\ndescription: plan B\nagent: plan\n---\nPlan $ARGUMENTS.\n",
+    )
+    .unwrap();
+
+    // Server root does not see project B's command/skill.
+    let (_, body) = call(&app, Method::GET, "/api/command", None).await;
+    assert!(
+        body.unwrap()["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|c| c["name"] != "architect-plan")
+    );
+
+    // Scoped directory query sees project B's command and skill.
+    let encoded_dir = project_b.path().to_string_lossy();
+    let (_, body) = call(
+        &app,
+        Method::GET,
+        &format!("/api/skill?location[directory]={encoded_dir}"),
+        None,
+    )
+    .await;
+    assert!(
+        body.unwrap()["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["id"] == "proj-b")
+    );
+    let (_, body) = call(
+        &app,
+        Method::GET,
+        &format!("/api/command?location[directory]={encoded_dir}"),
+        None,
+    )
+    .await;
+    assert!(
+        body.unwrap()["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["name"] == "architect-plan")
+    );
+}
+
+#[tokio::test]
+async fn location_reload_invalidates_commands_and_command_agent_applies() {
+    let harness = harness().await;
+    let app = router(harness.state.clone());
+
+    let project_b = tempfile::tempdir().unwrap();
+    let skill_dir = project_b.path().join(".opencode/skill/proj-b");
+    std::fs::create_dir_all(&skill_dir).unwrap();
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: ProjB\ndescription: project B skill\n---\nSkill from B.\n",
+    )
+    .unwrap();
+    let cmd_dir = project_b.path().join(".opencode/command");
+    std::fs::create_dir_all(&cmd_dir).unwrap();
+    std::fs::write(
+        cmd_dir.join("architect-plan.md"),
+        "---\ndescription: plan B\nagent: plan\n---\nPlan $ARGUMENTS.\n",
+    )
+    .unwrap();
+
+    // Populate command cache first, then add a command and reload.
+    let encoded_dir = project_b.path().to_string_lossy();
+    let _ = call(
+        &app,
+        Method::GET,
+        &format!("/api/command?location[directory]={encoded_dir}"),
+        None,
+    )
+    .await;
+    std::fs::write(
+        cmd_dir.join("hot-cmd.md"),
+        "---\ndescription: added later\n---\nAdded $ARGUMENTS.\n",
+    )
+    .unwrap();
+    let (status, _) = call(&app, Method::POST, "/api/location/reload", None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, body) = call(
+        &app,
+        Method::GET,
+        &format!("/api/command?location[directory]={encoded_dir}"),
+        None,
+    )
+    .await;
+    assert!(
+        body.unwrap()["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["name"] == "hot-cmd")
+    );
+
+    // Session in project B activates project B's skill & command and applies `agent: plan` -> `architect`.
+    let sid_b = session_id(
+        &create_session(
+            &app,
+            json!({ "location": { "directory": project_b.path().to_string_lossy() } }),
+        )
+        .await,
+    );
+    let (status, body) = call(
+        &app,
+        Method::POST,
+        &format!("/api/experimental/session/{sid_b}/skill"),
+        Some(json!({"id": "proj-b", "resume": false})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body:?}");
+
+    let (status, body) = call(
+        &app,
+        Method::POST,
+        &format!("/api/session/{sid_b}/command"),
+        Some(json!({"name": "architect-plan", "text": "migration"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body:?}");
+
+    let (_, body) = call(&app, Method::GET, &format!("/api/session/{sid_b}"), None).await;
+    assert_eq!(body.unwrap()["data"]["agent"], "architect");
+}

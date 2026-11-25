@@ -1,4 +1,5 @@
 import { Data, Equal, Match } from "effect"
+import type { CompactionPhase, CompactionTrigger } from "./compaction-state"
 
 export type PartRef = {
   messageID: string
@@ -29,6 +30,17 @@ export namespace TimelineRow {
 
   export class UserMessage extends Data.TaggedClass("UserMessage")<{
     userMessageID: string
+  }> {}
+
+  export class PeerMessage extends Data.TaggedClass("PeerMessage")<{
+    userMessageID: string
+    messageID: string
+    /** `metadata.kind === "answer"`: a reply to an earlier question, never a question opener. */
+    answer?: boolean
+    /** `metadata.replyTo`: the message this row answers. */
+    replyTo?: string
+    /** `metadata.cancelled`: the row stayed in history after its inbox item was cancelled. */
+    cancelled?: boolean
   }> {}
 
   export class Shell extends Data.TaggedClass("Shell")<{
@@ -73,10 +85,21 @@ export namespace TimelineRow {
     userMessageID: string
   }> {}
 
-  /** A compaction the server has admitted but not started. */
+  /**
+   * The session's one compaction row, folded from every signal that reports it
+   * (`compaction-state.ts`). `phase` decides the label and what the row offers.
+   */
   export class CompactionQueued extends Data.TaggedClass("CompactionQueued")<{
     userMessageID: string
-    inboxID: string
+    phase: Extract<CompactionPhase, "suggested" | "queued" | "running">
+    inboxID?: string
+    trigger?: CompactionTrigger
+    estimateTokens?: number
+    triggerTokens?: number
+    ceilingTokens?: number
+    beforeTokens?: number
+    afterTokens?: number
+    error?: string
   }> {}
 
   /**
@@ -100,6 +123,7 @@ export namespace TimelineRow {
   export type TimelineRow =
     | TurnGap
     | UserMessage
+    | PeerMessage
     | Shell
     | Notice
     | TurnDivider
@@ -114,6 +138,7 @@ export namespace TimelineRow {
   export const key: (row: TimelineRow) => string = Match.typeTags<TimelineRow>()({
     TurnGap: (row) => `turn-gap:${row.userMessageID}`,
     UserMessage: (row) => `user-message:${row.userMessageID}`,
+    PeerMessage: (row) => `peer-message:${row.messageID}`,
     Shell: (row) => `shell:${row.messageID}`,
     Notice: (row) => `notice:${row.messageID}`,
     TurnDivider: (row) => `turn-divider:${row.userMessageID}`,
@@ -124,7 +149,8 @@ export namespace TimelineRow {
     Thinking: (row) => `thinking:${row.userMessageID}`,
     Error: (row) => `error:${row.userMessageID}`,
     Retry: (row) => `retry:${row.userMessageID}`,
-    CompactionQueued: (row) => `compaction-queued:${row.inboxID}`,
+    // One row per session and phase: a coalesced admission or a replayed snapshot cannot mint a second one.
+    CompactionQueued: (row) => `compaction:${row.phase}`,
     TurnDiff: (row) => `turn-diff:${row.messageID}`,
     // One live status exists at a time; it keeps its identity when the active turn changes.
     Activity: () => "activity",
@@ -138,6 +164,7 @@ export namespace TimelineRow {
 export type TimelineRowMap = {
   TurnGap: { userMessageID: string }
   UserMessage: { userMessageID: string }
+  PeerMessage: { userMessageID: string; messageID: string; answer?: boolean; replyTo?: string; cancelled?: boolean }
   Shell: { userMessageID: string; messageID: string }
   Notice: { userMessageID: string; messageID: string }
   TurnDivider: { userMessageID: string }
@@ -155,7 +182,18 @@ export type TimelineRowMap = {
     kind?: "free-limit" | "budget-limit" | "model-budget-limit"
     resetAt?: number
   }
-  CompactionQueued: { userMessageID: string; inboxID: string }
+  CompactionQueued: {
+    userMessageID: string
+    phase: "suggested" | "queued" | "running"
+    inboxID?: string
+    trigger?: CompactionTrigger
+    estimateTokens?: number
+    triggerTokens?: number
+    ceilingTokens?: number
+    beforeTokens?: number
+    afterTokens?: number
+    error?: string
+  }
   TurnDiff: { userMessageID: string; messageID: string; from: string; files: readonly string[] }
   Activity: { userMessageID: string }
 }

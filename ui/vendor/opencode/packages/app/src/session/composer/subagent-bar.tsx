@@ -22,7 +22,7 @@ export function SubagentBar(props: {
   /** The build lane this session's command waits in, when it has one. */
   lane?: JSX.Element
   /** Peer messages for this child session; the count is what arrived while the drawer was closed. */
-  peer?: { count: Accessor<number>; queued?: Accessor<number>; onOpen: () => void }
+  peer?: { count: Accessor<number>; queued?: Accessor<number>; open?: Accessor<boolean>; onOpen: () => void }
 }) {
   const language = useLanguage()
   const [now, setNow] = createSignal(Date.now())
@@ -117,6 +117,7 @@ export function SubagentBar(props: {
             variant="ghost-faint"
             size="small"
             class="shrink-0 gap-1.5 px-1.5"
+            aria-expanded={peer().open?.()}
             aria-label={language.t("session.peer.open")}
             onClick={() => peer().onOpen()}
           >

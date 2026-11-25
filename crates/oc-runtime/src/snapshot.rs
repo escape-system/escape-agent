@@ -68,6 +68,18 @@ pub(crate) async fn capture_before_tool(
     input: &Value,
     directory: &str,
 ) {
+    if runtime
+        .inner
+        .config
+        .config
+        .merged()
+        .get("snapshots")
+        .and_then(Value::as_bool)
+        == Some(false)
+    {
+        return;
+    }
+
     let targets = match tool_name {
         "write" | "edit" => match input.get("path").and_then(Value::as_str) {
             Some(raw) => vec![raw.to_owned()],

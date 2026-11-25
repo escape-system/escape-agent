@@ -24,6 +24,9 @@ design is documented first; code follows the docs.
   (`credential.active`); per-key cooldowns are in-memory and reset on restart.
 - Every durable boundary must survive kill -9; terminal events are published
   only after commit.
+- Peer messages are materialized into the transcript at enqueue time (never
+  only in the inbox), and one compaction run emits exactly one
+  started→ended|failed pair whose `trigger` is the authoritative cause.
 - Performance budgets in `docs/15-performance.md` are release gates.
 
 ## Workspace

@@ -224,7 +224,7 @@ impl Catalog {
             }
             if let Some(reasoning) = value.get("reasoning") {
                 let support = reasoning_support_from_config(reasoning);
-                let variants = variants_for(&model, model.protocol, &support);
+                let variants = variants_for(&model, &effective_package, model.protocol, &support);
                 model.variants = variants;
             }
         }

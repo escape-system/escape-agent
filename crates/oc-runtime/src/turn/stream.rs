@@ -47,7 +47,7 @@ pub(super) fn classified_provider_error(message: &str) -> oc_llm::LlmError {
 /// [`oc_llm::LlmError::Failure`] when its failure class is known so key rotation
 /// and model fallback handle transport, timeout, and transient HTTP errors
 /// consistently instead of aborting the turn.
-fn classify_llm_error(error: oc_llm::LlmError) -> oc_llm::LlmError {
+pub(super) fn classify_llm_error(error: oc_llm::LlmError) -> oc_llm::LlmError {
     match error {
         oc_llm::LlmError::Provider { message } => classified_provider_error(&message),
         oc_llm::LlmError::Transport { message } => oc_llm::LlmError::Failure {
@@ -105,7 +105,7 @@ fn final_call(base_request: &LlmRequest) -> bool {
 /// A pool larger than this is a configuration accident; the cap keeps one step
 /// from turning into an unbounded provider loop while still covering every
 /// realistic backup-key count (contract §3).
-const MAX_KEY_ATTEMPTS: usize = 8;
+pub(super) const MAX_KEY_ATTEMPTS: usize = 8;
 
 /// The failure class that justifies rotating to another credential, if any.
 ///
@@ -115,8 +115,8 @@ const MAX_KEY_ATTEMPTS: usize = 8;
 /// repeat the same answer), so those keep today's model-chain behavior.
 /// `Http` statuses are mapped as a defensive fallback for transports that report
 /// the status before it is classified.
-fn key_failure_kind(failure: &StreamFailure) -> Option<oc_llm::FailureKind> {
-    match &failure.error {
+pub(super) fn is_key_rotatable(error: &oc_llm::LlmError) -> Option<oc_llm::FailureKind> {
+    match error {
         oc_llm::LlmError::Failure { kind, .. } => matches!(
             kind,
             oc_llm::FailureKind::Auth | oc_llm::FailureKind::Quota | oc_llm::FailureKind::RateLimit
@@ -129,6 +129,10 @@ fn key_failure_kind(failure: &StreamFailure) -> Option<oc_llm::FailureKind> {
         },
         _ => None,
     }
+}
+
+fn key_failure_kind(failure: &StreamFailure) -> Option<oc_llm::FailureKind> {
+    is_key_rotatable(&failure.error)
 }
 
 impl Runtime {
@@ -267,6 +271,9 @@ impl Runtime {
             tools: turn.tools.clone(),
             options: LlmOptions {
                 api_key: None,
+                temperature: turn.agent_request.temperature,
+                top_p: turn.agent_request.top_p,
+                headers: turn.agent_request.headers.clone(),
                 tool_choice: final_call.then(|| "none".to_owned()),
                 cache_key: Some(session.to_owned()),
                 ..LlmOptions::default()
@@ -359,7 +366,7 @@ impl Runtime {
     /// moves when the failing key *was* primary: a restart would otherwise pick
     /// the dead key first again. `set_credential_primary` reuses
     /// `activate_credential`'s transaction, so kill -9 safety is unchanged.
-    async fn mark_key_failure(
+    pub(super) async fn mark_key_failure(
         &self,
         provider: &str,
         credential_id: Option<&str>,

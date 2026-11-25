@@ -593,11 +593,45 @@ impl Runtime {
         let session_id = inbox.session_id.clone();
         let inbox_id = inbox.id.clone();
         let item = self.inner.config.store.enqueue(inbox).await?;
+        self.emit_inbox_enqueued(&session_id, &inbox_id, &item)
+            .await?;
+        Ok(item)
+    }
+
+    /// Enqueue a peer inbox item and materialise its transcript row in one
+    /// transaction, then publish `session.inbox.enqueued`.
+    ///
+    /// [`Self::enqueue_and_emit`] leaves the message invisible to every
+    /// transcript reader until the runtime promotes it, so a queued-then-
+    /// cancelled peer message never becomes history. This entry point commits
+    /// the doorbell and the `synthetic` row together (see
+    /// [`oc_store::Store::enqueue_materialized`]), so the message is readable
+    /// immediately with `metadata.delivered = false` and a cancellation keeps
+    /// it with a `metadata.cancelled` marker.
+    pub(crate) async fn enqueue_materialized(
+        &self,
+        inbox: oc_store::NewInbox,
+    ) -> Result<(oc_store::InboxRow, oc_types::MessageId), RuntimeError> {
+        let session_id = inbox.session_id.clone();
+        let inbox_id = inbox.id.clone();
+        let (row, message_id) = self.inner.config.store.enqueue_materialized(&inbox).await?;
+        let wire = row.to_wire();
+        self.emit_inbox_enqueued(&session_id, &inbox_id, &wire)
+            .await?;
+        Ok((row, message_id))
+    }
+
+    async fn emit_inbox_enqueued(
+        &self,
+        session_id: &str,
+        inbox_id: &str,
+        item: &Value,
+    ) -> Result<(), RuntimeError> {
         let directory = self
             .inner
             .config
             .store
-            .get_session(&session_id)
+            .get_session(session_id)
             .await?
             .and_then(|value| {
                 value
@@ -608,17 +642,17 @@ impl Runtime {
             .unwrap_or_default();
         if let Ok(parsed) = serde_json::from_value::<oc_types::InboxItem>(item.clone()) {
             self.emit(
-                &session_id,
+                session_id,
                 &directory,
                 oc_types::payload::SessionInboxEnqueued {
-                    session_id: SessionId::from_wire(session_id.clone()),
-                    inbox_id: oc_types::MessageId::from_wire(inbox_id),
+                    session_id: SessionId::from_wire(session_id.to_owned()),
+                    inbox_id: oc_types::MessageId::from_wire(inbox_id.to_owned()),
                     item: parsed,
                 },
             )
             .await?;
         }
-        Ok(item)
+        Ok(())
     }
 
     pub(crate) fn session_id(session: &str) -> SessionId {

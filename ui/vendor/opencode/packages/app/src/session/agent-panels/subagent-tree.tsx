@@ -6,6 +6,13 @@ import { formatElapsed } from "@/session/composer/activity-chips"
 import { useOpenSessionRoute } from "@/session/session-identity-header"
 import { useSubagentTreeQuery } from "./agent-queries"
 import type { SubagentNode } from "./agent-wire"
+import {
+  readSubagentTreeCollapsed,
+  subagentCount,
+  subagentCountIn,
+  subagentTreeNotice,
+  writeSubagentTreeCollapsed,
+} from "./subagent-tree-state"
 
 type Relation = "current" | "parent" | "ancestor" | "sibling" | "child" | "descendant"
 type FilterMode = "all" | "busy" | "failed" | "completed"
@@ -27,15 +34,10 @@ export function SubagentTreePanel(props: { sessionID: string; inline?: boolean }
   const open = useOpenSessionRoute()
   const tree = useSubagentTreeQuery(() => props.sessionID)
 
-  const initialCollapsed = () => {
-    if (typeof localStorage !== "undefined") {
-      const stored = localStorage.getItem("opencode.session.subagent-tree.v2.collapsed")
-      if (stored !== null) return stored === "true"
-    }
-    return true
-  }
-
-  const [collapsed, setCollapsed] = createSignal(initialCollapsed())
+  // The desktop header is the only surface that lists every subagent, so the strip starts open
+  // there. An explicit collapse is remembered; a stored collapse from the previous key version is
+  // upgraded into the new one, so a user who closed it stays closed.
+  const [collapsed, setCollapsed] = createSignal(readSubagentTreeCollapsed())
   const [filter, setFilter] = createSignal<FilterMode>("all")
   const [search, setSearch] = createSignal("")
   const [expandedBranches, setExpandedBranches] = createSignal<Record<string, boolean>>({})
@@ -44,17 +46,22 @@ export function SubagentTreePanel(props: { sessionID: string; inline?: boolean }
   const toggleCollapsed = () => {
     setCollapsed((val) => {
       const next = !val
-      if (typeof localStorage !== "undefined") {
-        localStorage.setItem("opencode.session.subagent-tree.v2.collapsed", String(next))
-      }
+      writeSubagentTreeCollapsed(next)
       return next
     })
   }
 
   const [now, setNow] = createSignal(Date.now())
 
+  // Rows still show the whole tree, including the routed session marked "current". The counts do
+  // not: the family root is the routed session itself, not a subagent. The mobile sheet reads the
+  // same helpers, so both surfaces report the same total.
   const nodes = createMemo(() => (tree.data?.available ? tree.data.value.nodes : []))
+  const rootID = createMemo(() => (tree.data?.available ? tree.data.value.root : undefined))
   const byID = createMemo(() => new Map(nodes().map((node) => [node.id, node])))
+  const count = createMemo(() => subagentCount(nodes(), rootID()))
+  // A refused read (401/403/503) or a failed one explains itself instead of rendering nothing.
+  const notice = createMemo(() => subagentTreeNotice({ isError: tree.isError, error: tree.error, data: tree.data }))
 
   // Direct children count and total descendant count for each branch node.
   const childCountByParent = createMemo(() => {
@@ -152,13 +159,9 @@ export function SubagentTreePanel(props: { sessionID: string; inline?: boolean }
   }
 
   const elapsedLabel = (ms: number) => formatElapsed(ms, (key, params) => language.t(key, params) ?? key)
-  const busyCount = createMemo(() => nodes().filter((n) => n.state === "busy").length)
-  const failedCount = createMemo(
-    () => nodes().filter((n) => n.state === "failed" || n.state === "interrupted").length,
-  )
-  const completedCount = createMemo(
-    () => nodes().filter((n) => n.state === "completed" || n.state === "idle").length,
-  )
+  const busyCount = createMemo(() => subagentCountIn(nodes(), ["busy"], rootID()))
+  const failedCount = createMemo(() => subagentCountIn(nodes(), ["failed", "interrupted"], rootID()))
+  const completedCount = createMemo(() => subagentCountIn(nodes(), ["completed", "idle"], rootID()))
 
   const filteredNodes = createMemo(() => {
     const mode = filter()
@@ -192,297 +195,316 @@ export function SubagentTreePanel(props: { sessionID: string; inline?: boolean }
     }
   }
 
-  return (
-    <Show when={tree.data?.available && nodes().length > 1}>
-      <div
-        data-component="session-agent-tree"
-        class="relative border-b border-v2-border-border-base bg-v2-background-bg-base"
-      >
-        <button
-          type="button"
-          class="flex w-full items-center gap-2 px-4 py-1.5 text-left text-11-regular text-v2-text-text-muted transition-colors hover:bg-v2-overlay-simple-overlay-hover md:px-6"
-          aria-expanded={!collapsed()}
-          aria-label={language.t(collapsed() ? "session.agentPanels.tree.expand" : "session.agentPanels.tree.collapse")}
-          onClick={toggleCollapsed}
-        >
-          <Icon name="branch-out" size="small" class="shrink-0 text-v2-icon-icon-faint" />
-          <span class="shrink-0 font-medium text-v2-text-text-base">{language.t("session.agentPanels.tree.title")}</span>
-          <span class="shrink-0 rounded-full bg-v2-surface-surface-muted px-2 py-0.5 text-[11px] tabular-nums text-v2-text-text-muted">
-            {language.t("session.agentPanels.tree.count", { count: String(nodes().length) })}
-          </span>
-          <Show when={busyCount() > 0}>
-            <span class="inline-flex shrink-0 items-center gap-1.5 rounded-full bg-v2-surface-surface-muted px-2 py-0.5 text-[11px] font-medium tabular-nums text-v2-state-fg-success">
-              <span class="size-1.5 rounded-full bg-current animate-pulse" />
-              {busyCount()} {language.t("session.agentPanels.state.busy")}
-            </span>
-          </Show>
-          <Show when={failedCount() > 0}>
-            <span class="inline-flex shrink-0 items-center gap-1 rounded-full bg-v2-surface-surface-muted px-2 py-0.5 text-[11px] font-medium tabular-nums text-v2-state-fg-danger">
-              <span class="size-1.5 rounded-full bg-current" />
-              {failedCount()} {language.t("session.agentPanels.state.failed")}
-            </span>
-          </Show>
-          <Show when={busyCount() === 0 && completedCount() > 0}>
-            <span class="hidden shrink-0 tabular-nums text-11-regular text-v2-text-text-faint sm:inline">
-              · {completedCount()} {language.t("session.agentPanels.state.completed")}
-            </span>
-          </Show>
-          <span class="flex-1" />
-          <Icon name={collapsed() ? "outline-chevron-right" : "chevron-down"} size="small" class="shrink-0" />
-        </button>
+  // A refused or failed read used to render nothing at all, which is indistinguishable from "this
+  // session has no subagents". One short line names the cause instead.
+  const unavailable = createMemo(() => (tree.data?.available ? undefined : notice()))
 
-        <Show when={!collapsed()}>
+  return (
+    <>
+      <Show when={unavailable()}>
+        {(reason) => (
           <div
-            class="flex flex-col border-b border-v2-border-border-base bg-v2-background-bg-base"
-            classList={{
-              "absolute inset-x-0 top-full z-40 shadow-[0_12px_32px_rgba(0,0,0,0.35)]": !props.inline,
-            }}
-            onWheel={stopTreeScrollIfOverflowing}
-            onTouchMove={stopTreeScrollIfOverflowing}
+            data-component="session-agent-tree-error"
+            data-detail={reason().detail}
+            role="status"
+            class="flex items-center gap-2 border-b border-v2-border-border-base bg-v2-background-bg-base px-4 py-1.5 text-11-regular text-v2-text-text-faint md:px-6"
           >
-            <Show when={nodes().length > 5}>
-              <div class="flex flex-wrap items-center justify-between gap-2 border-b border-v2-border-border-base/60 bg-v2-background-bg-layer-01 px-4 py-1.5 md:px-6">
-                <div class="flex flex-wrap items-center gap-1">
-                  <button
-                    type="button"
-                    class="rounded-full px-2.5 py-0.5 text-11-regular tabular-nums transition-colors"
-                    classList={{
-                      "bg-v2-overlay-simple-overlay-active font-medium text-v2-text-text-base": filter() === "all",
-                      "text-v2-text-text-muted hover:bg-v2-overlay-simple-overlay-hover": filter() !== "all",
-                    }}
-                    onClick={() => setFilter("all")}
-                  >
-                    {language.t("session.agentPanels.tree.filterAll")} ({nodes().length})
-                  </button>
-                  <Show when={busyCount() > 0 || filter() === "busy"}>
-                    <button
-                      type="button"
-                      class="inline-flex items-center gap-1 rounded-full px-2.5 py-0.5 text-11-regular tabular-nums transition-colors"
-                      classList={{
-                        "bg-v2-overlay-simple-overlay-active font-medium text-v2-state-fg-success":
-                          filter() === "busy",
-                        "text-v2-state-fg-success/80 hover:bg-v2-overlay-simple-overlay-hover": filter() !== "busy",
-                      }}
-                      onClick={() => setFilter(filter() === "busy" ? "all" : "busy")}
-                    >
-                      <span class="size-1.5 rounded-full bg-current animate-pulse" />
-                      {language.t("session.agentPanels.state.busy")} ({busyCount()})
-                    </button>
-                  </Show>
-                  <Show when={failedCount() > 0 || filter() === "failed"}>
-                    <button
-                      type="button"
-                      class="inline-flex items-center gap-1 rounded-full px-2.5 py-0.5 text-11-regular tabular-nums transition-colors"
-                      classList={{
-                        "bg-v2-overlay-simple-overlay-active font-medium text-v2-state-fg-danger":
-                          filter() === "failed",
-                        "text-v2-state-fg-danger/80 hover:bg-v2-overlay-simple-overlay-hover": filter() !== "failed",
-                      }}
-                      onClick={() => setFilter(filter() === "failed" ? "all" : "failed")}
-                    >
-                      {language.t("session.agentPanels.state.failed")} ({failedCount()})
-                    </button>
-                  </Show>
-                  <Show when={completedCount() > 0 || filter() === "completed"}>
+            <Icon name="circle-exclamation" size="small" class="shrink-0 text-v2-state-fg-warning" />
+            <span class="min-w-0 flex-1 truncate">{language.t("session.agentPanels.tree.unavailable")}</span>
+          </div>
+        )}
+      </Show>
+      <Show when={tree.data?.available && nodes().length > 1}>
+        <div
+          data-component="session-agent-tree"
+          class="relative border-b border-v2-border-border-base bg-v2-background-bg-base"
+        >
+          <button
+            type="button"
+            class="flex w-full items-center gap-2 px-4 py-1.5 text-left text-11-regular text-v2-text-text-muted transition-colors hover:bg-v2-overlay-simple-overlay-hover md:px-6"
+            aria-expanded={!collapsed()}
+            aria-label={language.t(collapsed() ? "session.agentPanels.tree.expand" : "session.agentPanels.tree.collapse")}
+            onClick={toggleCollapsed}
+          >
+            <Icon name="branch-out" size="small" class="shrink-0 text-v2-icon-icon-faint" />
+            <span class="shrink-0 font-medium text-v2-text-text-base">{language.t("session.agentPanels.tree.title")}</span>
+            <span class="shrink-0 rounded-full bg-v2-surface-surface-muted px-2 py-0.5 text-[11px] tabular-nums text-v2-text-text-muted">
+              {language.t("session.agentPanels.tree.count", { count: String(count()) })}
+            </span>
+            <Show when={busyCount() > 0}>
+              <span class="inline-flex shrink-0 items-center gap-1.5 rounded-full bg-v2-surface-surface-muted px-2 py-0.5 text-[11px] font-medium tabular-nums text-v2-state-fg-success">
+                <span class="size-1.5 rounded-full bg-current animate-pulse" />
+                {busyCount()} {language.t("session.agentPanels.state.busy")}
+              </span>
+            </Show>
+            <Show when={failedCount() > 0}>
+              <span class="inline-flex shrink-0 items-center gap-1 rounded-full bg-v2-surface-surface-muted px-2 py-0.5 text-[11px] font-medium tabular-nums text-v2-state-fg-danger">
+                <span class="size-1.5 rounded-full bg-current" />
+                {failedCount()} {language.t("session.agentPanels.state.failed")}
+              </span>
+            </Show>
+            <Show when={busyCount() === 0 && completedCount() > 0}>
+              <span class="hidden shrink-0 tabular-nums text-11-regular text-v2-text-text-faint sm:inline">
+                · {completedCount()} {language.t("session.agentPanels.state.completed")}
+              </span>
+            </Show>
+            <span class="flex-1" />
+            <Icon name={collapsed() ? "outline-chevron-right" : "chevron-down"} size="small" class="shrink-0" />
+          </button>
+
+          <Show when={!collapsed()}>
+            <div
+              class="flex flex-col border-b border-v2-border-border-base bg-v2-background-bg-base"
+              classList={{
+                "absolute inset-x-0 top-full z-40 shadow-[0_12px_32px_rgba(0,0,0,0.35)]": !props.inline,
+              }}
+              onWheel={stopTreeScrollIfOverflowing}
+              onTouchMove={stopTreeScrollIfOverflowing}
+            >
+              <Show when={nodes().length > 5}>
+                <div class="flex flex-wrap items-center justify-between gap-2 border-b border-v2-border-border-base/60 bg-v2-background-bg-layer-01 px-4 py-1.5 md:px-6">
+                  <div class="flex flex-wrap items-center gap-1">
                     <button
                       type="button"
                       class="rounded-full px-2.5 py-0.5 text-11-regular tabular-nums transition-colors"
                       classList={{
-                        "bg-v2-overlay-simple-overlay-active font-medium text-v2-text-text-base":
-                          filter() === "completed",
-                        "text-v2-text-text-muted hover:bg-v2-overlay-simple-overlay-hover": filter() !== "completed",
+                        "bg-v2-overlay-simple-overlay-active font-medium text-v2-text-text-base": filter() === "all",
+                        "text-v2-text-text-muted hover:bg-v2-overlay-simple-overlay-hover": filter() !== "all",
                       }}
-                      onClick={() => setFilter(filter() === "completed" ? "all" : "completed")}
+                      onClick={() => setFilter("all")}
                     >
-                      {language.t("session.agentPanels.state.completed")} ({completedCount()})
+                      {language.t("session.agentPanels.tree.filterAll")} ({count()})
                     </button>
-                  </Show>
-                  <Show when={hasGrandchildren() && filter() === "all" && !search().trim()}>
-                    <button
-                      type="button"
-                      class="rounded-full border border-v2-border-border-base px-2.5 py-0.5 text-11-regular text-v2-text-text-muted transition-colors hover:bg-v2-overlay-simple-overlay-hover hover:text-v2-text-text-base"
-                      onClick={toggleAllBranches}
-                    >
-                      {language.t(
-                        allBranchesExpanded()
-                          ? "session.agentPanels.tree.collapseBranches"
-                          : "session.agentPanels.tree.expandBranches",
-                      )}
-                    </button>
-                  </Show>
+                    <Show when={busyCount() > 0 || filter() === "busy"}>
+                      <button
+                        type="button"
+                        class="inline-flex items-center gap-1 rounded-full px-2.5 py-0.5 text-11-regular tabular-nums transition-colors"
+                        classList={{
+                          "bg-v2-overlay-simple-overlay-active font-medium text-v2-state-fg-success":
+                            filter() === "busy",
+                          "text-v2-state-fg-success/80 hover:bg-v2-overlay-simple-overlay-hover": filter() !== "busy",
+                        }}
+                        onClick={() => setFilter(filter() === "busy" ? "all" : "busy")}
+                      >
+                        <span class="size-1.5 rounded-full bg-current animate-pulse" />
+                        {language.t("session.agentPanels.state.busy")} ({busyCount()})
+                      </button>
+                    </Show>
+                    <Show when={failedCount() > 0 || filter() === "failed"}>
+                      <button
+                        type="button"
+                        class="inline-flex items-center gap-1 rounded-full px-2.5 py-0.5 text-11-regular tabular-nums transition-colors"
+                        classList={{
+                          "bg-v2-overlay-simple-overlay-active font-medium text-v2-state-fg-danger":
+                            filter() === "failed",
+                          "text-v2-state-fg-danger/80 hover:bg-v2-overlay-simple-overlay-hover": filter() !== "failed",
+                        }}
+                        onClick={() => setFilter(filter() === "failed" ? "all" : "failed")}
+                      >
+                        {language.t("session.agentPanels.state.failed")} ({failedCount()})
+                      </button>
+                    </Show>
+                    <Show when={completedCount() > 0 || filter() === "completed"}>
+                      <button
+                        type="button"
+                        class="rounded-full px-2.5 py-0.5 text-11-regular tabular-nums transition-colors"
+                        classList={{
+                          "bg-v2-overlay-simple-overlay-active font-medium text-v2-text-text-base":
+                            filter() === "completed",
+                          "text-v2-text-text-muted hover:bg-v2-overlay-simple-overlay-hover": filter() !== "completed",
+                        }}
+                        onClick={() => setFilter(filter() === "completed" ? "all" : "completed")}
+                      >
+                        {language.t("session.agentPanels.state.completed")} ({completedCount()})
+                      </button>
+                    </Show>
+                    <Show when={hasGrandchildren() && filter() === "all" && !search().trim()}>
+                      <button
+                        type="button"
+                        class="rounded-full border border-v2-border-border-base px-2.5 py-0.5 text-11-regular text-v2-text-text-muted transition-colors hover:bg-v2-overlay-simple-overlay-hover hover:text-v2-text-text-base"
+                        onClick={toggleAllBranches}
+                      >
+                        {language.t(
+                          allBranchesExpanded()
+                            ? "session.agentPanels.tree.collapseBranches"
+                            : "session.agentPanels.tree.expandBranches",
+                        )}
+                      </button>
+                    </Show>
+                  </div>
+                  <div class="relative flex min-w-[180px] max-w-[260px] flex-1 items-center">
+                    <input
+                      type="search"
+                      value={search()}
+                      placeholder={language.t("session.agentPanels.tree.search")}
+                      onInput={(e) => setSearch(e.currentTarget.value)}
+                      class="h-6 w-full rounded-md border border-v2-border-border-base bg-v2-background-bg-base px-2.5 text-11-regular text-v2-text-text-base placeholder:text-v2-text-text-faint focus:border-v2-border-border-focus focus:outline-none"
+                    />
+                  </div>
                 </div>
-                <div class="relative flex min-w-[180px] max-w-[260px] flex-1 items-center">
-                  <input
-                    type="search"
-                    value={search()}
-                    placeholder={language.t("session.agentPanels.tree.search")}
-                    onInput={(e) => setSearch(e.currentTarget.value)}
-                    class="h-6 w-full rounded-md border border-v2-border-border-base bg-v2-background-bg-base px-2.5 text-11-regular text-v2-text-text-base placeholder:text-v2-text-text-faint focus:border-v2-border-border-focus focus:outline-none"
-                  />
-                </div>
-              </div>
-            </Show>
+              </Show>
 
-            <div
-              ref={treeScrollRef}
-              role="tree"
-              data-scrollable={props.inline ? undefined : ""}
-              data-testid="session-agent-tree-nodes"
-              class="py-1"
-              classList={{
-                "max-h-[min(320px,50vh)] overflow-y-auto": !props.inline,
-              }}
-            >
-              <For each={filteredIds()}>
-                {(nodeId) => {
-                  const node = () => byID().get(nodeId)
-                  return (
-                    <Show when={node()}>
-                      {(item) => {
-                        const kind = () => relation(item())
-                        const current = () => kind() === "current"
-                        const childCount = () => childCountByParent().get(item().id) ?? 0
-                        const isExpandableBranch = () => item().depth >= 1 && childCount() > 0
-                        const branchOpen = () => isBranchExpanded(item().id)
+              <div
+                ref={treeScrollRef}
+                role="tree"
+                data-scrollable={props.inline ? undefined : ""}
+                data-testid="session-agent-tree-nodes"
+                class="py-1"
+                classList={{
+                  "max-h-[min(320px,50vh)] overflow-y-auto": !props.inline,
+                }}
+              >
+                <For each={filteredIds()}>
+                  {(nodeId) => {
+                    const node = () => byID().get(nodeId)
+                    return (
+                      <Show when={node()}>
+                        {(item) => {
+                          const kind = () => relation(item())
+                          const current = () => kind() === "current"
+                          const childCount = () => childCountByParent().get(item().id) ?? 0
+                          const isExpandableBranch = () => item().depth >= 1 && childCount() > 0
+                          const branchOpen = () => isBranchExpanded(item().id)
 
-                        return (
-                          <div
-                            role="treeitem"
-                            aria-current={current() ? "true" : undefined}
-                            aria-selected={current() ? "true" : undefined}
-                            aria-expanded={isExpandableBranch() ? branchOpen() : undefined}
-                            data-session-id={item().id}
-                            data-relation={kind()}
-                            class="flex h-7 w-full items-center gap-1.5 pe-4 text-left text-12-regular transition-colors hover:bg-v2-overlay-simple-overlay-hover"
-                            classList={{
-                              "font-[530] text-v2-text-text-base bg-v2-overlay-simple-overlay-active/50": current(),
-                              "text-v2-text-text-muted": !current(),
-                            }}
-                            style={{ "padding-inline-start": `${16 + Math.min(item().depth, 6) * 18}px` }}
-                          >
-                            <Show when={item().depth > 0}>
-                              <span
-                                class="shrink-0 select-none font-mono text-[11px] text-v2-text-text-faint/60"
-                                aria-hidden="true"
-                              >
-                                └─
-                              </span>
-                            </Show>
-                            <Show when={isExpandableBranch()}>
+                          return (
+                            <div
+                              role="treeitem"
+                              aria-current={current() ? "true" : undefined}
+                              aria-selected={current() ? "true" : undefined}
+                              aria-expanded={isExpandableBranch() ? branchOpen() : undefined}
+                              data-session-id={item().id}
+                              data-relation={kind()}
+                              class="flex h-7 w-full items-center gap-1.5 pe-4 text-left text-12-regular transition-colors hover:bg-v2-overlay-simple-overlay-hover"
+                              classList={{
+                                "font-[530] text-v2-text-text-base bg-v2-overlay-simple-overlay-active/50": current(),
+                                "text-v2-text-text-muted": !current(),
+                              }}
+                              style={{ "padding-inline-start": `${16 + Math.min(item().depth, 6) * 18}px` }}
+                            >
+                              <Show when={item().depth > 0}>
+                                <span
+                                  class="shrink-0 select-none font-mono text-[11px] text-v2-text-text-faint/60"
+                                  aria-hidden="true"
+                                >
+                                  └─
+                                </span>
+                              </Show>
+                              <Show when={isExpandableBranch()}>
+                                <button
+                                  type="button"
+                                  aria-label={language.t(
+                                    branchOpen()
+                                      ? "session.agentPanels.tree.collapseBranches"
+                                      : "session.agentPanels.tree.expandBranches",
+                                  )}
+                                  class="inline-flex h-5 shrink-0 items-center gap-0.5 rounded bg-v2-surface-surface-muted px-1.5 font-mono text-[10px] tabular-nums text-v2-text-text-muted transition-colors hover:bg-v2-overlay-simple-overlay-active hover:text-v2-text-text-base"
+                                  onClick={(e) => {
+                                    e.stopPropagation()
+                                    toggleBranch(item().id)
+                                  }}
+                                >
+                                  <Icon
+                                    name={branchOpen() ? "chevron-down" : "outline-chevron-right"}
+                                    size="small"
+                                    class="shrink-0"
+                                  />
+                                  <span>{branchOpen() ? childCount() : `+${childCount()}`}</span>
+                                </button>
+                              </Show>
                               <button
                                 type="button"
-                                aria-label={language.t(
-                                  branchOpen()
-                                    ? "session.agentPanels.tree.collapseBranches"
-                                    : "session.agentPanels.tree.expandBranches",
-                                )}
-                                class="inline-flex h-5 shrink-0 items-center gap-0.5 rounded bg-v2-surface-surface-muted px-1.5 font-mono text-[10px] tabular-nums text-v2-text-text-muted transition-colors hover:bg-v2-overlay-simple-overlay-active hover:text-v2-text-text-base"
-                                onClick={(e) => {
-                                  e.stopPropagation()
-                                  toggleBranch(item().id)
+                                disabled={current()}
+                                title={language.t("session.agentPanels.tree.open", { title: title(item()) })}
+                                class="flex h-full min-w-0 flex-1 items-center gap-2 text-left disabled:opacity-100"
+                                onClick={() => {
+                                  if (!current()) {
+                                    setCollapsed(true)
+                                    open(props.sessionID, item().id)
+                                  }
                                 }}
                               >
-                                <Icon
-                                  name={branchOpen() ? "chevron-down" : "outline-chevron-right"}
-                                  size="small"
-                                  class="shrink-0"
+                                <span
+                                  class="size-1.5 shrink-0 rounded-full"
+                                  classList={{
+                                    "bg-v2-state-fg-success animate-pulse": item().state === "busy",
+                                    "bg-v2-state-fg-danger":
+                                      item().state === "failed" || item().state === "interrupted",
+                                    "bg-v2-state-fg-warning": item().state === "suspended",
+                                    "bg-v2-text-text-faint/40":
+                                      item().state !== "busy" &&
+                                      item().state !== "failed" &&
+                                      item().state !== "interrupted" &&
+                                      item().state !== "suspended",
+                                  }}
                                 />
-                                <span>{branchOpen() ? childCount() : `+${childCount()}`}</span>
+                                <span
+                                  class="w-16 shrink-0 truncate text-11-regular capitalize"
+                                  classList={{
+                                    "font-semibold text-v2-text-text-base": current(),
+                                    "text-v2-text-text-faint": !current(),
+                                  }}
+                                >
+                                  {language.t(`session.agentPanels.relation.${kind()}`)}
+                                </span>
+                                <Show when={item().depth > 0}>
+                                  <span class="shrink-0 rounded bg-v2-surface-surface-muted px-1 font-mono text-[10px] tabular-nums text-v2-text-text-faint">
+                                    {language.t("session.agentPanels.tree.depth", { depth: String(item().depth) })}
+                                  </span>
+                                </Show>
+                                <span class="min-w-0 flex-1 truncate" dir="auto">
+                                  {title(item())}
+                                </span>
+                                <Show when={item().agent}>
+                                  <span class="hidden shrink-0 rounded bg-v2-surface-surface-muted px-1.5 py-0.5 text-[11px] capitalize text-v2-text-text-muted sm:inline-block">
+                                    {item().agent}
+                                  </span>
+                                </Show>
+                                <Show when={item().model}>
+                                  {(model) => (
+                                    <span
+                                      title={model()}
+                                      class="hidden max-w-[160px] shrink-0 truncate font-mono text-[11px] text-v2-text-text-faint md:inline-block"
+                                    >
+                                      {shortModelName(model())}
+                                    </span>
+                                  )}
+                                </Show>
+                                <span
+                                  class="w-20 shrink-0 text-end text-11-regular"
+                                  classList={{
+                                    "font-medium text-v2-state-fg-success": item().state === "busy",
+                                    "font-medium text-v2-state-fg-danger":
+                                      item().state === "failed" || item().state === "interrupted",
+                                    "text-v2-state-fg-warning": item().state === "suspended",
+                                    "text-v2-text-text-faint":
+                                      item().state !== "busy" &&
+                                      item().state !== "failed" &&
+                                      item().state !== "interrupted" &&
+                                      item().state !== "suspended",
+                                  }}
+                                >
+                                  {language.t(`session.agentPanels.state.${item().state}`)}
+                                </span>
+                                <Show when={elapsed(item())}>
+                                  {(ms) => (
+                                    <span class="w-16 shrink-0 text-end text-11-regular tabular-nums whitespace-nowrap text-v2-text-text-faint">
+                                      {elapsedLabel(ms())}
+                                    </span>
+                                  )}
+                                </Show>
                               </button>
-                            </Show>
-                            <button
-                              type="button"
-                              disabled={current()}
-                              title={language.t("session.agentPanels.tree.open", { title: title(item()) })}
-                              class="flex h-full min-w-0 flex-1 items-center gap-2 text-left disabled:opacity-100"
-                              onClick={() => {
-                                if (!current()) {
-                                  setCollapsed(true)
-                                  open(props.sessionID, item().id)
-                                }
-                              }}
-                            >
-                              <span
-                                class="size-1.5 shrink-0 rounded-full"
-                                classList={{
-                                  "bg-v2-state-fg-success animate-pulse": item().state === "busy",
-                                  "bg-v2-state-fg-danger":
-                                    item().state === "failed" || item().state === "interrupted",
-                                  "bg-v2-state-fg-warning": item().state === "suspended",
-                                  "bg-v2-text-text-faint/40":
-                                    item().state !== "busy" &&
-                                    item().state !== "failed" &&
-                                    item().state !== "interrupted" &&
-                                    item().state !== "suspended",
-                                }}
-                              />
-                              <span
-                                class="w-16 shrink-0 truncate text-11-regular capitalize"
-                                classList={{
-                                  "font-semibold text-v2-text-text-base": current(),
-                                  "text-v2-text-text-faint": !current(),
-                                }}
-                              >
-                                {language.t(`session.agentPanels.relation.${kind()}`)}
-                              </span>
-                              <Show when={item().depth > 0}>
-                                <span class="shrink-0 rounded bg-v2-surface-surface-muted px-1 font-mono text-[10px] tabular-nums text-v2-text-text-faint">
-                                  {language.t("session.agentPanels.tree.depth", { depth: String(item().depth) })}
-                                </span>
-                              </Show>
-                              <span class="min-w-0 flex-1 truncate" dir="auto">
-                                {title(item())}
-                              </span>
-                              <Show when={item().agent}>
-                                <span class="hidden shrink-0 rounded bg-v2-surface-surface-muted px-1.5 py-0.5 text-[11px] capitalize text-v2-text-text-muted sm:inline-block">
-                                  {item().agent}
-                                </span>
-                              </Show>
-                              <Show when={item().model}>
-                                {(model) => (
-                                  <span
-                                    title={model()}
-                                    class="hidden max-w-[160px] shrink-0 truncate font-mono text-[11px] text-v2-text-text-faint md:inline-block"
-                                  >
-                                    {shortModelName(model())}
-                                  </span>
-                                )}
-                              </Show>
-                              <span
-                                class="w-20 shrink-0 text-end text-11-regular"
-                                classList={{
-                                  "font-medium text-v2-state-fg-success": item().state === "busy",
-                                  "font-medium text-v2-state-fg-danger":
-                                    item().state === "failed" || item().state === "interrupted",
-                                  "text-v2-state-fg-warning": item().state === "suspended",
-                                  "text-v2-text-text-faint":
-                                    item().state !== "busy" &&
-                                    item().state !== "failed" &&
-                                    item().state !== "interrupted" &&
-                                    item().state !== "suspended",
-                                }}
-                              >
-                                {language.t(`session.agentPanels.state.${item().state}`)}
-                              </span>
-                              <Show when={elapsed(item())}>
-                                {(ms) => (
-                                  <span class="w-16 shrink-0 text-end text-11-regular tabular-nums whitespace-nowrap text-v2-text-text-faint">
-                                    {elapsedLabel(ms())}
-                                  </span>
-                                )}
-                              </Show>
-                            </button>
-                          </div>
-                        )
-                      }}
-                    </Show>
-                  )
-                }}
-              </For>
+                            </div>
+                          )
+                        }}
+                      </Show>
+                    )
+                  }}
+                </For>
+              </div>
             </div>
-          </div>
-        </Show>
-      </div>
-    </Show>
+          </Show>
+        </div>
+      </Show>
+    </>
   )
 }

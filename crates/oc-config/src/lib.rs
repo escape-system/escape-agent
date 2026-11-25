@@ -175,6 +175,9 @@ pub struct ConfigService {
     /// root), so the cache matters more here. Dropped by
     /// [`ConfigService::invalidate_skills`].
     skill_cache: RwLock<HashMap<String, Arc<Vec<SkillInfo>>>>,
+    /// Per-directory slash-command discovery, keyed like [`Self::skill_cache`].
+    /// Dropped by [`ConfigService::invalidate_commands`].
+    command_cache: RwLock<HashMap<String, Arc<Vec<CommandInfo>>>>,
     mcp_servers: Value,
     shell: String,
     model: Option<String>,

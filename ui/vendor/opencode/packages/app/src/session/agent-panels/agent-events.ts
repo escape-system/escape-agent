@@ -33,14 +33,29 @@ export interface AgentEvents {
 /** A peer message plus its place in the inbox/transcript lifecycle. */
 export type PeerRow = PeerMessage & { status?: "queued" | "sent"; delivery?: "queue" | "steer" }
 
+/** One Q&A entry in the peer drawer: a prompt/peer question or a subagent assistant reply. */
+export type PeerThreadRow =
+  | (PeerRow & { role: "question"; origin: "user" | "peer" })
+  | {
+      id: string
+      role: "answer"
+      text: string
+      agent?: string
+      created: number
+      streaming?: boolean
+      error?: string
+    }
+
 /** Peer messages for one child session, hydrated from the durable inbox and transcript. */
 export interface PeerFeed {
   /** Delivered rows and queued rows, chronological. */
   messages: Accessor<PeerRow[]>
+  /** Chronological Q&A thread (questions + subagent assistant replies). */
+  thread?: Accessor<PeerThreadRow[]>
   /** Rows still waiting in the session inbox (`status === "queued"`). */
   queued: Accessor<PeerRow[]>
   unread: Accessor<number>
-  add(message: PeerMessage): void
+  add(message: PeerMessage, delivery?: "queue" | "steer"): void
   markRead(): void
   steer?(inboxID: string): Promise<void>
   cancel?(inboxID: string): Promise<void>
@@ -140,17 +155,19 @@ export function createPeerFeed(sessionID: () => string | undefined): PeerFeed {
     const id = sessionID()
     if (!id) return
     const pending = server.ctx.data.session.pending as { hydrate?: (sessionID: string) => Promise<unknown> }
+    const messages = server.ctx.data.session.message as { hydrate?: (sessionID: string) => Promise<unknown> }
     void pending.hydrate?.(id)?.catch(() => undefined)
+    void messages.hydrate?.(id)?.catch(() => undefined)
   })
 
   // Live arrivals are held in a signal array: a `createStore` record read with
   // `Object.values` is not tracked by the memo below, which left event-only rows
   // invisible until the next store write.
-  const add = (message: PeerMessage) => {
-    setLive((current) =>
-      current.some((row) => row.id === message.id) ? current : [...current, { ...message, status: "queued" }],
-    )
-    setUnread((current) => current + 1)
+  const add = (message: PeerMessage, delivery?: "queue" | "steer") => {
+    const entry: PeerRow = { ...message, status: "queued", ...(delivery ? { delivery } : {}) }
+    setSeen(message.id, true)
+    setLive((current) => (current.some((row) => row.id === message.id) ? current : [...current, entry]))
+    if (!message.own) setUnread((current) => current + 1)
   }
 
   const stop = sdk.event.listen((event) => {
@@ -177,24 +194,39 @@ export function createPeerFeed(sessionID: () => string | undefined): PeerFeed {
 
   // A plain accessor, not `createMemo`: under the test/store mock the memo's
   // computation ran once at creation and never re-subscribed, so live rows never
-  // reached the drawer. Reading on demand is always current; the identity cache
-  // below keeps repeated reads between changes O(1).
-  let cacheKey: [string, unknown, number, string, unknown, number, PeerRow[]] | undefined
+  // reached the drawer. Reading on demand is always current; the snapshot cache
+  // below keeps repeated reads between changes O(1) while invalidating on in-place mutations.
+  let cacheKey: [string, unknown, number, string, unknown, number, string, PeerRow[]] | undefined
   let cacheValue: PeerRow[] = []
+  let cacheThread: PeerThreadRow[] = []
 
-  const messages = (): PeerRow[] => {
+  const snapshot = () => {
     const id = sessionID()
-    if (!id) return []
+    if (!id) return { messages: [] as PeerRow[], thread: [] as PeerThreadRow[] }
     const session = server.ctx.data.session
     const pending = session.pending.list(id)
     const transcript = session.message.list(id)
     const liveRows = live()
     const deliverySignature = pending
-      .map((item) => (isConfigObject(item) ? `${asText(item.id) ?? ""}:${asText(item.delivery) ?? ""}` : ""))
+      .map((item) =>
+        isConfigObject(item)
+          ? `${asText(item.id) ?? ""}:${asText(item.delivery) ?? ""}:${createdOf(item) ?? 0}`
+          : "",
+      )
       .join(",")
+    const transcriptSignature = transcript
+      .map((item) => {
+        if (!isConfigObject(item)) return ""
+        const rawItem = item as Record<string, unknown>
+        const content = Array.isArray(rawItem.content) ? rawItem.content : undefined
+        const tail = content?.at(-1)
+        const tailLen = isConfigObject(tail) && typeof tail.text === "string" ? tail.text.length : 0
+        const completed = isConfigObject(rawItem.time) ? (asCount(rawItem.time.completed) ?? -1) : -1
+        const err = isConfigObject(rawItem.error) ? (asText(rawItem.error.message)?.length ?? 1) : 0
+        return `${asText(rawItem.id) ?? ""}:${createdOf(rawItem) ?? 0}:${content?.length ?? 0}:${tailLen}:${completed}:${err}`
+      })
+      .join("|")
 
-    // Identity alone is not enough: a store proxy can mutate in place. Lifecycle
-    // events always change a length, or pending delivery mode (`queue` <-> `steer`).
     if (
       cacheKey &&
       cacheKey[0] === id &&
@@ -203,34 +235,79 @@ export function createPeerFeed(sessionID: () => string | undefined): PeerFeed {
       cacheKey[3] === deliverySignature &&
       cacheKey[4] === transcript &&
       cacheKey[5] === transcript.length &&
-      cacheKey[6] === liveRows
+      cacheKey[6] === transcriptSignature &&
+      cacheKey[7] === liveRows
     )
-      return cacheValue
+      return { messages: cacheValue, thread: cacheThread }
 
     const rows = new Map<string, PeerRow>()
+    const questions = new Map<string, PeerThreadRow & { role: "question" }>()
+    const answers: (PeerThreadRow & { role: "answer" })[] = []
+    const pendingIDs = new Set<string>()
 
     // Delivered transcript rows first, then live SSE events not yet in transcript,
     // and finally active inbox rows so any item still in `session_inbox` (including
     // materialized `steer` rows) accurately keeps `status: "queued"` until delivered.
     for (const item of transcript) {
-      const row = deliveredRow(item)
-      if (row) rows.set(row.id, row)
+      const peer = deliveredRow(item)
+      if (peer) {
+        rows.set(peer.id, peer)
+        questions.set(peer.id, { ...peer, role: "question", origin: "peer" })
+        continue
+      }
+      const user = userQuestionRow(item)
+      if (user) {
+        questions.set(user.id, user)
+        continue
+      }
+      const answer = assistantAnswerRow(item)
+      if (answer) answers.push(answer)
     }
     for (const message of liveRows) {
-      if (!rows.has(message.id)) rows.set(message.id, { ...message, status: "queued" })
+      pendingIDs.add(message.id)
+      if (!rows.has(message.id)) {
+        const entry: PeerRow = { ...message, status: "queued" }
+        rows.set(message.id, entry)
+        questions.set(message.id, { ...entry, role: "question", origin: "peer" })
+      }
     }
     for (const item of pending) {
       const row = queuedRow(item)
-      if (row) rows.set(row.id, row)
+      if (row) {
+        pendingIDs.add(row.id)
+        rows.set(row.id, row)
+        questions.set(row.id, { ...row, role: "question", origin: "peer" })
+      }
     }
 
-    cacheKey = [id, pending, pending.length, deliverySignature, transcript, transcript.length, liveRows]
-    cacheValue = [...rows.values()].sort(
-      (a, b) => a.created - b.created || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0),
-    )
+    const sortChrono = <T extends { created: number; id: string }>(a: T, b: T) =>
+      a.created - b.created || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)
 
-    return cacheValue
+    const sortedMessages = [...rows.values()].sort(sortChrono)
+    const deliveredThread = [
+      ...[...questions.values()].filter((row) => !pendingIDs.has(row.id)),
+      ...answers,
+    ].sort(sortChrono)
+    const pendingThread = [...questions.values()].filter((row) => pendingIDs.has(row.id)).sort(sortChrono)
+
+    cacheKey = [
+      id,
+      pending,
+      pending.length,
+      deliverySignature,
+      transcript,
+      transcript.length,
+      transcriptSignature,
+      liveRows,
+    ]
+    cacheValue = sortedMessages
+    cacheThread = [...deliveredThread, ...pendingThread]
+
+    return { messages: cacheValue, thread: cacheThread }
   }
+
+  const messages = () => snapshot().messages
+  const thread = () => snapshot().thread
 
   const queued = () => messages().filter((row) => row.status === "queued")
 
@@ -249,6 +326,7 @@ export function createPeerFeed(sessionID: () => string | undefined): PeerFeed {
 
   return {
     messages,
+    thread,
     queued,
     unread,
     add,
@@ -333,4 +411,50 @@ function createdOf(item: unknown): number | undefined {
   if (!isConfigObject(item) || !isConfigObject(item.time)) return undefined
 
   return asCount(item.time.created)
+}
+
+function userQuestionRow(item: unknown): (PeerThreadRow & { role: "question" }) | undefined {
+  if (!isConfigObject(item) || item.type !== "user") return undefined
+  const id = asText(item.id)
+  const text = asText(item.text)
+  if (!id || !text) return undefined
+
+  return {
+    id,
+    role: "question",
+    origin: "user",
+    from: "user",
+    own: true,
+    text,
+    created: createdOf(item) ?? 0,
+    status: "sent",
+  }
+}
+
+function assistantAnswerRow(item: unknown): (PeerThreadRow & { role: "answer" }) | undefined {
+  if (!isConfigObject(item) || item.type !== "assistant") return undefined
+  const id = asText(item.id)
+  if (!id) return undefined
+  const parts = Array.isArray(item.content) ? item.content : []
+  const texts = parts.flatMap((part) => {
+    if (!isConfigObject(part) || part.type !== "text") return []
+    const text = asText(part.text)
+    return text ? [text] : []
+  })
+  const text = texts.join("\n\n")
+  const time = isConfigObject(item.time) ? item.time : undefined
+  const streaming = time ? asCount(time.completed) === undefined : false
+  const error = isConfigObject(item.error) ? asText(item.error.message) : undefined
+
+  if (!text && !error && !streaming) return undefined
+
+  return {
+    id,
+    role: "answer",
+    text: text || error || "",
+    agent: asText(item.agent),
+    created: createdOf(item) ?? 0,
+    streaming,
+    ...(error ? { error } : {}),
+  }
 }

@@ -21,6 +21,7 @@ import { showToast } from "@/shell/notifications/toast"
 import { usePlatform } from "@/runtime/platform/platform"
 import { applyTimelineMessageHandoff, timelineChildTitle, visibleTimelineMessages } from "./controller-projection"
 import { createTimelineProjection } from "./projection"
+import { createSessionCompaction } from "./compaction"
 import { useServer } from "@/runtime/server/current"
 import { getSessionMessageHandoff } from "@/session/handoff"
 import type { ReasoningMode } from "@opencode/session-ui/timeline/projection"
@@ -68,6 +69,22 @@ export function createTimelineController(input: { session: TimelineSessionSource
   const language = useLanguage()
   const platform = usePlatform()
 
+  const compaction = createSessionCompaction({ sessionID: input.session.identity.sessionID })
+
+  // A queued peer message is a conversation turn, so it stays in the timeline for every session.
+  // A queued user prompt belongs to the composer's queue strip in a root session, and to the
+  // timeline only in a child, where there is no strip.
+  const showsQueuedInTimeline = createMemo(() => {
+    if (input.session.data.parentID()) return true
+    const id = input.session.identity.sessionID()
+
+    if (!id) return false
+
+    return data.session.pending
+      .list(id)
+      .some((item) => item.type === "synthetic" && item.delivery === "queue")
+  })
+
   const visibleMessages = createMemo(() => {
     const id = input.session.identity.sessionID()
 
@@ -75,6 +92,7 @@ export function createTimelineController(input: { session: TimelineSessionSource
       input.session.history.messages(),
       id ? data.session.pending.list(id) : [],
       input.session.data.info()?.revert?.messageID,
+      { includeQueued: showsQueuedInTimeline() },
     )
   })
 
@@ -93,6 +111,7 @@ export function createTimelineController(input: { session: TimelineSessionSource
     const id = input.session.identity.sessionID()
 
     if (!id) return new Set<string>()
+    const includeQueued = showsQueuedInTimeline()
 
     return new Set(
       data.session.pending
@@ -101,17 +120,12 @@ export function createTimelineController(input: { session: TimelineSessionSource
           (item.type === "user" &&
             item.delivery === "steer" &&
             data.session.pending.status(id, item.id) !== "starting") ||
-          (item.type === "synthetic" && item.delivery !== "queue")
+          (item.type === "synthetic" && item.delivery !== "queue") ||
+          (includeQueued && (item.type === "user" || item.type === "synthetic") && item.delivery === "queue")
             ? [item.id]
             : [],
         ),
     )
-  })
-
-  const queuedCompactionIDs = createMemo(() => {
-    const id = input.session.identity.sessionID()
-
-    return (id ? data.session.pending.list(id) : []).flatMap((item) => (item.type === "compaction" ? [item.id] : []))
   })
 
   const titleValue = createMemo(() => input.session.data.info()?.title)
@@ -180,7 +194,7 @@ export function createTimelineController(input: { session: TimelineSessionSource
     editToolDefaultOpen: editToolPartsExpanded,
     timelineDetail,
     pendingInputIDs,
-    queuedCompactionIDs,
+    compaction: compaction.state,
     turnDiffs: settings.general.showTurnDiffs,
   })
 

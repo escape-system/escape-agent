@@ -152,6 +152,14 @@ function locationQuery(ref: LocationRef) {
   return { directory: ref.directory }
 }
 
+/**
+ * `inboxID` names the pending inbox row; `inputID` names the compaction message. Older servers sent
+ * only `inputID`, and the two differ whenever admission coalesced onto an earlier proposal.
+ */
+function compactionInboxID(data: { inboxID?: string }): string | undefined {
+  return typeof data.inboxID === "string" && data.inboxID ? data.inboxID : undefined
+}
+
 function optimisticFiles(files: SessionPromptInput["files"]) {
   const items = files?.flatMap((file) => {
     if (!file.uri.startsWith("data:")) return []
@@ -320,6 +328,15 @@ export function createData(config: CreateDataInput) {
   // durable snapshot/terminal inbox event observes them, so a racing `pending.hydrate` cannot wipe
   // a live `session.inbox.enqueued` before the server snapshot reflects it.
   const livePending = new Map<string, Map<string, SessionInboxInfo>>()
+  // Inbox IDs a delivery or cancellation retired while a pending snapshot was in flight. The
+  // snapshot can predate that event, so merging its rows back would resurrect a consumed badge.
+  const consumedInbox = new Map<string, Set<string>>()
+
+  const markConsumed = (sessionID: string, inboxID: string) => {
+    const marks = consumedInbox.get(sessionID)
+    if (marks) marks.add(inboxID)
+    else consumedInbox.set(sessionID, new Set([inboxID]))
+  }
 
   function setSessionActive(sessionID: string, status: DataSessionStatus) {
     activeUpdates?.set(sessionID, status)
@@ -360,6 +377,7 @@ export function createData(config: CreateDataInput) {
 
   function removePending(sessionID: string, inboxID?: string) {
     if (!inboxID) return
+    markConsumed(sessionID, inboxID)
     livePending.get(sessionID)?.delete(inboxID)
     pendingUpdates.get(sessionID)?.set(inboxID, undefined)
     if (store.session.pending[sessionID]?.some((item) => item.id === inboxID))
@@ -951,8 +969,18 @@ export function createData(config: CreateDataInput) {
         message.update(event.data.sessionID, (draft, index) => {
           const position = index.get(event.data.inboxID)
           const existing = position === undefined ? undefined : draft[position]
-          if (existing) {
-            // Keep the row where the reader already sees it; promotion is not a new arrival.
+          if (position !== undefined && existing) {
+            if (pending?.delivery === "queue") {
+              // Queued items were materialized at enqueue time; on promotion the server assigns a new
+              // seq after work generated while waiting, so reposition to the delivery timestamp.
+              draft.splice(position, 1)
+              index.delete(event.data.inboxID)
+              message.reindex(draft, index, position)
+              existing.time.created = event.created
+              insertChronological(draft, index, existing)
+              return
+            }
+            // Keep steer rows where the reader already sees them; promotion is not a new arrival.
             existing.time.created = event.created
             return
           }
@@ -1237,18 +1265,30 @@ export function createData(config: CreateDataInput) {
         result.session.invalidate(event.data.sessionID)
         refresh(() => result.session.sync(event.data.sessionID))
         return
-      case "session.compaction.started":
-        if (event.data.inputID) removePending(event.data.sessionID, event.data.inputID)
+      case "session.compaction.started": {
+        // `pending` is keyed by inbox id; `inputID` names the compaction MESSAGE. Removing by the
+        // message id therefore left the queued badge behind forever. Prefer the inbox id the server
+        // now sends, and fall back to `inputID` for older servers.
+        const inboxID = compactionInboxID(event.data)
+        const inputID = event.data.inputID
+        if (inboxID) removePending(event.data.sessionID, inboxID)
+        else if (inputID) removePending(event.data.sessionID, inputID)
         message.insert(event.data.sessionID, {
-          id: event.data.inputID ?? SessionMessage.ID.fromEvent(event.id),
+          id: inputID ?? inboxID ?? SessionMessage.ID.fromEvent(event.id),
           type: "compaction",
           status: "running",
           reason: event.data.reason,
           summary: "",
           time: { created: event.created },
         })
-        if (event.data.inputID) compacting.get(event.data.sessionID)?.observed.add(event.data.inputID)
+        const observed = compacting.get(event.data.sessionID)?.observed
+        if (observed) {
+          if (inputID) observed.add(inputID)
+          if (inboxID) observed.add(inboxID)
+        }
+
         return
+      }
       case "session.execution.succeeded":
       case "session.execution.failed":
       case "session.execution.interrupted":
@@ -1321,12 +1361,10 @@ export function createData(config: CreateDataInput) {
           for (const item of draft.splice(position)) index.delete(item.id)
         })
         return
+      // `session.compaction.delta` is declared in the protocol but never emitted: docs/02-protocol.md
+      // marks it as not implemented. The handler was dead, so streaming summary text is not applied.
+      // A running compaction's summary arrives whole with `session.compaction.ended`.
       case "session.compaction.delta":
-        if (!store.session.message[event.data.sessionID]) return
-        message.update(event.data.sessionID, (draft) => {
-          const current = message.compaction(draft)
-          if (current?.status === "running") current.summary += event.data.text
-        })
         return
       case "session.compaction.ended":
         // Drop the per-step number so a missed `started` row cannot leave a stale pre-compaction value.
@@ -1360,8 +1398,11 @@ export function createData(config: CreateDataInput) {
           })
         })
         return
-      case "session.compaction.failed":
-        if (event.data.inputID) removePending(event.data.sessionID, event.data.inputID)
+      case "session.compaction.failed": {
+        const inboxID = compactionInboxID(event.data)
+        const inputID = event.data.inputID
+        if (inboxID) removePending(event.data.sessionID, inboxID)
+        else if (inputID) removePending(event.data.sessionID, inputID)
         message.update(event.data.sessionID, (draft, index) => {
           const position = draft.findLastIndex((item) => item.type === "compaction" && item.status === "running")
           const current = draft[position]
@@ -1382,8 +1423,14 @@ export function createData(config: CreateDataInput) {
           }
           message.append(draft, index, failed)
         })
-        if (event.data.inputID) compacting.get(event.data.sessionID)?.observed.add(event.data.inputID)
+        const observed = compacting.get(event.data.sessionID)?.observed
+        if (observed) {
+          if (inputID) observed.add(inputID)
+          if (inboxID) observed.add(inboxID)
+        }
+
         return
+      }
       case "permission.asked":
         if (store.session.permission[event.data.sessionID]?.some((request) => request.id === event.data.id)) return
         setStore("session", "permission", event.data.sessionID, [
@@ -1669,7 +1716,9 @@ export function createData(config: CreateDataInput) {
         // once the current execution has delivered input.
         status(sessionID: string, inboxID: string): DataPendingStatus | undefined {
           const pending = store.session.pending[sessionID] ?? []
-          const item = pending.find((entry) => entry.id === inboxID && entry.type === "user")
+          const item = pending.find(
+            (entry) => entry.id === inboxID && (entry.type === "user" || entry.type === "synthetic"),
+          )
           if (!item) return undefined
           if (item.delivery === "queue") return "queued"
           const messages = store.session.message[sessionID] ?? []
@@ -1678,7 +1727,13 @@ export function createData(config: CreateDataInput) {
             return boundary >= 0 && item.time.created <= messages[boundary].time.created ? "stranded" : "starting"
           return messages
             .slice(boundary + 1)
-            .some((entry) => entry.type === "user" && !pending.some((other) => other.id === entry.id))
+            .some(
+              (entry) =>
+                (entry.type === "user" ||
+                  (entry.type === "synthetic" &&
+                    (entry.metadata?.source === "peer" || (entry as { peer?: boolean }).peer === true))) &&
+                !pending.some((other) => other.id === entry.id),
+            )
             ? "steering"
             : "starting"
         },
@@ -1710,12 +1765,20 @@ export function createData(config: CreateDataInput) {
                   ?.filter((item) => item.type === "compaction")
                   .forEach((item) => outbox.delete(item.id))
               // Keep optimistic rows awaiting their echo AND live-stream enqueued rows not yet reflected in
-              // this snapshot (cleared on delivery, cancellation, or reconnect).
-              const live = [...(livePending.get(sessionID)?.values() ?? [])].filter((item) => !current.has(item.id))
+              // this snapshot (cleared on delivery, cancellation, or reconnect). A consumed row is
+              // dropped instead: the snapshot may predate the delivery, and merging it back would
+              // resurrect a badge the server already retired.
+              const consumed = consumedInbox.get(sessionID)
+              const keepLive = (item: SessionInboxInfo) => !current.has(item.id) && !consumed?.has(item.id)
+              const live = [...(livePending.get(sessionID)?.values() ?? [])].filter(keepLive)
               const seenIDs = new Set(live.map((item) => item.id))
               const inflight = (store.session.pending[sessionID] ?? []).filter(
-                (item) => outbox.has(item.id) && !current.has(item.id) && !seenIDs.has(item.id),
+                (item) =>
+                  outbox.has(item.id) && !current.has(item.id) && !seenIDs.has(item.id) && !consumed?.has(item.id),
               )
+              // A snapshot that still lists the row is positive evidence it is pending, so it retires the
+              // mark; one that no longer lists it must not be read as a cancellation.
+              consumed?.clear()
               const merged = live.length === 0 && inflight.length === 0 ? pending : [...pending, ...live, ...inflight]
               batch(() => {
                 setStore("session", "pending", sessionID, reconcile(merged))
@@ -2041,6 +2104,10 @@ export function createData(config: CreateDataInput) {
         },
         invalidate(sessionID: string) {
           sync.invalidate(`session.message:${sessionID}`)
+        },
+        hydrate(sessionID: string) {
+          sync.invalidate(`session.message:${sessionID}`)
+          return result.session.message.sync(sessionID)
         },
       },
       permission: {

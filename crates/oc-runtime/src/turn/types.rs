@@ -14,6 +14,101 @@ use crate::expectation::Expectation;
 
 use super::assistant::AssistantState;
 
+/// Per-agent request overrides resolved from `agent.request`.
+#[derive(Clone, Debug, Default)]
+pub(super) struct AgentRequestOverrides {
+    pub(super) temperature: Option<f64>,
+    pub(super) top_p: Option<f64>,
+    pub(super) headers: BTreeMap<String, String>,
+    pub(super) body: Map<String, Value>,
+}
+
+/// Configured output truncation limits from root `tool_output`.
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct ToolOutputLimits {
+    pub(super) max_lines: Option<usize>,
+    pub(super) max_bytes: Option<usize>,
+}
+
+pub(super) fn parse_tool_output_limits(merged: &Value) -> ToolOutputLimits {
+    let Some(obj) = merged.get("tool_output").and_then(Value::as_object) else {
+        return ToolOutputLimits::default();
+    };
+    let read_limit = |snake: &str, camel: &str| {
+        obj.get(snake)
+            .or_else(|| obj.get(camel))
+            .and_then(Value::as_u64)
+            .and_then(|v| usize::try_from(v).ok())
+            .filter(|v| *v > 0)
+    };
+    ToolOutputLimits {
+        max_lines: read_limit("max_lines", "maxLines"),
+        max_bytes: read_limit("max_bytes", "maxBytes"),
+    }
+}
+
+pub(super) fn parse_agent_request_overrides(agent: &Value) -> AgentRequestOverrides {
+    let Some(request) = agent.get("request").and_then(Value::as_object) else {
+        return AgentRequestOverrides::default();
+    };
+    let mut headers = BTreeMap::new();
+    if let Some(map) = request.get("headers").and_then(Value::as_object) {
+        for (key, value) in map {
+            if let Some(text) = value.as_str() {
+                headers.insert(key.clone(), text.to_owned());
+            }
+        }
+    }
+    let mut temperature = None;
+    let mut top_p = None;
+    let mut body = Map::new();
+    if let Some(map) = request.get("body").and_then(Value::as_object) {
+        for (key, value) in map {
+            match key.as_str() {
+                "temperature" => temperature = value.as_f64(),
+                "top_p" | "topP" => top_p = value.as_f64(),
+                _ => {
+                    body.insert(key.clone(), value.clone());
+                }
+            }
+        }
+    }
+    AgentRequestOverrides {
+        temperature,
+        top_p,
+        headers,
+        body,
+    }
+}
+
+fn merge_json_value(base: &mut Value, overlay: &Value) {
+    match (base, overlay) {
+        (Value::Object(base_map), Value::Object(overlay_map)) => {
+            merge_json_map(base_map, overlay_map);
+        }
+        (base_slot, overlay_val) => *base_slot = overlay_val.clone(),
+    }
+}
+
+fn merge_json_map(base: &mut Map<String, Value>, overlay: &Map<String, Value>) {
+    for (key, value) in overlay {
+        match base.get_mut(key) {
+            Some(existing) => merge_json_value(existing, value),
+            None => {
+                base.insert(key.clone(), value.clone());
+            }
+        }
+    }
+}
+
+pub(super) fn apply_model_body_overlay(model: &mut ResolvedModel, overlay: &Map<String, Value>) {
+    if overlay.is_empty() {
+        return;
+    }
+    let body = model.model.body.get_or_insert_with(|| Box::new(Map::new()));
+    merge_json_map(body, overlay);
+}
+
 /// Resolved session state for one execution.
 #[derive(Clone, Debug)]
 pub(super) struct ResolvedTurn {
@@ -23,6 +118,8 @@ pub(super) struct ResolvedTurn {
     pub(super) model: ResolvedModel,
     pub(super) model_ref: ModelRef,
     pub(super) agent_system: Option<String>,
+    pub(super) agent_request: AgentRequestOverrides,
+    pub(super) tool_output: ToolOutputLimits,
     pub(super) tool_names: Vec<String>,
     pub(super) registry: Arc<ToolRegistry>,
     pub(super) system: Vec<String>,

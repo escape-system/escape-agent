@@ -48,7 +48,8 @@
     "./tools/ansi": "./src/tools/ansi.ts",
     "./tools/shell-output": "./src/tools/shell-output.ts",
     "./v2/*.css": "./src/v2/components/*.css",
-    "./v2/*": "./src/v2/components/*.tsx"
+    "./v2/*": "./src/v2/components/*.tsx",
+    "./timeline/compaction": "./src/timeline/compaction-state.ts"
   },
   "scripts": {
     "typecheck": "bun check --no-script -b",

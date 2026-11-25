@@ -99,6 +99,90 @@ describe("visibleTimelineMessages", () => {
     })
   })
 
+  test("keeps queued peer messages at the tail of subagent timelines when includeQueued is set", () => {
+    const queuedPeer = {
+      id: "syn_queued",
+      sessionID: "ses_child",
+      time: { created: 3 },
+      type: "synthetic",
+      delivery: "queue",
+      payload: { text: "waiting peer", metadata: { source: "peer", from: "user" } },
+    } satisfies SessionInboxInfo
+    const steerPeer = {
+      id: "syn_steer",
+      sessionID: "ses_child",
+      time: { created: 4 },
+      type: "synthetic",
+      delivery: "steer",
+      payload: { text: "steering peer", metadata: { source: "peer", from: "user" } },
+    } satisfies SessionInboxInfo
+    const source = [
+      messages[0],
+      messages[1],
+      {
+        id: "syn_queued",
+        type: "synthetic",
+        text: "waiting peer",
+        metadata: { source: "peer", from: "user" },
+        time: { created: 3 },
+      },
+      {
+        id: "syn_steer",
+        type: "synthetic",
+        text: "steering peer",
+        metadata: { source: "peer", from: "user" },
+        time: { created: 4 },
+      },
+      work,
+    ] satisfies SessionMessageInfo[]
+
+    // Primary timelines omit queued rows.
+    expect(visibleTimelineMessages(source, [queuedPeer, steerPeer]).map((m) => m.id)).toEqual([
+      "msg_1",
+      "msg_2",
+      "msg_5",
+      "syn_steer",
+    ])
+    // Subagent timelines keep steers ahead of queued peer messages below active work.
+    expect(
+      visibleTimelineMessages(source, [queuedPeer, steerPeer], undefined, { includeQueued: true }).map((m) => m.id),
+    ).toEqual(["msg_1", "msg_2", "msg_5", "syn_steer", "syn_queued"])
+  })
+
+  test("keeps a queued peer row at the tail for a root session too", () => {
+    const root = "ses_root"
+    const queuedPeer = {
+      id: "syn_root_queued",
+      sessionID: root,
+      time: { created: 4 },
+      type: "synthetic",
+      delivery: "queue",
+      payload: { text: "peer note waiting", metadata: { source: "peer", from: "ses_sibling" } },
+    } satisfies SessionInboxInfo
+    const source = [
+      { id: "msg_root_user", type: "user", text: "root prompt", time: { created: 1 } },
+      { ...messages[1], id: "msg_root_work" },
+      {
+        id: "syn_root_queued",
+        type: "synthetic",
+        text: "peer note waiting",
+        metadata: { source: "peer", from: "ses_sibling" },
+        time: { created: 4 },
+      },
+    ] satisfies SessionMessageInfo[]
+
+    // A root session shows its queued peer row (it is part of the conversation) at the tail, after the work.
+    expect(visibleTimelineMessages(source, [queuedPeer], undefined, { includeQueued: true }).map((item) => item.id)).toEqual(
+      ["msg_root_user", "msg_root_work", "syn_root_queued"],
+    )
+    // A queued user prompt still belongs to the composer strip, so it stays out of a root timeline.
+    const queuedPrompt = { ...queuedPeer, type: "user", payload: { text: "queued prompt" } } satisfies SessionInboxInfo
+    expect(visibleTimelineMessages(source, [queuedPrompt]).map((item) => item.id)).toEqual([
+      "msg_root_user",
+      "msg_root_work",
+    ])
+  })
+
   test("moves a queued input after existing work when changed to steer", () => {
     const source = [...messages.slice(0, 3), work]
     expect(visibleTimelineMessages(source, [{ ...steer, delivery: "queue" }]).map((message) => message.id)).toEqual([

@@ -25,8 +25,14 @@ use super::variants::{ReasoningSupport, variants_for};
 use super::{Activation, Catalog, Cost, CostCache, ModelInfo, Protocol, ProviderInfo};
 use crate::error::LlmError;
 
-/// Public catalog endpoint, matching upstream's default.
-pub const DEFAULT_MODELS_URL: &str = "https://models.dev/api.json";
+/// Upstream v2 catalog endpoint with full `capabilities.reasoning` and protocol metadata.
+pub const DEFAULT_MODELS_V2_URL: &str = "https://models.opencode.ai/experimental/v2.0/api.json?type=chat,decision,image,video,realtime&include=openai-codex,openai-chatgpt";
+
+/// Legacy v1 fallback catalog endpoint (`models.dev`), also kept as [`DEFAULT_MODELS_URL`].
+pub const LEGACY_MODELS_URL: &str = "https://models.dev/api.json";
+
+/// Public catalog endpoint used when `OPENCODE_MODELS_URL` is unset (upstream v2 with v1 fallback).
+pub const DEFAULT_MODELS_URL: &str = DEFAULT_MODELS_V2_URL;
 
 /// Environment override, matching upstream's `OPENCODE_MODELS_URL`.
 pub const MODELS_URL_ENV: &str = "OPENCODE_MODELS_URL";
@@ -558,6 +564,7 @@ fn starter_nous_model(spec: &StarterNousModel<'_>) -> ModelInfo {
     model.capabilities.tools = true;
     model.cost = vec![spec.cost];
     let support = ReasoningSupport {
+        supported: true,
         toggle: false,
         effort: Some(
             spec.efforts
@@ -567,7 +574,11 @@ fn starter_nous_model(spec: &StarterNousModel<'_>) -> ModelInfo {
         ),
         budget: None,
     };
-    model.variants = variants_for(&model, Protocol::OpenAiChat, &support);
+    let package = model
+        .package
+        .as_deref()
+        .unwrap_or("@ai-sdk/openai-compatible");
+    model.variants = variants_for(&model, package, Protocol::OpenAiChat, &support);
     model
 }
 
@@ -707,11 +718,16 @@ fn apply_nous_capabilities(model: &mut ModelInfo, id: &str, row: &Value) {
                 vec!["low", "medium", "high", "max"]
             };
             let support = ReasoningSupport {
+                supported: true,
                 toggle: false,
                 effort: Some(efforts.into_iter().map(str::to_owned).collect()),
                 budget: None,
             };
-            model.variants = variants_for(model, Protocol::OpenAiChat, &support);
+            let package = model
+                .package
+                .as_deref()
+                .unwrap_or("@ai-sdk/openai-compatible");
+            model.variants = variants_for(model, package, Protocol::OpenAiChat, &support);
         }
     }
 }
@@ -820,6 +836,17 @@ pub fn transient_client() -> Client {
         .unwrap_or_else(|_| Client::new())
 }
 
+async fn fetch_catalog_body(client: &Client, url: &str) -> Result<String, LlmError> {
+    match fetch_live(client, url).await {
+        Ok(body) => Ok(body),
+        Err(error) if url == DEFAULT_MODELS_V2_URL => {
+            tracing::debug!(%error, "v2 model catalog fetch failed; falling back to models.dev v1");
+            fetch_live(client, LEGACY_MODELS_URL).await
+        }
+        Err(error) => Err(error),
+    }
+}
+
 /// Fetch, cache and apply the published catalog exactly once.
 ///
 /// The URL is explicit: callers must not rely on process-global environment
@@ -836,7 +863,9 @@ pub async fn refresh_now<F>(
 where
     F: Fn(&str) -> Result<(), String>,
 {
-    let body = fetch_live(client, url).await.map_err(|e| e.to_string())?;
+    let body = fetch_catalog_body(client, url)
+        .await
+        .map_err(|e| e.to_string())?;
     write_cache(cache, &body)?;
     apply(&body).map_err(|error| {
         tracing::warn!(%error, %url, "manual model catalog publish rejected");
@@ -866,7 +895,7 @@ where
             let Ok(client) = Client::builder().pool_max_idle_per_host(0).build() else {
                 continue;
             };
-            match fetch_live(&client, &url).await {
+            match fetch_catalog_body(&client, &url).await {
                 Ok(body) => {
                     drop(client);
                     if let Err(error) = write_cache(&cache, &body) {

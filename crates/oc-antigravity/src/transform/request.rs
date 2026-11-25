@@ -306,8 +306,24 @@ fn strip_antigravity_tier_for_cli(model: &str) -> Option<&str> {
 }
 
 fn apply_catalog_variant_options(resolved: &mut ResolvedTargetModel, options: &Map<String, Value>) {
+    if options
+        .get("thinking")
+        .and_then(|v| v.get("type"))
+        .and_then(Value::as_str)
+        == Some("disabled")
+        || options
+            .get("thinkingConfig")
+            .and_then(|v| v.get("includeThoughts"))
+            .and_then(Value::as_bool)
+            == Some(false)
+    {
+        resolved.thinking = ThinkingMode::Disabled;
+        return;
+    }
     if let Some(lvl) = options
         .get("thinkingLevel")
+        .or_else(|| options.get("reasoningEffort"))
+        .or_else(|| options.get("effort"))
         .and_then(Value::as_str)
         .or_else(|| {
             options
@@ -316,6 +332,10 @@ fn apply_catalog_variant_options(resolved: &mut ResolvedTargetModel, options: &M
                 .and_then(Value::as_str)
         })
     {
+        if lvl.eq_ignore_ascii_case("none") || lvl.eq_ignore_ascii_case("disabled") {
+            resolved.thinking = ThinkingMode::Disabled;
+            return;
+        }
         if resolved.family == ModelFamily::Claude {
             let budget = match lvl.to_ascii_lowercase().as_str() {
                 "minimal" | "low" => 8192,
@@ -331,18 +351,19 @@ fn apply_catalog_variant_options(resolved: &mut ResolvedTargetModel, options: &M
     if let Some(budget) = options
         .get("thinkingBudget")
         .and_then(Value::as_u64)
+        .or_else(|| {
+            options
+                .get("thinkingConfig")
+                .and_then(|v| v.get("thinkingBudget"))
+                .and_then(Value::as_u64)
+        })
         .and_then(|v| u32::try_from(v).ok())
     {
-        resolved.thinking = ThinkingMode::Budget(budget);
-        return;
-    }
-    if let Some(budget) = options
-        .get("thinkingConfig")
-        .and_then(|v| v.get("thinkingBudget"))
-        .and_then(Value::as_u64)
-        .and_then(|v| u32::try_from(v).ok())
-    {
-        resolved.thinking = ThinkingMode::Budget(budget);
+        resolved.thinking = if budget == 0 {
+            ThinkingMode::Disabled
+        } else {
+            ThinkingMode::Budget(budget)
+        };
     }
 }
 

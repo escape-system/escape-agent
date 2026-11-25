@@ -35,6 +35,19 @@ fn has_event(events: &[Value], kind: &str) -> bool {
     events.iter().any(|event| event["type"] == kind)
 }
 
+fn is_title_request(request: &Value) -> bool {
+    request
+        .to_string()
+        .contains("name conversations so the user can find them later")
+}
+
+fn turn_requests(fake: &FakeProvider) -> Vec<Value> {
+    fake.requests()
+        .into_iter()
+        .filter(|request| !is_title_request(request))
+        .collect()
+}
+
 #[tokio::test]
 async fn text_turn_completes_and_records_success() {
     let _guard = LOCK.lock().await;
@@ -52,7 +65,17 @@ async fn text_turn_completes_and_records_success() {
     let messages = wait_for_execution(&client, &base, &session).await.unwrap();
 
     assert_eq!(assistant_text(&messages).as_deref(), Some(TEXT));
-    assert_eq!(fake.requests().len(), 1, "one model call for a text turn");
+    let requests = fake.requests();
+    assert_eq!(
+        requests.iter().filter(|r| !is_title_request(r)).count(),
+        1,
+        "one model call for a text turn"
+    );
+    assert_eq!(
+        requests.iter().filter(|r| is_title_request(r)).count(),
+        1,
+        "untitled session triggers one auto-title call"
+    );
 
     let (_, active) = json_request(
         &client,
@@ -72,6 +95,10 @@ async fn text_turn_completes_and_records_success() {
     assert!(
         has_event(&events, "session.execution.succeeded"),
         "{events:?}"
+    );
+    assert!(
+        has_event(&events, "session.renamed"),
+        "untitled session should emit session.renamed: {events:?}"
     );
     harness.stop().await;
 }
@@ -108,7 +135,7 @@ async fn tool_turn_reads_a_real_file() {
     assert_eq!(tools[0]["state"]["status"], "completed");
     assert_eq!(tools[0]["state"]["input"]["path"], "hello.txt");
 
-    let requests = fake.requests();
+    let requests = turn_requests(&fake);
     assert_eq!(requests.len(), 2, "tool call then final answer");
     assert!(
         requests[1]["messages"]
@@ -288,7 +315,7 @@ async fn assert_tool_turn_completes(fake: FakeProvider, config: TestConfig, expe
 
     assert_eq!(assistant_text(&messages).as_deref(), Some(expected));
     assert_eq!(
-        fake.requests().len(),
+        turn_requests(&fake).len(),
         2,
         "tool turn should make two model calls"
     );
@@ -347,7 +374,11 @@ async fn retry_after_once_recovers_and_completes_end_to_end() {
         assistant_text(&messages).as_deref(),
         Some("recovered after 429")
     );
-    assert_eq!(fake.requests().len(), 2, "429 should trigger a clean retry");
+    assert_eq!(
+        turn_requests(&fake).len(),
+        2,
+        "429 should trigger a clean retry"
+    );
     harness.stop().await;
 }
 
@@ -407,7 +438,7 @@ async fn run_cli_auto_approves_by_default_and_rejects_non_tty_with_ask_permissio
             String::from_utf8_lossy(&out.stderr)
         );
         let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
-        let requests = fake.requests();
+        let requests = turn_requests(&fake);
         (stdout, requests)
     };
 

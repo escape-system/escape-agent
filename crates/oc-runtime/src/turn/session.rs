@@ -16,7 +16,10 @@ use crate::runtime::{ActorHandle, Runtime, RuntimeError};
 use super::permissions::tool_action;
 use super::stats::TurnStats;
 use super::stats::scribe_digest;
-use super::types::{ResolvedTurn, SessionInstructionsUpdated};
+use super::types::{
+    ResolvedTurn, SessionInstructionsUpdated, apply_model_body_overlay,
+    parse_agent_request_overrides, parse_tool_output_limits,
+};
 
 const DEFAULT_STEPS: u64 = 50;
 
@@ -142,9 +145,12 @@ impl Runtime {
             .map(str::trim)
             .filter(|v| !v.is_empty() && !v.eq_ignore_ascii_case("default"))
             .map(str::to_owned);
-        let resolved = config
+        let mut resolved = config
             .client
             .resolve_model(&config.catalog.current(), &model_ref.to_reference())?;
+        let agent_request = parse_agent_request_overrides(&agent);
+        apply_model_body_overlay(&mut resolved, &agent_request.body);
+        let tool_output = parse_tool_output_limits(config.config.merged());
         let context_window = resolved.model.limit.context;
         let session_rules = session_rules(info);
         let box_root = if self.memory().is_some() {
@@ -174,6 +180,8 @@ impl Runtime {
             model_ref,
             model: resolved,
             agent_system,
+            agent_request,
+            tool_output,
             tool_names,
             registry,
             system: Vec::new(),

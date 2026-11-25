@@ -13,6 +13,7 @@ import {
   Switch,
   createEffect,
   createMemo,
+  createSignal,
   onCleanup,
   untrack,
   type Accessor,
@@ -20,6 +21,8 @@ import {
 } from "solid-js"
 import { DiffChanges } from "@opencode/ui/diff-changes"
 import { Icon } from "@opencode/ui/icon"
+import { IconButton } from "@opencode/ui/icon-button"
+import { Tooltip } from "@opencode/ui/tooltip"
 import { Spring, frameLoop, prefersReducedMotion } from "@opencode/ui/motion"
 import { springStyle } from "@opencode/ui/motion/solid"
 import { Dynamic } from "solid-js/web"
@@ -37,10 +40,12 @@ import {
   SessionUserMessage,
   currentContentDefaultOpen,
 } from "../message/current-message"
+import { relativeTime, useNow } from "../message/relative-time"
 import {
   AssistantReasoningContent,
   SessionCompactionMessage,
   SessionCompactionQueued,
+  writeClipboard,
 } from "../message/message-content"
 import { taskAgentName, ToolRegistry, type ContextGroupPart } from "../tools/tool-renderer"
 import { GenericTool } from "../components/basic-tool"
@@ -63,6 +68,36 @@ const emptyAssistantMessages: SessionMessageAssistant[] = []
 
 // Past this many files, the rest of a turn's changes wait behind "Show all".
 const turnDiffFileLimit = 5
+
+const PEER_RELATIVE_TIME_KEYS = {
+  minute: "ui.message.time.minutesAgo",
+  hour: "ui.message.time.hoursAgo",
+  day: "ui.message.time.daysAgo",
+} as const
+
+function readPeerMetadata(value: SessionMessageInfo | undefined) {
+  if (value?.type !== "synthetic" || !isPeerNotice(value)) return undefined
+  const metadata = value.metadata
+  const from = Predicate.isString(metadata?.from) && metadata.from ? metadata.from : "peer"
+  const agent = Predicate.isString(metadata?.agent) && metadata.agent ? metadata.agent : undefined
+  const kind = Predicate.isString(metadata?.kind) && metadata.kind ? metadata.kind : undefined
+  const replyTo = Predicate.isString(metadata?.replyTo) && metadata.replyTo ? metadata.replyTo : undefined
+
+  return {
+    id: value.id,
+    from,
+    fromUser: from === "user",
+    agent,
+    kind,
+    /** A reply to an earlier question: it shows an Answer chip instead of a question label. */
+    answer: kind === "answer",
+    replyTo,
+    /** The inbox item was cancelled; the row stays in history with a chip and no actions. */
+    cancelled: metadata?.cancelled === true,
+    text: value.text,
+    created: value.time.created,
+  }
+}
 
 const decodeMetadataFile = Schema.decodeUnknownOption(Schema.Struct({ file: Schema.String }))
 
@@ -169,7 +204,8 @@ export function createSessionTimelineRowRenderer(input: {
     if (seen.sessionID !== sessionID) seen.ids.clear()
     seen.sessionID = sessionID
     input.projection.rows().forEach((row) => {
-      if (!Predicate.isTagged(row, "UserMessage") || seen.ids.has(row.userMessageID)) return
+      if ((!Predicate.isTagged(row, "UserMessage") && !Predicate.isTagged(row, "PeerMessage")) || seen.ids.has(row.userMessageID))
+        return
       seen.ids.add(row.userMessageID)
 
       if (loaded) arrived.add(row.userMessageID)
@@ -190,9 +226,9 @@ export function createSessionTimelineRowRenderer(input: {
     input.status().type !== "idle" && input.projection.activeMessageID() === messageID
 
   const duration = (messageID: string) => {
-    const user = input.projection.messageByID().get(messageID)
+    const opener = input.projection.messageByID().get(messageID)
 
-    if (user?.type !== "user") return null
+    if (opener?.type !== "user" && (opener?.type !== "synthetic" || !isPeerNotice(opener))) return null
 
     const completed = (input.projection.assistantMessagesByParent().get(messageID) ?? emptyAssistantMessages).reduce<
       number | undefined
@@ -202,9 +238,9 @@ export function createSessionTimelineRowRenderer(input: {
       return latest === undefined ? message.time.completed : Math.max(latest, message.time.completed)
     }, undefined)
 
-    if (completed === undefined || completed < user.time.created) return undefined
+    if (completed === undefined || completed < opener.time.created) return undefined
 
-    return completed - user.time.created
+    return completed - opener.time.created
   }
 
   const copyContentID = (messageID: string) => {
@@ -579,7 +615,11 @@ export function createSessionTimelineRowRenderer(input: {
       ref={(el) => {
         if (props.grow) growIn(el)
       }}
-      id={Predicate.isTagged(props.row, "UserMessage") ? input.anchor?.(props.row.userMessageID) : undefined}
+      id={
+        Predicate.isTagged(props.row, "UserMessage") || Predicate.isTagged(props.row, "PeerMessage")
+          ? input.anchor?.(props.row.userMessageID)
+          : undefined
+      }
       data-message-id={props.row.userMessageID}
       data-timeline-row={props.row._tag}
       data-timeline-spacing={Predicate.isTagged(props.row, "AssistantPart") ? props.row.spacing : undefined}
@@ -596,6 +636,244 @@ export function createSessionTimelineRowRenderer(input: {
       </div>
     </div>
   )
+
+  function PeerMessage(props: { messageID: string; grouped?: boolean }) {
+    const message = createMemo(() => input.projection.messageByID().get(props.messageID))
+    const peer = createMemo(() => readPeerMetadata(message()))
+    const pendingStatus = createMemo(() => input.actions?.pending?.status(props.messageID))
+    const queued = createMemo(() => !peer()?.cancelled && pendingStatus() === "queued")
+    const waiting = createMemo(
+      () => pendingStatus() === "steering" || pendingStatus() === "starting" || pendingStatus() === "stranded",
+    )
+    const now = useNow()
+    const numfmt = createMemo(() => new Intl.NumberFormat(i18n.locale()))
+    const datefmt = createMemo(() => new Intl.DateTimeFormat(i18n.locale(), { dateStyle: "medium" }))
+    const fulltimefmt = createMemo(() =>
+      new Intl.DateTimeFormat(i18n.locale(), { dateStyle: "full", timeStyle: "long" }),
+    )
+    const [copied, setCopied] = createSignal(false)
+    const [updating, setUpdating] = createSignal(false)
+
+    const stamp = createMemo(() => {
+      const created = peer()?.created
+      if (created === undefined) return ""
+      const relative = relativeTime(created, now())
+
+      if (relative.unit === "now") return i18n.t("ui.message.time.justNow")
+      if (relative.unit === "date") return datefmt().format(created)
+
+      return i18n.t(PEER_RELATIVE_TIME_KEYS[relative.unit], { count: numfmt().format(relative.count) })
+    })
+
+    const copy = async (text: string) => {
+      if (!text || !(await writeClipboard(text))) return
+      setCopied(true)
+      setTimeout(() => setCopied(false), 2000)
+    }
+
+    const runPending = async (task: () => Promise<void>) => {
+      if (updating()) return
+      setUpdating(true)
+      try {
+        await task()
+      } finally {
+        setUpdating(false)
+      }
+    }
+
+    return (
+      <Show when={peer()}>
+        {(entry) => (
+          <div
+            data-slot="session-turn-message-container"
+            data-component="peer-message"
+            data-type="peer"
+            data-message-id={entry().id}
+            data-pending={waiting() ? "true" : undefined}
+            data-queued={queued() ? "true" : undefined}
+            data-peer-kind={entry().answer ? "answer" : "question"}
+            data-reply-to={entry().replyTo}
+            data-cancelled={entry().cancelled ? "true" : undefined}
+            class={`w-full ${props.grouped ? "py-1" : padding()} flex flex-col items-end`}
+          >
+            <div class="w-fit max-w-[min(86%,64ch)] ml-auto flex flex-col items-end gap-1">
+              <div
+                data-slot="peer-message-bubble"
+                data-status={pendingStatus() ?? "sent"}
+                classList={{
+                  "w-full rounded-[10px] px-3 py-2 text-14-regular transition-colors": true,
+                  "border border-dashed border-v2-border-border-strong/80 bg-v2-background-bg-layer-01/85 text-v2-text-text-muted":
+                    queued(),
+                  "border border-v2-border-border-base/70 bg-v2-background-bg-layer-01 text-v2-text-text-muted":
+                    waiting(),
+                  "border border-v2-border-border-base/80 bg-v2-background-bg-layer-02 text-v2-text-text-base":
+                    !queued() && !waiting(),
+                }}
+              >
+                <div class="mb-1 flex flex-wrap items-center gap-1.5 text-11-regular text-v2-text-text-muted">
+                  <Icon
+                    name={waiting() ? "outline-steer" : "chat-bubble"}
+                    size="small"
+                    class="shrink-0 text-v2-icon-icon-faint"
+                  />
+                  <span class="rounded-full bg-v2-background-bg-layer-03/70 px-1.5 py-px font-[530] text-v2-text-text-accent">
+                    {entry().fromUser
+                      ? i18n.t("ui.sessionTimeline.notice.peerFromYou")
+                      : i18n.t("ui.sessionTimeline.notice.peerFrom", { sender: entry().from })}
+                  </span>
+                  <Show when={entry().agent}>
+                    {(agent) => (
+                      <span class="rounded bg-v2-background-bg-layer-03/50 px-1 py-px capitalize text-v2-text-text-faint">
+                        {agent()}
+                      </span>
+                    )}
+                  </Show>
+                  <Show when={entry().answer}>
+                    <span
+                      data-slot="peer-message-answer"
+                      class="rounded bg-v2-background-bg-layer-03/50 px-1 py-px text-v2-text-text-faint"
+                    >
+                      {i18n.t("ui.sessionTimeline.peer.answer")}
+                    </span>
+                  </Show>
+                  <Show when={!entry().answer && entry().kind}>
+                    {(kind) => <span class="text-v2-text-text-faint">{kind()}</span>}
+                  </Show>
+                  <Show when={entry().cancelled}>
+                    <span
+                      data-slot="peer-message-cancelled"
+                      class="ml-auto rounded-full border border-v2-border-border-base px-1.5 py-px font-[530] text-v2-text-text-faint"
+                    >
+                      {i18n.t("ui.sessionTimeline.peer.cancelled")}
+                    </span>
+                  </Show>
+                  <Show when={queued()}>
+                    <span
+                      data-slot="peer-message-status"
+                      data-status="queued"
+                      class="ml-auto rounded-full border border-v2-border-border-base px-1.5 py-px font-[530] text-v2-text-text-muted"
+                    >
+                      {i18n.t("ui.message.queued")}
+                    </span>
+                  </Show>
+                  <Show when={waiting()}>
+                    <span
+                      data-slot="peer-message-status"
+                      data-status={pendingStatus()}
+                      class="ml-auto rounded-full bg-v2-background-bg-layer-03/70 px-1.5 py-px font-[530] text-v2-text-text-muted"
+                    >
+                      {i18n.t("ui.message.pending")}
+                    </span>
+                  </Show>
+                </div>
+                <div
+                  data-slot="peer-message-text"
+                  class="select-text whitespace-pre-wrap break-words leading-5"
+                  dir="auto"
+                >
+                  {entry().text}
+                </div>
+                <Show when={queued() && !entry().cancelled && input.actions?.pending}>
+                  {(pendingActions) => (
+                    <div class="mt-2 flex flex-wrap items-center justify-between gap-2 border-t border-v2-border-border-base/60 pt-1.5 text-11-regular text-v2-text-text-muted">
+                      <span>{i18n.t("ui.sessionTimeline.peer.queuedHint")}</span>
+                      <div class="flex items-center gap-1.5">
+                        <Show when={pendingActions().steer}>
+                          {(steer) => (
+                            <button
+                              type="button"
+                              disabled={updating()}
+                              onMouseDown={(event) => event.preventDefault()}
+                              onClick={() =>
+                                void runPending(() => steer()({ sessionID: input.sessionID(), messageID: entry().id }))
+                              }
+                              class="inline-flex h-6 items-center gap-1 rounded-md border border-v2-border-border-base bg-v2-background-bg-layer-02 px-2 text-11-regular font-[530] text-v2-text-text-base hover:bg-v2-background-bg-layer-03 disabled:opacity-50"
+                            >
+                              {i18n.t("ui.sessionTimeline.peer.steerNow")}
+                            </button>
+                          )}
+                        </Show>
+                        <button
+                          type="button"
+                          disabled={updating()}
+                          onMouseDown={(event) => event.preventDefault()}
+                          onClick={() =>
+                            void runPending(() =>
+                              pendingActions().remove({ sessionID: input.sessionID(), messageID: entry().id }),
+                            )
+                          }
+                          class="inline-flex h-6 items-center gap-1 rounded-md px-2 text-11-regular text-v2-text-text-muted hover:bg-v2-background-bg-layer-02 hover:text-v2-text-text-base disabled:opacity-50"
+                        >
+                          {i18n.t("ui.sessionTimeline.peer.cancel")}
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                </Show>
+              </div>
+              <div class="flex items-center justify-end gap-1.5 px-0.5 text-11-regular text-v2-text-text-faint">
+                <Show when={waiting() && input.actions?.pending}>
+                  {(pendingActions) => (
+                    <>
+                      <Tooltip appearance="compact" value={i18n.t("ui.message.moveToQueue")} placement="top" gutter={4}>
+                        <IconButton
+                          icon={<Icon name="arrow-down-to-line" size="small" />}
+                          size="small"
+                          variant="ghost-muted"
+                          disabled={updating()}
+                          onMouseDown={(event) => event.preventDefault()}
+                          onClick={() =>
+                            void runPending(() =>
+                              pendingActions().queue({ sessionID: input.sessionID(), messageID: entry().id }),
+                            )
+                          }
+                          aria-label={i18n.t("ui.message.moveToQueue")}
+                        />
+                      </Tooltip>
+                      <Tooltip appearance="compact" value={i18n.t("ui.message.deletePending")} placement="top" gutter={4}>
+                        <IconButton
+                          icon={<Icon name="outline-trash" size="small" />}
+                          size="small"
+                          variant="ghost-muted"
+                          disabled={updating()}
+                          onMouseDown={(event) => event.preventDefault()}
+                          onClick={() =>
+                            void runPending(() =>
+                              pendingActions().remove({ sessionID: input.sessionID(), messageID: entry().id }),
+                            )
+                          }
+                          aria-label={i18n.t("ui.message.deletePending")}
+                        />
+                      </Tooltip>
+                      <span>{i18n.t("ui.sessionTimeline.peer.steeringHint")}</span>
+                    </>
+                  )}
+                </Show>
+                <Show when={!waiting() && !queued()}>
+                  <span title={fulltimefmt().format(entry().created)}>{stamp()}</span>
+                </Show>
+                <Tooltip
+                  appearance="compact"
+                  value={copied() ? i18n.t("ui.message.copied") : i18n.t("ui.message.copyMessage")}
+                  placement="top"
+                  gutter={4}
+                >
+                  <IconButton
+                    icon={<Icon name={copied() ? "check" : "copy"} size="small" />}
+                    size="small"
+                    variant="ghost-muted"
+                    onMouseDown={(event) => event.preventDefault()}
+                    onClick={() => void copy(entry().text)}
+                    aria-label={copied() ? i18n.t("ui.message.copied") : i18n.t("ui.message.copyMessage")}
+                  />
+                </Tooltip>
+              </div>
+            </div>
+          </div>
+        )}
+      </Show>
+    )
+  }
 
   function Notice(props: { messageID: string; grouped?: boolean }) {
     const inset = () => (props.grouped ? "" : padding())
@@ -649,24 +927,7 @@ export function createSessionTimelineRowRenderer(input: {
       }
     })
 
-    const peer = createMemo(() => {
-      const value = message()
-
-      if (value?.type !== "synthetic" || !isPeerNotice(value)) return undefined
-      const metadata = value.metadata
-      const from = Predicate.isString(metadata?.from) && metadata.from ? metadata.from : "peer"
-      const agent = Predicate.isString(metadata?.agent) && metadata.agent ? metadata.agent : undefined
-      const kind = Predicate.isString(metadata?.kind) && metadata.kind ? metadata.kind : undefined
-
-      return {
-        id: value.id,
-        from,
-        fromUser: from === "user",
-        agent,
-        kind,
-        text: value.text,
-      }
-    })
+    const peer = createMemo(() => readPeerMetadata(message()))
 
     const content = createMemo(() => {
       const value = message()
@@ -729,34 +990,7 @@ export function createSessionTimelineRowRenderer(input: {
     return (
       <>
         <Show when={peer()}>
-          {(entry) => (
-            <div
-              data-slot="session-timeline-notice"
-              data-type="peer"
-              data-message-id={entry().id}
-              class={`w-full ${props.grouped ? "py-1" : "pt-3 pb-1"} ${inset()}`}
-            >
-              <div class="rounded-lg border border-v2-border-border-base/80 bg-v2-background-bg-layer-01/60 px-3 py-2 text-13-regular text-v2-text-text-base">
-                <div class="mb-1 flex flex-wrap items-center gap-1.5 text-11-regular text-v2-text-text-muted">
-                  <Icon name="chat-bubble" size="small" class="shrink-0 text-v2-icon-icon-faint" />
-                  <span class="rounded-full bg-v2-background-bg-layer-02 px-1.5 py-px font-[530] text-v2-text-text-accent">
-                    {entry().fromUser
-                      ? i18n.t("ui.sessionTimeline.notice.peerFromYou")
-                      : i18n.t("ui.sessionTimeline.notice.peerFrom", { sender: entry().from })}
-                  </span>
-                  <Show when={entry().agent}>
-                    {(agent) => <span class="capitalize text-v2-text-text-faint">{agent()}</span>}
-                  </Show>
-                  <Show when={entry().kind}>
-                    {(kind) => <span class="text-v2-text-text-faint">{kind()}</span>}
-                  </Show>
-                </div>
-                <div class="select-text whitespace-pre-wrap break-words leading-5 text-v2-text-text-base" dir="auto">
-                  {entry().text}
-                </div>
-              </div>
-            </div>
-          )}
+          <PeerMessage messageID={props.messageID} grouped={props.grouped} />
         </Show>
         <Show when={!peer() && compaction()}>
           {(message) => (
@@ -1030,6 +1264,22 @@ export function createSessionTimelineRowRenderer(input: {
       )
     }
 
+    if (Predicate.isTagged(row(), "PeerMessage")) {
+      const current = () => {
+        const value = row()
+
+        if (!Predicate.isTagged(value, "PeerMessage")) throw new Error("Expected a peer-message timeline row")
+
+        return value
+      }
+
+      return (
+        <Frame row={current()} grow={arriving(current().userMessageID)}>
+          <PeerMessage messageID={current().messageID} />
+        </Frame>
+      )
+    }
+
     if (Predicate.isTagged(row(), "Shell")) {
       const current = () => {
         const value = row()
@@ -1093,11 +1343,24 @@ export function createSessionTimelineRowRenderer(input: {
         return value
       }
 
+      const compact = input.actions?.compact
+
       return (
         <Frame row={current()}>
           <div data-slot="session-turn-message-container" class={`w-full ${padding()}`}>
             <div data-slot="session-turn-compaction">
-              <SessionCompactionQueued />
+              <SessionCompactionQueued
+                phase={current().phase}
+                trigger={current().trigger}
+                estimateTokens={current().estimateTokens}
+                triggerTokens={current().triggerTokens}
+                ceilingTokens={current().ceilingTokens}
+                onCompact={
+                  compact && current().phase === "suggested"
+                    ? () => void compact({ sessionID: input.sessionID() })
+                    : undefined
+                }
+              />
             </div>
           </div>
         </Frame>
