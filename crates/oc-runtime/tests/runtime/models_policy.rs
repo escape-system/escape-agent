@@ -884,7 +884,14 @@ async fn compaction_without_a_chain_uses_the_turn_model() {
         requests[0].model.model.model_id, "alpha",
         "the request went to the turn model"
     );
+    // The row commits before its event is published, so the sink is awaited
+    // rather than read the instant the row appears.
+    harness.wait_for_events("session.compaction.ended", 1).await;
     let ended = harness.sink.data("session.compaction.ended");
-    assert_eq!(ended.len(), 1, "one ended event: {ended:?}");
+    assert_eq!(
+        ended.len(),
+        1,
+        "one ended event per compaction run: {ended:?}"
+    );
     assert_eq!(ended[0]["model"]["id"], "alpha");
 }

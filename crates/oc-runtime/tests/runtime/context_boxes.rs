@@ -33,9 +33,15 @@ async fn run_tool(
     Ok(result.output.unwrap_or_default())
 }
 
-/// Waits until the session has no inbox rows and every compaction row is
-/// settled. Returns the compaction rows.
-async fn wait_compaction(harness: &Harness) -> Vec<Value> {
+/// Waits until the session has no inbox rows and holds exactly `expected`
+/// settled compaction rows. Returns those rows.
+///
+/// The count is required, not merely checked afterwards: the runner consumes
+/// the queued compaction item *before* it writes the compaction message, so an
+/// intermediate state with zero rows and an empty inbox is legitimate. Only an
+/// explicit count makes that state distinguishable from completion, and it also
+/// turns a duplicate row into a timeout instead of a silent extra row.
+async fn wait_compaction(harness: &Harness, expected: usize) -> Vec<Value> {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let rows: Vec<Value> = harness
@@ -44,18 +50,33 @@ async fn wait_compaction(harness: &Harness) -> Vec<Value> {
             .into_iter()
             .filter(|message| message.get("type").and_then(Value::as_str) == Some("compaction"))
             .collect();
-        let settled = rows.iter().all(|row| {
-            matches!(
-                row.get("status").and_then(Value::as_str),
-                Some("completed" | "failed")
-            )
-        });
+        let settled = rows.len() == expected
+            && rows.iter().all(|row| {
+                matches!(
+                    row.get("status").and_then(Value::as_str),
+                    Some("completed" | "failed")
+                )
+            });
         if settled && harness.inbox().await.is_empty() {
             return rows;
         }
         assert!(Instant::now() < deadline, "timed out: {rows:?}");
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+}
+
+/// Waits until the session has no inbox rows, holds exactly `expected` settled
+/// compaction rows, and published the matching `session.compaction.ended`
+/// events.
+///
+/// A committed row precedes its event, so a test that asserts on the sink must
+/// wait for the sink too instead of reading it the instant the row appears.
+async fn wait_compaction_and_events(harness: &Harness, expected: usize) -> Vec<Value> {
+    let rows = wait_compaction(harness, expected).await;
+    harness
+        .wait_for_events("session.compaction.ended", expected)
+        .await;
+    rows
 }
 
 async fn enqueue_compaction(harness: &Harness) {
@@ -434,7 +455,7 @@ async fn compact_context_enqueues_a_queued_row_instead_of_compacting_inline() {
         .notify(&harness.session)
         .await
         .expect("notify");
-    let rows = wait_compaction(&harness).await;
+    let rows = wait_compaction(&harness, 1).await;
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0]["status"], "completed");
 }
@@ -461,7 +482,7 @@ async fn compact_context_tool_call_compacts_the_callers_own_session_at_the_next_
     // Its wake triggers the follow-up execution, which drains the queued row at
     // that next turn boundary.
     harness.prompt("compact this session").await;
-    let rows = wait_compaction(&harness).await;
+    let rows = wait_compaction(&harness, 1).await;
     assert_eq!(rows.len(), 1, "{rows:?}");
     assert_eq!(rows[0]["status"], "completed");
     assert_eq!(rows[0]["reason"], "manual");
@@ -525,7 +546,7 @@ async fn stable_boxes_survive_two_compactions_and_temporary_boxes_expire() {
         .expect("temporary box");
 
     enqueue_compaction(&harness).await;
-    let first = wait_compaction(&harness).await;
+    let first = wait_compaction(&harness, 1).await;
     assert_eq!(first.len(), 1);
     assert_eq!(first[0]["status"], "completed");
 
@@ -582,7 +603,7 @@ async fn stable_boxes_survive_two_compactions_and_temporary_boxes_expire() {
     assert!(stable.get("timeExpired").is_none());
 
     enqueue_compaction(&harness).await;
-    let second = wait_compaction(&harness).await;
+    let second = wait_compaction_and_events(&harness, 2).await;
     assert_eq!(second.len(), 2, "a second compaction committed");
     assert_eq!(second[1]["status"], "completed");
 

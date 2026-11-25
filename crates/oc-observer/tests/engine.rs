@@ -542,6 +542,15 @@ fn cancel_repair() -> String {
         .to_owned()
 }
 
+/// A `cancel_tool` repair aimed at an explicit target, for tests whose only
+/// running strip is not `tc_1`.
+fn cancel_repair_of(target: &str) -> String {
+    format!(
+        r#"{{"action":"repair","target":"{target}","reason":"hung roster wait",
+            "repair":{{"kind":"cancel_tool","args":{{}}}}}}"#
+    )
+}
+
 #[tokio::test]
 async fn an_overdue_strip_wakes_the_observer_once_per_backoff() {
     let cfg = ObserverConfig {
@@ -771,7 +780,13 @@ async fn roster_strip_is_not_overdue_while_child_session_is_busy() {
 
 #[tokio::test]
 async fn roster_strip_without_a_busy_child_still_becomes_overdue() {
-    let h = harness(ObserverConfig::default(), vec![Ok(cancel_repair())]);
+    // The repair must name the strip this test actually opened: `tc_roster`.
+    // Targeting `tc_1` made the engine reject the verdict as an unknown tool
+    // call, which looked like a wake bug but was a fixture mismatch.
+    let h = harness(
+        ObserverConfig::default(),
+        vec![Ok(cancel_repair_of("tc_roster"))],
+    );
     let mut roster_strip = strip("tc_roster", 0, 302);
     roster_strip.tool = "roster".to_owned();
     h.engine.observe_start(roster_strip);

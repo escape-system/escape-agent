@@ -6,10 +6,13 @@
 //! error before any durable row exists, honors
 //! `subagents.siblings.max_writes_per_min`, and leaves other senders alone.
 //!
-//! A write is durable as an inbox row and may be promoted to a message by the
-//! child actor mid-test, so the durable total is "inbox rows + promoted
-//! messages".
+//! A write is materialised at admission, so its inbox doorbell and its
+//! transcript message commit together under one id. The child actor may then
+//! promote or consume the doorbell mid-test, so the durable total is the set of
+//! *ids*: one accepted write is exactly one durable write, whether it is still
+//! pending (doorbell + message) or delivered (message only).
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use oc_store::{MessageQuery, Order};
@@ -17,11 +20,16 @@ use serde_json::{Value, json};
 
 use crate::support::*;
 
-/// Durable rows the child holds from `session_write`: promoted messages plus
-/// still-pending inbox rows. Messages are read first so a promotion racing the
-/// two reads can only undercount (and is retried), never double count.
+/// Durable writes the child holds from `session_write`, keyed by row id.
+///
+/// `enqueue_materialized` commits the pending doorbell and the transcript
+/// message with the same id, and promotion flips that message in place instead
+/// of inserting a second row. Counting rows would therefore count a pending
+/// write twice, so each id contributes once; the transcript row wins because it
+/// is read first and carries the full message shape.
 async fn durable_writes(harness: &Harness, child: &str) -> Vec<Value> {
-    let mut rows = Vec::new();
+    let mut rows: Vec<(String, Value)> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
     let mut cursor = None;
     loop {
         let page = harness
@@ -35,18 +43,36 @@ async fn durable_writes(harness: &Harness, child: &str) -> Vec<Value> {
             })
             .await
             .expect("messages");
-        rows.extend(page.items.into_iter().filter(|message| {
-            message["type"] == "synthetic"
-                && message.pointer("/metadata/source").and_then(Value::as_str) == Some("peer")
-        }));
+        for message in page.items {
+            let peer = message["type"] == "synthetic"
+                && message.pointer("/metadata/source").and_then(Value::as_str) == Some("peer");
+            if peer {
+                let id = message_id(&message);
+                if seen.insert(id.clone()) {
+                    rows.push((id, message));
+                }
+            }
+        }
         match page.cursor.next {
             Some(next) => cursor = Some(next),
             None => break,
         }
     }
-    let mut inbox: Vec<Value> = harness.store.list_inbox(child).await.expect("inbox");
-    rows.append(&mut inbox);
-    rows
+    let inbox: Vec<Value> = harness.store.list_inbox(child).await.expect("inbox");
+    for item in inbox {
+        let id = message_id(&item);
+        if seen.insert(id.clone()) {
+            rows.push((id, item));
+        }
+    }
+    rows.into_iter().map(|(_, row)| row).collect()
+}
+
+fn message_id(row: &Value) -> String {
+    row["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("row carries an id: {row}"))
+        .to_owned()
 }
 
 /// Poll until the conserved durable total reaches `expected` (the child actor

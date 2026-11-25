@@ -511,6 +511,23 @@ impl Harness {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
+
+    /// Waits until `count` events of `kind` were published.
+    ///
+    /// Events are published only after their durable row commits, so a test
+    /// that observes a committed row may still be ahead of the event that
+    /// describes it.
+    pub(crate) async fn wait_for_events(&self, kind: &str, count: usize) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while self.sink.count(kind) < count {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for {count} {kind} events, saw {}",
+                self.sink.count(kind)
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
 }
 
 pub(crate) fn path(path: &Path) -> String {
