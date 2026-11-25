@@ -87,10 +87,12 @@ type MessageTimelineProps = {
   onUnpin: () => void
   onUserScroll: (target?: EventTarget | null) => void
   onHistoryScroll: () => void
+  onLayoutSettled?: () => void
   onSelectionInteraction: (event: MouseEvent) => void
   pinned: boolean
   centered: boolean
   reserveReviewToggle: boolean
+  setCanBootstrap?: (fn: () => boolean) => void
   setContentRef: (el: HTMLDivElement) => void
   bottomInset?: number
   setVisibleRef?: (el: HTMLDivElement | undefined) => void
@@ -197,6 +199,8 @@ function MessageTimelineView(
     onSelectionInteraction: props.onSelectionInteraction,
     onUserScroll: props.onUserScroll,
     onHistoryScroll: props.onHistoryScroll,
+    onLayoutSettled: props.onLayoutSettled,
+    setCanBootstrap: props.setCanBootstrap,
     canRenderImmediately: (row, disclosure) => {
       if (
         Predicate.isTagged(row, "TurnGap") ||

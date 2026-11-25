@@ -333,7 +333,10 @@ Authorization is centralized in `SessionPolicy::can_message(from, to)`:
 `coordinator_scope` is the subtree rooted at the coordinator's parent (its
 siblings and their descendants), fixed at spawn time and stored on the session.
 
-Delivery: a `peer` inbox row with `sender_session_id`, `sender_agent`, `kind`.
+Delivery: a `synthetic` inbox row (`metadata.source="peer"`) carrying
+`sender_session_id`, `sender_agent`, `kind`; `peer` was an early inbox kind and
+legacy rows are still promoted as `synthetic`, because the message union has no
+`peer` type.
 The target gets a `<peer from="ses_…" agent="…" kind="…">text</peer>` block.
 Peer messages are not user messages; they never inherit user permissions and
 are marked `metadata.source="peer"` in the transcript. `siblings.wake=false`

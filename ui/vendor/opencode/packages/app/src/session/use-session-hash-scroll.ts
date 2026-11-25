@@ -18,6 +18,8 @@ export const useSessionHashScroll = (input: {
   follow: { unpin: () => void; toBottom: () => void }
   scroller: () => HTMLDivElement | undefined
   anchor: (id: string) => string
+  /** The view restored a mid-history position, so an empty hash must not force the end. */
+  restoredScroll?: () => boolean
   revealMessage?: (id: string) => void
   scheduleScrollState: (el: HTMLDivElement) => void
   consumePendingMessage: (key: string) => string | undefined
@@ -26,6 +28,35 @@ export const useSessionHashScroll = (input: {
   const messageById = createMemo(() => new Map(visibleUserMessages().map((m) => [m.id, m])))
   let pendingKey = ""
   let clearing = false
+  // Targets a load already ran for, so a target history cannot produce does not page forever.
+  const loadedTargets = new Set<string>()
+  // The last target the view gave up on; it falls back once instead of retrying or stranding at 0.
+  let staleTarget = ""
+
+  function staleToBottom(targetId: string) {
+    if (staleTarget === targetId) return
+    staleTarget = targetId
+    clearing = true
+    clearMessageHash()
+    input.follow.toBottom()
+    const el = input.scroller()
+
+    if (el) input.scheduleScrollState(el)
+  }
+
+  // Targets belong to one session; a switch must not inherit a previous session's give-up state.
+  let targetSession = input.sessionKey()
+  const targetsFor = () => {
+    const key = input.sessionKey()
+
+    if (key !== targetSession) {
+      targetSession = key
+      loadedTargets.clear()
+      staleTarget = ""
+    }
+
+    return key
+  }
 
   const location = useLocation<{ reveal?: string }>()
   const navigate = useNavigate()
@@ -119,6 +150,8 @@ export const useSessionHashScroll = (input: {
     if (!hash) {
       // A route that opens the session on a tool call leaves the scroll to the timeline, which reveals the call.
       if (location.state?.reveal) return
+      // A remount that restored a mid-history position must not be dragged to the end by an empty hash.
+      if (input.restoredScroll?.()) return
 
       input.follow.toBottom()
       const el = input.scroller()
@@ -131,15 +164,17 @@ export const useSessionHashScroll = (input: {
     const messageId = messageIdFromHash(hash)
 
     if (messageId) {
-      input.follow.unpin()
       const msg = messageById().get(messageId)
 
+      // Resolve first: unpinning for a target that cannot be shown would strand the reader.
       if (msg) {
+        input.follow.unpin()
         scrollToMessage(msg, behavior)
 
         return
       }
 
+      // History is exhausted, so this target can never appear; the load effect falls back once.
       return
     }
 
@@ -212,6 +247,8 @@ export const useSessionHashScroll = (input: {
 
     if (!sessionID || !input.messagesReady()) return
 
+    // Give-up state belongs to one session; a switch must not inherit it.
+    targetsFor()
     visibleUserMessages()
 
     let targetId = input.pendingMessage()
@@ -220,10 +257,20 @@ export const useSessionHashScroll = (input: {
 
     if (!targetId) return
 
-    if (messageById().has(targetId)) return
+    if (messageById().has(targetId)) {
+      loadedTargets.delete(targetId)
+      if (staleTarget === targetId) staleTarget = ""
+      return
+    }
 
-    if (!input.historyMore() || input.historyLoading()) return
+    // A stale or hidden target must not pin the view: clear it and land on the end once.
+    if (!input.historyMore()) return staleToBottom(targetId)
 
+    if (input.historyLoading()) return
+
+    // A load already ran for this target without producing it, so it cannot appear by paging further.
+    if (loadedTargets.has(targetId)) return staleToBottom(targetId)
+    loadedTargets.add(targetId)
     void input.loadMore(sessionID)
   })
 

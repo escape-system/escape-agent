@@ -424,7 +424,8 @@ export function ActiveSessionComposerRegion(props: {
   // Peer messages and the lane pill are session-scoped: they follow the routed
   // session, not the open tab.
   const sessionID = () => props.session.data.info()?.id
-  const peerFeed = createPeerFeed(sessionID)
+  const peerSessionID = () => (props.session.data.isChild() ? sessionID() : undefined)
+  const peerFeed = createPeerFeed(peerSessionID)
   const [peersOpen, setPeersOpen] = createSignal(false)
 
   // Only the server's LocationNotFoundError for the session's own Location replaces the composer.
@@ -571,37 +572,46 @@ export function ActiveSessionComposerRegion(props: {
                     {(id) => <SessionLanePill sessionID={id()} />}
                   </Show>
                 }
-                peer={{ count: peerFeed.unread, onOpen: () => setPeersOpen(true) }}
+                peer={{
+                  count: peerFeed.unread,
+                  queued: () => peerFeed.queued().length,
+                  onOpen: () => setPeersOpen(true),
+                }}
               />
             )}
           </Show>
         }
         above={
-          <Show when={!missing() && !props.session.data.isChild()}>
-            <SessionComposerLane>
-              <Show when={sessionID()} keyed>
-                {(id) => (
-                  <>
-                    <SessionGoalChip sessionID={id} />
-                    <SessionLanePill sessionID={id} />
-                  </>
-                )}
-              </Show>
-              <SessionActivityChips
-                subagents={subagents()}
-                shells={shells()}
-                shell={shell}
-                onOpen={open}
-                onStop={stop}
-                onEmpty={props.model.region.focusPrompt}
-              />
-              <Show when={todosVisible()}>
-                <SessionTodoPill todos={todos()} />
-              </Show>
-              <SessionPluginPills session={props.view()} screen={props.screen} alignment={alignment} />
-            </SessionComposerLane>
-            <SessionQueuePanel queue={props.model.queue} hidden={props.model.region.state.blocked()} />
-          </Show>
+          <>
+            <Show when={!missing() && !props.session.data.isChild()}>
+              <SessionComposerLane>
+                <Show when={sessionID()} keyed>
+                  {(id) => (
+                    <>
+                      <SessionGoalChip sessionID={id} />
+                      <SessionLanePill sessionID={id} />
+                    </>
+                  )}
+                </Show>
+                <SessionActivityChips
+                  subagents={subagents()}
+                  shells={shells()}
+                  shell={shell}
+                  onOpen={open}
+                  onStop={stop}
+                  onEmpty={props.model.region.focusPrompt}
+                />
+                <Show when={todosVisible()}>
+                  <SessionTodoPill todos={todos()} />
+                </Show>
+                <SessionPluginPills session={props.view()} screen={props.screen} alignment={alignment} />
+              </SessionComposerLane>
+              <SessionQueuePanel queue={props.model.queue} hidden={props.model.region.state.blocked()} />
+            </Show>
+            <Show when={!missing() && props.session.data.isChild()}>
+              <SessionQueuePanel queue={props.model.queue} hidden={props.model.region.state.blocked()} />
+            </Show>
+          </>
         }
         composer={
           <Show

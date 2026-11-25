@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
-use std::time::{Instant, UNIX_EPOCH};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use super::super::Symbol;
 use super::super::files::{collect_code_files, relative_to};
@@ -11,6 +11,8 @@ use crate::{ToolContext, ToolError};
 
 /// Maximum number of workspaces cached in the native graph index pool.
 const MAX_CACHED_ROOTS: usize = 2;
+/// Idle cached workspaces older than this are evicted on the next lookup.
+const MAX_IDLE_AGE: Duration = Duration::from_secs(600);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct FileStamp {
@@ -318,6 +320,19 @@ pub(super) fn with_index<T>(
         let mut guard = cache_pool()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let stale: Vec<PathBuf> = guard
+            .iter()
+            .filter(|(k, ws)| {
+                *k != &canonical
+                    && ws
+                        .try_lock()
+                        .is_ok_and(|g| g.last_used.elapsed() > MAX_IDLE_AGE)
+            })
+            .map(|(k, _)| k.clone())
+            .collect();
+        for key in stale {
+            guard.remove(&key);
+        }
         while guard.len() >= MAX_CACHED_ROOTS && !guard.contains_key(&canonical) {
             let oldest_key = guard
                 .iter()

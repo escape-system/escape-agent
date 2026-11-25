@@ -24,7 +24,8 @@ pub(crate) const DEFAULT_LIMIT: usize = 50;
 pub(crate) const MAX_LIMIT: usize = 200;
 const READ_POOL_SIZE: usize = 4;
 const BUSY_TIMEOUT_MS: u64 = 5_000;
-const CACHE_SIZE_KIB: i32 = -32_768;
+const WRITER_CACHE_SIZE_KIB: i32 = -8_192;
+const READER_CACHE_SIZE_KIB: i32 = -2_048;
 const READ_RETRIES: u32 = 4;
 
 type WriteJob = Box<dyn FnOnce(&mut Connection) + Send>;
@@ -304,8 +305,9 @@ fn open_file(path: PathBuf) -> Result<Store, StoreError> {
     }
     let lock = acquire_lock(&path)?;
     let mut writer_connection = Connection::open(&path)?;
-    configure(&writer_connection, false)?;
+    configure(&writer_connection, false, WRITER_CACHE_SIZE_KIB)?;
     migrate(&mut writer_connection)?;
+    let _ = writer_connection.execute_batch("PRAGMA shrink_memory;");
     let readers = open_readers(&path)?;
     let writer = spawn_writer(writer_connection);
     if !existed {
@@ -329,12 +331,12 @@ fn open_memory() -> Result<Store, StoreError> {
         MEMORY_COUNTER.fetch_add(1, AtomicOrdering::Relaxed)
     );
     let mut writer_connection = Connection::open(&name)?;
-    configure(&writer_connection, true)?;
+    configure(&writer_connection, true, WRITER_CACHE_SIZE_KIB)?;
     migrate(&mut writer_connection)?;
     let mut connections = Vec::with_capacity(READ_POOL_SIZE);
     for _ in 0..READ_POOL_SIZE {
         let connection = Connection::open(&name)?;
-        configure(&connection, true)?;
+        configure(&connection, true, READER_CACHE_SIZE_KIB)?;
         connections.push(Mutex::new(connection));
     }
     let writer = spawn_writer(writer_connection);
@@ -355,7 +357,7 @@ fn open_readers(path: &Path) -> Result<ReadPool, StoreError> {
     let mut connections = Vec::with_capacity(READ_POOL_SIZE);
     for _ in 0..READ_POOL_SIZE {
         let connection = Connection::open(path)?;
-        configure(&connection, false)?;
+        configure(&connection, false, READER_CACHE_SIZE_KIB)?;
         connections.push(Mutex::new(connection));
     }
     Ok(ReadPool {
@@ -364,13 +366,13 @@ fn open_readers(path: &Path) -> Result<ReadPool, StoreError> {
     })
 }
 
-fn configure(connection: &Connection, memory: bool) -> Result<(), StoreError> {
+fn configure(connection: &Connection, memory: bool, cache_kib: i32) -> Result<(), StoreError> {
     connection.busy_timeout(Duration::from_millis(BUSY_TIMEOUT_MS))?;
     let journal_mode = if memory { "MEMORY" } else { "WAL" };
     connection.execute_batch(&format!(
         "PRAGMA journal_mode={journal_mode};\n\
          PRAGMA synchronous=NORMAL;\n\
-         PRAGMA cache_size={CACHE_SIZE_KIB};\n\
+         PRAGMA cache_size={cache_kib};\n\
          PRAGMA temp_store=MEMORY;\n\
          PRAGMA foreign_keys=ON;"
     ))?;

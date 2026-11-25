@@ -3,7 +3,7 @@ import { ServerConnection } from "@/runtime/server/registry"
 import { authTokenFromCredentials } from "./api"
 import { ClientError, isUnauthorizedError, OpenCode } from "@opencode/client"
 import { Match } from "effect"
-import { Accessor, createEffect, createSignal, onCleanup } from "solid-js"
+import { Accessor, createEffect, createSignal, onCleanup, untrack } from "solid-js"
 import { createStore, reconcile } from "solid-js/store"
 
 export type ServerHealth = {
@@ -31,10 +31,15 @@ const defaultRetryDelayMs = 100
 
 const cacheMs = 750
 
-const healthCache = new Map<
-  string,
-  { at: number; done: boolean; fetch: typeof globalThis.fetch; promise: Promise<ServerHealth> }
->()
+type HealthCacheEntry = {
+  at: number
+  done: boolean
+  healthy?: boolean
+  fetch: typeof globalThis.fetch
+  promise: Promise<ServerHealth>
+}
+
+const healthCache = new Map<string, HealthCacheEntry>()
 
 function cacheKey(server: ServerConnection.HttpBase) {
   return `${server.url}\n${server.password ?? ""}`
@@ -162,15 +167,30 @@ export function useCheckServerHealth() {
     const hit = healthCache.get(key)
     const now = Date.now()
 
-    if (hit && hit.fetch === fetcher && (!hit.done || now - hit.at < cacheMs)) return hit.promise
+    if (hit && hit.fetch === fetcher && (!hit.done || (hit.healthy !== false && now - hit.at < cacheMs))) {
+      return hit.promise
+    }
 
-    const promise = checkServerHealth(http, fetcher).finally(() => {
-      const next = healthCache.get(key)
-
-      if (!next || next.promise !== promise) return
-      next.done = true
-      next.at = Date.now()
-    })
+    const promise = checkServerHealth(http, fetcher).then(
+      (res) => {
+        const next = healthCache.get(key)
+        if (next && next.promise === promise) {
+          next.done = true
+          next.healthy = res.healthy
+          next.at = Date.now()
+        }
+        return res
+      },
+      (error) => {
+        const next = healthCache.get(key)
+        if (next && next.promise === promise) {
+          next.done = true
+          next.healthy = false
+          next.at = Date.now()
+        }
+        throw error
+      },
+    )
 
     healthCache.set(key, { at: now, done: false, fetch: fetcher, promise })
 
@@ -233,6 +253,15 @@ export function createServerHealth(
       if (!list.some((conn) => conn.key === key)) endpoints.delete(key)
     }
 
+    // A Solid store read of an ABSENT key is not tracked, so a component that read `health[key]` before the first
+    // probe result would never re-render when it arrives: that is the frozen "Loading…" screen with no retry.
+    // Seeding a probe marker makes the key exist (and stay tracked) from the first render. `checking` keeps the
+    // pending pane's "connecting" copy, and `untrack` keeps this loop from re-running on every probe result.
+    for (const conn of list) {
+      if (conn.stage && conn.stage !== "ready") continue
+      if (untrack(() => status[conn.key]) === undefined) setStatus(conn.key, { healthy: false, checking: true })
+    }
+
     let dead = false
 
     const refresh = async () => {
@@ -245,7 +274,14 @@ export function createServerHealth(
             return
           }
 
-          const result = await check(conn.http)
+          // A probe that rejects is still a failed probe: it must commit a retryable outage instead of leaving the
+          // key on its previous value (undefined at boot) for another whole poll interval, or forever.
+          let result: ServerHealth
+          try {
+            result = await check(conn.http)
+          } catch {
+            result = { healthy: false }
+          }
           results[conn.key] = result
 
           if (!dead) setStatus(conn.key, reconcile(result))

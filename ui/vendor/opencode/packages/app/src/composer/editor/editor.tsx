@@ -282,8 +282,8 @@ export function ComposerEditor(props: ComposerEditorProps) {
           <div
             data-component="composer-scroll"
             data-scrollable
-            class="relative overflow-y-auto"
-            classList={{ "max-h-[180px]": historyLayout.height === undefined }}
+            class="relative"
+            classList={{ "overflow-y-auto max-h-[180px]": historyLayout.height === undefined }}
             onScroll={updateScroll}
             ref={viewport}
           >

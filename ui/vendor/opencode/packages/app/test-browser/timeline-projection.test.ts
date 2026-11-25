@@ -305,6 +305,20 @@ for (const factory of [createTimelineProjection, createReactiveTimelineProjectio
         verify()
         setState("messages", [assistant("new-session", [{ type: "text", text: "New session" }])])
         verify()
+        setState("messages", [
+          { id: "user_peer", type: "user", text: "Start child", time: { created: 1 } },
+          assistant("ans_peer", [{ type: "text", text: "Working on it" }]),
+          {
+            id: "syn_peer",
+            type: "synthetic",
+            text: "Peer instruction line 1\nPeer instruction line 2",
+            metadata: { source: "peer", from: "user" },
+            time: { created: 3 },
+          },
+        ])
+        verify()
+        const peerRows = projection.rows()
+        expect(peerRows.some((row) => row._tag === "Notice" && row.messageID === "syn_peer")).toBe(true)
         dispose()
       })
     })

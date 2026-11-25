@@ -153,6 +153,16 @@ export interface MockServerConfig {
   password?: Resolvable<string>
   // Serves GET /auth/connect/:code: `code` redeems once for `token` (send it as the password); others answer 401.
   pairing?: { code: string; token: string }
+  // Agentic extension routes the typed HttpApi surface does not declare. A built-mode session queries all of
+  // them on mount, so the mock answers the empty documented shape instead of failing the test with
+  // "Unmocked API request". Shapes are the ones `src/session/agent-panels/agent-wire.ts` parses.
+  goal?: (sessionID: string) => unknown
+  lanes?: unknown[]
+  observer?: unknown
+  observerRepairs?: unknown[]
+  subagentTree?: (sessionID: string) => unknown
+  // `GET /api/models/registry` (bare or `{data}`): `{models: []}` renders as "no catalog", never a 501.
+  modelsRegistry?: unknown
 }
 
 export type MockPtyInfo = {
@@ -206,6 +216,46 @@ type MockStreamWindow = Window & {
   __testSseTransports?: Record<string, { command: (input: MockSendCommand) => void }>
   // Per-origin mock event streams; in-page benchmark probes push through them directly.
   __mockServerStreams?: Record<string, MockStream>
+}
+
+/**
+ * Answers the routes with no entry in the typed mock surface. Only GET/HEAD is answered: a write to one of
+ * these paths still reaches the transport and fails loudly instead of being silently faked.
+ */
+function extensionAnswer(config: MockServerConfig, url: URL): { data: unknown } | undefined {
+  const sessionID = url.searchParams.get("sessionID") ?? ""
+
+  switch (url.pathname) {
+    case "/api/models/registry":
+      return {
+        data: config.modelsRegistry ?? {
+          models: [],
+          chain: [],
+          chains: {},
+          fallback: { on: [], maxHops: 0 },
+          agentNotes: {},
+          quota: {},
+          usage: { windowHours: 0 },
+          modelHealth: [],
+          keyHealth: [],
+        },
+      }
+    case "/api/experimental/goal":
+      return { data: config.goal?.(sessionID) ?? null }
+    case "/api/experimental/goal/history":
+      return { data: [] }
+    case "/api/experimental/lane":
+      return { data: config.lanes ?? [] }
+    case "/api/experimental/observer":
+      return { data: config.observer ?? {} }
+    case "/api/experimental/observer/repairs":
+      return { data: config.observerRepairs ?? [] }
+    case "/api/experimental/subagent/tree":
+      // `parseSubagentTree` rejects a body without `root`, so the default names the requested session.
+      return { data: config.subagentTree?.(sessionID) ?? { root: sessionID, nodes: [] } }
+    default:
+      return undefined
+  }
 }
 
 export async function mockOpenCodeServer(page: Page, config: MockServerConfig) {
@@ -396,6 +446,18 @@ export async function mockOpenCodeServer(page: Page, config: MockServerConfig) {
     }
 
     const body = route.request().postDataBuffer()
+
+    // Give-backs for the extension routes (see `extensionAnswer`); everything else stays on the transport.
+    if (route.request().method() === "GET" || route.request().method() === "HEAD") {
+      const extension = extensionAnswer(config, url)
+
+      if (extension)
+        return route.fulfill({
+          status: 200,
+          headers: { ...corsHeaders, "content-type": "application/json" },
+          json: extension,
+        })
+    }
 
     const response = await transport.handler(
       new Request(url, {

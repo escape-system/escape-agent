@@ -48,6 +48,7 @@ import { usePlatform } from "@/runtime/platform/platform"
 import { useServer } from "@/runtime/server/current"
 import { reviewGlyphFill, SessionReviewToggle } from "./header/session-header-actions"
 import { createTimelineCache } from "./timeline/cache"
+import { SessionAgentPanelsMobile } from "./agent-panels/agent-drawer"
 import { createPanelMotion, holdLandingWidth, panelOpacity } from "@/shell/panel-motion"
 
 export function SessionScreenView(props: { session: SessionModel }) {
@@ -303,6 +304,8 @@ function SessionScreenContent(props: {
           onUnpin={timeline.view.unpin}
           onUserScroll={timeline.view.markUserScroll}
           onHistoryScroll={timeline.view.onHistoryScroll}
+          onLayoutSettled={timeline.view.onLayoutSettled}
+          setCanBootstrap={timeline.view.setCanBootstrap}
           onSelectionInteraction={timeline.view.selectionInteraction}
           pinned={timeline.view.pinned()}
           centered={screen.centered()}
@@ -353,23 +356,29 @@ function SessionScreenContent(props: {
       />
       <TimelineQuote controller={quote} />
       <Show when={!isDesktop() && !!session.identity.params.id && !bottomMobileTabs()}>{mobileTabs()}</Show>
-      {/* Narrow screens hide the timeline header, so the session's location gets its own bar. */}
+      {/* Narrow screens hide the timeline header, so the session's location gets its own bar. The agent panels
+          live in that hidden header, so the bar also hosts their mobile entry point. */}
       <Show when={!isDesktop() && !!session.identity.params.id && mobileView() === "session"}>
         <div
           data-slot="session-location-bar"
-          class="flex h-9 shrink-0 items-center border-b border-v2-border-border-base px-2"
+          class="flex min-h-11 shrink-0 items-center gap-1 border-b border-v2-border-border-base px-2"
         >
-          <SessionLocation
-            project={location.project()}
-            directory={location.directory()}
-            compact={!!session.data.info()?.parentID}
-            context={{
-              get session() {
-                return props.view()
-              },
-              screen: props.screen,
-            }}
-          />
+          <div class="min-w-0 flex-1">
+            <SessionLocation
+              project={location.project()}
+              directory={location.directory()}
+              compact={!!session.data.info()?.parentID}
+              context={{
+                get session() {
+                  return props.view()
+                },
+                screen: props.screen,
+              }}
+            />
+          </div>
+          <Show when={session.identity.params.id}>
+            {(id) => <SessionAgentPanelsMobile sessionID={id()} />}
+          </Show>
         </div>
       </Show>
       {/* Surface query errors without suspending session metadata while messages load. */}

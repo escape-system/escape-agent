@@ -12,6 +12,7 @@ description = "HTTP, SSE and static server for opencode-rust"
 async-trait.workspace = true
 axum.workspace = true
 base64.workspace = true
+flate2.workspace = true
 futures-util.workspace = true
 hex.workspace = true
 hmac.workspace = true
@@ -46,7 +47,6 @@ tracing.workspace = true
 url.workspace = true
 
 [dev-dependencies]
-flate2.workspace = true
 http-body-util.workspace = true
 tempfile.workspace = true
 tokio-tungstenite.workspace = true

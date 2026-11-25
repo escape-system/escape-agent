@@ -25,10 +25,19 @@ pub struct CachedSignatureEntry {
     pub session_key: Option<String>,
 }
 
+/// Hard cap on in-memory & persisted signature entries to prevent unbounded RAM growth.
+const MAX_CACHE_ENTRIES: usize = 2_000;
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct PersistedSignatureStore {
     version: u32,
     entries: HashMap<String, CachedSignatureEntry>,
+}
+
+#[derive(Serialize)]
+struct BorrowedSignatureStore<'a> {
+    version: u32,
+    entries: &'a HashMap<String, CachedSignatureEntry>,
 }
 
 /// Dual-TTL signature cache keyed by `(session_key, text_hash)` with global text-hash fallback.
@@ -59,13 +68,15 @@ impl SignatureCache {
                 }
             }
         }
-        Ok(Self {
+        let mut cache = Self {
             cfg,
             path,
             entries,
             dirty: false,
             last_write_ms: now_ms,
-        })
+        };
+        cache.evict_excess();
+        Ok(cache)
     }
 
     /// Default path `<config_dir>/antigravity-signature-cache.json`.
@@ -107,7 +118,26 @@ impl SignatureCache {
                 .insert(format!("{session_key}:{text_hash}"), entry.clone());
         }
         self.entries.insert(format!("global:{text_hash}"), entry);
+        self.evict_excess();
         self.dirty = true;
+    }
+
+    fn evict_excess(&mut self) {
+        if self.entries.len() <= MAX_CACHE_ENTRIES {
+            return;
+        }
+        let excess = self.entries.len() - MAX_CACHE_ENTRIES;
+        let mut by_age: Vec<(i64, String)> = self
+            .entries
+            .iter()
+            .map(|(k, v)| (v.last_accessed, k.clone()))
+            .collect();
+        if excess < by_age.len() {
+            by_age.select_nth_unstable_by(excess, |a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+            for (_, key) in &by_age[..excess] {
+                self.entries.remove(key);
+            }
+        }
     }
 
     /// Look up a valid cached signature by exact `(session_key, thinking_text)` or global text hash.
@@ -165,9 +195,9 @@ impl SignatureCache {
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            let payload = PersistedSignatureStore {
+            let payload = BorrowedSignatureStore {
                 version: 1,
-                entries: self.entries.clone(),
+                entries: &self.entries,
             };
             let tmp = path.with_extension("json.tmp");
             std::fs::write(&tmp, serde_json::to_string(&payload)?)?;
@@ -218,5 +248,40 @@ mod tests {
             .get("ses_other", "Let me inspect main.rs carefully.", 2000)
             .expect("global fallback");
         assert_eq!(fallback.signature, "sig_abc_123");
+    }
+
+    #[test]
+    fn signature_cache_bounds_entries_at_capacity() {
+        let cfg = SignatureCacheConfig::default();
+        let mut cache = SignatureCache::load(None, cfg, 1_000).expect("load");
+        for i in 0..=MAX_CACHE_ENTRIES {
+            let now = 1_000 + i64::try_from(i).expect("idx");
+            cache.store(
+                &format!("ses_{i}"),
+                &format!("unique thinking prompt #{i}"),
+                "sig_val",
+                ModelFamily::Gemini,
+                now,
+            );
+        }
+        assert_eq!(cache.entries.len(), MAX_CACHE_ENTRIES);
+        let check_now = 1_000 + i64::try_from(MAX_CACHE_ENTRIES).expect("idx");
+        assert!(
+            cache
+                .get("ses_0", "unique thinking prompt #0", check_now)
+                .is_none(),
+            "oldest entry must be evicted when capacity is exceeded"
+        );
+        let newest = MAX_CACHE_ENTRIES;
+        assert!(
+            cache
+                .get(
+                    &format!("ses_{newest}"),
+                    &format!("unique thinking prompt #{newest}"),
+                    check_now,
+                )
+                .is_some(),
+            "most recent entry must remain cached"
+        );
     }
 }

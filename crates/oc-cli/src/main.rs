@@ -14,7 +14,11 @@ mod serve;
 mod service;
 
 use clap::Parser;
+use oc_alloc::MiMalloc;
 use tracing_subscriber::EnvFilter;
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
 
 use crate::antigravity_cmd::run_auth;
 use crate::auth::service_get;
@@ -22,8 +26,18 @@ use crate::cli::{ChatOptions, Cli, Command, RunOptions, ServeOptions, ServiceCom
 use crate::run::{run_chat, run_once};
 use crate::serve::serve;
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
+    oc_alloc::configure_low_footprint();
+    let workers = std::thread::available_parallelism().map_or(4, |count| count.get().min(8));
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(workers)
+        .max_blocking_threads(32)
+        .enable_all()
+        .build()?;
+    runtime.block_on(async_main())
+}
+
+async fn async_main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let default_level = match &cli.command {
         Some(Command::Serve { .. } | Command::Service { .. }) => "info",

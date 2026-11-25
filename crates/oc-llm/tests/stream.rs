@@ -40,6 +40,14 @@ const FIXTURE: &str = r#"{
         "cost": {"text": {"input": {"price": 3}, "output": {"price": 15}}},
         "api": {"messages": {"base_url": "http://unused.invalid", "sdk": {"aisdk": "@ai-sdk/anthropic"}}}
       },
+      "hungerg-free": {
+        "id": "hungerg-free", "type": "chat", "name": "HungerG Free", "release_date": "2026-11-24",
+        "modalities": {"input": ["text"], "output": ["text"]},
+        "capabilities": {"tools": {"supported": true}, "reasoning": {"supported": true, "effort": ["max"]}, "temperature": true},
+        "limit": {"context": 1000000, "output": 65536},
+        "cost": {"text": {"input": {"price": 0}, "output": {"price": 0}}},
+        "api": {"chat-completions": {"base_url": "http://unused.invalid", "sdk": {"aisdk": "@ai-sdk/openai-compatible"}}}
+      },
       "gemini-pro": {
         "id": "gemini-pro", "type": "chat", "name": "Gemini", "release_date": "2025-02-01",
         "modalities": {"input": ["text"], "output": ["text"]},
@@ -298,6 +306,29 @@ async fn openai_stream_text_tool_and_usage() {
     assert_eq!(body["stream"], true);
     assert_eq!(body["tools"][0]["function"]["name"], "read");
     assert_eq!(body["messages"][0]["role"], "system");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn openai_hungerg_max_effort_reaches_the_wire() {
+    let (base, server, fake) = spawn().await;
+    let client = LlmClient::new().unwrap();
+    let events = collect(
+        client
+            .stream(request("test/hungerg-free#max", base))
+            .await
+            .unwrap(),
+    )
+    .await;
+    server.abort();
+
+    assert!(events.iter().any(|event| matches!(
+        event,
+        LlmEvent::Finish { reason, .. } if reason == "tool-calls"
+    )));
+    let bodies = fake.bodies.lock().unwrap();
+    let body = bodies.last().expect("request body");
+    assert_eq!(body["model"], "hungerg-free");
+    assert_eq!(body["reasoning_effort"], "max");
 }
 
 #[tokio::test(flavor = "multi_thread")]

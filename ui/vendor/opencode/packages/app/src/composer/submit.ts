@@ -269,7 +269,8 @@ export function createComposerSubmit(input: ComposerSubmitInput) {
       if (held()) return Promise.resolve(void setHeld(false))
 
       if (input.adapter.kind !== "active-session") return Promise.resolve()
-      const session = input.adapter.session()
+      const adapter = input.adapter
+      const session = adapter.session()
       const state = stopState(session.id)
 
       // A second click while the first request is pending must not send another interrupt.
@@ -281,12 +282,12 @@ export function createComposerSubmit(input: ComposerSubmitInput) {
       // Clear the run now so the stop reads as immediate, following the send path's optimistic status write. The store
       // keeps the request durable: every status read reports idle until an execution boundary settles it, so a lagging
       // running event cannot make the session look busy again. A rejected request releases it and puts the state back.
-      const wasRunning = input.adapter.working()
+      const wasRunning = adapter.working()
 
       if (wasRunning) session.data.session.requestStop([session.id])
 
       return Promise.resolve()
-        .then(() => input.adapter.interrupt())
+        .then(() => adapter.interrupt())
         .then(
           // A fulfilled request means the run is stopped, including when the server had nothing live to interrupt.
           () => undefined,

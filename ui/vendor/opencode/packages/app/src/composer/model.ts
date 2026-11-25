@@ -26,8 +26,6 @@ import { parseSessionMention } from "@opencode/util/session-mention"
 import { createKnownServerSessions, createServerSessionEntries } from "@/shell/commands/palette"
 import { matchesSessionTitle } from "./session-match"
 import type { ComposerAdapter, ComposerControls, ComposerQueue } from "./adapter"
-import { isAttachment } from "./prompt-parts"
-import { isCommentItem } from "./state"
 import type { PromptHistoryComment } from "./history/entry"
 import { createComposerHistory } from "./history/store"
 import { createComposerSubmit } from "./submit"
@@ -97,23 +95,6 @@ export function createComposerModel(adapter: ComposerAdapter, options?: { queue?
     const active = plugins.files.active()
 
     return active ? [active, ...all.filter((path) => path !== active)] : all
-  })
-
-  const attachments = createMemo(() => prompt.current().filter(isAttachment))
-
-  const commentCount = createMemo(() => {
-    if (mode() === "shell") return 0
-
-    return prompt.context.items().filter(isCommentItem).length
-  })
-
-  const blank = createMemo(() => {
-    const text = prompt
-      .current()
-      .map((part) => ("content" in part ? part.content : ""))
-      .join("")
-
-    return text.trim().length === 0 && attachments().length === 0 && commentCount() === 0
   })
 
   const stopping = createMemo(() => adapter.working())

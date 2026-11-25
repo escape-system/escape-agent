@@ -20,6 +20,7 @@ const view = (count: () => number): SessionQueueView => ({
   undo: () => undefined,
   edit: () => false,
   reorder: async () => undefined,
+  reorderable: () => true,
 })
 
 export default {

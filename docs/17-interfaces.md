@@ -49,8 +49,17 @@ public surface; `cargo doc -p <crate> --no-deps` is the reference.
   permissions/directory/path/revert/archived`.
 - Messages: `append_message`, `get_message`, `list_messages`,
   `update_message`; `MessageQuery::new`.
-- Inbox: `enqueue`, `list_inbox`, `promote_inbox`, `cancel_inbox`,
-  `set_delivery`; duplicate id → `Conflict`.
+- Inbox: `enqueue`, `enqueue_steer`, `list_inbox`, `promote_inbox`,
+  `cancel_inbox`, `set_delivery`; duplicate id → `Conflict`. `enqueue_steer`
+  is additive: one transaction commits the `steer` inbox row and its message
+  row (payload + `time.created`), so a failed admission leaves no executable
+  row behind; `queue` delivery and unknown kinds are `Invalid`.
+- Inbox wire types: `peer` and `observer` are additive inbox kinds promoted
+  (and reported by `list_inbox`/`enqueue_steer`) as `synthetic`, because the
+  message union carries no such type; the sender identity stays in the payload
+  (`metadata.source`, `from`, `agent`, `kind`). Promotion still happens before
+  `session.inbox.delivered` is published, so the durable event order is
+  unchanged.
 - Events: `append_event` (persists + projects + dense seq in one transaction),
   `events_after`.
 - `promote_inbox` allocates a fresh seq, deletes the inbox row, inserts the

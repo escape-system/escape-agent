@@ -2088,7 +2088,7 @@ function ExecuteDetails(props: { code: string; output: string; error?: string; c
           <span data-slot="execute-details-meta">{i18n.plural("ui.tool.execute.calls", props.calls)}</span>
         </div>
       </DialogHeader>
-      <DialogBody class="min-h-0 flex-none overflow-y-auto">
+      <DialogBody class="min-h-0 flex-1 overflow-y-auto">
         <div data-component="execute-details" style={{ "--execute-details-number-width": `${numberDigits()}ch` }}>
           <ExecuteDetailsSection
             label={i18n.t("ui.tool.execute.code")}

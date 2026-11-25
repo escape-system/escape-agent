@@ -4,8 +4,8 @@ use std::time::Duration;
 
 use axum::body::{Body, to_bytes};
 use axum::http::header::{
-    ACCEPT, ACCEPT_ENCODING, AUTHORIZATION, CONTENT_ENCODING, CONTENT_TYPE, COOKIE, HOST, LOCATION,
-    ORIGIN, SET_COOKIE, VARY, WWW_AUTHENTICATE,
+    ACCEPT, ACCEPT_ENCODING, AUTHORIZATION, CONTENT_ENCODING, CONTENT_TYPE, COOKIE, ETAG, HOST,
+    IF_NONE_MATCH, LOCATION, ORIGIN, SET_COOKIE, VARY, WWW_AUTHENTICATE,
 };
 use axum::http::{Request, StatusCode};
 use base64::Engine;
@@ -1080,4 +1080,65 @@ async fn sse_is_never_compressed() {
         first.contains("\"type\":\"server.connected\""),
         "unexpected first frame: {first:?}"
     );
+}
+
+#[tokio::test]
+async fn static_assets_etag_and_cache_work() {
+    let dir = compression_dist();
+    let app = router(state(None).with_web_dist(dir.path()));
+
+    let first = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/_assets/app-abc.js")
+                .header(ACCEPT_ENCODING, "gzip")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    let etag = first
+        .headers()
+        .get(ETAG)
+        .expect("static response should carry a strong ETag")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    assert!(etag.starts_with('"') && etag.ends_with('"'));
+
+    // Re-requesting with If-None-Match returns 304 Not Modified without re-sending body.
+    let revalidated = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/_assets/app-abc.js")
+                .header(ACCEPT_ENCODING, "gzip")
+                .header(IF_NONE_MATCH, etag.as_str())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(revalidated.status(), StatusCode::NOT_MODIFIED);
+    assert_eq!(revalidated.headers().get(ETAG).unwrap(), &etag);
+    assert_eq!(revalidated.headers().get(VARY).unwrap(), "accept-encoding");
+    let empty_body = to_bytes(revalidated.into_body(), 1024).await.unwrap();
+    assert!(empty_body.is_empty());
+
+    // Subsequent cache hit serves identical content without touching changed disk unless metadata changes.
+    let repeat = app
+        .oneshot(
+            Request::builder()
+                .uri("/_assets/app-abc.js")
+                .header(ACCEPT_ENCODING, "gzip")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(repeat.status(), StatusCode::OK);
+    assert_eq!(repeat.headers().get(ETAG).unwrap(), &etag);
+    assert_eq!(repeat.headers().get(CONTENT_ENCODING).unwrap(), "gzip");
 }

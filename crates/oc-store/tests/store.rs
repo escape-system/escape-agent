@@ -1149,3 +1149,227 @@ async fn promoting_the_same_inbox_item_twice_yields_one_message() {
     );
     assert!(store.list_inbox(&session).await.expect("inbox").is_empty());
 }
+#[tokio::test]
+async fn enqueue_steer_materialises_the_message_in_one_transaction() {
+    let store = Store::open_memory().await.expect("memory store");
+    let session = seed_session(&store, "ses_steer_atomic").await;
+
+    let item = store
+        .enqueue_steer(NewInbox {
+            id: "msg_steer_atomic".to_owned(),
+            session_id: session.clone(),
+            kind: "user".to_owned(),
+            payload: json!({ "text": "run this" }),
+            delivery: Delivery::Steer,
+        })
+        .await
+        .expect("enqueue_steer");
+    assert_eq!(item["id"], "msg_steer_atomic");
+    assert_eq!(item["type"], "user");
+    assert_eq!(item["delivery"], "steer");
+    assert_eq!(item["payload"]["text"], "run this");
+    assert!(item["time"]["created"].as_i64().unwrap() > 0);
+
+    // The message is visible immediately, with the inbox `time.created`
+    // carried into the body exactly like a promoted row.
+    let message = store
+        .get_message(&session, "msg_steer_atomic")
+        .await
+        .expect("get message")
+        .expect("materialised message");
+    assert_eq!(message["type"], "user");
+    assert_eq!(message["text"], "run this");
+    assert_eq!(message["time"]["created"], item["time"]["created"]);
+
+    // The inbox row is the doorbell: the runtime consumes it instead of
+    // promoting a second transcript row.
+    let pending = store.list_inbox(&session).await.expect("list inbox");
+    assert_eq!(ids(&pending), vec!["msg_steer_atomic"]);
+}
+
+#[tokio::test]
+async fn enqueue_steer_rolls_back_both_rows_on_a_message_id_collision() {
+    let store = Store::open_memory().await.expect("memory store");
+    let owner = seed_session(&store, "ses_steer_owner").await;
+    let target = seed_session(&store, "ses_steer_target").await;
+
+    // `session_message.id` is a database-wide primary key, while `enqueue_steer`
+    // only checks `session_inbox` for the duplicate. The message insert must
+    // therefore be able to fail after the inbox insert succeeded — and when it
+    // does, the transaction must leave no executable inbox row behind.
+    store
+        .append_message(new_message(
+            &owner,
+            "msg_steer_collision",
+            "user",
+            "seed",
+            1_000,
+        ))
+        .await
+        .expect("seed owner message");
+
+    let error = store
+        .enqueue_steer(NewInbox {
+            id: "msg_steer_collision".to_owned(),
+            session_id: target.clone(),
+            kind: "user".to_owned(),
+            payload: json!({ "text": "must not run" }),
+            delivery: Delivery::Steer,
+        })
+        .await
+        .expect_err("cross-session message id collision must fail");
+    assert!(
+        matches!(error, StoreError::Sqlite(_)),
+        "collision surfaces the primary-key failure, got {error:?}"
+    );
+
+    assert!(
+        store
+            .list_inbox(&target)
+            .await
+            .expect("target inbox")
+            .is_empty(),
+        "failed admission left an executable inbox row"
+    );
+    assert!(
+        store
+            .get_message(&target, "msg_steer_collision")
+            .await
+            .expect("target message")
+            .is_none()
+    );
+    // The owner's row is untouched.
+    assert_eq!(
+        store
+            .get_message(&owner, "msg_steer_collision")
+            .await
+            .expect("owner message")
+            .expect("owner row")["text"],
+        "seed"
+    );
+}
+
+#[tokio::test]
+async fn enqueue_steer_rejects_queue_delivery_and_unknown_kinds() {
+    let store = Store::open_memory().await.expect("memory store");
+    let session = seed_session(&store, "ses_steer_reject").await;
+
+    let error = store
+        .enqueue_steer(NewInbox {
+            id: "msg_steer_queue".to_owned(),
+            session_id: session.clone(),
+            kind: "user".to_owned(),
+            payload: json!({ "text": "queued" }),
+            delivery: Delivery::Queue,
+        })
+        .await
+        .expect_err("queue delivery must not materialise");
+    assert!(matches!(error, StoreError::Invalid(_)), "{error:?}");
+    assert!(store.list_inbox(&session).await.expect("inbox").is_empty());
+
+    let error = store
+        .enqueue_steer(NewInbox {
+            id: "msg_steer_bogus".to_owned(),
+            session_id: session.clone(),
+            kind: "bogus".to_owned(),
+            payload: json!({ "text": "x" }),
+            delivery: Delivery::Steer,
+        })
+        .await
+        .expect_err("unknown kind must be rejected");
+    assert!(matches!(error, StoreError::Invalid(_)), "{error:?}");
+}
+
+#[tokio::test]
+async fn legacy_peer_inbox_rows_are_surfaced_and_promoted_as_synthetic() {
+    let store = Store::open_memory().await.expect("memory store");
+    let session = seed_session(&store, "ses_peer_legacy").await;
+
+    // `peer`/`observer` were accepted by `enqueue` before `talk` moved to
+    // `synthetic`; a queued badge for such a row must decode against the
+    // wire union and promote to a renderable message type.
+    store
+        .append_event(NewEvent {
+            id: "evt_legacy_peer".to_owned(),
+            aggregate_id: session.clone(),
+            kind: "session.inbox.enqueued".to_owned(),
+            data: json!({
+                "sessionID": session,
+                "inboxID": "msg_legacy_peer",
+                "item": {
+                    "type": "peer",
+                    "payload": {
+                        "text": "hello from a sibling",
+                        "from": "ses_sender",
+                        "agent": "general",
+                        "kind": "note",
+                    },
+                    "delivery": "queue",
+                },
+            }),
+            durable: true,
+            version: 1,
+            created: 2_000,
+        })
+        .await
+        .expect("legacy peer enqueued event");
+
+    let pending = store.list_inbox(&session).await.expect("inbox");
+    assert_eq!(pending.len(), 1, "{pending:?}");
+    assert_eq!(pending[0]["type"], "synthetic", "{pending:?}");
+    assert_eq!(pending[0]["payload"]["from"], "ses_sender");
+
+    let promoted = store
+        .promote_inbox(&session, "msg_legacy_peer")
+        .await
+        .expect("promote")
+        .expect("promoted row");
+    assert_eq!(promoted["type"], "synthetic", "{promoted:?}");
+    assert_eq!(promoted["text"], "hello from a sibling");
+    assert_eq!(promoted["from"], "ses_sender");
+}
+
+#[tokio::test]
+async fn enqueue_steer_materialises_peer_and_observer_as_synthetic() {
+    let store = Store::open_memory().await.expect("memory store");
+    let session = seed_session(&store, "ses_steer_normalize").await;
+
+    // `peer`/`observer` are accepted inbox kinds but not wire message types.
+    // The admission transaction must normalize both the inbox row it persists
+    // and the message row it materialises, exactly like `promote_inbox`.
+    for (id, kind) in [
+        ("msg_steer_peer", "peer"),
+        ("msg_steer_observer", "observer"),
+    ] {
+        let item = store
+            .enqueue_steer(NewInbox {
+                id: id.to_owned(),
+                session_id: session.clone(),
+                kind: kind.to_owned(),
+                payload: json!({ "text": format!("from {kind}"), "metadata": { "source": kind } }),
+                delivery: Delivery::Steer,
+            })
+            .await
+            .expect("enqueue_steer");
+        assert_eq!(item["type"], "synthetic", "{item:?}");
+        assert_eq!(item["payload"]["metadata"]["source"], kind);
+
+        let message = store
+            .get_message(&session, id)
+            .await
+            .expect("get message")
+            .expect("materialised message");
+        assert_eq!(message["type"], "synthetic", "{message:?}");
+        assert_eq!(message["text"], format!("from {kind}"));
+        assert_eq!(message["metadata"]["source"], kind);
+    }
+
+    let pending = store.list_inbox(&session).await.expect("list inbox");
+    assert_eq!(ids(&pending), vec!["msg_steer_peer", "msg_steer_observer"]);
+    assert!(
+        pending
+            .iter()
+            .all(|row| row["type"].as_str() == Some("synthetic")),
+        "{pending:?}"
+    );
+}

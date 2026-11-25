@@ -272,6 +272,9 @@ export const dict = {
   "ui.common.fileCount.one": "{{count}} dosyası",
   "ui.common.fileCount.other": "{{count}} dosyaları",
   "ui.messagePart.context.updates": "Güncellemeler",
+  "ui.sessionTimeline.notice.peer": "Eş mesaj",
+  "ui.sessionTimeline.notice.peerFromYou": "Siz → Alt ajan",
+  "ui.sessionTimeline.notice.peerFrom": "Gönderen: {{sender}}",
   "ui.promptInput.cancelUpload": "Yüklemeyi iptal et",
   "ui.promptInput.uploading": "%{{percent}}",
 } satisfies Partial<Record<Keys, string>>

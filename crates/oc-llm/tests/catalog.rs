@@ -310,6 +310,67 @@ fn embedded_snapshot_exposes_hy4_flash_free() {
 }
 
 #[test]
+fn hungerg_max_survives_models_dev_and_reasoning_config_overlays() {
+    let snapshot = r#"{
+      "opencode-go": {
+        "id": "opencode-go",
+        "name": "OpenCode Go",
+        "env": [],
+        "npm": "@ai-sdk/openai-compatible",
+        "api": "https://opencode.ai/inference/go/openai/v1",
+        "models": {
+          "hungerg-free": {
+            "id": "hungerg-free",
+            "name": "HungerG Free",
+            "reasoning": true,
+            "reasoning_options": [],
+            "tool_call": true,
+            "limit": {"context": 1000000, "output": 65536},
+            "cost": {"input": 0, "output": 0}
+          },
+          "stealth-without-max": {
+            "id": "stealth-without-max",
+            "name": "Stealth Without Max",
+            "reasoning": true,
+            "reasoning_options": [],
+            "tool_call": true,
+            "limit": {"context": 1000000, "output": 65536},
+            "cost": {"input": 0, "output": 0}
+          }
+        }
+      }
+    }"#;
+    let mut catalog = Catalog::from_snapshot(snapshot).unwrap();
+    assert_eq!(
+        catalog
+            .resolve("opencode-go/hungerg-free#max")
+            .unwrap()
+            .settings()["reasoningEffort"],
+        "max"
+    );
+    assert!(
+        catalog
+            .resolve("opencode-go/stealth-without-max#max")
+            .is_err()
+    );
+
+    let config = json!({
+        "opencode-go": {
+            "models": {
+                "hungerg-free": {
+                    "capabilities": {"reasoning": {"supported": true}}
+                }
+            }
+        }
+    });
+    catalog.apply_config(&config).unwrap();
+    let resolved = catalog.resolve("opencode-go/hungerg-free#max").unwrap();
+    assert_eq!(resolved.model_id(), "hungerg-free");
+    assert_eq!(resolved.settings()["reasoningEffort"], "max");
+    assert_eq!(resolved.model.variants.len(), 1);
+}
+
+#[test]
 fn errors_have_no_candidate_panic_on_empty() {
     let catalog = Catalog::from_snapshot(FIXTURE).unwrap();
     let error = catalog.resolve("missing/x").unwrap_err();

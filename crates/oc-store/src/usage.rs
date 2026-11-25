@@ -4,7 +4,11 @@
 //! rollup is a `json_extract` GROUP BY and needs no extra table. The message
 //! discriminator lives in the `type` column, not in `data`.
 
+use std::fmt::Write as _;
+
 use rusqlite::Connection;
+use rusqlite::params_from_iter;
+use rusqlite::types::Value as SqlValue;
 
 use crate::db::Store;
 use crate::error::StoreError;
@@ -12,6 +16,11 @@ use crate::error::StoreError;
 /// Hard cap on grouped `(provider, model)` rows returned by [`model_usage`],
 /// so one pathological database cannot produce an unbounded response.
 pub const MAX_USAGE_ROWS: usize = 200;
+
+const FIVE_HOURS_MS: i64 = 5 * 3_600_000;
+const ONE_DAY_MS: i64 = 86_400_000;
+const SEVEN_DAYS_MS: i64 = 7 * 86_400_000;
+const THIRTY_DAYS_MS: i64 = 30 * 86_400_000;
 
 /// One `(provider, model)` usage rollup.
 #[derive(Debug, Clone, PartialEq)]
@@ -32,6 +41,30 @@ pub struct ModelUsageRow {
     pub cost: f64,
 }
 
+/// Token, step and spend totals for one time window.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct WindowSum {
+    pub steps: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub reasoning_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cache_write_tokens: i64,
+    pub cost_usd: f64,
+}
+
+/// Multi-window local usage grouped by `(provider_id, model_id)` in SQLite.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LocalModelUsageRow {
+    pub provider_id: String,
+    pub model_id: String,
+    pub five_hours: WindowSum,
+    pub day: WindowSum,
+    pub week: WindowSum,
+    pub month: WindowSum,
+    pub all_time: WindowSum,
+}
+
 const SQL: &str = "
 SELECT json_extract(m.data,'$.model.providerID') provider_id,
        json_extract(m.data,'$.model.id') model_id,
@@ -44,6 +77,74 @@ FROM session_message m
 WHERE m.type='assistant' AND m.time_created >= ?1 AND json_extract(m.data,'$.model.id') IS NOT NULL
 GROUP BY 1,2 ORDER BY cost DESC LIMIT ?2";
 
+const LOCAL_USAGE_SQL: &str = "
+WITH rows AS (
+  SELECT
+    json_extract(m.data, '$.model.providerID') AS provider_id,
+    CASE
+      WHEN json_type(m.data, '$.model.id') = 'text' THEN json_extract(m.data, '$.model.id')
+      ELSE ''
+    END AS model_id,
+    CASE
+      WHEN json_type(m.data, '$.time') IS NULL THEN m.time_created
+      WHEN json_type(m.data, '$.time.created') IN ('integer', 'real') THEN CAST(json_extract(m.data, '$.time.created') AS INTEGER)
+      ELSE 0
+    END AS ts,
+    s.time_created AS session_created,
+    CASE WHEN json_type(m.data, '$.tokens.input') = 'integer' THEN json_extract(m.data, '$.tokens.input') ELSE 0 END AS t_in,
+    CASE WHEN json_type(m.data, '$.tokens.output') = 'integer' THEN json_extract(m.data, '$.tokens.output') ELSE 0 END AS t_out,
+    CASE WHEN json_type(m.data, '$.tokens.reasoning') = 'integer' THEN json_extract(m.data, '$.tokens.reasoning') ELSE 0 END AS t_reas,
+    CASE WHEN json_type(m.data, '$.tokens.cache.read') = 'integer' THEN json_extract(m.data, '$.tokens.cache.read') ELSE 0 END AS t_cr,
+    CASE WHEN json_type(m.data, '$.tokens.cache.write') = 'integer' THEN json_extract(m.data, '$.tokens.cache.write') ELSE 0 END AS t_cw,
+    CASE WHEN json_type(m.data, '$.cost') IN ('integer', 'real') THEN CAST(json_extract(m.data, '$.cost') AS REAL) ELSE 0.0 END AS cost_val
+  FROM session_message m
+  JOIN session_v2 s ON s.id = m.session_id
+  WHERE m.type = 'assistant'
+    AND json_type(m.data, '$.model.providerID') = 'text'
+    AND json_extract(m.data, '$.model.providerID') != ''
+)
+SELECT
+  provider_id,
+  model_id,
+  CAST(SUM(CASE WHEN ts >= ?1 THEN 1 ELSE 0 END) AS INTEGER),
+  CAST(SUM(CASE WHEN ts >= ?1 THEN t_in ELSE 0 END) AS INTEGER),
+  CAST(SUM(CASE WHEN ts >= ?1 THEN t_out ELSE 0 END) AS INTEGER),
+  CAST(SUM(CASE WHEN ts >= ?1 THEN t_reas ELSE 0 END) AS INTEGER),
+  CAST(SUM(CASE WHEN ts >= ?1 THEN t_cr ELSE 0 END) AS INTEGER),
+  CAST(SUM(CASE WHEN ts >= ?1 THEN t_cw ELSE 0 END) AS INTEGER),
+  CAST(SUM(CASE WHEN ts >= ?1 THEN cost_val ELSE 0.0 END) AS REAL),
+  CAST(SUM(CASE WHEN ts >= ?2 THEN 1 ELSE 0 END) AS INTEGER),
+  CAST(SUM(CASE WHEN ts >= ?2 THEN t_in ELSE 0 END) AS INTEGER),
+  CAST(SUM(CASE WHEN ts >= ?2 THEN t_out ELSE 0 END) AS INTEGER),
+  CAST(SUM(CASE WHEN ts >= ?2 THEN t_reas ELSE 0 END) AS INTEGER),
+  CAST(SUM(CASE WHEN ts >= ?2 THEN t_cr ELSE 0 END) AS INTEGER),
+  CAST(SUM(CASE WHEN ts >= ?2 THEN t_cw ELSE 0 END) AS INTEGER),
+  CAST(SUM(CASE WHEN ts >= ?2 THEN cost_val ELSE 0.0 END) AS REAL),
+  CAST(SUM(CASE WHEN ts >= ?3 THEN 1 ELSE 0 END) AS INTEGER),
+  CAST(SUM(CASE WHEN ts >= ?3 THEN t_in ELSE 0 END) AS INTEGER),
+  CAST(SUM(CASE WHEN ts >= ?3 THEN t_out ELSE 0 END) AS INTEGER),
+  CAST(SUM(CASE WHEN ts >= ?3 THEN t_reas ELSE 0 END) AS INTEGER),
+  CAST(SUM(CASE WHEN ts >= ?3 THEN t_cr ELSE 0 END) AS INTEGER),
+  CAST(SUM(CASE WHEN ts >= ?3 THEN t_cw ELSE 0 END) AS INTEGER),
+  CAST(SUM(CASE WHEN ts >= ?3 THEN cost_val ELSE 0.0 END) AS REAL),
+  CAST(SUM(CASE WHEN ts >= ?4 THEN 1 ELSE 0 END) AS INTEGER),
+  CAST(SUM(CASE WHEN ts >= ?4 THEN t_in ELSE 0 END) AS INTEGER),
+  CAST(SUM(CASE WHEN ts >= ?4 THEN t_out ELSE 0 END) AS INTEGER),
+  CAST(SUM(CASE WHEN ts >= ?4 THEN t_reas ELSE 0 END) AS INTEGER),
+  CAST(SUM(CASE WHEN ts >= ?4 THEN t_cr ELSE 0 END) AS INTEGER),
+  CAST(SUM(CASE WHEN ts >= ?4 THEN t_cw ELSE 0 END) AS INTEGER),
+  CAST(SUM(CASE WHEN ts >= ?4 THEN cost_val ELSE 0.0 END) AS REAL),
+  CAST(COUNT(*) AS INTEGER),
+  CAST(SUM(t_in) AS INTEGER),
+  CAST(SUM(t_out) AS INTEGER),
+  CAST(SUM(t_reas) AS INTEGER),
+  CAST(SUM(t_cr) AS INTEGER),
+  CAST(SUM(t_cw) AS INTEGER),
+  CAST(SUM(cost_val) AS REAL)
+FROM rows
+WHERE ts >= session_created
+GROUP BY provider_id, model_id";
+
 /// Roll up assistant messages created at or after `since_ms` (epoch ms).
 ///
 /// `since_ms` is an absolute lower bound, not a window length: callers compute
@@ -54,7 +155,7 @@ pub fn model_usage(
     connection: &Connection,
     since_ms: i64,
 ) -> Result<Vec<ModelUsageRow>, StoreError> {
-    let mut statement = connection.prepare(SQL)?;
+    let mut statement = connection.prepare_cached(SQL)?;
     let limit = i64::try_from(MAX_USAGE_ROWS).unwrap_or(i64::MAX);
     let mut rows = statement.query(rusqlite::params![since_ms, limit])?;
     let mut out = Vec::new();
@@ -72,11 +173,127 @@ pub fn model_usage(
     Ok(out)
 }
 
+fn read_window(row: &rusqlite::Row<'_>, offset: usize) -> Result<WindowSum, rusqlite::Error> {
+    Ok(WindowSum {
+        steps: row.get(offset)?,
+        input_tokens: row.get(offset + 1)?,
+        output_tokens: row.get(offset + 2)?,
+        reasoning_tokens: row.get(offset + 3)?,
+        cache_read_tokens: row.get(offset + 4)?,
+        cache_write_tokens: row.get(offset + 5)?,
+        cost_usd: row.get(offset + 6)?,
+    })
+}
+
+/// Roll up all five quota windows (`5h`, `24h`, `7d`, `30d`, `all_time`) per
+/// `(provider_id, model_id)` directly in SQLite without decoding full messages.
+pub fn local_provider_usage(
+    connection: &Connection,
+    now_ms: i64,
+) -> Result<Vec<LocalModelUsageRow>, StoreError> {
+    let mut statement = connection.prepare_cached(LOCAL_USAGE_SQL)?;
+    let five_h = now_ms.saturating_sub(FIVE_HOURS_MS);
+    let day = now_ms.saturating_sub(ONE_DAY_MS);
+    let week = now_ms.saturating_sub(SEVEN_DAYS_MS);
+    let month = now_ms.saturating_sub(THIRTY_DAYS_MS);
+    let mut rows = statement.query(rusqlite::params![five_h, day, week, month])?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        out.push(LocalModelUsageRow {
+            provider_id: row.get(0)?,
+            model_id: row.get(1)?,
+            five_hours: read_window(row, 2)?,
+            day: read_window(row, 9)?,
+            week: read_window(row, 16)?,
+            month: read_window(row, 23)?,
+            all_time: read_window(row, 30)?,
+        });
+    }
+    Ok(out)
+}
+
 impl Store {
     /// Per-model usage since `since_ms` (epoch ms), highest cost first.
     pub async fn model_usage(&self, since_ms: i64) -> Result<Vec<ModelUsageRow>, StoreError> {
         self.read(move |connection| model_usage(connection, since_ms))
             .await
+    }
+
+    /// Multi-window local usage rollup grouped by `(provider_id, model_id)`.
+    pub async fn local_provider_usage(
+        &self,
+        now_ms: i64,
+    ) -> Result<Vec<LocalModelUsageRow>, StoreError> {
+        self.read(move |connection| local_provider_usage(connection, now_ms))
+            .await
+    }
+
+    /// Per-model usage since `since_ms` restricted to `session_ids`.
+    pub async fn model_usage_for_sessions(
+        &self,
+        session_ids: &[String],
+        since_ms: i64,
+    ) -> Result<Vec<ModelUsageRow>, StoreError> {
+        if session_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let session_ids = session_ids.to_vec();
+        self.read(move |connection| {
+            let mut sql = String::from(
+                "SELECT json_extract(m.data,'$.model.providerID') provider_id,
+                        json_extract(m.data,'$.model.id') model_id,
+                        CAST(COUNT(*) AS INTEGER) requests,
+                        CAST(SUM(COALESCE(json_extract(m.data,'$.tokens.input'),0)) AS INTEGER) tokens_in,
+                        CAST(SUM(COALESCE(json_extract(m.data,'$.tokens.output'),0)) AS INTEGER) tokens_out,
+                        CAST(SUM(COALESCE(json_extract(m.data,'$.tokens.reasoning'),0)) AS INTEGER) tokens_reasoning,
+                        CAST(SUM(COALESCE(json_extract(m.data,'$.cost'),0.0)) AS REAL) cost
+                 FROM session_message m
+                 WHERE m.type='assistant'
+                   AND json_type(m.data,'$.model.providerID') = 'text'
+                   AND json_extract(m.data,'$.model.providerID') != ''
+                   AND json_type(m.data,'$.model.id') = 'text'
+                   AND json_extract(m.data,'$.model.id') != ''
+                   AND (CASE
+                          WHEN json_type(m.data,'$.time') IS NULL THEN m.time_created
+                          WHEN json_type(m.data,'$.time.created') IN ('integer','real') THEN CAST(json_extract(m.data,'$.time.created') AS INTEGER)
+                          ELSE 0
+                        END) >= ?1
+                   AND m.session_id IN (",
+            );
+            let mut values: Vec<SqlValue> = Vec::with_capacity(session_ids.len() + 2);
+            values.push(SqlValue::Integer(since_ms));
+            for (idx, sid) in session_ids.iter().enumerate() {
+                if idx > 0 {
+                    sql.push(',');
+                }
+                let _ = write!(sql, "?{}", idx + 2);
+                values.push(SqlValue::Text(sid.clone()));
+            }
+            let limit_param = values.len() + 1;
+            let _ = write!(
+                sql,
+                ") GROUP BY 1,2 ORDER BY cost DESC LIMIT ?{limit_param}"
+            );
+            values.push(SqlValue::Integer(
+                i64::try_from(MAX_USAGE_ROWS).unwrap_or(i64::MAX),
+            ));
+            let mut statement = connection.prepare(&sql)?;
+            let mut rows = statement.query(params_from_iter(values.iter()))?;
+            let mut out = Vec::new();
+            while let Some(row) = rows.next()? {
+                out.push(ModelUsageRow {
+                    provider_id: row.get(0)?,
+                    model_id: row.get(1)?,
+                    requests: row.get(2)?,
+                    tokens_in: row.get(3)?,
+                    tokens_out: row.get(4)?,
+                    tokens_reasoning: row.get(5)?,
+                    cost: row.get(6)?,
+                });
+            }
+            Ok(out)
+        })
+        .await
     }
 }
 
@@ -231,5 +448,159 @@ mod tests {
         let recent = store.model_usage(5_000).await.expect("rollup");
         assert_eq!(recent.len(), 1);
         assert_eq!(recent[0].model_id, "glm-5.3-flash");
+    }
+
+    async fn seed_window_test_data(store: &Store, now_ms: i64) {
+        for (id, parent_id, time_created) in [
+            ("ses_primary", None, 10_000_i64),
+            ("ses_fork", Some("ses_primary".to_owned()), 1_000_000_000),
+        ] {
+            store
+                .create_session(NewSession {
+                    id: id.to_owned(),
+                    parent_id,
+                    project_id: "prj_usage".to_owned(),
+                    directory: "/tmp/usage".to_owned(),
+                    title: None,
+                    agent: None,
+                    model: None,
+                    metadata: None,
+                    permissions: None,
+                    time_created,
+                })
+                .await
+                .expect("session");
+        }
+        let rows = [
+            (
+                "m_5h",
+                "ses_primary",
+                json!({
+                    "model": {"providerID": "anthropic", "id": "claude-sonnet-4"},
+                    "cost": 1.25,
+                    "tokens": {"input": 10, "output": 20, "reasoning": 5, "cache": {"read": 3, "write": 2}}
+                }),
+                now_ms - 60_000,
+            ),
+            (
+                "m_day",
+                "ses_primary",
+                json!({
+                    "model": {"providerID": "anthropic", "id": "claude-sonnet-4"},
+                    "cost": 0.5,
+                    "tokens": {"input": 40, "output": 10}
+                }),
+                now_ms - 10 * 3_600_000,
+            ),
+            (
+                "m_month_nomodel",
+                "ses_primary",
+                json!({
+                    "model": {"providerID": "anthropic"},
+                    "cost": 0.25,
+                    "tokens": {"input": 100}
+                }),
+                now_ms - 20 * 86_400_000,
+            ),
+            (
+                "m_old",
+                "ses_primary",
+                json!({
+                    "model": {"providerID": "anthropic", "id": "claude-opus-4"},
+                    "cost": 2.0,
+                    "tokens": {"input": 200, "output": 50}
+                }),
+                now_ms - 45 * 86_400_000,
+            ),
+            (
+                "m_prefork",
+                "ses_fork",
+                json!({
+                    "model": {"providerID": "anthropic", "id": "claude-sonnet-4"},
+                    "cost": 999.0,
+                    "tokens": {"input": 9999}
+                }),
+                500_000_000,
+            ),
+            (
+                "m_fork_live",
+                "ses_fork",
+                json!({
+                    "model": {"providerID": "openai", "id": "gpt-5"},
+                    "cost": 3.0,
+                    "tokens": {"input": 70, "output": 30}
+                }),
+                now_ms - 60_000,
+            ),
+        ];
+        for (id, sid, data, at) in rows {
+            store
+                .append_message(NewMessage {
+                    id: id.to_owned(),
+                    session_id: sid.to_owned(),
+                    kind: "assistant".to_owned(),
+                    data,
+                    time_created: at,
+                })
+                .await
+                .expect("append");
+        }
+    }
+
+    #[tokio::test]
+    async fn local_provider_usage_and_scoped_model_usage_match_windows_and_fork_boundary() {
+        let store = Store::open_memory().await.expect("memory store");
+        let now_ms = 5_000_000_000_i64;
+        seed_window_test_data(&store, now_ms).await;
+
+        let local = store
+            .local_provider_usage(now_ms)
+            .await
+            .expect("local usage");
+        let anthropic_rows: Vec<&LocalModelUsageRow> = local
+            .iter()
+            .filter(|r| r.provider_id == "anthropic")
+            .collect();
+        let sonnet = anthropic_rows
+            .iter()
+            .find(|r| r.model_id == "claude-sonnet-4")
+            .expect("sonnet row");
+        assert_eq!(sonnet.five_hours.steps, 1);
+        assert_eq!(sonnet.five_hours.input_tokens, 10);
+        assert_eq!(sonnet.five_hours.cache_read_tokens, 3);
+        assert_eq!(sonnet.five_hours.cache_write_tokens, 2);
+        assert_eq!(sonnet.day.steps, 2);
+        assert_eq!(sonnet.day.input_tokens, 50);
+        assert_eq!(sonnet.all_time.steps, 2);
+
+        let no_model = anthropic_rows
+            .iter()
+            .find(|r| r.model_id.is_empty())
+            .expect("missing model id still rolls up at provider level");
+        assert_eq!(no_model.month.steps, 1);
+        assert_eq!(no_model.month.input_tokens, 100);
+        assert_eq!(no_model.week.steps, 0);
+
+        let opus = anthropic_rows
+            .iter()
+            .find(|r| r.model_id == "claude-opus-4")
+            .expect("opus row");
+        assert_eq!(opus.month.steps, 0);
+        assert_eq!(opus.all_time.steps, 1);
+
+        let scoped_primary = store
+            .model_usage_for_sessions(&["ses_primary".to_owned()], 0)
+            .await
+            .expect("scoped primary");
+        assert!(
+            scoped_primary.iter().all(|r| r.provider_id == "anthropic"),
+            "forked session openai usage must not leak into ses_primary scope: {scoped_primary:?}"
+        );
+        let scoped_fork = store
+            .model_usage_for_sessions(&["ses_fork".to_owned()], 1_000_000_000)
+            .await
+            .expect("scoped fork");
+        assert_eq!(scoped_fork.len(), 1);
+        assert_eq!(scoped_fork[0].model_id, "gpt-5");
     }
 }

@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import { createRoot } from "solid-js"
+import { createStore } from "solid-js/store"
 
 type RawEvent = { type: string; data?: unknown }
 type Handler = (event: RawEvent) => void
@@ -26,18 +27,52 @@ function fakeServer() {
   }
 }
 
-let server = fakeServer()
+/**
+ * The store slice the peer feed reads: `pending.list` and `message.list`. The
+ * real store is a `createStore` inside `useServer()`; here it is the same shape
+ * so a new mount reads the same snapshot and cannot duplicate rows.
+ */
+function fakeStore() {
+  const [store, setStore] = createStore<{
+    session: { pending: Record<string, unknown[]>; message: Record<string, unknown[]> }
+  }>({ session: { pending: {}, message: {} } })
 
-// The panels only need the server's event bus; the typed clients are not part of these paths.
+  return {
+    store: {
+      session: {
+        pending: { list: (sessionID: string) => store.session.pending[sessionID] ?? [] },
+        message: { list: (sessionID: string) => store.session.message[sessionID] ?? [] },
+      },
+    },
+    setPending(sessionID: string, rows: unknown[]) {
+      setStore("session", "pending", sessionID, rows)
+    },
+    setMessages(sessionID: string, rows: unknown[]) {
+      setStore("session", "message", sessionID, rows)
+    },
+  }
+}
+
+let server = fakeServer()
+let state = fakeStore()
+
+// The panels only need the server's event bus and the store accessors; the typed clients are not part of these paths.
 const { mock } = await import("bun:test")
 
 mock.module("@/runtime/server/client", () => ({ useServerSDK: () => server.sdk }))
+mock.module("@/runtime/server/current", () => ({
+  useServer: () => ({ ctx: { data: state.store } }),
+}))
 
 const { createAgentEvents, createPeerFeed } = await import("./agent-events")
 
 function events(sessionID: () => string | undefined, root: () => string | undefined) {
   server = fakeServer()
   return createRoot((dispose) => ({ ...createAgentEvents({ sessionID, root }), dispose }))
+}
+
+function feed(sessionID: () => string | undefined = () => "ses_child") {
+  return createRoot((dispose) => ({ ...createPeerFeed(sessionID), dispose }))
 }
 
 describe("agent events", () => {
@@ -145,59 +180,224 @@ describe("agent events", () => {
 })
 
 describe("peer feed", () => {
-  test("folds duplicate ids into one row and increments unread per arrival", () => {
-    const feed = createRoot((dispose) => ({ ...createPeerFeed(() => "ses_child"), dispose }))
+  const inbox = (id: string, text: string, created: number, extra: Record<string, unknown> = {}) => ({
+    id,
+    sessionID: "ses_child",
+    time: { created },
+    type: "synthetic",
+    delivery: "queue",
+    payload: { text, peer: true, metadata: { source: "peer", from: "user" }, ...extra },
+  })
+
+  const delivered = (id: string, text: string, created: number, extra: Record<string, unknown> = {}) => ({
+    id,
+    sessionID: "ses_child",
+    time: { created },
+    type: "synthetic",
+    text,
+    peer: true,
+    metadata: { source: "peer", from: "user" },
+    ...extra,
+  })
+
+  test("hydrates delivered peer rows from the transcript", () => {
+    state = fakeStore()
+    state.setMessages("ses_child", [
+      delivered("msg_1", "hello", 1),
+      { id: "msg_2", sessionID: "ses_child", time: { created: 2 }, type: "user", text: "plain user" },
+      delivered("msg_3", "legacy", 3, { type: "peer" }),
+    ])
+    const peer = feed()
     try {
-      const message = { id: "row_1", from: "ses_peer", text: "hello", created: 1 }
-      feed.add(message)
-      feed.add({ ...message, text: "changed" })
-      expect(feed.messages()).toEqual([message])
-      expect(feed.unread()).toBe(2)
+      expect(peer.messages().map((row) => row.id)).toEqual(["msg_1", "msg_3"])
+      expect(peer.messages().every((row) => row.status === "sent")).toBe(true)
+      // Hydration is history, not an arrival.
+      expect(peer.unread()).toBe(0)
     } finally {
-      feed.dispose()
+      peer.dispose()
     }
   })
 
-  test("marks every arrival read on demand", () => {
-    const feed = createRoot((dispose) => ({ ...createPeerFeed(() => "ses_child"), dispose }))
+  test("hydrates queued rows from the inbox and keeps them out of the delivered list", () => {
+    state = fakeStore()
+    state.setPending("ses_child", [
+      inbox("msg_q1", "queued", 4),
+      { ...inbox("msg_q2", "user prompt", 5), payload: { text: "user prompt" } },
+      { ...inbox("msg_q3", "compaction", 6), type: "compaction", payload: {} },
+    ])
+    const peer = feed()
     try {
-      feed.add({ id: "row_1", from: "ses_peer", text: "one", created: 1 })
-      feed.add({ id: "row_2", from: "ses_peer", text: "two", created: 2 })
-      expect(feed.unread()).toBe(2)
-      feed.markRead()
-      expect(feed.unread()).toBe(0)
-      expect(feed.messages().map((message) => message.id)).toEqual(["row_1", "row_2"])
+      expect(peer.queued().map((row) => row.id)).toEqual(["msg_q1"])
+      expect(peer.messages().map((row) => row.status)).toEqual(["queued"])
+      expect(peer.unread()).toBe(0)
     } finally {
-      feed.dispose()
+      peer.dispose()
+    }
+  })
+
+  test("dedupes a live event against the inbox row it names", () => {
+    state = fakeStore()
+    state.setPending("ses_child", [inbox("msg_q1", "queued", 4)])
+    const peer = feed()
+    try {
+      server.emit("subagent.peer.message", {
+        sessionID: "ses_child",
+        from: "user",
+        text: "queued",
+        created: 4,
+        messageID: "msg_q1",
+      })
+      expect(peer.messages()).toHaveLength(1)
+      expect(peer.queued()).toHaveLength(1)
+
+      // While still in inbox, transcript materialization keeps status `"queued"`.
+      state.setMessages("ses_child", [delivered("msg_q1", "queued", 4)])
+      expect(peer.messages()).toHaveLength(1)
+      expect(peer.messages()[0]?.status).toBe("queued")
+
+      // Delivery removes it from inbox and promotes it cleanly to `"sent"`.
+      server.emit("session.inbox.delivered", { sessionID: "ses_child", inboxID: "msg_q1" })
+      state.setPending("ses_child", [])
+      expect(peer.messages()).toHaveLength(1)
+      expect(peer.messages()[0]?.status).toBe("sent")
+    } finally {
+      peer.dispose()
+    }
+  })
+
+  test("reopening against the same store snapshot does not duplicate rows or inflate unread", () => {
+    state = fakeStore()
+    state.setMessages("ses_child", [delivered("msg_1", "hello", 1)])
+    state.setPending("ses_child", [inbox("msg_q1", "queued", 2)])
+
+    const first = feed()
+    expect(first.messages().map((row) => row.id)).toEqual(["msg_1", "msg_q1"])
+    first.dispose()
+
+    server = fakeServer()
+    const second = feed()
+    try {
+      expect(second.messages().map((row) => row.id)).toEqual(["msg_1", "msg_q1"])
+      expect(second.unread()).toBe(0)
+    } finally {
+      second.dispose()
+    }
+  })
+
+  test("counts only live arrivals as unread and marks them read on demand", () => {
+    state = fakeStore()
+    state.setMessages("ses_child", [delivered("msg_1", "history", 1)])
+    const peer = feed()
+    try {
+      expect(peer.unread()).toBe(0)
+      server.emit("subagent.peer.message", { sessionID: "ses_child", from: "ses_peer", text: "live", created: 9 })
+      expect(peer.messages().map((row) => row.text)).toEqual(["history", "live"])
+      expect(peer.unread()).toBe(1)
+      peer.markRead()
+      expect(peer.unread()).toBe(0)
+    } finally {
+      peer.dispose()
+    }
+  })
+
+  test("does not re-count a re-emitted live event id", () => {
+    state = fakeStore()
+    const peer = feed()
+    try {
+      const event = { sessionID: "ses_child", from: "ses_peer", text: "hi", created: 3, messageID: "msg_9" }
+      server.emit("subagent.peer.message", event)
+      server.emit("subagent.peer.message", event)
+      expect(peer.messages()).toHaveLength(1)
+      expect(peer.unread()).toBe(1)
+    } finally {
+      peer.dispose()
     }
   })
 
   test("accepts only events addressed to its own session", () => {
+    state = fakeStore()
     server = fakeServer()
-    const feed = createRoot((dispose) => ({ ...createPeerFeed(() => "ses_child"), dispose }))
+    const peer = feed()
     try {
       server.emit("subagent.peer.message", { sessionID: "ses_other", text: "not mine", created: 1 })
       server.emit("peer.message", { sessionID: "ses_child", text: "wrong type", created: 2 })
       server.emit("subagent.peer.message", { sessionID: "ses_child", text: "", created: 3 })
-      expect(feed.messages()).toEqual([])
-      expect(feed.unread()).toBe(0)
+      expect(peer.messages()).toEqual([])
+      expect(peer.unread()).toBe(0)
 
       server.emit("subagent.peer.message", { sessionID: "ses_child", from: "ses_peer", text: "mine", created: 4 })
-      expect(feed.messages()).toHaveLength(1)
-      expect(feed.messages()[0]).toMatchObject({ from: "ses_peer", text: "mine", created: 4 })
-      expect(feed.unread()).toBe(1)
+      expect(peer.messages()).toHaveLength(1)
+      expect(peer.messages()[0]).toMatchObject({ from: "ses_peer", text: "mine", created: 4 })
+      expect(peer.unread()).toBe(1)
     } finally {
-      feed.dispose()
+      peer.dispose()
     }
   })
 
   test("stops listening when its drawer closes", () => {
+    state = fakeStore()
     server = fakeServer()
-    const feed = createRoot((dispose) => ({ ...createPeerFeed(() => "ses_child"), dispose }))
-    feed.dispose()
+    const peer = feed()
+    peer.dispose()
     expect(server.listeners()).toBe(0)
 
     server.emit("subagent.peer.message", { sessionID: "ses_child", text: "late", created: 1 })
-    expect(feed.messages()).toEqual([])
+    expect(peer.messages()).toEqual([])
+  })
+
+  test("keeps queued status on active inbox rows even when materialized in transcript, until delivered", () => {
+    state = fakeStore()
+    server = fakeServer()
+    const peer = feed()
+    try {
+      const id = "msg_steer_mat"
+      const payload = { text: "steer instruction", peer: true, metadata: { source: "peer", from: "user" } }
+      state.setMessages("ses_child", [
+        {
+          id,
+          type: "synthetic",
+          text: "steer instruction",
+          peer: true,
+          metadata: { source: "peer", from: "user" },
+          time: { created: 10 },
+        },
+      ])
+      state.setPending("ses_child", [
+        { id, type: "synthetic", delivery: "steer", payload, time: { created: 10 } },
+      ])
+
+      expect(peer.messages()).toHaveLength(1)
+      expect(peer.messages()[0]).toMatchObject({ id, status: "queued", delivery: "steer", own: true })
+      expect(peer.queued()).toHaveLength(1)
+
+      server.emit("session.inbox.delivered", { sessionID: "ses_child", inboxID: id })
+      state.setPending("ses_child", [])
+      expect(peer.messages()[0]).toMatchObject({ id, status: "sent" })
+      expect(peer.queued()).toEqual([])
+    } finally {
+      peer.dispose()
+    }
+  })
+
+  test("drops live unread row if cancelled or delivered before store sync", () => {
+    state = fakeStore()
+    server = fakeServer()
+    const peer = feed()
+    try {
+      server.emit("subagent.peer.message", {
+        sessionID: "ses_child",
+        from: "user",
+        text: "cancel me",
+        created: 5,
+        messageID: "msg_cancel_1",
+      })
+      expect(peer.queued().map((row) => row.id)).toEqual(["msg_cancel_1"])
+
+      server.emit("session.inbox.cancelled", { sessionID: "ses_child", inboxID: "msg_cancel_1" })
+      expect(peer.messages()).toEqual([])
+      expect(peer.queued()).toEqual([])
+    } finally {
+      peer.dispose()
+    }
   })
 })

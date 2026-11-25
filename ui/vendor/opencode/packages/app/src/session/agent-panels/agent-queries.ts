@@ -2,6 +2,7 @@ import { onCleanup } from "solid-js"
 import { useQuery } from "@tanstack/solid-query"
 import { serverMessage, useAgenticRequest } from "@/settings/agentic/config"
 import { useServerSDK } from "@/runtime/server/client"
+import { useServer } from "@/runtime/server/current"
 import {
   parseGoal,
   parseLaneStatuses,
@@ -45,6 +46,7 @@ async function read(request: Request, path: string, signal: AbortSignal | undefi
 // the composer chip issues each request once.
 export function useSubagentTreeQuery(sessionID: () => string | undefined) {
   const sdk = useServerSDK()
+  const server = useServer()
   const request = useAgenticRequest()
 
   const query = useQuery(() => ({
@@ -64,11 +66,13 @@ export function useSubagentTreeQuery(sessionID: () => string | undefined) {
     // twice a second, which re-renders the timeline's sticky header and makes the
     // composer flicker while typing.
     refetchOnMount: true,
-    staleTime: 1_000,
+    // The tree only changes on a status/execution event, and each one triggers a
+    // trailing refetch. Two seconds keeps a remount from asking again while the
+    // previous answer is still the newest the server has.
+    staleTime: 2_000,
     retry: false,
   }))
 
-  let refetchTimer: ReturnType<typeof setTimeout> | undefined
   const eventSession = (raw: { data?: unknown }) => {
     if (!raw.data || typeof raw.data !== "object") return undefined
     const data = raw.data as { sessionID?: unknown; id?: unknown }
@@ -79,14 +83,28 @@ export function useSubagentTreeQuery(sessionID: () => string | undefined) {
         ? data.id
         : undefined
   }
+  const knownNodes = () => new Set((query.data?.available ? query.data.value.nodes : []).map((node) => node.id))
+  const related = (raw: { type?: string; data?: unknown }, current: string) => {
+    const source = eventSession(raw)
+    if (!source || source === current) return true
+    if (knownNodes().has(source)) return true
+    const family = server.ctx.data.session.family(current)
+    if (family.includes(source)) return true
+    if (raw.data && typeof raw.data === "object") {
+      const parentID = (raw.data as { parentID?: unknown }).parentID
+      if (typeof parentID === "string" && (parentID === current || knownNodes().has(parentID) || family.includes(parentID)))
+        return true
+    }
+
+    return false
+  }
+  const refetchDebounce = createEventRefetchDebounce(() => void query.refetch())
   const stop = sdk.event.listen((event) => {
     const raw = event as unknown as { type?: string; data?: unknown }
     const current = sessionID()
 
     if (!current || !raw.type) return
-    const source = eventSession(raw)
-
-    if (source && source !== current) return
+    if (!related(raw, current)) return
     if (
       raw.type === "session.created" ||
       raw.type === "session.deleted" ||
@@ -95,21 +113,54 @@ export function useSubagentTreeQuery(sessionID: () => string | undefined) {
       raw.type === "session.status" ||
       raw.type.startsWith("session.execution.")
     ) {
-      // Trailing debounce: a steady stream of status/execution events must not
-      // refetch every 250 ms. Reset the timer on each matching event instead.
-      if (refetchTimer !== undefined) clearTimeout(refetchTimer)
-      refetchTimer = setTimeout(() => {
-        refetchTimer = undefined
-        void query.refetch()
-      }, 600)
+      refetchDebounce.schedule()
     }
   })
   onCleanup(() => {
-    if (refetchTimer !== undefined) clearTimeout(refetchTimer)
+    refetchDebounce.cancel()
     stop()
   })
 
   return query
+}
+
+/**
+ * Trailing debounce for the tree's event-driven refetch.
+ *
+ * A burst of `session.status` / `session.execution.*` events must produce one
+ * request, on the trailing edge, not one per event. Each call restarts the
+ * timer; `cancel()` clears it on cleanup so a disposed panel cannot refetch.
+ * `delayMs` and `setTimeout` are injectable for tests.
+ */
+export function createEventRefetchDebounce(
+  refetch: () => void,
+  delayMs = 600,
+  timers?: unknown,
+) {
+  // Structural cast keeps the public shape loose enough for tests to inject a fake clock.
+  const clock = (timers ?? { setTimeout, clearTimeout }) as {
+    setTimeout(run: () => void, delay: number): ReturnType<typeof setTimeout>
+    clearTimeout(id: ReturnType<typeof setTimeout>): void
+  }
+  let timer: ReturnType<typeof setTimeout> | undefined
+
+  return {
+    schedule() {
+      if (timer !== undefined) clock.clearTimeout(timer)
+      timer = clock.setTimeout(() => {
+        timer = undefined
+        refetch()
+      }, delayMs)
+    },
+    cancel() {
+      if (timer === undefined) return
+      clock.clearTimeout(timer)
+      timer = undefined
+    },
+    pending() {
+      return timer !== undefined
+    },
+  }
 }
 
 export function useObserverRepairsQuery(sessionID: () => string | undefined) {

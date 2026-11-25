@@ -4,20 +4,13 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use oc_store::Store;
-use serde_json::Value;
+use oc_store::{Store, WindowSum};
 
 use crate::AppState;
-use crate::data::session_ext::common::{messages_all, sessions_all, time_of};
 use crate::error::ErrorResponse;
 
 use super::CACHE_TTL_MS;
-use super::types::{ModelUsageRow, ProviderLocalUsage, ProviderUsageAccum};
-
-const FIVE_HOURS_MS: i64 = 5 * 3_600_000;
-const ONE_DAY_MS: i64 = 86_400_000;
-const SEVEN_DAYS_MS: i64 = 7 * 86_400_000;
-const THIRTY_DAYS_MS: i64 = 30 * 86_400_000;
+use super::types::{ModelUsageRow, ProviderLocalUsage, ProviderUsageAccum, UsageWindowTotals};
 
 /// In-process rollup of the session/message scan the UI polls every 60 s.
 #[derive(Debug, Default)]
@@ -66,6 +59,23 @@ pub(super) async fn usage_cached(
     }
 }
 
+fn add_window(target: &mut UsageWindowTotals, src: WindowSum) {
+    target.steps += src.steps;
+    target.input_tokens += src.input_tokens;
+    target.output_tokens += src.output_tokens;
+    target.reasoning_tokens += src.reasoning_tokens;
+    target.cache_read_tokens += src.cache_read_tokens;
+    target.cache_write_tokens += src.cache_write_tokens;
+    target.total_tokens += src.input_tokens
+        + src.output_tokens
+        + src.reasoning_tokens
+        + src.cache_read_tokens
+        + src.cache_write_tokens;
+    if src.cost_usd.is_finite() {
+        target.cost_usd += src.cost_usd;
+    }
+}
+
 async fn scan_local_usage(
     store: Option<&Arc<Store>>,
     now_ms: i64,
@@ -73,68 +83,26 @@ async fn scan_local_usage(
     let Some(store) = store else {
         return Ok(BTreeMap::new());
     };
-    let sessions = sessions_all(store, None).await?;
+    let rows = store.local_provider_usage(now_ms).await?;
     let mut accums: BTreeMap<String, ProviderUsageAccum> = BTreeMap::new();
-    let five_hours_since = now_ms - FIVE_HOURS_MS;
-    let day_since = now_ms - ONE_DAY_MS;
-    let week_since = now_ms - SEVEN_DAYS_MS;
-    let month_since = now_ms - THIRTY_DAYS_MS;
-
-    for session in &sessions {
-        let Some(session_id) = session.get("id").and_then(Value::as_str) else {
-            continue;
-        };
-        let created = session
-            .pointer("/time/created")
-            .and_then(Value::as_i64)
-            .unwrap_or(0);
-        for message in messages_all(store, session_id).await? {
-            if message.get("type").and_then(Value::as_str) != Some("assistant") {
-                continue;
-            }
-            let ts = time_of(&message).unwrap_or(0);
-            if ts < created {
-                continue;
-            }
-            let Some(provider_id) = message
-                .pointer("/model/providerID")
-                .and_then(Value::as_str)
-                .filter(|s| !s.is_empty())
-            else {
-                continue;
-            };
-            let entry = accums.entry(provider_id.to_owned()).or_default();
-            entry.all_time.add(&message);
-            if ts >= month_since {
-                entry.month.add(&message);
-            }
-            if ts >= week_since {
-                entry.week.add(&message);
-            }
-            if ts >= day_since {
-                entry.day.add(&message);
-            }
-            if ts >= five_hours_since {
-                entry.five_hours.add(&message);
-            }
-            if let Some(model_id) = message
-                .pointer("/model/id")
-                .and_then(Value::as_str)
-                .filter(|s| !s.is_empty())
-            {
-                let tokens = message_token_total(&message);
-                let cost = message
-                    .get("cost")
-                    .and_then(Value::as_f64)
-                    .filter(|c| c.is_finite())
-                    .unwrap_or(0.0);
-                let model_entry = entry
-                    .models
-                    .entry(model_id.to_owned())
-                    .or_insert((0, 0, 0.0));
-                model_entry.0 += 1;
-                model_entry.1 += tokens;
-                model_entry.2 += cost;
+    for row in rows {
+        let entry = accums.entry(row.provider_id).or_default();
+        add_window(&mut entry.five_hours, row.five_hours);
+        add_window(&mut entry.day, row.day);
+        add_window(&mut entry.week, row.week);
+        add_window(&mut entry.month, row.month);
+        add_window(&mut entry.all_time, row.all_time);
+        if !row.model_id.is_empty() && row.all_time.steps > 0 {
+            let total_tokens = row.all_time.input_tokens
+                + row.all_time.output_tokens
+                + row.all_time.reasoning_tokens
+                + row.all_time.cache_read_tokens
+                + row.all_time.cache_write_tokens;
+            let model_entry = entry.models.entry(row.model_id).or_insert((0, 0, 0.0));
+            model_entry.0 += row.all_time.steps;
+            model_entry.1 += total_tokens;
+            if row.all_time.cost_usd.is_finite() {
+                model_entry.2 += row.all_time.cost_usd;
             }
         }
     }
@@ -173,15 +141,4 @@ fn finalize_provider_usage(acc: ProviderUsageAccum) -> ProviderLocalUsage {
         all_time: acc.all_time,
         top_models: models,
     }
-}
-
-fn message_token_total(msg: &Value) -> i64 {
-    ["input", "output", "reasoning", "cache/read", "cache/write"]
-        .into_iter()
-        .map(|field| {
-            msg.pointer(&format!("/tokens/{field}"))
-                .and_then(Value::as_i64)
-                .unwrap_or(0)
-        })
-        .sum()
 }

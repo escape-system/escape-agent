@@ -211,7 +211,7 @@ describe("save", () => {
     documents = []
     globalThis.fetch = (async () => {
       throw new TypeError("Failed to fetch")
-    }) as typeof globalThis.fetch
+    }) as unknown as typeof globalThis.fetch
     const { config, dispose } = create()
 
     try {

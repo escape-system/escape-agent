@@ -57,16 +57,127 @@
   inherits: false;
 }
 
+/* The on-screen keyboard owns this variable (`runtime/platform/keyboard.ts`); it always publishes 0px or the covered
+   height. The pre-mount fallback keeps `var(--keyboard-inset)` readable from the first frame. */
+:root {
+  --keyboard-inset: 0px;
+}
+
+/* Installed apps run without browser chrome, so the dynamic viewport is the honest height: it follows the keyboard
+   and the home indicator, while 100vh stays the fallback for engines without dvh. */
 @media (display-mode: standalone) {
-  /* WebKit excludes safe-area insets from dvh in installed apps. */
   #root {
     height: 100vh;
+    height: 100dvh;
   }
 }
 
 /* iOS can report navigator.standalone without matching display-mode. */
 #root[data-standalone="true"] {
   height: 100vh;
+  height: 100dvh;
+}
+
+/* The keyboard insets the visual viewport without resizing the layout viewport on iOS, so the composer reserves the
+   covered height itself; Android's `interactive-widget=resizes-content` already resizes the layout and reports 0. */
+[data-component="session-composer-dock"] {
+  padding-bottom: calc(0.75rem + var(--keyboard-inset, 0px));
+}
+
+/* Touch and narrow viewports: every queue, tree and subagent-bar control is a 44px target, and rows wrap instead of
+   overflowing at 320px. Unlayered on purpose so it wins over Tailwind utilities without !important. */
+@media (max-width: 640px), (pointer: coarse) {
+  :root [data-component="session-queue-row"] {
+    height: auto;
+    min-height: 44px;
+    flex-wrap: wrap;
+    padding-block: 4px;
+    row-gap: 2px;
+  }
+
+  :root [data-component="session-queue-row"] > div:first-child {
+    flex: 1 1 100%;
+    min-height: 32px;
+  }
+
+  :root [data-component="session-queue-row"] [data-action="session-queue-edit"] {
+    display: flex;
+    min-height: 32px;
+    align-items: center;
+  }
+
+  :root [data-slot="session-queue-actions"] {
+    flex: 1 1 100%;
+    justify-content: flex-end;
+  }
+
+  :root [data-slot="session-queue-actions"] button {
+    min-width: 44px;
+    min-height: 44px;
+  }
+
+  :root [data-slot="session-queue-list"] {
+    max-height: min(216px, 40dvh);
+  }
+
+  :root [data-component="session-agent-tree"] > button {
+    min-height: 44px;
+  }
+
+  :root [data-component="session-agent-tree"] [role="treeitem"] {
+    height: auto;
+    min-height: 44px;
+    /* Depth indent is an inline style; cap it on narrow screens so a deep branch cannot push the row past 320px. */
+    padding-inline-start: 12px !important;
+  }
+
+  :root [data-component="session-agent-tree"] [role="treeitem"] button {
+    min-height: 44px;
+  }
+
+  :root [data-component="session-agent-tree"] button[class~="rounded-full"] {
+    min-height: 44px;
+  }
+
+  :root [data-component="session-agent-tree"] input[type="search"] {
+    min-height: 44px;
+  }
+
+  :root [data-component="subagent-bar"] {
+    height: auto;
+    min-height: 44px;
+    flex-wrap: wrap;
+    padding-block: 4px;
+    row-gap: 2px;
+  }
+
+  :root [data-component="subagent-bar"] > div {
+    flex-wrap: wrap;
+    overflow: hidden;
+    row-gap: 2px;
+  }
+
+  :root [data-component="subagent-bar"] > button {
+    min-width: 44px;
+    min-height: 44px;
+    justify-content: center;
+  }
+}
+
+/* Below 360px the widest labels are the first to go: the model name, the row relation and the elapsed column. State,
+   title, depth and the way back stay readable without horizontal scrolling. */
+@media (max-width: 359.98px) {
+  :root [data-component="subagent-bar"] [data-slot="subagent-model"] {
+    display: none;
+  }
+
+  :root [data-component="session-agent-tree"] [role="treeitem"] button > span[class~="w-16"][class~="text-end"] {
+    display: none;
+  }
+
+  :root [data-component="session-agent-tree"] [role="treeitem"] button > span[class~="w-20"] {
+    width: auto;
+  }
 }
 
 @layer components {

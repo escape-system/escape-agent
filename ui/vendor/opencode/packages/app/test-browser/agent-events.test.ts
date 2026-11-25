@@ -9,6 +9,9 @@ type Handler = (event: RawEvent) => void
 const listeners = new Set<Handler>()
 
 mock.module("@/runtime/server/client", () => ({
+  createServerSdkContext: () => {
+    throw new Error("createServerSdkContext is not used in agent-events test")
+  },
   useServerSDK: () => ({
     scope: "local",
     event: {

@@ -50,13 +50,18 @@ async fn advice_rows_count(store: &oc_store::Store, session: &str) -> usize {
         .iter()
         .filter(|row| advice_rows(row))
         .count();
+    // Advice is admitted as an `observer` inbox kind but promoted as
+    // `synthetic` (the wire message union has no `observer`). Identify the row
+    // by `/metadata/advice` and leave the kind unfiltered, so the two
+    // zero-row assertions below fail if an advice row is promoted under any
+    // kind instead of silently counting nothing.
     let page = store
         .list_messages(MessageQuery {
             session_id: session.to_owned(),
             limit: 200,
             order: Order::Desc,
             cursor: None,
-            kind: Some("observer".to_owned()),
+            kind: None,
         })
         .await
         .expect("messages");

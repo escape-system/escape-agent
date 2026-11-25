@@ -322,6 +322,9 @@ const source = {
   "ui.sessionTimeline.notice.finished": "{{actor}} finished",
   "ui.sessionTimeline.notice.instructionsUpdated": "Instructions updated",
   "ui.sessionTimeline.notice.restart": "Continuing after restart",
+  "ui.sessionTimeline.notice.peer": "Peer message",
+  "ui.sessionTimeline.notice.peerFromYou": "You → Subagent",
+  "ui.sessionTimeline.notice.peerFrom": "From {{sender}}",
   "ui.message.queued": "Queued",
   "ui.message.attachment.alt": "attachment",
 

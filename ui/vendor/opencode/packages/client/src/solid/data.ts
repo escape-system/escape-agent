@@ -35,6 +35,7 @@ import type {
   ShellInfo,
   SkillInfo,
   ToolContent,
+  TokenUsageInfo,
   UsageLimitsInfo,
   VcsInfo,
   OpenCodeEvent,
@@ -122,6 +123,7 @@ type LocationData = {
 type Store = {
   session: {
     info: Record<string, SessionInfo>
+    lastStep: Record<string, { tokens: TokenUsageInfo; time: number } | undefined>
     // Family index keyed by a family's root (or furthest-known-ancestor when the
     // true root is not yet loaded). The value is a flat deduplicated list of every
     // session ID in that family, including the key itself once its info arrives.
@@ -314,6 +316,10 @@ export function createData(config: CreateDataInput) {
   const sync = createSync()
   let activeUpdates: Map<string, DataSessionStatus | undefined> | undefined
   const pendingUpdates = new Map<string, Map<string, SessionInboxInfo | SessionInbox.Delivery | undefined>>()
+  // Live SSE admissions kept until either their session reconnects (`server.connected`) or the
+  // durable snapshot/terminal inbox event observes them, so a racing `pending.hydrate` cannot wipe
+  // a live `session.inbox.enqueued` before the server snapshot reflects it.
+  const livePending = new Map<string, Map<string, SessionInboxInfo>>()
 
   function setSessionActive(sessionID: string, status: DataSessionStatus) {
     activeUpdates?.set(sessionID, status)
@@ -354,6 +360,7 @@ export function createData(config: CreateDataInput) {
 
   function removePending(sessionID: string, inboxID?: string) {
     if (!inboxID) return
+    livePending.get(sessionID)?.delete(inboxID)
     pendingUpdates.get(sessionID)?.set(inboxID, undefined)
     if (store.session.pending[sessionID]?.some((item) => item.id === inboxID))
       setStore(
@@ -401,12 +408,34 @@ export function createData(config: CreateDataInput) {
       })
   }
 
+  // Returns true when neither the store nor an in-flight snapshot read knows the row, so the caller
+  // can schedule the read that will place it.
   function updatePending(sessionID: string, inboxID: string, delivery: SessionInbox.Delivery) {
+    const live = livePending.get(sessionID)?.get(inboxID)
+    if (live) livePending.get(sessionID)?.set(inboxID, { ...live, delivery })
     const index = store.session.pending[sessionID]?.findIndex((item) => item.id === inboxID) ?? -1
     const item = store.session.pending[sessionID]?.[index]
-    pendingUpdates.get(sessionID)?.set(inboxID, item ? { ...item, delivery } : delivery)
-    if (index < 0 || !item || item.delivery === delivery) return
+    const updates = pendingUpdates.get(sessionID)
+    updates?.set(inboxID, item ? { ...item, delivery } : delivery)
+    if (index < 0 || !item) return updates === undefined
+    if (item.delivery === delivery) return false
     setStore("session", "pending", sessionID, index, { ...item, delivery })
+    return false
+  }
+
+  // One pending re-read per session per tick. An event that overtakes the pending snapshot leaves
+  // no row to update; the read that follows carries server truth, so a stale snapshot cannot
+  // resurrect an old delivery.
+  const pendingResyncs = new Set<string>()
+  onCleanup(() => pendingResyncs.clear())
+  function schedulePendingResync(sessionID: string) {
+    if (pendingResyncs.has(sessionID)) return
+    pendingResyncs.add(sessionID)
+    queueMicrotask(() => {
+      pendingResyncs.delete(sessionID)
+      if (disposed) return
+      void result.session.pending.sync(sessionID).catch(() => undefined)
+    })
   }
 
   // Inbox IDs of optimistic admissions awaiting acknowledgement, so rejection
@@ -491,6 +520,16 @@ export function createData(config: CreateDataInput) {
       if (position === undefined) return message.append(draft, index, row)
       draft[position] = row
     })
+  }
+
+  // Insert a transcript row at its chronological slot. A promoted item the client never
+  // rendered must not appear below output that was created after it.
+  function insertChronological(messages: SessionMessageInfo[], index: Map<string, number>, row: SessionMessageInfo) {
+    if (index.has(row.id)) return
+    const at = messages.findIndex((item) => item.time.created > row.time.created)
+    const position = at < 0 ? messages.length : at
+    messages.splice(position, 0, row)
+    message.reindex(messages, index, position)
   }
 
   // Remove an inbox item from pending, input, and the visible transcript.
@@ -643,6 +682,7 @@ export function createData(config: CreateDataInput) {
 
   function evictSession(sessionID: string) {
     if (sessionOutbox.has(sessionID)) return
+    livePending.delete(sessionID)
     sync.invalidate(`session.pending:${sessionID}`)
     sync.invalidate(`session.message:${sessionID}`)
     messageLoads.delete(sessionID)
@@ -667,6 +707,7 @@ export function createData(config: CreateDataInput) {
 
   function removeSession(sessionID: string) {
     activeUpdates?.set(sessionID, undefined)
+    livePending.delete(sessionID)
     store.session.pending[sessionID]?.forEach((item) => outbox.delete(item.id))
     messageIndex.delete(sessionID)
     sync.invalidate(`session:${sessionID}`)
@@ -684,6 +725,7 @@ export function createData(config: CreateDataInput) {
         delete draft.messageCursor[sessionID]
         delete draft.messageLoading[sessionID]
         delete draft.pending[sessionID]
+        delete draft.lastStep[sessionID]
         delete draft.permission[sessionID]
         delete draft.form[sessionID]
         for (const [rootID, family] of Object.entries(draft.family)) {
@@ -698,6 +740,7 @@ export function createData(config: CreateDataInput) {
   function handleEvent(event: OpenCodeEvent) {
     switch (event.type) {
       case "server.connected": {
+        livePending.clear()
         const updates = new Map<string, DataSessionStatus | undefined>()
         activeUpdates = updates
         refresh(() =>
@@ -742,13 +785,14 @@ export function createData(config: CreateDataInput) {
         sessionOutbox.delete(event.data.sessionID)
         result.session.invalidate(event.data.sessionID)
         refresh(() => result.session.sync(event.data.sessionID))
-        if (event.data.parentID) {
-          result.session.invalidate(event.data.parentID)
+        const parentID = event.data.parentID
+        if (parentID) {
+          result.session.invalidate(parentID)
           // The family sync is keyed apart from the plain session sync. Without invalidating it, a parent whose
           // family was already loaded answers `sync(parent, { children: true })` from the completed key and the
           // new subagent only appears after F5.
-          sync.invalidate(`session.family:${event.data.parentID}`)
-          refresh(() => result.session.sync(event.data.parentID, { children: true }))
+          sync.invalidate(`session.family:${parentID}`)
+          refresh(() => result.session.sync(parentID, { children: true }))
         }
         // Band-aid: a newly created session starts empty, so live events can be its source of truth.
         // Fetching pending inputs and projected messages separately lets promotion move an input between snapshots,
@@ -900,22 +944,34 @@ export function createData(config: CreateDataInput) {
       }
       case "session.inbox.delivered": {
         const admitted = result.session.input.has(event.data.sessionID, event.data.inboxID)
+        // The promotion only repositions a row that is already rendered. Capture the item first so a
+        // delivery whose row was evicted while it waited still materializes from the pending payload.
+        const pending = store.session.pending[event.data.sessionID]?.find((item) => item.id === event.data.inboxID)
         removePending(event.data.sessionID, event.data.inboxID)
         message.update(event.data.sessionID, (draft, index) => {
           const position = index.get(event.data.inboxID)
-          if (position === undefined) return
-          const existing = draft[position]
-          if (!existing || !admitted) return
-          existing.time.created = event.created
-          draft.splice(position, 1)
-          draft.push(existing)
-          message.reindex(draft, index, position)
+          const existing = position === undefined ? undefined : draft[position]
+          if (existing) {
+            // Keep the row where the reader already sees it; promotion is not a new arrival.
+            existing.time.created = event.created
+            return
+          }
+          if (!admitted || !pending) return
+          if (pending.type !== "user" && pending.type !== "synthetic") return
+          const row =
+            pending.type === "user"
+              ? { id: pending.id, type: "user" as const, ...pending.payload, time: { created: event.created } }
+              : { id: pending.id, type: "synthetic" as const, ...pending.payload, time: { created: event.created } }
+          insertChronological(draft, index, row)
         })
         compacting.get(event.data.sessionID)?.observed.add(event.data.inboxID)
         return
       }
       case "session.inbox.delivery.changed":
-        updatePending(event.data.sessionID, event.data.inboxID, event.data.delivery)
+        // An event can overtake the pending snapshot. When neither the store nor an in-flight
+        // snapshot read knows the row, keep the update and resync once instead of dropping it.
+        if (updatePending(event.data.sessionID, event.data.inboxID, event.data.delivery))
+          schedulePendingResync(event.data.sessionID)
         return
       case "session.inbox.cancelled": {
         retractLocal(event.data.sessionID, event.data.inboxID)
@@ -931,6 +987,9 @@ export function createData(config: CreateDataInput) {
           ...event.data.item,
         }
         pendingUpdates.get(item.sessionID)?.set(item.id, item)
+        const sessionLive = livePending.get(item.sessionID)
+        if (sessionLive) sessionLive.set(item.id, item)
+        else livePending.set(item.sessionID, new Map([[item.id, item]]))
         admitLocal(item)
         if (event.data.item.type === "compaction") {
           const active = compacting.get(event.data.sessionID)
@@ -1641,17 +1700,23 @@ export function createData(config: CreateDataInput) {
               })
               const pending = [...current.values()]
               // A positive read acknowledges admission even when its SSE echo is delayed.
-              pending.forEach((item) => outbox.delete(item.id))
+              pending.forEach((item) => {
+                outbox.delete(item.id)
+                livePending.get(sessionID)?.delete(item.id)
+              })
               // Compactions also coalesce by Session, not just by the proposed ID.
               if (pending.some((item) => item.type === "compaction"))
                 store.session.pending[sessionID]
                   ?.filter((item) => item.type === "compaction")
                   .forEach((item) => outbox.delete(item.id))
-              // Keep optimistic rows still awaiting their echo: this fetch may
-              // have raced ahead of an in-flight admission the server does not
-              // know about yet.
-              const inflight = (store.session.pending[sessionID] ?? []).filter((item) => outbox.has(item.id))
-              const merged = inflight.length === 0 ? pending : [...pending, ...inflight]
+              // Keep optimistic rows awaiting their echo AND live-stream enqueued rows not yet reflected in
+              // this snapshot (cleared on delivery, cancellation, or reconnect).
+              const live = [...(livePending.get(sessionID)?.values() ?? [])].filter((item) => !current.has(item.id))
+              const seenIDs = new Set(live.map((item) => item.id))
+              const inflight = (store.session.pending[sessionID] ?? []).filter(
+                (item) => outbox.has(item.id) && !current.has(item.id) && !seenIDs.has(item.id),
+              )
+              const merged = live.length === 0 && inflight.length === 0 ? pending : [...pending, ...live, ...inflight]
               batch(() => {
                 setStore("session", "pending", sessionID, reconcile(merged))
                 merged.forEach(materializeInboxMessage)
@@ -1663,6 +1728,14 @@ export function createData(config: CreateDataInput) {
         },
         invalidate(sessionID: string) {
           sync.invalidate(`session.pending:${sessionID}`)
+        },
+        // `session.created` completes this key so the racy initial read is skipped, but completion is
+        // permanent: without this, a session created in this tab never reads its durable inbox and the
+        // queue strip stays empty while `GET /session/:id/inbox` keeps returning the queued rows.
+        // Hydration is the explicit durable read, and it still coalesces with an in-flight sync.
+        hydrate(sessionID: string) {
+          sync.invalidate(`session.pending:${sessionID}`)
+          return result.session.pending.sync(sessionID)
         },
       },
       // Optimistic session creation: admit a local record under a
@@ -1864,14 +1937,34 @@ export function createData(config: CreateDataInput) {
                 item.type === "user" || item.type === "synthetic" ? [item.id] : [],
               ),
             )
-            const local = (store.session.message[sessionID] ?? []).filter(
+            const existing = store.session.message[sessionID] ?? []
+            const local = existing.filter(
               (item) => !ids.has(item.id) && (outbox.has(item.id) || admitted.has(item.id)),
             )
-            const messages = local.length === 0 ? fetched : [...fetched, ...local]
+            // A first page says nothing about pages `loadMore` already fetched. Rows older than the
+            // oldest fetched message and absent from the response are that history; dropping them
+            // rekeys the virtualizer and throws the reader back to the top.
+            const oldest = fetched[0]?.time.created
+            const preserved =
+              oldest === undefined
+                ? []
+                : existing.filter(
+                    (item) => !ids.has(item.id) && item.time.created < oldest && !local.includes(item),
+                  )
+            const messages = [...preserved, ...fetched, ...local]
             batch(() => {
               messageIndex.set(sessionID, new Map(messages.map((message, index) => [message.id, index])))
               setStore("session", "message", sessionID, reconcile(messages))
-              setStore("session", "messageCursor", sessionID, response.cursor.next ?? undefined)
+              // The first page's cursor points at the second page; with older pages loaded the kept
+              // cursor still walks the rest of the history down to it.
+              setStore(
+                "session",
+                "messageCursor",
+                sessionID,
+                preserved.length > 0
+                  ? store.session.messageCursor[sessionID]
+                  : (response.cursor.next ?? undefined),
+              )
             })
           })
         },

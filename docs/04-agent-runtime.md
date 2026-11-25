@@ -12,14 +12,18 @@ prompt → inbox row (durable) → wake actor → execution.started
 ```
 
 - `session_inbox` types: `user`, `synthetic`, `compaction`, `move`, plus our
-  `peer` (subagent-to-sibling) and `observer` (repair note, or host-side
-  compaction advice with `metadata.advice="compact"`). Delivery is
+  additive `peer` (subagent-to-sibling) and `observer` (repair note, or
+  host-side compaction advice with `metadata.advice="compact"`). The last two
+  are inbox-only kinds: they are reported and promoted as `synthetic` because
+  the message union has no `peer`/`observer`, with the sender identity kept in
+  the payload (`metadata.source`, `from`, `agent`, `kind`). Delivery is
   `steer` (promote mid-turn) or `queue` (next turn).
 - One execution per session at a time. New prompts during an execution are
   admitted, not rejected; `steer` promotes at step boundaries. Only `steer`
-  prompts are written to the transcript at admission; a `queue` row stays
-  inbox-only (invisible to the running turn's requests) until the runtime
-  promotes it as the next execution.
+  prompts are written to the transcript at admission, in the same transaction
+  as the inbox row (`Store::enqueue_steer`); a `queue` row stays inbox-only
+  (invisible to the running turn's requests) until the runtime promotes it as
+  the next execution.
 - `POST /interrupt?resume=` stops the current execution. The `resume` query
   parameter is accepted for wire compatibility and **ignored**: there is no
   paused-execution state in the runtime, so nothing is kept claimed for a
@@ -36,7 +40,8 @@ prompt → inbox row (durable) → wake actor → execution.started
 ## One turn
 
 1. **Promote inbox** (`SessionInbox.nextPromotable`): handle `move`,
-   `compaction`, then user/synthetic/peer.
+   `compaction`, then user/synthetic (`peer`/`observer` rows are promoted as
+   `synthetic`).
 2. **Context**: session, agent, merged permissions, tool snapshot, instruction
    sources. Emit `session.instructions.updated` deltas when sources changed.
 3. **Title**: generate if empty (hidden `title` agent, cheap model).

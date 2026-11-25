@@ -515,6 +515,16 @@ async fn subagent_tree_and_peer_message() {
     assert_eq!(inbox.len(), 1);
     assert_eq!(inbox[0]["id"], item["id"]);
 
+    // The route writes a wire-valid inbox item: `Session.Inbox.Item` only has
+    // user/synthetic/compaction/move, so a client decoder cannot drop it.
+    for queued in &inbox {
+        let kind = queued["type"].as_str().unwrap();
+        assert!(
+            matches!(kind, "user" | "synthetic" | "compaction" | "move"),
+            "off-wire inbox kind {kind:?}: {queued}"
+        );
+    }
+
     let (status, _) = call(
         &harness.app,
         Method::POST,
@@ -523,6 +533,39 @@ async fn subagent_tree_and_peer_message() {
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // Steering delivery atomically writes both the inbox row and the synthetic peer transcript row.
+    let (status, body) = call(
+        &harness.app,
+        Method::POST,
+        "/api/experimental/subagent/ses_child/message",
+        Some(json!({"text": "focus on clippy first", "delivery": "steer"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "steer message failed: {body:?}");
+    let steered = data(body);
+    let steer_id = steered["id"].as_str().unwrap();
+    assert_eq!(steered["delivery"], "steer");
+    assert_eq!(steered["type"], "synthetic");
+
+    let inbox = harness.store.list_inbox(&harness.child).await.unwrap();
+    assert!(
+        inbox
+            .iter()
+            .any(|row| row["id"] == steer_id && row["delivery"] == "steer")
+    );
+
+    let transcript_row = harness
+        .store
+        .get_message(&harness.child, steer_id)
+        .await
+        .unwrap()
+        .expect("steer message must materialize into child transcript immediately");
+    assert_eq!(transcript_row["type"], "synthetic");
+    assert_eq!(transcript_row["text"], "focus on clippy first");
+    assert_eq!(transcript_row["peer"], true);
+    assert_eq!(transcript_row["metadata"]["source"], "peer");
+    assert_eq!(transcript_row["metadata"]["from"], "user");
 }
 
 #[tokio::test]

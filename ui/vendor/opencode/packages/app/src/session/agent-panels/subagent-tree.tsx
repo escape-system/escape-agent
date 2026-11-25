@@ -21,7 +21,7 @@ function shortModelName(model: string): string {
  * that session in the current tab; the routed session is marked and is not a
  * link to itself.
  */
-export function SubagentTreePanel(props: { sessionID: string }) {
+export function SubagentTreePanel(props: { sessionID: string; inline?: boolean }) {
   const language = useLanguage()
   const server = useServer()
   const open = useOpenSessionRoute()
@@ -233,7 +233,10 @@ export function SubagentTreePanel(props: { sessionID: string }) {
 
         <Show when={!collapsed()}>
           <div
-            class="absolute inset-x-0 top-full z-40 flex flex-col border-b border-v2-border-border-base bg-v2-background-bg-base shadow-[0_12px_32px_rgba(0,0,0,0.35)]"
+            class="flex flex-col border-b border-v2-border-border-base bg-v2-background-bg-base"
+            classList={{
+              "absolute inset-x-0 top-full z-40 shadow-[0_12px_32px_rgba(0,0,0,0.35)]": !props.inline,
+            }}
             onWheel={stopTreeScrollIfOverflowing}
             onTouchMove={stopTreeScrollIfOverflowing}
           >
@@ -323,9 +326,12 @@ export function SubagentTreePanel(props: { sessionID: string }) {
             <div
               ref={treeScrollRef}
               role="tree"
-              data-scrollable
+              data-scrollable={props.inline ? undefined : ""}
               data-testid="session-agent-tree-nodes"
-              class="max-h-[min(320px,50vh)] overflow-y-auto py-1"
+              class="py-1"
+              classList={{
+                "max-h-[min(320px,50vh)] overflow-y-auto": !props.inline,
+              }}
             >
               <For each={filteredIds()}>
                 {(nodeId) => {

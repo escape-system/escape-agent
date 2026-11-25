@@ -10,7 +10,6 @@ use oc_llm::{
     ProviderApiSpend, ProviderBalanceSummary, ProviderRateLimit, QuotaCapability, QuotaWindow,
 };
 use serde::Serialize;
-use serde_json::Value;
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -186,43 +185,6 @@ pub(super) struct UsageWindowTotals {
     pub(super) cache_write_tokens: i64,
     pub(super) total_tokens: i64,
     pub(super) cost_usd: f64,
-}
-
-impl UsageWindowTotals {
-    pub(super) fn add(&mut self, msg: &Value) {
-        let input = msg
-            .pointer("/tokens/input")
-            .and_then(Value::as_i64)
-            .unwrap_or(0);
-        let output = msg
-            .pointer("/tokens/output")
-            .and_then(Value::as_i64)
-            .unwrap_or(0);
-        let reasoning = msg
-            .pointer("/tokens/reasoning")
-            .and_then(Value::as_i64)
-            .unwrap_or(0);
-        let cache_read = msg
-            .pointer("/tokens/cache/read")
-            .and_then(Value::as_i64)
-            .unwrap_or(0);
-        let cache_write = msg
-            .pointer("/tokens/cache/write")
-            .and_then(Value::as_i64)
-            .unwrap_or(0);
-        let cost = msg.get("cost").and_then(Value::as_f64).unwrap_or(0.0);
-
-        self.steps += 1;
-        self.input_tokens += input;
-        self.output_tokens += output;
-        self.reasoning_tokens += reasoning;
-        self.cache_read_tokens += cache_read;
-        self.cache_write_tokens += cache_write;
-        self.total_tokens += input + output + reasoning + cache_read + cache_write;
-        if cost.is_finite() {
-            self.cost_usd += cost;
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize)]

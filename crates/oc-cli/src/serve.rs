@@ -113,6 +113,12 @@ pub(crate) async fn serve(options: ServeOptions) -> anyhow::Result<()> {
         service_mode.then_some((registration_path.as_path(), service_id.as_str())),
     );
 
+    tokio::task::yield_now().await;
+    oc_alloc::purge_idle_memory();
+    tokio::spawn(async {
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        oc_alloc::purge_idle_memory();
+    });
     let result = axum::serve(listener, router(state))
         .with_graceful_shutdown(shutdown.clone().cancelled_owned())
         .await

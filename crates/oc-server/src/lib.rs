@@ -24,7 +24,7 @@ use std::time::Duration;
 use axum::Router;
 use axum::extract::{DefaultBodyLimit, Request, State};
 use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
-use axum::http::{HeaderName, Method};
+use axum::http::{HeaderMap, HeaderName, Method};
 use axum::middleware;
 use axum::response::Response;
 use axum::routing::{get, patch as patch_route, post, put};
@@ -82,6 +82,9 @@ pub struct AppState {
     antigravity: Option<Arc<AntigravityService>>,
     llm: Option<Arc<SharedLlmClient>>,
     quota_cache: Arc<RwLock<data::quotas::QuotaCache>>,
+    static_cache: Arc<static_files::StaticCache>,
+    location_cache: Arc<data::location::LocationCache>,
+    model_cache: Arc<data::model::ModelCache>,
     tickets: Arc<TicketStore>,
 }
 
@@ -136,6 +139,9 @@ impl AppState {
             antigravity: None,
             llm: None,
             quota_cache: data::quotas::new_quota_cache(),
+            static_cache: Arc::new(static_files::StaticCache::default()),
+            location_cache: Arc::new(data::location::LocationCache::default()),
+            model_cache: Arc::new(data::model::ModelCache::default()),
             tickets: Arc::new(TicketStore::new()),
         }
     }
@@ -413,6 +419,18 @@ impl AppState {
         &self.quota_cache
     }
 
+    pub(crate) fn static_cache(&self) -> &static_files::StaticCache {
+        &self.static_cache
+    }
+
+    pub(crate) fn location_cache(&self) -> &data::location::LocationCache {
+        &self.location_cache
+    }
+
+    pub(crate) fn model_cache(&self) -> &data::model::ModelCache {
+        &self.model_cache
+    }
+
     /// Short-lived single-use WebSocket tickets.
     pub(crate) fn tickets(&self) -> &TicketStore {
         &self.tickets
@@ -440,6 +458,16 @@ impl AppState {
     /// Serve a static asset if a web build is configured.
     pub async fn static_response(&self, method: &Method, path: &str) -> Option<Response> {
         static_files::serve(self, method, path).await
+    }
+
+    /// Serve a static asset with request header negotiation (`Accept-Encoding`, `If-None-Match`).
+    pub(crate) async fn static_response_with_headers(
+        &self,
+        method: &Method,
+        path: &str,
+        headers: &HeaderMap,
+    ) -> Option<Response> {
+        static_files::serve_with_headers(self, method, path, headers).await
     }
 
     #[must_use]

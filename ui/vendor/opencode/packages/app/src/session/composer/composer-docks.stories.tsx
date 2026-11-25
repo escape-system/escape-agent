@@ -159,6 +159,7 @@ function ComposerDocksPreview(props: DockArgs) {
     remove: async (id) => dequeue(id),
     undo: dequeue,
     edit: () => false,
+    reorderable: () => true,
     reorder: async (ids) =>
       void setState(
         "rows",

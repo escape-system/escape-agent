@@ -94,7 +94,19 @@ fn with_settings(id: &str, inner: Map<String, Value>) -> Variant {
     settings_variant(id, &Value::Object(inner))
 }
 
-fn openai_variants(_model: &ModelInfo, support: &ReasoningSupport) -> Vec<Variant> {
+fn openai_variants(model: &ModelInfo, support: &ReasoningSupport) -> Vec<Variant> {
+    // Both Go feeds mark HungerG reasoning-capable but omit its effort list.
+    // Pin its maximum in the shared synthesizer so feed parsing and later
+    // config overlays cannot drop the selectable `#max` variant.
+    if model.provider_id == "opencode-go" && model.id == "hungerg-free" {
+        return vec![with_settings(
+            "max",
+            Map::from_iter([(
+                "reasoningEffort".to_string(),
+                Value::String("max".to_string()),
+            )]),
+        )];
+    }
     let Some(values) = support.effort.as_ref() else {
         return Vec::new();
     };

@@ -38,7 +38,10 @@ pub async fn entries(State(state): State<AppState>) -> Result<Json<Value>, Error
 /// calls as upstream `ConfigShell.Option[]` (`{path,name,acceptable}`).
 pub async fn shells(State(state): State<AppState>) -> Json<Value> {
     let configured = state.config().map(|config| config.shell());
-    Json(Value::Array(shell_options(configured.as_deref())))
+    let options = tokio::task::spawn_blocking(move || shell_options(configured.as_deref()))
+        .await
+        .unwrap_or_default();
+    Json(Value::Array(options))
 }
 
 fn shell_options(configured: Option<&str>) -> Vec<Value> {

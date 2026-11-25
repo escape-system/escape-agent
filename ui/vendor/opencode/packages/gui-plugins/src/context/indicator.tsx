@@ -160,7 +160,10 @@ export function SessionContextUsage(props: {
               type="button"
               variant="ghost-muted"
               class="group shrink-0"
-              title={context()?.limit ? `context window ${context()!.limit.toLocaleString(i18n.locale())}` : undefined}
+              title={(() => {
+                const limit = context()?.limit
+                return limit ? `context window ${limit.toLocaleString(i18n.locale())}` : undefined
+              })()}
               style={{ padding: "0 6px", color: "var(--v2-text-text-faint)" }}
               onClick={openContext}
               aria-expanded={layout.state(`${ctx.id}:main`, props.session) === "visible"}

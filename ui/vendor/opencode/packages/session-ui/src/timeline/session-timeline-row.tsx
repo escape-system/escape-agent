@@ -46,7 +46,7 @@ import { taskAgentName, ToolRegistry, type ContextGroupPart } from "../tools/too
 import { GenericTool } from "../components/basic-tool"
 import { SessionRetry } from "../components/session-retry"
 import { SessionError } from "../components/session-error"
-import { timelineCategory, type TimelineDetail } from "./detail"
+import { isPeerNotice, timelineCategory, type TimelineDetail } from "./detail"
 import { currentToolFailed } from "../message/current-tool-state"
 import { userMessageRuns, userRunSpring } from "./user-runs"
 import { attached } from "../components/message-file"
@@ -649,6 +649,25 @@ export function createSessionTimelineRowRenderer(input: {
       }
     })
 
+    const peer = createMemo(() => {
+      const value = message()
+
+      if (value?.type !== "synthetic" || !isPeerNotice(value)) return undefined
+      const metadata = value.metadata
+      const from = Predicate.isString(metadata?.from) && metadata.from ? metadata.from : "peer"
+      const agent = Predicate.isString(metadata?.agent) && metadata.agent ? metadata.agent : undefined
+      const kind = Predicate.isString(metadata?.kind) && metadata.kind ? metadata.kind : undefined
+
+      return {
+        id: value.id,
+        from,
+        fromUser: from === "user",
+        agent,
+        kind,
+        text: value.text,
+      }
+    })
+
     const content = createMemo(() => {
       const value = message()
 
@@ -709,7 +728,37 @@ export function createSessionTimelineRowRenderer(input: {
 
     return (
       <>
-        <Show when={compaction()}>
+        <Show when={peer()}>
+          {(entry) => (
+            <div
+              data-slot="session-timeline-notice"
+              data-type="peer"
+              data-message-id={entry().id}
+              class={`w-full ${props.grouped ? "py-1" : "pt-3 pb-1"} ${inset()}`}
+            >
+              <div class="rounded-lg border border-v2-border-border-base/80 bg-v2-background-bg-layer-01/60 px-3 py-2 text-13-regular text-v2-text-text-base">
+                <div class="mb-1 flex flex-wrap items-center gap-1.5 text-11-regular text-v2-text-text-muted">
+                  <Icon name="chat-bubble" size="small" class="shrink-0 text-v2-icon-icon-faint" />
+                  <span class="rounded-full bg-v2-background-bg-layer-02 px-1.5 py-px font-[530] text-v2-text-text-accent">
+                    {entry().fromUser
+                      ? i18n.t("ui.sessionTimeline.notice.peerFromYou")
+                      : i18n.t("ui.sessionTimeline.notice.peerFrom", { sender: entry().from })}
+                  </span>
+                  <Show when={entry().agent}>
+                    {(agent) => <span class="capitalize text-v2-text-text-faint">{agent()}</span>}
+                  </Show>
+                  <Show when={entry().kind}>
+                    {(kind) => <span class="text-v2-text-text-faint">{kind()}</span>}
+                  </Show>
+                </div>
+                <div class="select-text whitespace-pre-wrap break-words leading-5 text-v2-text-text-base" dir="auto">
+                  {entry().text}
+                </div>
+              </div>
+            </div>
+          )}
+        </Show>
+        <Show when={!peer() && compaction()}>
           {(message) => (
             <div data-slot="session-turn-message-container" class={`w-full ${inset()}`}>
               <div data-slot="session-turn-compaction">
@@ -719,12 +768,12 @@ export function createSessionTimelineRowRenderer(input: {
           )}
         </Show>
         <Show
-          when={moved()}
+          when={!peer() && moved()}
           fallback={
             <Show
-              when={model()}
+              when={!peer() && model()}
               fallback={
-                <Show when={content()}>
+                <Show when={!peer() && content()}>
                   {(content) => (
                     <Show
                       when={content().items?.length}

@@ -172,6 +172,34 @@ describe("visibleTimelineMessages", () => {
     expect(visibleTimelineMessages(messages, pending).map((message) => message.id)).toEqual(["msg_1", "msg_2", "msg_4"])
   })
 
+  test("hides queued peer synthetic rows until steered or delivered", () => {
+    const peerQueued = {
+      id: "msg_peer_q",
+      sessionID: "ses_1",
+      time: { created: 4 },
+      type: "synthetic",
+      delivery: "queue",
+      payload: { text: "queued peer note", metadata: { source: "peer", from: "user" } },
+    } satisfies SessionInboxInfo
+    const peerMsg = {
+      id: peerQueued.id,
+      type: "synthetic",
+      text: "queued peer note",
+      metadata: { source: "peer", from: "user" },
+      time: peerQueued.time,
+    } satisfies SessionMessageInfo
+    const source = [...messages.slice(0, 2), work, peerMsg]
+
+    expect(visibleTimelineMessages(source, [peerQueued]).map((item) => item.id)).toEqual(["msg_1", "msg_2", "msg_5"])
+    expect(visibleTimelineMessages(source, [{ ...peerQueued, delivery: "steer" }]).map((item) => item.id)).toEqual([
+      "msg_1",
+      "msg_2",
+      "msg_5",
+      "msg_peer_q",
+    ])
+    expect(visibleTimelineMessages(source, []).map((item) => item.id)).toEqual(["msg_1", "msg_2", "msg_5", "msg_peer_q"])
+  })
+
   test("hides the staged revert boundary and later messages", () => {
     expect(visibleTimelineMessages(messages, [], "msg_4").map((message) => message.id)).toEqual([
       "msg_1",

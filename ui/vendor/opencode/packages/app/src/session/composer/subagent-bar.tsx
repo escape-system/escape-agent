@@ -22,7 +22,7 @@ export function SubagentBar(props: {
   /** The build lane this session's command waits in, when it has one. */
   lane?: JSX.Element
   /** Peer messages for this child session; the count is what arrived while the drawer was closed. */
-  peer?: { count: Accessor<number>; onOpen: () => void }
+  peer?: { count: Accessor<number>; queued?: Accessor<number>; onOpen: () => void }
 }) {
   const language = useLanguage()
   const [now, setNow] = createSignal(Date.now())
@@ -122,6 +122,14 @@ export function SubagentBar(props: {
           >
             <Icon name="chat-bubble" size="small" />
             <span class="hidden sm:block">{language.t("session.peer.title")}</span>
+            <Show when={(peer().queued?.() ?? 0) > 0}>
+              <span
+                data-testid="session-peer-queued"
+                class="rounded-full bg-v2-surface-surface-muted px-1.5 text-11-regular tabular-nums text-v2-text-text-muted"
+              >
+                {peer().queued?.()} {language.t("session.peer.queued")}
+              </span>
+            </Show>
             <Show when={peer().count() > 0}>
               <span
                 data-testid="session-peer-unread"
@@ -134,7 +142,9 @@ export function SubagentBar(props: {
         )}
       </Show>
       <Button type="button" variant="ghost-faint" size="small" class="shrink-0 gap-1.5 px-1.5" onClick={props.onBack}>
-        {language.t("session.child.backToParent")}
+        <span data-slot="subagent-bar-back-label" class="truncate">
+          {language.t("session.child.backToParent")}
+        </span>
         <span class="hidden sm:block">
           <Keybind keys={[formatKeybind("esc", language.t)]} variant="neutral" />
         </span>

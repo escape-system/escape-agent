@@ -24,7 +24,7 @@
 //! file, so it reaches the cell on the next process start or an explicit
 //! `ConfigService::refresh_models_from_disk` call.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use axum::Json;
 use axum::extract::rejection::{JsonRejection, QueryRejection};
@@ -38,8 +38,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 use crate::AppState;
-use crate::data::model::available_provider_ids;
-use crate::data::session_ext::common::{messages_all, sessions_all, time_of};
+use crate::data::model::{
+    available_provider_ids_with_credentials, filtered_catalog_models,
+    has_direct_google_access_with_credentials, load_credentials,
+};
 use crate::data::{query_error, require_catalog, require_config, schema_error};
 use crate::error::ErrorResponse;
 
@@ -53,10 +55,6 @@ const MAX_MODELS: usize = 1000;
 const MAX_CHAIN: usize = 16;
 /// Bound on the session tree walk a `sessionID` scope may cover.
 const MAX_SUBTREE_SESSIONS: usize = 500;
-/// Bound on the sessions one usage scan reads.
-const MAX_SCAN_SESSIONS: usize = 2_000;
-/// Bound on the messages one usage scan reads.
-const MAX_SCAN_MESSAGES: usize = 200_000;
 /// Documented default reserve share when `models.quota.reserve_percent` is absent.
 const DEFAULT_RESERVE_PERCENT: i64 = 10;
 /// Documented default quota window when `models.quota.window_hours` is absent.
@@ -640,33 +638,12 @@ impl UsageAccum {
             && self.tokens_reasoning == 0
             && self.cost_usd == 0.0
     }
-
-    fn add(&mut self, message: &Value) {
-        self.requests += 1;
-        self.tokens_input += tokens_of(message, "input");
-        self.tokens_output += tokens_of(message, "output");
-        self.tokens_reasoning += tokens_of(message, "reasoning");
-        self.cost_usd += message
-            .get("cost")
-            .and_then(Value::as_f64)
-            .filter(|cost| cost.is_finite())
-            .unwrap_or(0.0);
-    }
-}
-
-fn tokens_of(message: &Value, field: &str) -> i64 {
-    message
-        .pointer(&format!("/tokens/{field}"))
-        .and_then(Value::as_i64)
-        .unwrap_or(0)
 }
 
 /// Roll up assistant-message usage since `since_ms`, optionally limited to the
 /// session ids in `scope`.
 ///
-/// Unscoped calls use the frozen store rollup ([`oc_store::Store::model_usage`],
-/// one indexed SQL pass); a `sessionID` scope needs the bounded session walk
-/// because that SQL has no session filter.
+/// Uses SQLite `json_extract` aggregation instead of decoding message JSON trees.
 pub(crate) async fn model_usage_since(
     state: &AppState,
     since_ms: i64,
@@ -698,10 +675,6 @@ pub(crate) async fn model_usage_since(
 
 /// Roll up assistant-message usage since `since_ms`, optionally limited to the
 /// session ids in `scope`.
-///
-/// Bounded: at most [`MAX_SCAN_SESSIONS`] sessions and [`MAX_SCAN_MESSAGES`]
-/// messages are read. Returns an empty map when no store is attached (there is
-/// no recorded usage then).
 pub(crate) async fn scan_usage(
     state: &AppState,
     since_ms: i64,
@@ -710,47 +683,25 @@ pub(crate) async fn scan_usage(
     let Some(store) = state.store() else {
         return Ok(BTreeMap::new());
     };
-    let sessions = sessions_all(store, None).await?;
-    let allowed: Option<BTreeSet<&str>> = scope.map(|ids| ids.iter().map(String::as_str).collect());
+    let rows = match scope {
+        None => store.model_usage(since_ms).await?,
+        Some([]) => return Ok(BTreeMap::new()),
+        Some(ids) => {
+            let mut combined = Vec::new();
+            for chunk in ids.chunks(MAX_SUBTREE_SESSIONS) {
+                combined.extend(store.model_usage_for_sessions(chunk, since_ms).await?);
+            }
+            combined
+        }
+    };
     let mut usage: BTreeMap<(String, String), UsageAccum> = BTreeMap::new();
-    let mut scanned = 0usize;
-    'sessions: for session in sessions.iter().take(MAX_SCAN_SESSIONS) {
-        let Some(session_id) = session.get("id").and_then(Value::as_str) else {
-            continue;
-        };
-        if allowed
-            .as_ref()
-            .is_some_and(|set| !set.contains(session_id))
-        {
-            continue;
-        }
-        for message in messages_all(store, session_id).await? {
-            scanned += 1;
-            if scanned > MAX_SCAN_MESSAGES {
-                break 'sessions;
-            }
-            if message.get("type").and_then(Value::as_str) != Some("assistant") {
-                continue;
-            }
-            if time_of(&message).unwrap_or(0) < since_ms {
-                continue;
-            }
-            let provider_id = message
-                .pointer("/model/providerID")
-                .and_then(Value::as_str)
-                .filter(|id| !id.is_empty());
-            let model_id = message
-                .pointer("/model/id")
-                .and_then(Value::as_str)
-                .filter(|id| !id.is_empty());
-            let (Some(provider_id), Some(model_id)) = (provider_id, model_id) else {
-                continue;
-            };
-            usage
-                .entry((provider_id.to_owned(), model_id.to_owned()))
-                .or_default()
-                .add(&message);
-        }
+    for row in rows {
+        let accum = usage.entry((row.provider_id, row.model_id)).or_default();
+        accum.requests += row.requests;
+        accum.tokens_input += row.tokens_in;
+        accum.tokens_output += row.tokens_out;
+        accum.tokens_reasoning += row.tokens_reasoning;
+        accum.cost_usd += row.cost;
     }
     Ok(usage)
 }
@@ -905,27 +856,13 @@ async fn build_registry(
     let policy = oc_runtime::models_policy(require_config(state)?);
     let fallback_disabled = policy.fallback().disabled_by_config();
 
-    let available = available_provider_ids(state, catalog.as_ref()).await;
-    let direct_google = super::model::has_direct_google_access(state, catalog.as_ref()).await;
-    let mut infos: Vec<ModelInfo> = catalog.models();
-    infos.retain(|model| available.contains(&model.provider_id));
-    if available.contains("google")
-        && let Some(antigravity) = state.antigravity()
-    {
-        if !direct_google {
-            infos.retain(|model| model.provider_id != "google");
-        }
-        for extra in antigravity.antigravity_model_infos() {
-            if let Some(position) = infos
-                .iter()
-                .position(|model| model.provider_id == "google" && model.id == extra.id)
-            {
-                infos[position] = extra;
-            } else {
-                infos.push(extra);
-            }
-        }
-    }
+    let credentials = load_credentials(state).await;
+    let available = available_provider_ids_with_credentials(state, catalog.as_ref(), &credentials);
+    let direct_google =
+        has_direct_google_access_with_credentials(state, catalog.as_ref(), &credentials);
+    let (filtered_models, _) =
+        filtered_catalog_models(state, catalog.as_ref(), &available, direct_google);
+    let mut infos: Vec<ModelInfo> = (*filtered_models).clone();
     infos.sort_by(|a, b| {
         a.provider_id
             .cmp(&b.provider_id)
@@ -940,6 +877,10 @@ async fn build_registry(
         .model_health()
         .map(|health| health.entries(now))
         .unwrap_or_default();
+    let mut health_map = HashMap::with_capacity(health.len());
+    for (seen, entry) in &health {
+        health_map.entry(seen.as_str()).or_insert(entry);
+    }
     let health_key = |reference: &str| -> String {
         reference
             .split_once('#')
@@ -949,10 +890,9 @@ async fn build_registry(
     };
     let unavailable_of = |reference: &str| -> Option<RegistryUnavailable> {
         let key = health_key(reference);
-        health
-            .iter()
-            .find(|(seen, _)| *seen == key)
-            .map(|(_, entry)| RegistryUnavailable {
+        health_map
+            .get(key.as_str())
+            .map(|entry| RegistryUnavailable {
                 until_ms: entry.until_ms,
                 kind: entry.kind.as_str().to_owned(),
                 message: entry.message.clone(),

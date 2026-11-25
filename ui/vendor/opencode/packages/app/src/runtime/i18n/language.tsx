@@ -235,6 +235,14 @@ export function loadInitialLocale() {
   return initialLocale
 }
 
+/**
+ * The locale the first frame renders with, available synchronously. Its dictionary may still be loading, in which
+ * case `LanguageProvider` renders the English base and swaps the chunk in after the first paint.
+ */
+export function initialLocaleHint(): Locale {
+  return warm
+}
+
 export const { use: useLanguage, provider: LanguageProvider } = createSimpleContext({
   name: "Language",
   gate: false,

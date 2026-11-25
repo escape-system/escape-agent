@@ -85,5 +85,5 @@ pub use schedule::{
 };
 pub use session::{NewSession, NewSessionTree, SessionPage, SessionPatch, SessionQuery};
 pub use snapshot::{NewSnapshot, SnapshotRow};
-pub use usage::{MAX_USAGE_ROWS, ModelUsageRow, model_usage};
+pub use usage::{LocalModelUsageRow, MAX_USAGE_ROWS, ModelUsageRow, WindowSum, model_usage};
 pub use worktrees::NewWorktree;

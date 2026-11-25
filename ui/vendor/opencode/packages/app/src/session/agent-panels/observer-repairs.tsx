@@ -19,6 +19,7 @@ export function ObserverRepairPanel(props: {
   rootID?: string
   live: Accessor<ObserverRepair[]>
   escalation: Accessor<{ reason: string; budget?: number } | undefined>
+  inline?: boolean
 }) {
   const language = useLanguage()
   const server = useServer()
@@ -171,14 +172,20 @@ export function ObserverRepairPanel(props: {
         </button>
         <Show when={!collapsed()}>
           <div
-            class="absolute inset-x-0 top-full z-40 border-b border-v2-border-border-base bg-v2-background-bg-base shadow-[0_12px_32px_rgba(0,0,0,0.35)]"
+            class="border-b border-v2-border-border-base bg-v2-background-bg-base"
+            classList={{
+              "absolute inset-x-0 top-full z-40 shadow-[0_12px_32px_rgba(0,0,0,0.35)]": !props.inline,
+            }}
             onWheel={stopIfScrollable}
             onTouchMove={stopIfScrollable}
           >
             <ol
               ref={repairListRef}
-              data-scrollable
-              class="max-h-[min(240px,45vh)] overflow-y-auto py-1"
+              data-scrollable={props.inline ? undefined : ""}
+              class="py-1"
+              classList={{
+                "max-h-[min(240px,45vh)] overflow-y-auto": !props.inline,
+              }}
               data-testid="session-observer-repair-rows"
             >
               <For each={rows()}>

@@ -13,14 +13,18 @@
 //! is set. Disabled providers are never available.
 
 use std::collections::BTreeSet;
+use std::sync::{Arc, Mutex};
 
 use axum::Json;
+use axum::body::{Body, Bytes};
 use axum::extract::{Path, RawQuery, State};
-use axum::http::HeaderMap;
+use axum::http::header::CONTENT_TYPE;
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use axum::response::{IntoResponse, Response};
 use oc_antigravity::ANTIGRAVITY_PROVIDER_ID;
 use oc_llm::catalog::refresh;
 use oc_llm::{Activation, Catalog, LlmError, ModelInfo, ProviderInfo};
-use oc_types::{ApiError, DataEnvelope, EventEnvelope, LocationEnvelope};
+use oc_types::{ApiError, DataEnvelope, EventEnvelope, LocationEnvelope, LocationRef};
 use serde_json::{Value, json};
 
 use crate::AppState;
@@ -28,6 +32,71 @@ use crate::data::location;
 use crate::data::require_catalog;
 use crate::data::require_config;
 use crate::error::ErrorResponse;
+
+#[derive(Debug, Clone)]
+struct EnvProviderEntry {
+    id: String,
+    activation: Activation,
+    env: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct CachedModelsData {
+    catalog_ptr: usize,
+    available: BTreeSet<String>,
+    direct_google: bool,
+    ag_models: Vec<ModelInfo>,
+    models: Arc<Vec<ModelInfo>>,
+    json_array: Arc<Bytes>,
+}
+
+#[derive(Debug, Clone)]
+struct CachedProvidersData {
+    catalog_ptr: usize,
+    available: BTreeSet<String>,
+    json_array: Arc<Bytes>,
+}
+
+/// Per-`AppState` cache for extracted catalog provider metadata and pre-filtered
+/// `/api/model` and `/api/provider` JSON payloads.
+#[derive(Debug, Default)]
+pub(crate) struct ModelCache {
+    env_providers: Mutex<Option<(usize, Vec<EnvProviderEntry>)>>,
+    models_data: Mutex<Option<CachedModelsData>>,
+    providers_data: Mutex<Option<CachedProvidersData>>,
+}
+
+impl ModelCache {
+    fn provider_env_list(&self, catalog: &Catalog) -> Vec<EnvProviderEntry> {
+        let ptr = std::ptr::from_ref(catalog) as usize;
+        {
+            let guard = self
+                .env_providers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some((cached_ptr, entries)) = &*guard
+                && *cached_ptr == ptr
+            {
+                return entries.clone();
+            }
+        }
+        let entries: Vec<EnvProviderEntry> = catalog
+            .providers()
+            .into_iter()
+            .map(|provider| EnvProviderEntry {
+                id: provider.id,
+                activation: provider.activation,
+                env: provider.env,
+            })
+            .collect();
+        let mut guard = self
+            .env_providers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *guard = Some((ptr, entries.clone()));
+        entries
+    }
+}
 
 /// Parsed query pairs. Repeated keys (`?types=a&types=b`) are preserved.
 struct Params {
@@ -62,6 +131,19 @@ impl Params {
     }
 }
 
+pub(crate) async fn load_credentials(state: &AppState) -> Vec<Value> {
+    let Some(store) = state.store() else {
+        return Vec::new();
+    };
+    match store.list_credentials().await {
+        Ok(entries) => entries,
+        Err(error) => {
+            tracing::warn!(%error, "could not list credentials for provider availability");
+            Vec::new()
+        }
+    }
+}
+
 /// Providers the client may actually use: configured in the `providers` map,
 /// backed by a stored credential, or reachable through one of their environment
 /// variables. Disabled providers are never available.
@@ -71,6 +153,15 @@ impl Params {
 pub(crate) async fn available_provider_ids(
     state: &AppState,
     catalog: &Catalog,
+) -> BTreeSet<String> {
+    let credentials = load_credentials(state).await;
+    available_provider_ids_with_credentials(state, catalog, &credentials)
+}
+
+pub(crate) fn available_provider_ids_with_credentials(
+    state: &AppState,
+    catalog: &Catalog,
+    credentials: &[Value],
 ) -> BTreeSet<String> {
     fn add(catalog: &Catalog, available: &mut BTreeSet<String>, id: &str) {
         if catalog
@@ -95,22 +186,13 @@ pub(crate) async fn available_provider_ids(
         }
     }
 
-    if let Some(store) = state.store() {
-        match store.list_credentials().await {
-            Ok(entries) => {
-                for entry in entries {
-                    if let Some(id) = entry.get("integrationID").and_then(Value::as_str) {
-                        add(catalog, &mut available, id);
-                    }
-                }
-            }
-            Err(error) => {
-                tracing::warn!(%error, "could not list credentials for provider availability");
-            }
+    for entry in credentials {
+        if let Some(id) = entry.get("integrationID").and_then(Value::as_str) {
+            add(catalog, &mut available, id);
         }
     }
 
-    for provider in catalog.providers() {
+    for provider in state.model_cache().provider_env_list(catalog) {
         if provider.activation == Activation::Disabled {
             continue;
         }
@@ -119,7 +201,7 @@ pub(crate) async fn available_provider_ids(
             .iter()
             .any(|name| std::env::var_os(name).is_some())
         {
-            available.insert(provider.id.clone());
+            available.insert(provider.id);
         }
     }
 
@@ -135,25 +217,17 @@ pub(crate) async fn available_provider_ids(
 /// Providers the quota report may surface: only those with a **genuinely
 /// active** credential (or a usable Antigravity account), never providers that
 /// merely exist in the catalog, in history, or as a disabled credential row.
-///
-/// This is deliberately separate from [`available_provider_ids`]: the model and
-/// provider routes must keep listing a provider whose credential the user
-/// deactivated (the settings UI has to offer re-activation), whereas the quota
-/// report measures live usage and must not show a card for it.
-///
-/// Rules, in order:
-///
-/// 1. An **active** credential row (`active == true`). `opencode-go` also
-///    accepts an active `opencode` credential because it is an alias of that
-///    integration. A `google` OAuth row is Antigravity-managed and is decided by
-///    rule 4 instead; only a direct (non-OAuth) `google` key counts here.
-/// 2. `providers` configuration keys and environment variables, but **only**
-///    for provider ids that own no credential row at all. That keeps a plain
-///    `ANTHROPIC_API_KEY` / `providers.anthropic` setup working while a
-///    provider whose stored credential was deactivated stays hidden.
-/// 3. `google` only when Antigravity has at least one usable account
-///    (`enabled && !revoked && !verification_required`).
+#[allow(dead_code)]
 pub(crate) async fn active_provider_ids(state: &AppState, catalog: &Catalog) -> BTreeSet<String> {
+    let credentials = load_credentials(state).await;
+    active_provider_ids_with_credentials(state, catalog, &credentials)
+}
+
+pub(crate) fn active_provider_ids_with_credentials(
+    state: &AppState,
+    catalog: &Catalog,
+    credentials: &[Value],
+) -> BTreeSet<String> {
     fn add(catalog: &Catalog, available: &mut BTreeSet<String>, id: &str) {
         if catalog
             .provider(id)
@@ -166,49 +240,28 @@ pub(crate) async fn active_provider_ids(state: &AppState, catalog: &Catalog) -> 
     let mut active = BTreeSet::new();
     let antigravity_attached = state.antigravity().is_some();
 
-    // Integration ids that own at least one credential row, active or not. An
-    // env/config-only provider must own no row at all (rule 2).
     let mut credential_integrations: BTreeSet<String> = BTreeSet::new();
-    // Integrations with at least one `active == true` row. Kept apart from
-    // `active` so the `opencode-go` alias works even when `opencode` itself is
-    // absent from the catalog.
     let mut active_integrations: BTreeSet<String> = BTreeSet::new();
-    // `google` reached through a direct API key rather than the account pool.
     let mut google_direct_key = false;
-    if let Some(store) = state.store() {
-        match store.list_credentials().await {
-            Ok(entries) => {
-                for entry in entries {
-                    let Some(id) = entry.get("integrationID").and_then(Value::as_str) else {
-                        continue;
-                    };
-                    credential_integrations.insert(id.to_owned());
-                    if entry.get("active").and_then(Value::as_bool) != Some(true) {
-                        continue;
-                    }
-                    active_integrations.insert(id.to_owned());
-                    let is_oauth =
-                        entry.pointer("/value/type").and_then(Value::as_str) == Some("oauth");
-                    if id == ANTIGRAVITY_PROVIDER_ID && antigravity_attached {
-                        // The pool owns an OAuth `google` credential: a disabled
-                        // or revoked account must not surface a quota card.
-                        if !is_oauth {
-                            google_direct_key = true;
-                        }
-                        continue;
-                    }
-                    add(catalog, &mut active, id);
-                }
-            }
-            Err(error) => {
-                tracing::warn!(%error, "could not list credentials for active provider availability");
-            }
+    for entry in credentials {
+        let Some(id) = entry.get("integrationID").and_then(Value::as_str) else {
+            continue;
+        };
+        credential_integrations.insert(id.to_owned());
+        if entry.get("active").and_then(Value::as_bool) != Some(true) {
+            continue;
         }
+        active_integrations.insert(id.to_owned());
+        let is_oauth = entry.pointer("/value/type").and_then(Value::as_str) == Some("oauth");
+        if id == ANTIGRAVITY_PROVIDER_ID && antigravity_attached {
+            if !is_oauth {
+                google_direct_key = true;
+            }
+            continue;
+        }
+        add(catalog, &mut active, id);
     }
 
-    // `opencode-go` is an alias of the `opencode` integration: an active
-    // `opencode` credential is a valid credential for `opencode-go` too, and no
-    // other credential family may stand in.
     if active_integrations.contains("opencode") {
         add(catalog, &mut active, "opencode-go");
     }
@@ -216,8 +269,6 @@ pub(crate) async fn active_provider_ids(state: &AppState, catalog: &Catalog) -> 
         add(catalog, &mut active, ANTIGRAVITY_PROVIDER_ID);
     }
 
-    // Rule 2: configuration and environment only decide availability for
-    // providers that store no credential at all.
     if let Some(config) = state.config()
         && let Some(providers) = config.merged().get("providers").and_then(Value::as_object)
     {
@@ -229,7 +280,7 @@ pub(crate) async fn active_provider_ids(state: &AppState, catalog: &Catalog) -> 
         }
     }
 
-    for provider in catalog.providers() {
+    for provider in state.model_cache().provider_env_list(catalog) {
         if provider.activation == Activation::Disabled {
             continue;
         }
@@ -241,7 +292,7 @@ pub(crate) async fn active_provider_ids(state: &AppState, catalog: &Catalog) -> 
             .iter()
             .any(|name| std::env::var_os(name).is_some())
         {
-            active.insert(provider.id.clone());
+            active.insert(provider.id);
         }
     }
 
@@ -259,7 +310,11 @@ pub(crate) async fn active_provider_ids(state: &AppState, catalog: &Catalog) -> 
 /// `providers.google` config entry, or a Google API key environment variable.
 /// When false and Antigravity is attached, `"google"` is served exclusively by
 /// Antigravity OAuth, so raw `models.dev` AI Studio entries are omitted.
-pub(crate) async fn has_direct_google_access(state: &AppState, catalog: &Catalog) -> bool {
+pub(crate) fn has_direct_google_access_with_credentials(
+    state: &AppState,
+    catalog: &Catalog,
+    credentials: &[Value],
+) -> bool {
     if state.antigravity().is_none() {
         return true;
     }
@@ -272,14 +327,11 @@ pub(crate) async fn has_direct_google_access(state: &AppState, catalog: &Catalog
     {
         return true;
     }
-    if let Some(store) = state.store()
-        && let Ok(entries) = store.list_credentials().await
-        && entries.iter().any(|entry| {
-            entry.get("integrationID").and_then(Value::as_str) == Some(ANTIGRAVITY_PROVIDER_ID)
-                && entry.get("active").and_then(Value::as_bool) == Some(true)
-                && entry.pointer("/value/type").and_then(Value::as_str) != Some("oauth")
-        })
-    {
+    if credentials.iter().any(|entry| {
+        entry.get("integrationID").and_then(Value::as_str) == Some(ANTIGRAVITY_PROVIDER_ID)
+            && entry.get("active").and_then(Value::as_bool) == Some(true)
+            && entry.pointer("/value/type").and_then(Value::as_str) != Some("oauth")
+    }) {
         return true;
     }
     catalog
@@ -292,56 +344,164 @@ pub(crate) async fn has_direct_google_access(state: &AppState, catalog: &Catalog
         })
 }
 
+pub(crate) fn filtered_catalog_models(
+    state: &AppState,
+    catalog: &Catalog,
+    available: &BTreeSet<String>,
+    direct_google: bool,
+) -> (Arc<Vec<ModelInfo>>, Arc<Bytes>) {
+    let catalog_ptr = std::ptr::from_ref(catalog) as usize;
+    let ag_models = if available.contains("google")
+        && let Some(ag) = state.antigravity()
+    {
+        ag.antigravity_model_infos()
+    } else {
+        Vec::new()
+    };
+
+    {
+        let guard = state
+            .model_cache()
+            .models_data
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(cached) = &*guard
+            && cached.catalog_ptr == catalog_ptr
+            && cached.direct_google == direct_google
+            && &cached.available == available
+            && cached.ag_models == ag_models
+        {
+            return (Arc::clone(&cached.models), Arc::clone(&cached.json_array));
+        }
+    }
+
+    let mut models = catalog.models();
+    models.retain(|model| available.contains(&model.provider_id));
+    if available.contains("google") && state.antigravity().is_some() {
+        if !direct_google {
+            models.retain(|m| m.provider_id != "google");
+        }
+        for extra in &ag_models {
+            if let Some(pos) = models
+                .iter()
+                .position(|m| m.provider_id == "google" && m.id == extra.id)
+            {
+                models[pos] = extra.clone();
+            } else {
+                models.push(extra.clone());
+            }
+        }
+    }
+    let json_bytes = Bytes::from(serde_json::to_vec(&models).unwrap_or_else(|_| b"[]".to_vec()));
+    let models = Arc::new(models);
+    let json_array = Arc::new(json_bytes);
+    let mut guard = state
+        .model_cache()
+        .models_data
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *guard = Some(CachedModelsData {
+        catalog_ptr,
+        available: available.clone(),
+        direct_google,
+        ag_models,
+        models: Arc::clone(&models),
+        json_array: Arc::clone(&json_array),
+    });
+    (models, json_array)
+}
+
+fn filtered_providers_json(
+    state: &AppState,
+    catalog: &Catalog,
+    available: &BTreeSet<String>,
+) -> Arc<Bytes> {
+    let catalog_ptr = std::ptr::from_ref(catalog) as usize;
+    {
+        let guard = state
+            .model_cache()
+            .providers_data
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(cached) = &*guard
+            && cached.catalog_ptr == catalog_ptr
+            && &cached.available == available
+        {
+            return Arc::clone(&cached.json_array);
+        }
+    }
+    let mut providers = catalog.providers();
+    providers.retain(|provider| available.contains(&provider.id));
+    let json_array = Arc::new(Bytes::from(
+        serde_json::to_vec(&providers).unwrap_or_else(|_| b"[]".to_vec()),
+    ));
+    let mut guard = state
+        .model_cache()
+        .providers_data
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *guard = Some(CachedProvidersData {
+        catalog_ptr,
+        available: available.clone(),
+        json_array: Arc::clone(&json_array),
+    });
+    json_array
+}
+
+fn location_envelope_response(location: &LocationRef, data_json: &[u8]) -> Response {
+    let loc_bytes = serde_json::to_vec(location).unwrap_or_else(|_| b"{}".to_vec());
+    let mut out = Vec::with_capacity(24 + loc_bytes.len() + data_json.len());
+    out.extend_from_slice(br#"{"location":"#);
+    out.extend_from_slice(&loc_bytes);
+    out.extend_from_slice(br#","data":"#);
+    out.extend_from_slice(data_json);
+    out.push(b'}');
+    let mut response = (StatusCode::OK, Body::from(out)).into_response();
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    response
+}
+
 /// `GET /api/model?types=`
 pub async fn models(
     State(state): State<AppState>,
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
-) -> Result<Json<LocationEnvelope<Vec<ModelInfo>>>, ErrorResponse> {
+) -> Result<Response, ErrorResponse> {
     let params = Params::parse(raw.as_deref());
     let catalog = require_catalog(&state)?;
     let resolved = location::resolve(&state, &headers, None, params.first("location[directory]"));
 
-    let available = available_provider_ids(&state, catalog.as_ref()).await;
-    let direct_google = has_direct_google_access(&state, catalog.as_ref()).await;
+    let credentials = load_credentials(&state).await;
+    let available = available_provider_ids_with_credentials(&state, catalog.as_ref(), &credentials);
+    let direct_google =
+        has_direct_google_access_with_credentials(&state, catalog.as_ref(), &credentials);
     let types = params.list("types");
-    let mut models = catalog.models();
-    models.retain(|model| available.contains(&model.provider_id));
-    if available.contains("google")
-        && let Some(ag) = state.antigravity()
-    {
-        if !direct_google {
-            models.retain(|m| m.provider_id != "google");
-        }
-        for extra in ag.antigravity_model_infos() {
-            if let Some(pos) = models
-                .iter()
-                .position(|m| m.provider_id == "google" && m.id == extra.id)
-            {
-                models[pos] = extra;
-            } else {
-                models.push(extra);
-            }
-        }
+    let (models, json_array) =
+        filtered_catalog_models(&state, catalog.as_ref(), &available, direct_google);
+
+    if types.is_empty() {
+        return Ok(location_envelope_response(
+            &resolved.reference(),
+            &json_array,
+        ));
     }
-    if !types.is_empty() {
-        models.retain(|model| {
+
+    let filtered: Vec<ModelInfo> = models
+        .iter()
+        .filter(|model| {
             model
                 .kind
                 .as_deref()
                 .is_some_and(|kind| types.iter().any(|wanted| wanted.eq_ignore_ascii_case(kind)))
-        });
-    }
-
-    Ok(Json(LocationEnvelope::new(resolved.reference(), models)))
+        })
+        .cloned()
+        .collect();
+    Ok(Json(LocationEnvelope::new(resolved.reference(), filtered)).into_response())
 }
 
 /// `POST /api/model/refresh`
-///
-/// Fetch the published catalog on demand, replace the served generation under
-/// the same plausibility gate and overlays as the background loop, and announce
-/// the swap. Failures are reported honestly: no event and no cell swap happens
-/// until the whole body has been accepted.
 pub async fn refresh_models(
     State(state): State<AppState>,
 ) -> Result<Json<DataEnvelope<Value>>, ErrorResponse> {
@@ -442,8 +602,6 @@ pub async fn default_model(
     let Some(reference) = config.model() else {
         return Err(model_not_found("", "", "No default model configured".to_owned()).into());
     };
-    // `resolve` reports unknown providers/models, invalid references and
-    // unknown variants; all of them are a missing default model to the client.
     let model = match catalog.resolve(&reference) {
         Ok(model) => model,
         Err(error) => {
@@ -480,14 +638,16 @@ pub async fn providers(
     State(state): State<AppState>,
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
-) -> Result<Json<LocationEnvelope<Vec<ProviderInfo>>>, ErrorResponse> {
+) -> Result<Response, ErrorResponse> {
     let params = Params::parse(raw.as_deref());
     let catalog = require_catalog(&state)?;
     let resolved = location::resolve(&state, &headers, None, params.first("location[directory]"));
     let available = available_provider_ids(&state, catalog.as_ref()).await;
-    let mut providers = catalog.providers();
-    providers.retain(|provider| available.contains(&provider.id));
-    Ok(Json(LocationEnvelope::new(resolved.reference(), providers)))
+    let json_array = filtered_providers_json(&state, catalog.as_ref(), &available);
+    Ok(location_envelope_response(
+        &resolved.reference(),
+        &json_array,
+    ))
 }
 
 /// `GET /api/provider/:id`

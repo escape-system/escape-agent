@@ -9,7 +9,7 @@ use oc_llm::{ProviderRateLimit, QuotaCapability};
 use oc_types::now_millis;
 
 use crate::AppState;
-use crate::data::model::active_provider_ids;
+use crate::data::model::active_provider_ids_with_credentials;
 use crate::error::ErrorResponse;
 
 use super::antigravity::refresh_antigravity_if_needed;
@@ -45,7 +45,7 @@ pub(super) async fn build_unified_quotas(
     // intentionally not used here — it keeps inactive providers visible to the
     // model/provider routes.
     let active_ids = match catalog {
-        Some(cat) => active_provider_ids(state, cat).await,
+        Some(cat) => active_provider_ids_with_credentials(state, cat, &credentials),
         None => BTreeSet::new(),
     };
 

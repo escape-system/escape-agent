@@ -5,6 +5,8 @@
 //! and page bookkeeping, [patch] the update paths, [tree] the parent/child
 //! helpers and [value] the row-to-wire mapping.
 
+use std::sync::LazyLock;
+
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -150,6 +152,9 @@ tokens_reasoning, tokens_cache_read, tokens_cache_write, time_created, time_upda
 time_idle, time_viewed, idle_outcome, time_compacting, time_archived, time_suspended, \
 resume_attempts";
 
+static GET_SESSION_SQL: LazyLock<String> =
+    LazyLock::new(|| format!("SELECT {SESSION_COLUMNS} FROM session_v2 WHERE id = ?1"));
+
 impl Store {
     /// Creates a session and returns its wire `Session.Info`.
     ///
@@ -206,9 +211,9 @@ impl Store {
     pub async fn get_session(&self, id: &str) -> Result<Option<Value>, StoreError> {
         let id = id.to_owned();
         self.read(move |connection| {
-            let sql = format!("SELECT {SESSION_COLUMNS} FROM session_v2 WHERE id = ?1");
-            let row = connection
-                .query_row(&sql, [&id], |row| Ok(session_value(row)))
+            let mut statement = connection.prepare_cached(&GET_SESSION_SQL)?;
+            let row = statement
+                .query_row([&id], |row| Ok(session_value(row)))
                 .optional()?;
             row.transpose()
         })

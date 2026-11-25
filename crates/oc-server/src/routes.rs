@@ -221,8 +221,11 @@ pub async fn fallback(req: Request) -> Response {
 
     let method = req.method().clone();
     let uri_path = req.uri().path().to_owned();
+    let headers = req.headers().clone();
     if let Some(state) = state
-        && let Some(response) = state.static_response(&method, &uri_path).await
+        && let Some(response) = state
+            .static_response_with_headers(&method, &uri_path, &headers)
+            .await
     {
         return response;
     }

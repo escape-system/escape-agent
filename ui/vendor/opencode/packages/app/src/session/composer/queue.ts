@@ -22,6 +22,15 @@ import { showToast } from "@/shell/notifications/toast"
 type QueuedPromptFile = PromptAttachment
 
 export type QueuedPrompt = Extract<SessionInboxInfo, { type: "user" }>
+// A queue row the strip can show. Synthetic peer input is queueable too, but only user prompts
+// expose the edit/undo surface.
+export type QueuedItem = Extract<SessionInboxInfo, { type: "user" | "synthetic" }>
+
+// Dragging re-admits the queue, which cannot reorder a queued control row and cannot run beside an
+// edit or another queue mutation. The panel disables drag instead of letting rewrite() throw.
+export function queueReorderable(items: readonly SessionInboxInfo[], busy: boolean) {
+  return !busy && !items.some((item) => item.delivery === "queue" && item.type !== "user")
+}
 
 // An edit confirmed from the composer while the server catches up. The strip shows it in place of
 // the original until the server's queue reflects it, so a slow round trip never looks undone.
@@ -182,8 +191,19 @@ export function createSessionQueue(input: {
   const queued = createMemo(() =>
     data.session.pending
       .list(input.sessionID)
-      .filter((item): item is QueuedPrompt => item.type === "user" && item.delivery === "queue"),
+      .filter((item): item is QueuedItem => item.delivery === "queue" && (item.type === "user" || item.type === "synthetic")),
   )
+
+  // `session.created` completes `session.pending:<id>` (data.ts) so the racy initial read is skipped,
+  // and completion is permanent. A session created in this tab therefore never reads its durable inbox
+  // through a plain `pending.sync`: the strip stayed empty while `GET /session/:id/inbox` already
+  // returned the queued user/synthetic rows. Hydrate explicitly on mount; it coalesces with any
+  // in-flight sync, so a reconnect or a second controller never duplicates the read.
+  void data.session.pending.hydrate(input.sessionID).catch(() => undefined)
+
+  // A synthetic peer post has no edit or undo surface, so the strip labels it by origin and keeps it
+  // read-only; the rows themselves still show so a queued post never disappears from the queue.
+  const reorderable = () => queueReorderable(data.session.pending.list(input.sessionID), mutation.isPending)
 
   const rows = createMemo(() => {
     const current = queuedPromptRows(queued(), state.sent, state.gone)
@@ -319,7 +339,8 @@ export function createSessionQueue(input: {
     return server.api.session.inbox.update({ sessionID: input.sessionID, inboxID: id, delivery: "steer" }).then(
       () => {
         void background?.move()
-        hide([id])
+        // No local hide: the row leaves `queued()` only when the server's own truth says so
+        // (delivery.changed / pending list), so the strip and the transcript never both drop it.
       },
       () => notify(),
     )
@@ -338,7 +359,8 @@ export function createSessionQueue(input: {
     if (mutation.isPending || state.editing || sending(id)) return
     const item = queued().find((entry) => entry.id === id)
 
-    if (!item) return
+    // A synthetic peer post has no composer draft to restore, so undo is unavailable for it.
+    if (!item || item.type !== "user") return
 
     if (input.draft.mode.current() !== "normal") {
       showToast({ title: language.t("session.queue.undoShell") })
@@ -389,7 +411,7 @@ export function createSessionQueue(input: {
     if (state.editing?.id === id) return true
     const item = queued().find((entry) => entry.id === id)
 
-    if (!item) return false
+    if (!item || item.type !== "user") return false
 
     if (state.editing) cancelEdit()
     const draft = input.draft.current()
@@ -454,7 +476,8 @@ export function createSessionQueue(input: {
     const attachments = prompt.filter(isAttachment)
 
     if (!text.trim() && !attachments.length) return cancelEdit()
-    const item = queued().find((entry) => entry.id === editing.id)
+    // `edit()` only opens an edit for a user prompt, so a synthetic peer row can never be confirmed here.
+    const item = queued().find((entry): entry is QueuedPrompt => entry.id === editing.id && entry.type === "user")
     const original = item ? queuedPromptAttachments(item) : []
 
     const pristine =
@@ -494,6 +517,7 @@ export function createSessionQueue(input: {
 
   return {
     count: () => rows().length,
+    reorderable,
     delivery: () => (input.working() ? input.behavior() : "steer"),
     alternate: () => {
       if (state.editing) return "steer"
@@ -523,19 +547,29 @@ export type SessionQueue = ReturnType<typeof createSessionQueue>
 // The slice of the queue the panel renders and drives.
 export type SessionQueueView = Pick<
   SessionQueue,
-  "rows" | "editing" | "working" | "busy" | "steer" | "remove" | "undo" | "edit" | "reorder"
+  "rows" | "editing" | "working" | "busy" | "steer" | "remove" | "undo" | "edit" | "reorder" | "reorderable"
 >
 
 // An edit in flight shows its edited text on the original row, and every row it rewrites shows as
 // pending. A re-admitted copy stays hidden while the row it replaces is listed, so the strip keeps
 // its order; a steered edit leaves the strip once the server admits it. Rows the server confirmed
 // gone stay hidden while its events catch up.
-export function queuedPromptRows(items: QueuedPrompt[], sent: SentEdit[] = [], gone: string[] = []) {
+export function queuedPromptRows(items: QueuedItem[], sent: SentEdit[] = [], gone: string[] = []) {
   const queued = items.filter((item) => !gone.includes(item.id))
   const listed = new Set(queued.map((item) => item.id))
   const moves = sent.flatMap((edit) => Object.entries(edit.moved))
 
-  return queued.flatMap((item): { id: string; text: string; attachments: number; pending?: boolean }[] => {
+  return queued.flatMap(
+    (
+      item,
+    ): {
+      id: string
+      text: string
+      attachments: number
+      pending?: boolean
+      /** A queued peer/control row: shown, read-only, labelled by origin. */
+      synthetic?: boolean
+    }[] => {
     // The latest edit of this prompt, on its original row or, once that is gone, on its replacement.
     const edit = sent.findLast((entry) => entry.original === item.id || entry.moved[entry.original] === item.id)
 
@@ -549,12 +583,16 @@ export function queuedPromptRows(items: QueuedPrompt[], sent: SentEdit[] = [], g
         text: edit ? edit.text : queuedPromptText(item),
         attachments: edit
           ? edit.attachments
-          : (item.payload.files?.length ?? 0) +
-            (readPromptPresentation(item.payload.metadata)?.attachments.length ?? 0),
+          : item.type === "user"
+            ? (item.payload.files?.length ?? 0) +
+              (readPromptPresentation(item.payload.metadata)?.attachments.length ?? 0)
+            : 0,
         pending: moves.some(([old, next]) => old === item.id || next === item.id) ? true : undefined,
+        ...(item.type === "synthetic" ? { synthetic: true } : {}),
       },
     ]
-  })
+    },
+  )
 }
 
 // A prompt of only comments or attachments adds no text, so it needs no paragraph break.
@@ -568,7 +606,7 @@ function mergePrompt(draft: Prompt, prompt: Prompt) {
 
 const decodeDisplayText = Schema.decodeUnknownOption(Schema.Struct({ displayText: Schema.NonEmptyString }))
 
-export function queuedPromptText(item: QueuedPrompt) {
+export function queuedPromptText(item: QueuedItem) {
   return Option.match(decodeDisplayText(item.payload.metadata), {
     onNone: () => item.payload.text,
     onSome: (metadata) => metadata.displayText,

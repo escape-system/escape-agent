@@ -472,6 +472,7 @@ fn project_inbox_delivered(
         params![inbox_id, session_id],
     )?;
     if kind != "move" && kind != "compaction" {
+        let kind = crate::inbox::message_kind(&kind);
         let payload: Value = db::decode_json(&payload)?;
         let body = message::body_with_time(&payload, created)?;
         let encoded = db::encode_json(&body)?;

@@ -4,6 +4,7 @@ mod aggregate;
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Arc;
 
 use axum::Json;
 use axum::extract::rejection::QueryRejection;
@@ -17,8 +18,7 @@ use crate::data::{query_error, require_store};
 use crate::error::ErrorResponse;
 
 use self::aggregate::{
-    add_tokens, date_key, day_ordinal, day_ordinal_from_key, empty_tokens, float_at, median,
-    parse_epoch, tokens_total,
+    TokenCounts, date_key, day_ordinal, day_ordinal_from_key, float_at, median, parse_epoch,
 };
 use super::common::{id_of, messages_all, sessions_all, time_of};
 
@@ -37,12 +37,84 @@ pub struct StatsParams {
     tools: Option<String>,
 }
 
+struct ExtractedToolCall {
+    name: String,
+    status: String,
+    duration: Option<u32>,
+}
+
+struct AssistantExtract {
+    tokens: TokenCounts,
+    cost: f64,
+    model: Option<(String, String, String)>,
+    tools: Vec<ExtractedToolCall>,
+}
+
 struct ScannedMessage {
-    session_id: String,
-    parent_id: Option<String>,
-    kind: String,
+    session_id: Arc<str>,
+    is_subagent: bool,
+    is_user: bool,
     time: i64,
-    data: Value,
+    assistant: Option<AssistantExtract>,
+}
+
+fn extract_assistant(message: &Value, include_tools: bool) -> AssistantExtract {
+    let model = message.get("model").and_then(|model| {
+        let provider = model
+            .get("providerID")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let id = model.get("id").and_then(Value::as_str).unwrap_or_default();
+        if provider.is_empty() || id.is_empty() {
+            return None;
+        }
+        let variant = model
+            .get("variant")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        Some((provider.to_owned(), id.to_owned(), variant.to_owned()))
+    });
+    let tools =
+        if include_tools && let Some(content) = message.get("content").and_then(Value::as_array) {
+            content
+                .iter()
+                .filter(|part| part.get("type").and_then(Value::as_str) == Some("tool"))
+                .map(|part| {
+                    let name = part
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown")
+                        .to_owned();
+                    let status = part
+                        .pointer("/state/status")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned();
+                    let ran = part.pointer("/time/ran").and_then(Value::as_i64);
+                    let completed = part.pointer("/time/completed").and_then(Value::as_i64);
+                    let duration = match (ran, completed) {
+                        (Some(ran), Some(completed)) if completed >= ran => {
+                            u32::try_from(completed - ran).ok()
+                        }
+                        _ => None,
+                    };
+                    ExtractedToolCall {
+                        name,
+                        status,
+                        duration,
+                    }
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+    AssistantExtract {
+        tokens: TokenCounts::from_message(message),
+        cost: float_at(message, "/cost"),
+        model,
+        tools,
+    }
 }
 
 #[derive(Default)]
@@ -94,21 +166,18 @@ pub async fn stats(
     let mut earliest: Option<i64> = None;
     for session in &sessions {
         let session_id = id_of(session);
-        let parent_id = session
-            .get("parentID")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
+        let is_subagent = session.get("parentID").and_then(Value::as_str).is_some();
         let created = session
             .get("time")
             .and_then(|time| time.get("created"))
             .and_then(Value::as_i64)
             .unwrap_or(0);
+        let sid: Arc<str> = Arc::from(session_id.as_str());
         for message in messages_all(store, &session_id).await? {
             let kind = message
                 .get("type")
                 .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_owned();
+                .unwrap_or_default();
             if kind != "user" && kind != "assistant" {
                 continue;
             }
@@ -119,12 +188,18 @@ pub async fn stats(
                 continue;
             }
             earliest = Some(earliest.map_or(time, |current| current.min(time)));
+            let is_user = kind == "user";
+            let assistant = if is_user {
+                None
+            } else {
+                Some(extract_assistant(&message, tools_mode != "none"))
+            };
             scanned.push(ScannedMessage {
-                session_id: session_id.clone(),
-                parent_id: parent_id.clone(),
-                kind,
+                session_id: Arc::clone(&sid),
+                is_subagent,
+                is_user,
                 time,
-                data: message,
+                assistant,
             });
         }
     }
@@ -140,35 +215,38 @@ pub async fn stats(
         );
     }
 
-    let mut unique_sessions = HashSet::new();
-    let mut subagents = HashSet::new();
+    let mut unique_sessions: HashSet<Arc<str>> = HashSet::new();
+    let mut subagents: HashSet<Arc<str>> = HashSet::new();
     let mut prompts = 0_i64;
     let mut steps = 0_i64;
-    let mut tokens = empty_tokens();
+    let mut tokens = TokenCounts::default();
     let mut cost = 0.0_f64;
     let mut activity: BTreeMap<i64, (String, i64)> = BTreeMap::new();
-    let mut models: HashMap<String, (Value, i64, Value, f64)> = HashMap::new();
+    let mut models: HashMap<String, (Value, i64, TokenCounts, f64)> = HashMap::new();
     let mut tools: HashMap<String, ToolAggregate> = HashMap::new();
 
     for message in &scanned {
         if message.time < from {
             continue;
         }
-        if message.parent_id.is_none() {
-            unique_sessions.insert(message.session_id.clone());
+        if message.is_subagent {
+            subagents.insert(Arc::clone(&message.session_id));
         } else {
-            subagents.insert(message.session_id.clone());
+            unique_sessions.insert(Arc::clone(&message.session_id));
         }
-        if message.kind == "user" {
-            if message.parent_id.is_none() {
+        if message.is_user {
+            if !message.is_subagent {
                 prompts += 1;
             }
             continue;
         }
+        let Some(ref extracted) = message.assistant else {
+            continue;
+        };
 
         steps += 1;
-        add_tokens(&mut tokens, &message.data);
-        cost += float_at(&message.data, "/cost");
+        tokens.add_assign(extracted.tokens);
+        cost += extracted.cost;
 
         let ordinal = day_ordinal(message.time);
         let entry = activity
@@ -176,22 +254,7 @@ pub async fn stats(
             .or_insert_with(|| (date_key(message.time), 0));
         entry.1 += 1;
 
-        let provider = message
-            .data
-            .pointer("/model/providerID")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let model_id = message
-            .data
-            .pointer("/model/id")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        if !provider.is_empty() && !model_id.is_empty() {
-            let variant = message
-                .data
-                .pointer("/model/variant")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
+        if let Some((provider, model_id, variant)) = &extracted.model {
             let key = format!("{provider}/{model_id}#{variant}");
             let entry = models.entry(key).or_insert_with(|| {
                 let mut reference = Map::new();
@@ -200,42 +263,23 @@ pub async fn stats(
                 if !variant.is_empty() {
                     reference.insert("variant".to_owned(), json!(variant));
                 }
-                (Value::Object(reference), 0, empty_tokens(), 0.0)
+                (Value::Object(reference), 0, TokenCounts::default(), 0.0)
             });
             entry.1 += 1;
-            add_tokens(&mut entry.2, &message.data);
-            entry.3 += float_at(&message.data, "/cost");
+            entry.2.add_assign(extracted.tokens);
+            entry.3 += extracted.cost;
         }
 
-        if tools_mode != "none"
-            && let Some(content) = message.data.get("content").and_then(Value::as_array)
-        {
-            for part in content {
-                if part.get("type").and_then(Value::as_str) != Some("tool") {
-                    continue;
-                }
-                let name = part
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown")
-                    .to_owned();
-                let status = part
-                    .pointer("/state/status")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                let entry = tools.entry(name).or_default();
+        if tools_mode != "none" {
+            for part in &extracted.tools {
+                let entry = tools.entry(part.name.clone()).or_default();
                 entry.calls += 1;
-                match status {
+                match part.status.as_str() {
                     "completed" => entry.succeeded += 1,
                     "error" => entry.failed += 1,
                     _ => entry.unfinished += 1,
                 }
-                let ran = part.pointer("/time/ran").and_then(Value::as_i64);
-                let completed = part.pointer("/time/completed").and_then(Value::as_i64);
-                if let (Some(ran), Some(completed)) = (ran, completed)
-                    && completed >= ran
-                    && let Ok(duration) = u32::try_from(completed - ran)
-                {
+                if let Some(duration) = part.duration {
                     entry.durations.push(duration);
                 }
             }
@@ -321,11 +365,11 @@ pub async fn stats(
         .into_values()
         .map(|(model, steps, tokens, cost)| {
             (
-                tokens_total(&tokens),
+                tokens.total(),
                 json!({
                     "model": model,
                     "steps": steps,
-                    "tokens": tokens,
+                    "tokens": tokens.to_json(),
                     "cost": cost,
                 }),
             )
@@ -340,7 +384,7 @@ pub async fn stats(
             "subagents": subagents.len(),
             "prompts": prompts,
             "steps": steps,
-            "tokens": tokens,
+            "tokens": tokens.to_json(),
             "cost": cost,
             "tools": tool_value,
             "activeDays": active_days,

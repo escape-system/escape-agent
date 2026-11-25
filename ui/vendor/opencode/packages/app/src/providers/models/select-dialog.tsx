@@ -267,11 +267,11 @@ const ModelList: Component<{
           onClearClick={() => setSearch("")}
         />
       </div>
-      <div class="relative min-h-0" classList={{ "flex-1": !props.mobile }}>
+      <div class="relative min-h-0 flex-1">
         <div
           ref={(element) => (scrollRef = element)}
-          class="settings-panel settings-models pt-1 pb-4"
-          classList={{ "h-full px-4": !props.mobile, "max-h-[min(360px,40dvh)]": props.mobile }}
+          class="settings-panel settings-models h-full min-h-0 pt-1 pb-4"
+          classList={{ "px-4": !props.mobile }}
         >
           <Show
             when={models().length > 0}
@@ -409,9 +409,9 @@ function ModelDrawer(props: {
               ref={content}
               tabIndex={-1}
               data-slot="model-selector-drawer"
-              class="flex min-h-0 flex-col gap-2 outline-none"
+              class="flex min-h-0 flex-1 flex-col gap-2 outline-none"
             >
-              <div class="flex min-h-0 flex-col">
+              <div class="flex min-h-0 flex-1 flex-col">
                 <ModelList
                   mobile
                   open={store.open}

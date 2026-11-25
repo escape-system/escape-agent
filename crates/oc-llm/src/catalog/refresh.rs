@@ -1039,6 +1039,62 @@ mod tests {
     }
 
     #[test]
+    fn opencode_go_hungerg_free_exposes_max_effort() {
+        let body = r#"{
+          "object": "list",
+          "data": [{
+            "id": "hungerg-free", "type": "chat", "name": "HungerG Free",
+            "capabilities": {
+              "tools": {"supported": true},
+              "reasoning": {"supported": true}
+            },
+            "limit": {"context": 1000000, "output": 65536},
+            "api": {"chat-completions": {
+              "base_url": "https://opencode.ai/inference/go/openai/v1",
+              "sdk": {"aisdk": "@ai-sdk/openai-compatible"}
+            }}
+          }]
+        }"#;
+        let models = parse_provider_models(body, OPENCODE_GO_PROVIDER_ID).unwrap();
+        assert_eq!(models.len(), 1);
+        let hungerg = &models[0];
+        assert_eq!(hungerg.id, "hungerg-free");
+        assert_eq!(hungerg.protocol, Protocol::OpenAiChat);
+        assert_eq!(hungerg.variants.len(), 1);
+        assert_eq!(hungerg.variants[0].id, "max");
+        assert_eq!(
+            hungerg.variants[0]
+                .settings
+                .as_ref()
+                .and_then(|settings| settings.get("reasoningEffort")),
+            Some(&Value::String("max".to_owned()))
+        );
+
+        let mut catalog = Catalog::default();
+        catalog.upsert_provider(ProviderInfo {
+            id: OPENCODE_GO_PROVIDER_ID.to_owned(),
+            canonical: None,
+            name: OPENCODE_GO_PROVIDER_ID.to_owned(),
+            activation: Activation::Auto,
+            package: "@ai-sdk/openai-compatible".to_owned(),
+            compatibility: None,
+            settings: None,
+            headers: None,
+            body: None,
+            env: Vec::new(),
+        });
+        apply_provider_models(&mut catalog, OPENCODE_GO_PROVIDER_ID, models);
+        let resolved = catalog
+            .resolve("opencode-go/hungerg-free#max")
+            .expect("maximum HungerG effort resolves");
+        assert_eq!(resolved.model_id(), "hungerg-free");
+        assert_eq!(
+            resolved.settings().get("reasoningEffort"),
+            Some(&Value::String("max".to_owned()))
+        );
+    }
+
+    #[test]
     fn membership_prune_withdraws_only_unlisted_ids() {
         let mut catalog = Catalog::default();
         for id in ["kept-a", "kept-b", "dropped", "kept-c"] {

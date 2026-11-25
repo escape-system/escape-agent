@@ -17,9 +17,6 @@ use crate::data::{
 };
 use crate::error::ErrorResponse;
 
-/// How many times a failed `cancel_inbox` is retried after the first attempt.
-const CANCEL_INBOX_RETRIES: u32 = 1;
-
 /// Splits an optional `1..=10` depth prefix off a subagent-mode argument list.
 ///
 /// Both the `/mode` prompt path and the `/command` path funnel through this so
@@ -379,74 +376,34 @@ async fn admit(
     payload.extend(extra);
     let payload = Value::Object(payload);
 
-    // Only `steer` input is materialised; `queue` rows stay inbox-only and the
-    // runtime promotes them when the current turn settles. Writing the message
-    // here would leak the text into the running turn's next request and run
-    // the prompt twice.
-    let mut message_data = None;
-    if delivery == Delivery::Steer {
-        let mut data = payload.clone();
-        if let Value::Object(map) = &mut data {
-            map.insert("time".to_owned(), json!({ "created": now_millis() }));
-        }
-        message_data = Some(data);
-    }
-
-    let item = store
-        .enqueue(NewInbox {
-            id: id.clone(),
-            session_id: session_id.to_owned(),
-            kind: "user".to_owned(),
-            payload,
-            delivery,
-        })
-        .await?;
-
-    if let Some(data) = message_data
-        && let Err(error) = store
-            .append_message(NewMessage {
+    // A `steer` prompt is materialised immediately because the running turn
+    // reads the transcript at its next step; the inbox row and the message row
+    // are committed in one transaction (`enqueue_steer`), so there is no window
+    // in which a caller is told the prompt failed while an executable inbox row
+    // survives. `queue` rows stay inbox-only and the runtime promotes them when
+    // the current turn settles; writing the message here would leak the text
+    // into the running turn's next request and run the prompt twice.
+    let item = if delivery == Delivery::Steer {
+        store
+            .enqueue_steer(NewInbox {
                 id: id.clone(),
                 session_id: session_id.to_owned(),
                 kind: "user".to_owned(),
-                data,
-                time_created: now_millis(),
+                payload,
+                delivery,
             })
-            .await
-    {
-        // The inbox row is already committed, so returning an error while it
-        // survives would let the runtime promote the leftover `steer` row on
-        // the next turn and run the text the client was told had failed.
-        // Cancelling here — after, not before, the append — is deliberate:
-        // cancelling first would delete the row and lose the prompt entirely if
-        // the append then failed. The accepted window is "cancel keeps
-        // failing": the message is absent from the transcript but the prompt may
-        // still run. One retry covers a transient writer hiccup.
-        let mut attempt = 0;
-        loop {
-            match store.cancel_inbox(session_id, &id).await {
-                Ok(_) => break,
-                Err(cancel) if attempt < CANCEL_INBOX_RETRIES => {
-                    attempt += 1;
-                    tracing::warn!(
-                        session = %session_id,
-                        inbox = %id,
-                        error = %cancel,
-                        "inbox cancel failed; retrying"
-                    );
-                }
-                Err(cancel) => {
-                    tracing::error!(
-                        session = %session_id,
-                        inbox = %id,
-                        error = %cancel,
-                        "inbox cancel failed: the prompt may still run on the next turn"
-                    );
-                    break;
-                }
-            }
-        }
-        return Err(error.into());
-    }
+            .await?
+    } else {
+        store
+            .enqueue(NewInbox {
+                id: id.clone(),
+                session_id: session_id.to_owned(),
+                kind: "user".to_owned(),
+                payload,
+                delivery,
+            })
+            .await?
+    };
 
     publish_enqueued(state, session_id, &id, &item).await?;
     notify(state, session_id).await?;

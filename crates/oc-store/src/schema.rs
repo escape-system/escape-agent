@@ -478,6 +478,14 @@ CREATE INDEX context_box_root_scope_live_idx
 /// running `0001` and then this migration, so they reach the same shape.
 const SESSION_IDLE_REASON: &str = "ALTER TABLE session_v2 ADD COLUMN idle_reason TEXT;";
 
+/// Partial covering index on assistant message timestamps so `model_usage`
+/// and local quota rollups use a narrow range scan instead of walking the full
+/// `session_message` table.
+const MESSAGE_ASSISTANT_TIME_IDX: &str = r"
+CREATE INDEX IF NOT EXISTS message_assistant_time_idx
+  ON session_message(time_created) WHERE type = 'assistant';
+";
+
 pub(crate) const MIGRATIONS: &[Migration] = &[
     Migration {
         id: "0001_wire",
@@ -543,5 +551,10 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         id: "0013_context_box_scope",
         sql: CONTEXT_BOX_SCOPE,
         column_guard: Some(("context_box", "scope")),
+    },
+    Migration {
+        id: "0014_message_assistant_time_idx",
+        sql: MESSAGE_ASSISTANT_TIME_IDX,
+        column_guard: None,
     },
 ];

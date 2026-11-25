@@ -8,6 +8,7 @@ import { useLayout } from "@/shell/state/layout"
 import type { SessionModel } from "../model"
 import { useSessionHashScroll } from "../use-session-hash-scroll"
 import { createTimelineModel } from "./model"
+import { hasCachedRestore, shouldLoadHistory, type LoadHistoryIntent } from "./virtualizer"
 
 export function createSessionTimelineInteraction(session: SessionModel) {
   const layout = useLayout()
@@ -52,8 +53,11 @@ export function createSessionTimelineInteraction(session: SessionModel) {
   const pinned = () => state.follow.sessionKey !== session.identity.sessionKey() || state.follow.pinned
   const pin = () => setState("follow", { sessionKey: session.identity.sessionKey(), pinned: true })
 
-  const unpin = () => {
-    if (!scroller || scroller.scrollHeight - scroller.clientHeight <= 1) return
+  // A timeline with nothing to scroll cannot follow anything, yet an explicit upward gesture still
+  // means "show me older rows": the gesture passes allowShort so the session may page history in.
+  const unpin = (options?: { allowShort?: boolean }) => {
+    if (!scroller) return
+    if (!options?.allowShort && scroller.scrollHeight - scroller.clientHeight <= 1) return
     setState("follow", { sessionKey: session.identity.sessionKey(), pinned: false })
   }
 
@@ -67,6 +71,17 @@ export function createSessionTimelineInteraction(session: SessionModel) {
   let revealPart = (_target: string) => false
 
   let scrollToEnd = (_behavior?: ScrollBehavior) => {}
+  let canBootstrap = () => true
+
+  // A remount may resume a mid-history position. It may bypass only the first bottom-forcing
+  // decision (empty hash or session change), not later explicit navigation.
+  let restoredOnce = hasCachedRestore(session.identity.sessionKey())
+  const wasRestored = () => {
+    if (!restoredOnce) return false
+    restoredOnce = false
+
+    return true
+  }
 
   let scrollMark = 0
   let messageMark = 0
@@ -75,6 +90,8 @@ export function createSessionTimelineInteraction(session: SessionModel) {
   let fillFrame: (() => void) | undefined
   let historyContinuationFrame: number | undefined
   const historyRequests = new Set<string>()
+  // The short-viewport bootstrap is bounded: one page on first layout, never again on this mount.
+  let bootstrapSpent = false
   const visibleUserMessages = timeline.visibleUserMessages
   const anchor = (id: string) => `message-${id}`
 
@@ -157,11 +174,14 @@ export function createSessionTimelineInteraction(session: SessionModel) {
     visibleUserMessages,
     historyMore: timeline.history.more,
     historyLoading: timeline.history.loading,
-    loadMore: loadOlder,
+    // A hash/pending target the reader asked for may page history while the view is pinned.
+    loadMore: () => loadOlder("navigation"),
     currentMessageId: () => state.messageID,
     pendingMessage: () => state.pendingMessage,
     setPendingMessage: (value) => setState("pendingMessage", value),
     setActiveMessage,
+    // A timeline that came back mid-history must not be dragged to the end by an empty hash.
+    restoredScroll: wasRestored,
     follow: {
       unpin,
       toBottom: () => {
@@ -230,10 +250,25 @@ export function createSessionTimelineInteraction(session: SessionModel) {
     fill()
   }
 
-  async function loadOlder() {
+  async function loadOlder(intent: LoadHistoryIntent = "user") {
     const owner = session.ownership.capture()
 
-    if (timeline.history.loading() || historyRequests.has(owner.key)) return
+    // Every path pages through this gate: restore/anchor/correction never load, so a programmatic
+    // scroll write near the top cannot turn into a prepend -> correction -> jump-to-top loop.
+    if (
+      !shouldLoadHistory({
+        intent,
+        loading: timeline.history.loading(),
+        more: timeline.history.more(),
+        pinned: pinned(),
+        scrollTop: scroller?.scrollTop ?? 0,
+        bootstrapSpent,
+      }) ||
+      historyRequests.has(owner.key)
+    )
+      return
+    // Only an explicit user gesture may keep chaining pages as the reader drags toward the top.
+    if (intent === "bootstrap") bootstrapSpent = true
     historyRequests.add(owner.key)
     const before = timeline.messages().length
 
@@ -243,27 +278,22 @@ export function createSessionTimelineInteraction(session: SessionModel) {
       historyRequests.delete(owner.key)
     }
 
-    if (!owner.current() || timeline.messages().length <= before) return
+    if (intent !== "user" || !owner.current() || timeline.messages().length <= before) return
 
     if (pinned() || !scroller || scroller.scrollTop >= 200 || !timeline.history.more()) return
 
     if (historyContinuationFrame !== undefined) cancelAnimationFrame(historyContinuationFrame)
     historyContinuationFrame = requestAnimationFrame(() => {
       historyContinuationFrame = undefined
-      owner.run(onHistoryScroll)
+      owner.run(() => onHistoryScroll("user"))
     })
   }
 
-  const onHistoryScroll = () => {
-    if (
-      historyRequests.has(session.ownership.key()) ||
-      timeline.history.loading() ||
-      pinned() ||
-      !scroller ||
-      scroller.scrollTop >= 200
-    )
-      return
-    void loadOlder()
+  // Geometry alone never loads: the virtualizer calls this only for a live gesture, and the intent
+  // parameter makes a call from restore/anchor/repair inert.
+  const onHistoryScroll = (intent?: "user") => {
+    if (intent !== "user" || historyRequests.has(session.ownership.key())) return
+    void loadOlder("user")
   }
 
   // Like the scroll state, measures in the shared frame loop's read phase.
@@ -275,6 +305,7 @@ export function createSessionTimelineInteraction(session: SessionModel) {
         short =
           !!session.identity.params.id &&
           timeline.ready() &&
+          canBootstrap() &&
           pinned() &&
           !timeline.history.loading() &&
           !!scroller &&
@@ -283,7 +314,8 @@ export function createSessionTimelineInteraction(session: SessionModel) {
       () => {
         fillFrame = undefined
 
-        if (short && timeline.history.more()) void loadOlder()
+        // A short pinned viewport fills once on first layout; later corrections must not refill.
+        if (short) void loadOlder("bootstrap")
 
         return false
       },
@@ -316,6 +348,8 @@ export function createSessionTimelineInteraction(session: SessionModel) {
       () => session.identity.params.id,
       (id, previous) => {
         if (!id || !previous || id === previous || state.messageID || state.pendingMessage || location.hash) return
+        // A remount that resumes mid-history must not be pinned to the end by the id change.
+        if (wasRestored()) return
         pin()
         scrollToEnd()
       },
@@ -364,12 +398,10 @@ export function createSessionTimelineInteraction(session: SessionModel) {
       const next = Math.round((entry.borderBoxSize[0]?.blockSize ?? 0) * dpr) / dpr
 
       if (next === state.inset) return
-      const delta = next - state.inset
 
-      // Measured before the new inset applies: a shrinking region also keeps a reader whose end it uncovers.
-      const stick = scroller
-        ? pinned() || scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop < 10 + Math.max(0, -delta)
-        : false
+      // Measured before the new inset applies. Only a view that is genuinely following the end
+      // keeps following when the queue or composer changes height; a reader mid-history stays put.
+      const stick = scroller ? pinned() : false
 
       setState("inset", next)
 
@@ -407,10 +439,14 @@ export function createSessionTimelineInteraction(session: SessionModel) {
       anchor,
       markUserScroll,
       onHistoryScroll,
+      onLayoutSettled: () => fill(),
       pin,
       pinned,
       selectionInteraction,
       scheduleScrollState,
+      setCanBootstrap: (ready: () => boolean) => {
+        canBootstrap = ready
+      },
       setContentRef: (element: HTMLDivElement | undefined) => {
         setState("refs", "content", element)
 

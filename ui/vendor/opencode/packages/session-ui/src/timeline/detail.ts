@@ -114,9 +114,17 @@ export function timelineCategory(
   return "tools"
 }
 
+export function isPeerNotice(message: SessionMessageInfo): boolean {
+  if (message.type !== "synthetic") return false
+  const hasPeerFlag = "peer" in message && message.peer === true
+
+  return (message.metadata?.source === "peer" || hasPeerFlag) && !!message.text.trim()
+}
+
 // Like the TUI, background work reports its outcome as its own row where it finished, never folded into a group.
 // A subagent's outcome follows the subagent setting, so it shows wherever its launch does.
 export function timelineNoticePlacement(message: SessionMessageInfo, detail: TimelineDetail): TimelinePlacement {
+  if (isPeerNotice(message)) return "separate"
   const source = message.type === "synthetic" ? message.metadata?.source : undefined
   const placement = source === "subagent" ? detail.subagents.placement : detail.notices.placement
 
@@ -129,6 +137,7 @@ export function timelineNoticeRequired(message: SessionMessageInfo) {
   if (message.type === "compaction") return message.status !== "completed"
 
   if (message.type !== "synthetic") return false
+  if (isPeerNotice(message)) return true
   const metadata = message.metadata
 
   return (

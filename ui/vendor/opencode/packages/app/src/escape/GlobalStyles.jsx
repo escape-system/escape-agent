@@ -160,19 +160,23 @@ body {
 }
 :focus:not(:focus-visible) { outline: none; }
 
-* {
-  scrollbar-width: thin;
-  scrollbar-color: rgb(var(--ea-gold-rgb) / 0.26) transparent;
+/* Layer base defaults so utility classes (.no-scrollbar, .scroll-view__viewport) and
+   themed .scrollbar-styled containers take precedence cleanly without forcing native bars. */
+@layer base {
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: rgb(var(--ea-gold-rgb) / 0.26) transparent;
+  }
 }
-*::-webkit-scrollbar { width: 9px; height: 9px; }
-*::-webkit-scrollbar-track { background: transparent; }
-*::-webkit-scrollbar-thumb {
+*:not(.no-scrollbar):not(.scroll-view__viewport)::-webkit-scrollbar { width: 9px; height: 9px; }
+*:not(.no-scrollbar):not(.scroll-view__viewport)::-webkit-scrollbar-track { background: transparent; }
+*:not(.no-scrollbar):not(.scroll-view__viewport)::-webkit-scrollbar-thumb {
   background: rgb(var(--ea-gold-rgb) / 0.22);
   border: 2px solid transparent;
   border-radius: 999px;
   background-clip: padding-box;
 }
-*::-webkit-scrollbar-thumb:hover {
+*:not(.no-scrollbar):not(.scroll-view__viewport)::-webkit-scrollbar-thumb:hover {
   background: rgb(var(--ea-gold-rgb) / 0.46);
   background-clip: padding-box;
 }

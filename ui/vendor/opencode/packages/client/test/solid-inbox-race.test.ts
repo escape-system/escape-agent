@@ -160,3 +160,46 @@ test("hydration coalesces a concurrent optimistic compaction even if its POST fa
     setup.dispose()
   }
 })
+
+test("hydrate after live session.inbox.enqueued keeps queued synthetic row until delivered or reconnected", async () => {
+  const peerItem: SessionInboxItem = {
+    id: "msg_live_before_hydrate",
+    sessionID: "ses_race",
+    type: "synthetic",
+    delivery: "queue",
+    time: { created: 10 },
+    payload: { text: "queued before hydrate", peer: true, metadata: { source: "peer", from: "user" } },
+  }
+  const response = Promise.withResolvers<Response>()
+  const setup = fixture(() => response.promise)
+  try {
+    setup.emit({
+      id: "evt_live",
+      type: "session.inbox.enqueued",
+      created: 10,
+      durable: { aggregateID: peerItem.sessionID, seq: 1, version: 1 },
+      data: {
+        sessionID: peerItem.sessionID,
+        inboxID: peerItem.id,
+        item: { type: peerItem.type, delivery: peerItem.delivery, payload: peerItem.payload },
+      },
+    })
+
+    const reading = setup.data.session.pending.hydrate(peerItem.sessionID)
+    response.resolve(Response.json({ data: [] }))
+    await reading
+    expect(setup.data.session.pending.list(peerItem.sessionID)).toEqual([peerItem])
+
+    setup.emit({
+      id: "evt_delivered",
+      type: "session.inbox.delivered",
+      created: 11,
+      durable: { aggregateID: peerItem.sessionID, seq: 2, version: 1 },
+      data: { sessionID: peerItem.sessionID, inboxID: peerItem.id },
+    })
+    expect(setup.data.session.pending.list(peerItem.sessionID)).toEqual([])
+  } finally {
+    response.resolve(Response.json({ data: [] }))
+    setup.dispose()
+  }
+})

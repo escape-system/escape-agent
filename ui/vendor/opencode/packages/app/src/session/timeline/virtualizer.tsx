@@ -49,15 +49,141 @@ const zoomSlack = 4
 
 const upwardKeys = new Set(["up", "page-up", "home"])
 
-const cache = new Map<
-  string,
-  {
-    measurements: VirtualItem[]
-    toolOpen: Record<string, boolean | undefined>
-    patchGroupKeys: Map<string, string>
-    presentationKey?: string
+/** Distance from the top within which an upward gesture asks for an older page. */
+export const historyTopThreshold = 200
+
+type RestoreAnchor = { key: string; top: number }
+
+/** Whether a disposed timeline left a mid-history position an unpinned remount would restore. */
+export function hasCachedRestore(sessionKey: string) {
+  return restorePlan(cache.get(sessionKey), false).restore
+}
+
+type TimelineCache = {
+  measurements: VirtualItem[]
+  toolOpen: Record<string, boolean | undefined>
+  patchGroupKeys: Map<string, string>
+  presentationKey?: string
+  /** listRoot.scrollTop when the view was disposed. */
+  offset: number
+  /** The view was pinned at its reachable end when it was disposed. */
+  atEnd: boolean
+  /** The first row crossing the viewport's top edge, so a remount can put it back there. */
+  anchor?: RestoreAnchor
+}
+
+const cache = new Map<string, TimelineCache>()
+
+export type RestorePlan = { offset: number; restore: boolean }
+
+/**
+ * Where a remounting timeline opens. A pinned session keeps following its end; a reader who left
+ * mid-history resumes the offset captured at dispose instead of landing on the oldest row.
+ */
+export function restorePlan(
+  cached: Pick<TimelineCache, "offset" | "atEnd" | "anchor"> | undefined,
+  pinned: boolean,
+): RestorePlan {
+  // Missing or at-end state keeps today's behavior: end when pinned, otherwise the initial 0.
+  if (pinned) return { offset: Number.MAX_SAFE_INTEGER, restore: false }
+  if (!cached || cached.atEnd || !(cached.offset > 0)) return { offset: 0, restore: false }
+  return { offset: cached.offset, restore: true }
+}
+
+/** Keeps a restored offset inside the range a freshly bound list root reports. */
+export function clampRestoredOffset(offset: number, scrollHeight: number, clientHeight: number) {
+  return Math.max(0, Math.min(offset, Math.max(0, scrollHeight - clientHeight)))
+}
+
+/**
+ * The offset a reattached scroll element must be put back to. A cached view is removed from the page
+ * and inserted again on a mobile view switch, and an element starts a fresh insertion at 0, so the
+ * reader's position is gone unless it is written back. `last` is the offset of the element's last
+ * real scroll report; `live` is what the reattached element reports now. Returns `undefined` when no
+ * write is needed: a pinned view keeps following its end, a root that already reports the reading
+ * offset needs nothing, and a range too short to reach it clamps to the top.
+ */
+export function reconnectRestore(input: {
+  pinned: boolean
+  last: number
+  live: number
+  scrollHeight: number
+  clientHeight: number
+}) {
+  if (input.pinned) return
+  if (!(input.last > 0)) return
+
+  const target = clampRestoredOffset(input.last, input.scrollHeight, input.clientHeight)
+
+  if (!(target > 0)) return
+  if (Math.abs(target - input.live) <= 1) return
+
+  return target
+}
+
+/** The scroll correction that puts a cached anchor row back at the viewport offset it had. */
+export function anchorCorrection(anchorTop: number, rowTop: number) {
+  const delta = rowTop - anchorTop
+  return Math.abs(delta) < 1 ? 0 : delta
+}
+
+/**
+ * Decides what a first report from a freshly reattached scroll element means. A reattached route
+ * reports 0 before layout puts the cached offset back, so that report must not overwrite it.
+ * `keep` holds the restored offset; `pending` stays true until a real (non-zero) offset arrives.
+ */
+export function restoredOffsetReport(pending: boolean, offset: number) {
+  if (!pending) return { keep: false, pending: false }
+  if (offset <= 0) return { keep: true, pending: true }
+  return { keep: false, pending: false }
+}
+
+export function prependAnchorDelta(
+  prevKeys: readonly string[],
+  nextKeys: readonly string[],
+  sizeForKey: (key: string) => number,
+): { shift: number; prepended: string[]; delta: number } {
+  if (prevKeys.length === 0 || nextKeys.length <= prevKeys.length) {
+    return { shift: 0, prepended: [], delta: 0 }
   }
->()
+
+  const shift = nextKeys.indexOf(prevKeys[0]!)
+  if (shift <= 0) return { shift: 0, prepended: [], delta: 0 }
+
+  if (prevKeys.length > 1) {
+    const tailIndex = nextKeys.indexOf(prevKeys[prevKeys.length - 1]!, shift)
+    if (tailIndex < shift) return { shift: 0, prepended: [], delta: 0 }
+  }
+
+  const prepended = nextKeys.slice(0, shift)
+  const delta = prepended.reduce((sum, key) => sum + sizeForKey(key), 0)
+  return { shift, prepended, delta }
+}
+
+export type LoadHistoryIntent = "user" | "navigation" | "bootstrap" | "restore" | "correction"
+
+/**
+ * Whether one more history page may load. Only explicit input may page history: a live
+ * wheel/touch/pointer/key gesture (`user`), a targeted hash navigation, or the bounded
+ * short-viewport bootstrap. Programmatic restore/anchor/scroll repair is `restore`/`correction`
+ * and never loads, so a correction that lands near the top cannot start a prepend -> correction
+ * loop that jumps the reader to older messages.
+ */
+export function shouldLoadHistory(input: {
+  intent: LoadHistoryIntent
+  loading: boolean
+  more: boolean
+  pinned: boolean
+  scrollTop: number
+  /** The initial short-viewport bootstrap already spent its bounded pages. */
+  bootstrapSpent: boolean
+}): boolean {
+  if (input.loading || !input.more) return false
+  if (input.intent === "restore" || input.intent === "correction") return false
+  if (input.intent === "navigation") return true
+  if (input.intent === "bootstrap") return !input.bootstrapSpent
+  return !input.pinned && input.scrollTop < historyTopThreshold
+}
 
 type Projection = Pick<
   ReturnType<typeof createTimelineProjection>,
@@ -81,10 +207,13 @@ type Input = {
   setVisibleRef?: (element: HTMLDivElement | undefined) => void
   onScheduleScrollState: (element: HTMLDivElement) => void
   onPin: () => void
-  onUnpin: () => void
+  /** `allowShort` lets an explicit gesture stop following even when the timeline cannot scroll. */
+  onUnpin: (options?: { allowShort?: boolean }) => void
   onSelectionInteraction: (event: MouseEvent) => void
   onUserScroll: (target?: EventTarget | null) => void
-  onHistoryScroll: () => void
+  onHistoryScroll: (intent?: "user") => void
+  onLayoutSettled?: () => void
+  setCanBootstrap?: (fn: () => boolean) => void
   canRenderImmediately?: (
     row: TimelineRow.TimelineRow,
     disclosure: Readonly<Record<string, boolean | undefined>>,
@@ -111,6 +240,8 @@ export function createTimelineVirtualizer(input: Input) {
   const ownerSessionKey = input.sessionKey()
   const entry = cache.get(ownerSessionKey)
   const cached = entry?.presentationKey === input.presentationKey?.() ? entry : undefined
+  // A remount (mobile view switch, tab switch, route return) opens at the cached offset instead of 0.
+  const plan = restorePlan(cached, input.pinned())
   const initialMeasurements = cached?.measurements
   const coldBottomMount = !initialMeasurements?.length && input.pinned()
   const [listRoot, setListRoot] = createSignal<HTMLDivElement>()
@@ -143,6 +274,8 @@ export function createTimelineVirtualizer(input: Input) {
 
   const knownKeys = new Set(rowKeys())
   const addedKeys = new Set<string>()
+  const prependedKeys = new Set<string>()
+  let previousKeys = rowKeys()
   // Programmatic corrections (pin, measure, history reconcile) move scrollTop
   // without a user intent. Only a real gesture may load older history when the
   // resulting scroll event lands near the top, otherwise a correction becomes
@@ -151,6 +284,16 @@ export function createTimelineVirtualizer(input: Input) {
 
   const getItemKey = createMemo(() => {
     const keys = rowKeys()
+    const prepend = prependAnchorDelta(
+      previousKeys,
+      keys,
+      (key) => virtualizer.itemSizeCache.get(key) ?? fallbackItemSize,
+    )
+    if (prepend.shift > 0) {
+      prepend.prepended.forEach((key) => prependedKeys.add(key))
+    }
+    previousKeys = keys
+
     keys
       .filter((key) => !knownKeys.has(key))
       .forEach((key) => {
@@ -158,7 +301,10 @@ export function createTimelineVirtualizer(input: Input) {
         addedKeys.add(key)
       })
     for (const key of [...addedKeys]) {
-      if (!keys.includes(key)) addedKeys.delete(key)
+      if (!keys.includes(key)) {
+        addedKeys.delete(key)
+        prependedKeys.delete(key)
+      }
     }
 
     return (index: number) => keys[index] ?? "removed"
@@ -228,6 +374,14 @@ export function createTimelineVirtualizer(input: Input) {
     },
   )
   let scrollTop = 0
+  // The last position the reader actually held. A reattached element reports 0 before anything
+  // restores it, so the reconnect path cannot read the live offset as the position to return to.
+  let lastAttachedOffset = 0
+  // A remount keeps the offset captured at dispose until the reattach observer reports a real one.
+  let restorePending = plan.restore
+  let restoredOffset = plan.offset
+  let anchorCorrected = false
+  let userScrolledSinceMount = false
   // A scroll arrived within the zoom slack of the end and may have reached it.
   let endPending = false
   let reportOffset: ((offset: number, scrolling: boolean) => void) | undefined
@@ -263,6 +417,19 @@ export function createTimelineVirtualizer(input: Input) {
     observeElementOffset: (instance, callback) => {
       reportOffset = (offset, scrolling) => {
         if (!active()) return
+        // Reattaching a route reports the fresh element's 0 before layout restores the cached
+        // offset. Keep the restored position; end the window on the first real report.
+        const decision = restoredOffsetReport(restorePending, offset)
+
+        if (decision.keep) {
+          const root = listRoot()
+
+          if (root && restoredOffset > 0 && root.scrollTop !== restoredOffset) root.scrollTop = restoredOffset
+          return
+        }
+
+        if (!decision.pending) restorePending = false
+        if (offset > 0) lastAttachedOffset = offset
         // Rows and the sizer use the opposite translation while native touch
         // scrolling keeps its own offset. Range selection uses the logical offset.
         batch(() => {
@@ -295,10 +462,11 @@ export function createTimelineVirtualizer(input: Input) {
         virtualContent?.querySelectorAll<HTMLDivElement>("[data-index]").forEach(virtualizer.measureElement)
 
         if (input.pinned()) virtualizer.scrollToEnd()
+        else restoreReattachedOffset()
         settleColdBottom()
       })
     },
-    initialOffset: () => (input.pinned() ? Number.MAX_SAFE_INTEGER : 0),
+    initialOffset: () => plan.offset,
     initialMeasurementsCache: initialMeasurements,
     estimateSize: () => fallbackItemSize,
     // A newly observed element gets a real ResizeObserver box before paint. Reuse
@@ -423,15 +591,23 @@ export function createTimelineVirtualizer(input: Input) {
     })
   }
 
-  onCleanup(() => pendingSizes.clear())
+  onCleanup(() => {
+    pendingSizes.clear()
+    prependedKeys.clear()
+  })
   virtualizer.shouldAdjustScrollPositionOnItemSizeChange = (item, delta, instance) => {
     // Prepended rows can resize more than once as deferred content mounts. Keep
-    // compensating while they remain entirely above the visible content fold.
+    // compensating while they remain above the reader's anchor row. Non-prepended
+    // added rows must stay strictly above the viewport fold (item.end already includes
+    // scrollMargin in @tanstack/virtual-core).
     const first = instance.range?.startIndex
+    const key = String(item.key)
 
-    const adjust = addedKeys.has(String(item.key))
-      ? item.end <= (instance.scrollOffset ?? 0) + instance.scrollAdjustments + instance.options.scrollMargin
-      : first !== undefined && item.index < first
+    const adjust = prependedKeys.has(key)
+      ? item.end <= (instance.scrollOffset ?? 0) + instance.scrollAdjustments + instance.options.scrollMargin + 1
+      : addedKeys.has(key)
+        ? item.end <= (instance.scrollOffset ?? 0) + instance.scrollAdjustments
+        : first !== undefined && item.index < first
 
     if (!touchScrolling || input.pinned()) return adjust
 
@@ -521,11 +697,69 @@ export function createTimelineVirtualizer(input: Input) {
 
     // Hand over every pin, even one the scroll already reaches: TanStack lands exactly on its last target once the
     // scroll is within a pixel of it, which would undo a compensation for a row above that resized since.
+    userScrollIntent = false
     virtualizer.scrollToOffset(offset)
   }
 
   function releaseAnchor() {
     if (rendering.anchor) setRendering("anchor", undefined)
+  }
+
+  // After a remount's sizes settle, put the cached first-visible row back where it was. One correction
+  // per mount, never while following the end or after the reader has scrolled.
+  function restoreAnchor(anchor: RestoreAnchor | undefined) {
+    if (anchorCorrected) return
+
+    if (!anchor || plan.restore === false || input.pinned() || userScrolledSinceMount || restorePending) return
+    const root = listRoot()
+
+    if (!root) return
+    const row = rowLayer?.querySelector<HTMLElement>(`[data-timeline-key="${CSS.escape(anchor.key)}"]`)
+
+    if (!row) return
+    anchorCorrected = true
+    const rowTop = row.getBoundingClientRect().top - root.getBoundingClientRect().top
+    const delta = anchorCorrection(anchor.top, rowTop)
+
+    if (!delta) return
+    userScrollIntent = false
+    root.scrollTop = clampRestoredOffset(root.scrollTop + delta, root.scrollHeight, root.clientHeight)
+  }
+
+  // A cached timeline is not disposed on a mobile view switch: its root is detached and reattached,
+  // which resets the element's own offset to 0. Put an unpinned reader back where they were, once per
+  // reattachment, without an intent that could page history.
+  function restoreReattachedOffset() {
+    const root = listRoot()
+
+    if (!root || !active() || rendering.anchor) return
+    const target = reconnectRestore({
+      pinned: input.pinned(),
+      last: lastAttachedOffset,
+      live: root.scrollTop,
+      scrollHeight: root.scrollHeight,
+      clientHeight: root.clientHeight,
+    })
+
+    if (target === undefined) return
+    userScrollIntent = false
+    lastAttachedOffset = target
+    restorePending = true
+    restoredOffset = target
+    root.scrollTop = target
+    // Rows land at their real sizes a frame later; re-clamp once they do, so a shorter range cannot
+    // leave the view short of the position it recovered. The window is bounded like a remount's, so a
+    // range that can never reach the target cannot swallow every later report.
+    requestAnimationFrame(() => {
+      if (!root.isConnected) return
+      const clamped = clampRestoredOffset(target, root.scrollHeight, root.clientHeight)
+
+      if (clamped !== root.scrollTop) root.scrollTop = clamped
+      requestAnimationFrame(() => {
+        if (!root.isConnected) return
+        restorePending = false
+      })
+    })
   }
 
   function prepareNavigation() {
@@ -577,8 +811,10 @@ export function createTimelineVirtualizer(input: Input) {
 
       reportOffset?.(root.scrollTop, false)
       settleColdBottom()
+      restoreAnchor(cached?.anchor)
     })
     input.setRevealPart?.(revealPart)
+    input.setCanBootstrap?.(() => !coldPending && !rendering.initialTail && !pendingSizes.size && !pendingMeasurements())
     input.setRevealMessage?.((id, partID) => {
       if (!active()) return
 
@@ -721,6 +957,7 @@ export function createTimelineVirtualizer(input: Input) {
       contentObserver?.disconnect()
       viewportObserver?.disconnect()
       virtualContent.style.removeProperty("visibility")
+      input.onLayoutSettled?.()
     })
   }
 
@@ -746,6 +983,8 @@ export function createTimelineVirtualizer(input: Input) {
 
     if (measuredSessionKey !== key) {
       measuredSessionKey = key
+      prependedKeys.clear()
+      previousKeys = rowKeys()
       virtualizer.measure()
     }
   })
@@ -755,7 +994,31 @@ export function createTimelineVirtualizer(input: Input) {
     // TanStack owns anchoring; browser scroll anchoring would fight its adjustments.
     root.style.overflowAnchor = "none"
     setListRoot(root)
+
+    // A fresh element starts at 0; put a mid-history reader back before the first report can pin.
+    if (restorePending && restoredOffset > 0) {
+      userScrollIntent = false
+      root.scrollTop = clampRestoredOffset(restoredOffset, root.scrollHeight, root.clientHeight)
+      requestAnimationFrame(() => {
+        if (!root.isConnected) return
+
+        if (!input.pinned()) {
+          const clamped = clampRestoredOffset(restoredOffset, root.scrollHeight, root.clientHeight)
+
+          if (clamped !== root.scrollTop) root.scrollTop = clamped
+        }
+
+        requestAnimationFrame(() => {
+          if (!root.isConnected) return
+          restorePending = false
+          // Rows have real sizes by now; put the cached first-visible row back where it was.
+          restoreAnchor(cached?.anchor)
+        })
+      })
+    }
+
     scrollTop = root.scrollTop
+    if (scrollTop > 0) lastAttachedOffset = scrollTop
     maxScroll = root.scrollHeight - root.clientHeight
 
     if (active()) input.setScrollRef(root)
@@ -783,15 +1046,31 @@ export function createTimelineVirtualizer(input: Input) {
   const handleListWheel = (event: WheelEvent & { currentTarget: HTMLDivElement }) => {
     releaseAnchor()
     userScrollIntent = true
+    userScrolledSinceMount = true
     input.onUserScroll(event.target)
 
-    if (event.deltaY < 0) input.onUnpin()
+    if (event.deltaY < 0) {
+      // An upward gesture stops following even when the timeline is too short to scroll, so older
+      // pages can still page in above the reader.
+      input.onUnpin({ allowShort: true })
+      const root = listRoot()
+
+      // Ask from the gesture, not from the resulting scroll event: the virtualizer's own
+      // corrections also fire scroll events and would otherwise spend the flag before the reader's
+      // scroll arrives. The gate inside loadOlder still requires the view to be near the top, so a
+      // wheel mid-history is a cheap no-op.
+      input.onHistoryScroll("user")
+      // At the exact top nothing can scroll, so no scroll event will arrive to clear the flag; a
+      // stale flag would let the next programmatic write (hash seek, restore) page history.
+      if (root && root.scrollTop <= 0) userScrollIntent = false
+    }
   }
 
   const handleListTouchStart = (event: TouchEvent) => {
     clearTouchTarget()
     releaseAnchor()
     userScrollIntent = true
+    userScrolledSinceMount = true
     input.onUserScroll(event.target)
     touchScrolling = true
     touchStart = event.touches[0]?.clientY
@@ -826,7 +1105,15 @@ export function createTimelineVirtualizer(input: Input) {
     // A nested scrollport owns the intent. If it chains into the timeline at a
     // boundary, the resulting native timeline scroll below will unpin instead.
     if (touchNested) return
-    input.onUnpin()
+    input.onUnpin({ allowShort: true })
+    const root = listRoot()
+
+    // A drag at the very top scrolls nothing, so the gesture is the only signal that asks for older rows.
+    if (root && root.scrollTop < historyTopThreshold) {
+      input.onHistoryScroll("user")
+      // A drag that cannot scroll also fires no scroll event to spend the flag.
+      if (root.scrollTop <= 0) userScrollIntent = false
+    }
   }
 
   const handleListTouchEnd = () => {
@@ -850,6 +1137,7 @@ export function createTimelineVirtualizer(input: Input) {
   const handleListPointerDown = (event: PointerEvent) => {
     releaseAnchor()
     userScrollIntent = true
+    userScrolledSinceMount = true
     input.onUserScroll(event.target)
     pointerHeld = true
   }
@@ -877,9 +1165,20 @@ export function createTimelineVirtualizer(input: Input) {
     if (scrollKeyOwner(event.currentTarget, event.target, key) !== event.currentTarget) return
     releaseAnchor()
     userScrollIntent = true
+    userScrolledSinceMount = true
     input.onUserScroll(event.currentTarget)
 
-    if (upwardKeys.has(key)) input.onUnpin()
+    if (upwardKeys.has(key)) {
+      input.onUnpin({ allowShort: true })
+      const root = listRoot()
+
+      // At the top the key cannot scroll, so it asks for the older page directly.
+      if (root && root.scrollTop < historyTopThreshold) {
+        input.onHistoryScroll("user")
+        // A key that cannot scroll fires no scroll event to spend the flag.
+        if (root.scrollTop <= 0) userScrollIntent = false
+      }
+    }
   }
 
   // Following resumes by arriving at the end, either by scrolling there or by content shrinking
@@ -895,6 +1194,7 @@ export function createTimelineVirtualizer(input: Input) {
     const atEnd = maxScroll - scrollTop <= endEpsilon
     const arrived = scrollTop > previousTop + endEpsilon || maxScroll < previousMaxScroll
 
+    if (scrollTop > 0) lastAttachedOffset = scrollTop
     if (scrollTop < previousTop) endPending = false
 
     // An anchor holds its tool even when reaching it lands at the end; only the user's own scroll lets it go.
@@ -904,9 +1204,11 @@ export function createTimelineVirtualizer(input: Input) {
     else if (arrived && !rendering.anchor && maxScroll - scrollTop <= zoomSlack) endPending = true
     settleColdBottom()
     input.onScheduleScrollState(root)
+    // Only a live gesture, or the intent a wheel/touch/key listener just set, may page history.
+    // Every programmatic correction clears the flag, so a restore/anchor write cannot reach loadOlder.
     if (pointerHeld || touchScrolling || userScrollIntent) {
       userScrollIntent = false
-      input.onHistoryScroll()
+      input.onHistoryScroll("user")
     }
   }
 
@@ -1085,13 +1387,37 @@ export function createTimelineVirtualizer(input: Input) {
     )
   }
 
+  function captureRestore(root: HTMLDivElement | undefined): { offset: number; atEnd: boolean; anchor?: RestoreAnchor } {
+    if (!root) return { offset: 0, atEnd: false }
+
+    const offset = root.scrollTop
+    const atEnd = input.pinned() && atReachableEnd(root)
+    const rootTop = root.getBoundingClientRect().top
+    const first = [...(rowLayer?.querySelectorAll<HTMLElement>("[data-timeline-key]") ?? [])].find(
+      (row) => row.getBoundingClientRect().bottom > rootTop,
+    )
+
+    if (!first) return { offset, atEnd }
+
+    const key = first.dataset.timelineKey
+
+    if (!key) return { offset, atEnd }
+
+    return { offset, atEnd, anchor: { key, top: first.getBoundingClientRect().top - rootTop } }
+  }
+
   onCleanup(() => {
+    // Capture the visible position while the element still has layout, then the size snapshot.
+    const restored = captureRestore(listRoot())
+    const snapshot = virtualizer.takeSnapshot()
+
     cache.delete(ownerSessionKey)
     cache.set(ownerSessionKey, {
-      measurements: virtualizer.takeSnapshot(),
+      measurements: snapshot,
       toolOpen: { ...toolOpen },
       patchGroupKeys,
       presentationKey: input.presentationKey?.(),
+      ...restored,
     })
 
     while (cache.size > 16) cache.delete(cache.keys().next().value!)

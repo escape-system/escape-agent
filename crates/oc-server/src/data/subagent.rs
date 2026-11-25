@@ -11,7 +11,7 @@
 use axum::Json;
 use axum::extract::rejection::{JsonRejection, QueryRejection};
 use axum::extract::{Path, Query, State};
-use oc_store::{NewInbox, SessionNodeRow};
+use oc_store::{Delivery, NewInbox, SessionNodeRow};
 use oc_types::{ApiError, EventEnvelope, EventId, EventLocation, MessageId, now_millis};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
@@ -114,15 +114,27 @@ pub async fn message(
         "metadata".to_owned(),
         json!({ "source": "peer", "from": "user" }),
     );
-    let item = store
-        .enqueue(NewInbox {
-            id: id.clone(),
-            session_id: session_id.clone(),
-            kind: "synthetic".to_owned(),
-            payload: Value::Object(payload),
-            delivery,
-        })
-        .await?;
+    let item = if delivery == Delivery::Steer {
+        store
+            .enqueue_steer(NewInbox {
+                id: id.clone(),
+                session_id: session_id.clone(),
+                kind: "synthetic".to_owned(),
+                payload: Value::Object(payload),
+                delivery,
+            })
+            .await?
+    } else {
+        store
+            .enqueue(NewInbox {
+                id: id.clone(),
+                session_id: session_id.clone(),
+                kind: "synthetic".to_owned(),
+                payload: Value::Object(payload),
+                delivery,
+            })
+            .await?
+    };
     publish_enqueued(&state, &session_id, &id, &item).await?;
     state.publish(EventEnvelope {
         id: EventId::new(),

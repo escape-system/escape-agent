@@ -721,9 +721,14 @@ async fn talk_allows_siblings_parent_and_child_but_rejects_strangers() {
     .expect("siblings may talk");
     let inbox = harness.store.list_inbox(&b).await.expect("inbox");
     assert_eq!(inbox.len(), 1);
-    assert_eq!(inbox[0]["type"], "peer");
+    // `peer` is not in the wire `Session.Inbox.Item` union; `talk` writes the
+    // wire-valid `synthetic` kind and keeps the sender metadata, so a client
+    // that only knows the upstream four kinds can still render the queued row.
+    assert_eq!(inbox[0]["type"], "synthetic");
     assert_eq!(inbox[0]["payload"]["from"], a.as_str());
     assert_eq!(inbox[0]["payload"]["metadata"]["source"], "peer");
+    assert_eq!(inbox[0]["payload"]["kind"], "note");
+    assert_eq!(inbox[0]["payload"]["agent"], "general");
 
     tool.execute(
         &tool_context(&harness, &a),

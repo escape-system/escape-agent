@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/oc-types",
+    "crates/oc-alloc",
     "crates/oc-store",
     "crates/oc-config",
     "crates/oc-llm",
@@ -30,6 +31,7 @@ repository = "https://github.com/escape-system/escape-agent"
 authors = ["opencode-rust contributors"]
 
 [workspace.dependencies]
+oc-alloc = { path = "crates/oc-alloc" }
 oc-types = { path = "crates/oc-types" }
 oc-store = { path = "crates/oc-store" }
 oc-config = { path = "crates/oc-config" }
@@ -64,6 +66,7 @@ http = "1"
 http-body-util = "0.1"
 ignore = "0.4"
 jsonc-parser = { version = "0.34", features = ["serde", "serde_json"] }
+mimalloc = { version = "0.1", features = ["override", "no_thp", "extended"] }
 mime_guess = "2"
 parking_lot = "0.12"
 percent-encoding = "2"

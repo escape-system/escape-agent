@@ -1,4 +1,4 @@
-import { createEffect, on, Show, type JSX, type ParentProps } from "solid-js"
+import { createEffect, on, onCleanup, Show, type JSX, type ParentProps } from "solid-js"
 import { createStore } from "solid-js/store"
 import { Button } from "@opencode/ui/button"
 import { DrawerContext } from "@opencode/plugin/gui/host"
@@ -7,6 +7,52 @@ import { MobileDrawer, MobileDrawerClose, MobileDrawerContent, MobileDrawerLabel
 import "./mobile-panel-drawer.css"
 
 type DrawerView = { title: string; content: JSX.Element; trigger: HTMLElement }
+
+/**
+ * Attach the sheet's Escape handling to the document.
+ *
+ * This is deliberately not corvu's `closeOnEscapeKeyDown`: in the browser run the
+ * dismissible layer never delivered Escape for this sheet, so the lifecycle owner
+ * wires the listener itself. Two details are load-bearing:
+ *
+ * - it listens in the **capture** phase, because an app-level bubble handler that
+ *   consumes Escape would otherwise keep the sheet open, and
+ * - it **ignores `defaultPrevented`**, because handlers registered earlier on
+ *   `document` (composers, command menus) call `preventDefault()` for their own
+ *   purposes and that must not make a modal sheet undismissable.
+ *
+ * Returns the detach function, which the caller must run on cleanup so a closed
+ * sheet leaves no document listener behind.
+ */
+export function listenForEscape(onEscape: () => void): () => void {
+  const handler = (event: KeyboardEvent) => {
+    if (event.key !== "Escape" || event.isComposing) return
+    onEscape()
+  }
+
+  document.addEventListener("keydown", handler, { capture: true })
+
+  return () => document.removeEventListener("keydown", handler, { capture: true })
+}
+
+/**
+ * Close the sheet and hand focus back to its opener.
+ *
+ * The focus return happens on a microtask because hosts commonly unmount the
+ * sheet in the same tick (`agent-drawer.tsx` renders it under `<Show>`), which
+ * disposes the dialog before corvu's `finalFocusEl` restore can run. It is
+ * idempotent: a host that also restores focus itself must not see a focus bounce.
+ */
+export function closeMobilePanel(options: {
+  onClose: () => void
+  returnFocus?: () => HTMLElement | undefined
+}): void {
+  options.onClose()
+  queueMicrotask(() => {
+    const target = options.returnFocus?.()
+    if (target && document.activeElement !== target) target.focus()
+  })
+}
 
 export function MobilePanelDrawer(
   props: ParentProps<{
@@ -30,6 +76,24 @@ export function MobilePanelDrawer(
       },
     ),
   )
+
+  // The lifecycle owner wires Escape itself: corvu's dismissible layer does not
+  // deliver Escape for this sheet in practice, and a host that unmounts the sheet
+  // synchronously (the agent drawer's `<Show>`) disposes the dialog before
+  // `finalFocusEl` can run. `closeMobilePanel` therefore closes and restores the
+  // opener on a microtask, which is correct for both mounted and unmounting hosts.
+  //
+  // No `defer` here: hosts render this component inside `<Show when={open()}>`, so
+  // it mounts with `open` already true and a deferred effect would never attach.
+  createEffect(() => {
+    if (!props.open) return
+
+    const detach = listenForEscape(() => {
+      closeMobilePanel({ onClose: () => props.onOpenChange(false), returnFocus: props.returnFocus })
+    })
+
+    onCleanup(detach)
+  })
 
   const navigation = {
     close: () => props.onOpenChange(false),

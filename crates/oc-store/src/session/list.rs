@@ -158,7 +158,7 @@ impl Store {
 
         let (rows, frozen) = self
             .read(move |connection| {
-                let mut statement = connection.prepare(&sql)?;
+                let mut statement = connection.prepare_cached(&sql)?;
                 let mut mapped = statement.query(params_from_iter(values.iter()))?;
                 let mut items: Vec<(i64, String, Value)> = Vec::new();
                 let mut frozen: Option<i64> = None;

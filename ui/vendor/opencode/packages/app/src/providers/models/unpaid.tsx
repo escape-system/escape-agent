@@ -88,7 +88,7 @@ export const DialogSelectModelUnpaid: Component<{ model?: ModelState }> = (props
       <DialogHeader closeLabel={language.t("common.close")}>
         <DialogTitle>{language.t("dialog.model.select.title")}</DialogTitle>
       </DialogHeader>
-      <DialogBody class="max-h-[calc(100vh_-_68px)] min-h-0 flex-none gap-0 overflow-y-auto px-2 pb-2">
+      <DialogBody class="min-h-0 flex-1 gap-0 overflow-y-auto px-2 pb-2">
         <div ref={listEl} class="flex min-h-0 flex-col">
           <div data-section="free-models" class="flex w-full flex-col items-start pb-3">
             <div class="flex h-8 w-full flex-none select-none flex-row items-center px-3 pb-2">

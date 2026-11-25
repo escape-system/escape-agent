@@ -76,17 +76,57 @@ pub(crate) async fn open_services(
         })
         .context("load configuration")?,
     );
-    let mut catalog =
-        oc_server::catalog_from_config(config.as_ref()).context("load model catalog")?;
-    let has_nous_cache = apply_cached_nous_models(&mut catalog);
-    let has_go_cache = apply_cached_opencode_go_models(&mut catalog);
-    if (has_nous_cache || has_go_cache)
-        && let Some(providers) = config.merged().get("providers")
-    {
-        catalog
-            .apply_config(providers)
-            .context("reapply providers over cached provider models")?;
-    }
+    // models.dev is a dynamic source, not a build artifact: a plausible cached
+    // catalog replaces the embedded snapshot at startup, so avoid parsing the
+    // 7.9 MB embedded snapshot first only to immediately drop it.
+    let cached_live =
+        match oc_llm::catalog::refresh::read_cache(&oc_llm::catalog::refresh::cache_path()) {
+            Some(Ok(body)) => match oc_llm::catalog::refresh::parse_live(&body) {
+                Ok(mut live) if oc_llm::catalog::refresh::is_plausible(&live) => {
+                    oc_llm::catalog::refresh::apply_builtin_providers(&mut live);
+                    apply_cached_nous_models(&mut live);
+                    apply_cached_opencode_go_models(&mut live);
+                    if let Some(providers) = config.merged().get("providers") {
+                        live.apply_config(providers)
+                            .context("apply providers to the cached catalog")?;
+                    }
+                    Some(live)
+                }
+                Ok(live) => {
+                    tracing::warn!(
+                        models = live.models().len(),
+                        "cached model catalog too small; using the embedded snapshot"
+                    );
+                    None
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "cached model catalog unparseable");
+                    None
+                }
+            },
+            Some(Err(error)) => {
+                tracing::warn!(%error, "cached model catalog unreadable");
+                None
+            }
+            None => None,
+        };
+
+    let mut catalog = if let Some(live) = cached_live {
+        live
+    } else {
+        let mut embedded =
+            oc_server::catalog_from_config(config.as_ref()).context("load model catalog")?;
+        let has_nous_cache = apply_cached_nous_models(&mut embedded);
+        let has_go_cache = apply_cached_opencode_go_models(&mut embedded);
+        if (has_nous_cache || has_go_cache)
+            && let Some(providers) = config.merged().get("providers")
+        {
+            embedded
+                .apply_config(providers)
+                .context("reapply providers over cached provider models")?;
+        }
+        embedded
+    };
     // `config_dir: None` is deliberate: Antigravity account, signature and
     // model-cache state is global (`resolve_config_dir()`), so every project
     // shares one account pool; only `antigravity.jsonc` discovery is per-project.
@@ -107,39 +147,8 @@ pub(crate) async fn open_services(
             None
         }
     };
-    // models.dev is a dynamic source, not a build artifact: a catalog fetched by
-    // a previous run *replaces* the embedded floor, then the same overlays the
-    // embedded path uses are re-applied. An implausible or unparseable cache is
-    // ignored, never served, so a truncated file cannot empty the picker.
-    match oc_llm::catalog::refresh::read_cache(&oc_llm::catalog::refresh::cache_path()) {
-        Some(Ok(body)) => match oc_llm::catalog::refresh::parse_live(&body) {
-            Ok(mut live) if oc_llm::catalog::refresh::is_plausible(&live) => {
-                oc_llm::catalog::refresh::apply_builtin_providers(&mut live);
-                apply_cached_nous_models(&mut live);
-                apply_cached_opencode_go_models(&mut live);
-                catalog = live;
-                if let Some(providers) = config.merged().get("providers") {
-                    catalog
-                        .apply_config(providers)
-                        .context("apply providers to the cached catalog")?;
-                }
-                // `catalog = live` dropped the Antigravity overlay applied
-                // above; without re-applying it the cached catalog would hide
-                // every Antigravity model until the first background refresh.
-                if let Some(svc) = &antigravity {
-                    svc.overlay_catalog(&mut catalog);
-                }
-            }
-            Ok(live) => tracing::warn!(
-                models = live.models().len(),
-                "cached model catalog too small; using the embedded snapshot"
-            ),
-            Err(error) => tracing::warn!(%error, "cached model catalog unparseable"),
-        },
-        Some(Err(error)) => tracing::warn!(%error, "cached model catalog unreadable"),
-        None => {}
-    }
     let catalog = std::sync::Arc::new(oc_llm::CatalogCell::new(catalog));
+    oc_alloc::purge_idle_memory();
     Ok(Services {
         store,
         config,
@@ -378,6 +387,7 @@ pub(crate) fn start_background_tasks(
                 antigravity.overlay_catalog(&mut live);
             }
             cell.replace(live);
+            oc_alloc::purge_idle_memory();
             state.publish(oc_types::EventEnvelope::now(
                 "models-dev.refreshed",
                 serde_json::json!({}),
@@ -438,9 +448,9 @@ fn apply_cached_opencode_go_models(catalog: &mut oc_llm::Catalog) -> bool {
 /// no longer includes), so the loop applies upserts *and* withdrawals.
 fn spawn_opencode_go_refresh_loop(cell: Arc<oc_llm::CatalogCell>, state: AppState) {
     tokio::spawn(async move {
-        let client = oc_llm::catalog::refresh::client();
         let url = oc_llm::catalog::refresh::opencode_go_models_url();
         let cache = oc_llm::catalog::refresh::opencode_go_cache_path();
+        let mut client = None;
         let mut first = true;
         loop {
             let delay = if first {
@@ -450,8 +460,8 @@ fn spawn_opencode_go_refresh_loop(cell: Arc<oc_llm::CatalogCell>, state: AppStat
             };
             first = false;
             tokio::time::sleep(delay).await;
-            match oc_llm::catalog::refresh::fetch_opencode_go_models_with_body(&client, &url).await
-            {
+            let client = client.get_or_insert_with(oc_llm::catalog::refresh::client);
+            match oc_llm::catalog::refresh::fetch_opencode_go_models_with_body(client, &url).await {
                 Ok((body, models)) => {
                     if let Err(error) = oc_llm::catalog::refresh::write_cache(&cache, &body) {
                         tracing::debug!(%error, "opencode-go model list cache write failed");
@@ -473,6 +483,7 @@ fn spawn_opencode_go_refresh_loop(cell: Arc<oc_llm::CatalogCell>, state: AppStat
                         antigravity.overlay_catalog(&mut next);
                     }
                     cell.replace(next);
+                    oc_alloc::purge_idle_memory();
                     tracing::info!(upserted, removed, "opencode-go model list refreshed");
                     state.publish(oc_types::EventEnvelope::now(
                         "models-dev.refreshed",
@@ -487,7 +498,7 @@ fn spawn_opencode_go_refresh_loop(cell: Arc<oc_llm::CatalogCell>, state: AppStat
 
 fn spawn_nous_refresh_loop(cell: Arc<oc_llm::CatalogCell>, state: AppState) {
     tokio::spawn(async move {
-        let client = oc_llm::catalog::refresh::client();
+        let mut client = None;
         let mut first = true;
         loop {
             let delay = if first {
@@ -497,7 +508,8 @@ fn spawn_nous_refresh_loop(cell: Arc<oc_llm::CatalogCell>, state: AppState) {
             };
             first = false;
             tokio::time::sleep(delay).await;
-            match oc_llm::catalog::refresh::fetch_nous_models_now(&client).await {
+            let client = client.get_or_insert_with(oc_llm::catalog::refresh::client);
+            match oc_llm::catalog::refresh::fetch_nous_models_now(client).await {
                 Ok((body, models)) => {
                     if let Err(error) = oc_llm::catalog::refresh::write_cache(
                         &oc_llm::catalog::refresh::nous_cache_path(),
@@ -519,6 +531,7 @@ fn spawn_nous_refresh_loop(cell: Arc<oc_llm::CatalogCell>, state: AppState) {
                         antigravity.overlay_catalog(&mut next);
                     }
                     cell.replace(next);
+                    oc_alloc::purge_idle_memory();
                     state.publish(oc_types::EventEnvelope::now(
                         "models-dev.refreshed",
                         serde_json::json!({}),

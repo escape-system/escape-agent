@@ -38,6 +38,15 @@ fn push_messages(messages: &[Value], out: &mut Vec<LlmMessage>) {
             Some("user") => {
                 out.push(LlmMessage::new(Role::User, user_parts(message)));
             }
+            // `peer` is the legacy type for subagent-to-peer notes; new peer
+            // rows are stored as `synthetic` with `metadata.source="peer"` so
+            // the wire message union stays valid. Both spellings render as the
+            // same `<peer>` block, so a model sees one stable shape.
+            Some("synthetic") if is_peer(message) => {
+                if let Some(text) = peer_text(message) {
+                    out.push(LlmMessage::user(text));
+                }
+            }
             Some("synthetic" | "system" | "skill" | "observer") => {
                 if let Some(text) = message.get("text").and_then(Value::as_str)
                     && !text.is_empty()
@@ -66,6 +75,49 @@ fn push_messages(messages: &[Value], out: &mut Vec<LlmMessage>) {
             Some(_) | None => {}
         }
     }
+}
+
+/// A synthetic row written by `talk`/`session_write` carries
+/// `metadata.source="peer"`; it is a peer note, not a plain notice.
+fn is_peer(message: &Value) -> bool {
+    message
+        .pointer("/metadata/source")
+        .and_then(Value::as_str)
+        .is_some_and(|source| source == "peer")
+}
+
+/// Renders a peer note as `<peer from=… agent=… kind=…>text</peer>`.
+///
+/// `talk` writes the sender on the payload top level; `session_write` only
+/// records `metadata.from`, so both are read. Missing fields fall back to the
+/// same placeholders the legacy `peer` branch used, keeping the model-visible
+/// shape identical across the storage change.
+fn peer_text(message: &Value) -> Option<String> {
+    let text = message.get("text").and_then(Value::as_str)?;
+    if text.is_empty() {
+        return None;
+    }
+    let field = |key: &str| {
+        message
+            .get(key)
+            .and_then(Value::as_str)
+            .or_else(|| {
+                message
+                    .pointer(&format!("/metadata/{key}"))
+                    .and_then(Value::as_str)
+            })
+            .unwrap_or("?")
+    };
+    let kind = message
+        .get("kind")
+        .and_then(Value::as_str)
+        .or_else(|| message.pointer("/metadata/kind").and_then(Value::as_str))
+        .unwrap_or("note");
+    Some(format!(
+        "<peer from=\"{}\" agent=\"{}\" kind=\"{kind}\">{text}</peer>",
+        field("from"),
+        field("agent")
+    ))
 }
 
 fn user_parts(message: &Value) -> Vec<ContentPart> {
@@ -307,6 +359,51 @@ mod tests {
             &llm[1].content[0],
             ContentPart::ToolResult { tool_call_id, .. } if tool_call_id == "call_run_1"
         ));
+    }
+
+    #[test]
+    fn peer_notes_keep_the_xml_block_after_the_synthetic_normalization() {
+        // New peer rows are `synthetic` + `metadata.source="peer"`; the model must
+        // keep seeing the same `<peer …>` block the legacy `peer` type produced.
+        let talked = vec![json!({
+            "type": "synthetic",
+            "id": "msg_peer1",
+            "text": "status?",
+            "kind": "question",
+            "from": "ses_a",
+            "agent": "general",
+            "metadata": {"source": "peer", "from": "ses_a", "agent": "general", "kind": "question"},
+        })];
+        let llm = messages_from_store(&talked);
+        assert_eq!(llm.len(), 1);
+        assert_eq!(
+            llm[0].content[0].as_text(),
+            Some(r#"<peer from="ses_a" agent="general" kind="question">status?</peer>"#)
+        );
+
+        // `session_write` only records the sender under `metadata`.
+        let written = vec![json!({
+            "type": "synthetic",
+            "id": "msg_peer2",
+            "text": "run the tests",
+            "metadata": {"source": "peer", "from": "ses_parent"},
+        })];
+        let llm = messages_from_store(&written);
+        assert_eq!(
+            llm[0].content[0].as_text(),
+            Some(r#"<peer from="ses_parent" agent="?" kind="note">run the tests</peer>"#)
+        );
+
+        // A plain synthetic row (no peer metadata) stays a plain user-role text.
+        let plain = vec![json!({
+            "type": "synthetic",
+            "id": "msg_plain",
+            "text": "notice",
+            "metadata": {"source": "observer"},
+        })];
+        let llm = messages_from_store(&plain);
+        assert_eq!(llm[0].content[0].as_text(), Some("notice"));
+        assert!(!llm[0].content[0].as_text().unwrap().contains("<peer"));
     }
 
     #[test]

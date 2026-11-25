@@ -24,7 +24,7 @@ use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::Json;
-use axum::body::Body;
+use axum::body::{Body, Bytes};
 use axum::extract::rejection::QueryRejection;
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::header::{
@@ -87,8 +87,14 @@ pub async fn read(
 ) -> Result<Response, ErrorResponse> {
     let Query(params) = params.map_err(|error| ErrorResponse::from(query_error(error)))?;
     let resolved = location::resolve(&state, &headers, None, params.directory.as_deref());
-    let root = canonical_root(&resolved)?;
-    let target = confined(&root, &path)?;
+    let resolved_for_fs = resolved.clone();
+    let path_for_fs = path.clone();
+    let target = tokio::task::spawn_blocking(move || {
+        let root = canonical_root(&resolved_for_fs)?;
+        confined(&root, &path_for_fs)
+    })
+    .await
+    .map_err(|error| ErrorResponse::from(internal(error)))??;
 
     let meta = fs::metadata(&target)
         .await
@@ -141,13 +147,13 @@ pub async fn read(
         .map_or(ByteRange::Full, |value| parse_range(value, len));
 
     let (status, content_range, body) = match requested {
-        ByteRange::Full => (StatusCode::OK, None, bytes),
+        ByteRange::Full => (StatusCode::OK, None, Bytes::from(bytes)),
         ByteRange::Partial { start, end } => {
+            let full = Bytes::from(bytes);
             let slice = match (usize::try_from(start), usize::try_from(end)) {
-                (Ok(start), Ok(end)) => bytes.get(start..=end).unwrap_or(bytes.as_slice()),
-                _ => bytes.as_slice(),
-            }
-            .to_vec();
+                (Ok(start), Ok(end)) if start <= end && end < full.len() => full.slice(start..=end),
+                _ => full,
+            };
             (
                 StatusCode::PARTIAL_CONTENT,
                 Some(format!("bytes {start}-{end}/{len}")),
@@ -187,43 +193,44 @@ pub async fn list(
 ) -> Result<Json<LocationEnvelope<Vec<FsEntry>>>, ErrorResponse> {
     let Query(params) = params.map_err(|error| ErrorResponse::from(query_error(error)))?;
     let resolved = location::resolve(&state, &headers, None, params.directory.as_deref());
-    let root = canonical_root(&resolved)?;
-
-    let target = match params.path.as_deref() {
-        None | Some("") => root.clone(),
-        Some(path) => navigate(&root, path)?,
-    };
-
-    let mut directory = fs::read_dir(&target)
-        .await
-        .map_err(|_| ErrorResponse::from(file_not_found(&target.to_string_lossy())))?;
-    let mut entries = Vec::new();
-    while let Some(entry) = directory
-        .next_entry()
-        .await
-        .map_err(|error| ErrorResponse::from(internal(error)))?
-    {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        let path = entry.path();
-        let Ok(meta) = entry.metadata().await else {
-            continue;
+    let reference = resolved.reference();
+    let entries = tokio::task::spawn_blocking(move || -> Result<Vec<FsEntry>, ErrorResponse> {
+        let root = canonical_root(&resolved)?;
+        let target = match params.path.as_deref() {
+            None | Some("") => root.clone(),
+            Some(path) => navigate(&root, path)?,
         };
-        if !is_listable(&meta) {
-            continue;
-        }
-        if let Some(entry) = entry_for(&root, name, &path, &meta) {
-            entries.push(entry);
-        }
-    }
-    entries.sort_by_cached_key(|entry| {
-        (
-            kind_rank(entry.kind),
-            entry.name.to_lowercase(),
-            entry.name.clone(),
-        )
-    });
 
-    Ok(Json(LocationEnvelope::new(resolved.reference(), entries)))
+        let directory = std::fs::read_dir(&target)
+            .map_err(|_| ErrorResponse::from(file_not_found(&target.to_string_lossy())))?;
+        let mut entries = Vec::new();
+        for item in directory {
+            let entry = item.map_err(|error| ErrorResponse::from(internal(error)))?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let path = entry.path();
+            let Ok(meta) = std::fs::metadata(&path) else {
+                continue;
+            };
+            if !is_listable(&meta) {
+                continue;
+            }
+            if let Some(entry) = entry_for(&root, name, &path, &meta) {
+                entries.push(entry);
+            }
+        }
+        entries.sort_by_cached_key(|entry| {
+            (
+                kind_rank(entry.kind),
+                entry.name.to_lowercase(),
+                entry.name.clone(),
+            )
+        });
+        Ok(entries)
+    })
+    .await
+    .map_err(|error| ErrorResponse::from(internal(error)))??;
+
+    Ok(Json(LocationEnvelope::new(reference, entries)))
 }
 
 /// `GET /api/fs/find?query=&type=&limit=`

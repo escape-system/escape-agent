@@ -21,10 +21,6 @@ pub(super) fn parse_epoch(raw: &str, field: &str) -> Result<i64, ApiError> {
     ))
 }
 
-pub(super) fn number_at(value: &Value, pointer: &str) -> i64 {
-    value.pointer(pointer).and_then(json_i64).unwrap_or(0)
-}
-
 pub(super) fn float_at(value: &Value, pointer: &str) -> f64 {
     value
         .pointer(pointer)
@@ -32,32 +28,56 @@ pub(super) fn float_at(value: &Value, pointer: &str) -> f64 {
         .unwrap_or(0.0)
 }
 
-pub(super) fn empty_tokens() -> Value {
-    json!({ "input": 0, "output": 0, "reasoning": 0, "cache": { "read": 0, "write": 0 } })
+#[derive(Default, Clone, Copy)]
+pub(super) struct TokenCounts {
+    pub(super) input: i64,
+    pub(super) output: i64,
+    pub(super) reasoning: i64,
+    pub(super) cache_read: i64,
+    pub(super) cache_write: i64,
 }
 
-pub(super) fn add_tokens(total: &mut Value, message: &Value) {
-    for (target, source) in [
-        ("/input", "/tokens/input"),
-        ("/output", "/tokens/output"),
-        ("/reasoning", "/tokens/reasoning"),
-        ("/cache/read", "/tokens/cache/read"),
-        ("/cache/write", "/tokens/cache/write"),
-    ] {
-        let current = number_at(total, target);
-        let add = number_at(message, source);
-        if let Some(slot) = total.pointer_mut(target) {
-            *slot = json!(current + add);
+impl TokenCounts {
+    pub(super) fn from_message(message: &Value) -> Self {
+        let Some(tokens) = message.get("tokens") else {
+            return Self::default();
+        };
+        let cache = tokens.get("cache");
+        Self {
+            input: tokens.get("input").and_then(json_i64).unwrap_or(0),
+            output: tokens.get("output").and_then(json_i64).unwrap_or(0),
+            reasoning: tokens.get("reasoning").and_then(json_i64).unwrap_or(0),
+            cache_read: cache
+                .and_then(|c| c.get("read"))
+                .and_then(json_i64)
+                .unwrap_or(0),
+            cache_write: cache
+                .and_then(|c| c.get("write"))
+                .and_then(json_i64)
+                .unwrap_or(0),
         }
     }
-}
 
-pub(super) fn tokens_total(tokens: &Value) -> i64 {
-    number_at(tokens, "/input")
-        + number_at(tokens, "/output")
-        + number_at(tokens, "/reasoning")
-        + number_at(tokens, "/cache/read")
-        + number_at(tokens, "/cache/write")
+    pub(super) fn add_assign(&mut self, other: Self) {
+        self.input += other.input;
+        self.output += other.output;
+        self.reasoning += other.reasoning;
+        self.cache_read += other.cache_read;
+        self.cache_write += other.cache_write;
+    }
+
+    pub(super) fn total(self) -> i64 {
+        self.input + self.output + self.reasoning + self.cache_read + self.cache_write
+    }
+
+    pub(super) fn to_json(self) -> Value {
+        json!({
+            "input": self.input,
+            "output": self.output,
+            "reasoning": self.reasoning,
+            "cache": { "read": self.cache_read, "write": self.cache_write }
+        })
+    }
 }
 
 /// Days since the Unix epoch to a civil `(year, month, day)` (Hinnant).

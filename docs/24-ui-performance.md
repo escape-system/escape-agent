@@ -110,18 +110,20 @@ returns `content-length: 0` for HEAD):
 
 ## Ranked findings
 
-Ordered by payload removed per unit of change. Each is reported, not fixed
-here.
+Ordered by payload removed per unit of change. Each was reported, not fixed, at
+the time of the 2026-11-07 audit. Rows marked **fixed** have since shipped; the
+rest still stand. Current numbers and the remaining opens are in
+[Shipped-state delta, 2026-11-25](#shipped-state-delta-2026-11-25).
 
 | # | Finding | Location | Mechanism |
 |---|---|---|---|
-| a | Production sourcemaps shipped | `packages/app/vite.config.ts:52` (`sourcemap: true`) | 2,642 `.map` files, 61,472,659 B, 40.9 % of `web/dist`. Served publicly; the Sentry plugin only deletes maps when `SENTRY_AUTH_TOKEN` is set, and it is unset |
-| b | Zero static compression | `Cargo.toml:85` (`tower-http` features `cors`, `trace` only); layers at `crates/oc-server/src/lib.rs:566-578`; rule at `docs/13-ui.md:19` | No `CompressionLayer`. First load is 3,109,371 B raw; the same bytes at gzip-9 are 869,785 B, a 72.0 % reduction the client never sees |
-| c | Four 3 s polling queries | `src/session/agent-panels/agent-queries.ts:63,90,113,136` | `refetchInterval: 3_000` on subagent tree, repairs, observer state and goal: 80 requests/min per open session panel, contradicting `docs/13-ui.md:177-178` (`refetchOnMount:false`, `staleTime: 30s`) |
+| a **fixed** | Production sourcemaps shipped | `packages/app/vite.config.ts:52` (`sourcemap: true`) | 2,642 `.map` files, 61,472,659 B, 40.9 % of `web/dist`. Served publicly; the Sentry plugin only deletes maps when `SENTRY_AUTH_TOKEN` is set, and it is unset |
+| b **fixed** | Zero static compression | `Cargo.toml:85` (`tower-http` features `cors`, `trace` only); layers at `crates/oc-server/src/lib.rs:566-578`; rule at `docs/13-ui.md:19` | No `CompressionLayer`. First load is 3,109,371 B raw; the same bytes at gzip-9 are 869,785 B, a 72.0 % reduction the client never sees |
+| c **fixed** | Four 3 s polling queries | `src/session/agent-panels/agent-queries.ts:63,90,113,136` | `refetchInterval: 3_000` on subagent tree, repairs, observer state and goal: 80 requests/min per open session panel, contradicting `docs/13-ui.md:177-178` (`refetchOnMount:false`, `staleTime: 30s`) |
 | d | `effect@4.0.6` in the startup graph | chunk `_assets/dist-DOFOGWOn.js`, 806,807 B (247,541 B gzip-9), 217 sources all under `effect@4.0.6`; imported from `src/session/timeline/message-timeline.tsx:3`, `virtualizer.tsx:10`, `controller.tsx:7`, `src/shell/state/layout.tsx:2`, `src/shell/commands/command.tsx:5`, `src/shell/tabs/schema.ts:3` | The chunk is in the 72-module static closure and is its largest module, ahead of the 763,305 B entry. `Predicate.isTagged` is used in `message-timeline.tsx` and `virtualizer.tsx`; `controller.tsx` uses `Predicate.isString`; the shell files use `Schema`/`SchemaGetter` |
-| e | Third-party favicon fetch per external link | `packages/session-ui/src/components/markdown.tsx:373` | Renders `https://www.google.com/s2/favicons?domain=…` per rendered external link: a cross-origin request, and a third-party dependency in a local-first UI |
+| e **fixed** | Third-party favicon fetch per external link | `packages/session-ui/src/components/markdown.tsx:373` | Renders `https://www.google.com/s2/favicons?domain=…` per rendered external link: a cross-origin request, and a third-party dependency in a local-first UI |
 | f | One Solid root per code block | `packages/session-ui/src/components/markdown.tsx:150-170` (`render()` at `:156`), called from `:1084` and `:1172` | Every code block mounts its own reactive root for a copy button instead of sharing one component tree |
-| g | PWA precaches the entire build | `packages/app/vite.pwa.ts:34,36` (`globPatterns: ["**/*"]`, `maximumFileSizeToCacheInBytes: Number.MAX_SAFE_INTEGER`) | `sw.js` install fetches 2,816 entries / 37,591,783 B, including every lazy chunk and every 34 MiB of wasm |
+| g **fixed** | PWA precaches the entire build | `packages/app/vite.pwa.ts:34,36` (`globPatterns: ["**/*"]`, `maximumFileSizeToCacheInBytes: Number.MAX_SAFE_INTEGER`) | `sw.js` install fetches 2,816 entries / 37,591,783 B, including every lazy chunk and every 34 MiB of wasm |
 | h | 71 eager `modulepreload` refs | eager imports at `src/shell/routes/routes.tsx:3,8,9,10` and `src/app.tsx:13,20`; the lazy route table is `routes.tsx:50-77` | Shell, Home, `CommandProvider`, `SettingsProvider` and the layout/settings providers are imported at module scope, so the whole startup closure is preloaded before the first route renders. The route table itself is lazy and is not the cause |
 
 ## What is not a bottleneck
@@ -161,11 +163,15 @@ touch component behavior.
 
 | Item | Evidence |
 |---|---|
-| `bench/baseline.json` referenced by the perf doc is absent | `docs/15-performance.md:99`; `ls bench/` → no `baseline.json` |
-| Docs say four UI patches, `ui/patches/` has five | `docs/13-ui.md:28,43`; `ls ui/patches/*.patch \| wc -l` → 5, including `0005-attachment-mime-guard.patch` |
-| `expect_seconds` documented for the subagent tree does not exist in `src` | `docs/13-ui.md:87-88`; `grep -rn 'expect_seconds\|expectSeconds' packages/*/src` → no matches |
-| `memory.updated` documented as a reducer case appears nowhere in `src` | `docs/13-ui.md:176`; `grep -rn 'memory\.updated' packages/*/src` → no matches |
-| `agent-queries.ts` uses `refetchOnMount:true` / 3 s instead of the documented `false` / 30 s | `src/session/agent-panels/agent-queries.ts:63,90,113,136` vs `docs/13-ui.md:177-178` |
+| `bench/baseline.json` referenced by the perf doc is absent | `docs/15-performance.md:99`; `ls bench/` → no such directory |
+| No DOM-mount regression for `SessionQueuePanel` | Bun emits an unresolved hoisted JSX helper for that `.tsx` under the `solid-js/h` preload; coverage is pure `queuePanelRowIDs` cases plus a real-Solid memo test |
+| Finding (d) `effect@4.0.6` still in the startup closure | `web/dist/_assets/dist-DOFOGWOn.js` 806,765 B, largest non-vendor chunk after `ghostty-web` |
+| No real-device / iOS Safari / safe-area / hardware-Escape proof | Headless Chromium only |
+
+Doc-drift items previously listed here are **closed by this wave**: `docs/13-ui.md`
+now says nine patches, the subagent tree row no longer claims an
+`expect_seconds` budget, the reducer section no longer claims a `memory.updated`
+case, and the polling paragraph matches `agent-queries.ts` as built.
 
 ## How to re-measure
 
@@ -208,6 +214,84 @@ chromium.launch({
   args: ["--no-sandbox", "--disable-dev-shm-usage"],
 })
 ```
+
+## Shipped-state delta, 2026-11-25
+
+Re-measured on the served `web/dist` after the UI closure wave. These are the
+numbers a budget check actually sees today; the 2026-11-07 tables above are the
+historical baseline and are left as measured.
+
+| Metric | Value | Command |
+|---|---|---|
+| dist bytes / files | 89,599,391 B (85.4 MiB) / 2,891 | `du -sb web/dist`; `find web/dist -type f \| wc -l` |
+| `*.map` files | 0 | `find web/dist -name '*.map' \| wc -l` |
+| entry chunk | `_assets/index-BXyiOx6c.js`, 766,741 B | `grep -o '_assets/index-[^"]*\.js' web/dist/index.html` |
+| `rel="modulepreload"` | 73 (budget 75) | `grep -o 'rel="modulepreload"' web/dist/index.html \| wc -l` |
+| `rel="stylesheet"` | 16 | `grep -o 'rel="stylesheet"' web/dist/index.html \| wc -l` |
+| `index.html` | 9,768 B | `stat -c%s web/dist/index.html` |
+| `sw.js` | 17,604 B | `stat -c%s web/dist/sw.js` |
+| `google.com/s2/favicons` in `_assets/*.js` | 0 files | `grep -rl 'google.com/s2/favicons' web/dist/_assets/*.js \| wc -l` |
+| largest `_assets` chunk | `ghostty-web-_dDLb8Vl.js` 1,380,965 B; `dist-DOFOGWOn.js` 806,765 B | `ls -S web/dist/_assets/*.js` |
+
+Gate tails (both exit 0):
+
+```
+verify-dist: OK (93 root-relative assets, /root/escape-agent/web/dist/_assets present)
+check-dist-budget: OK (/root/escape-agent/web/dist) — 85.4 MiB, 0 maps, entry gzip 198.0 KiB, 73 preloads, sw precache 1.39 MiB
+```
+
+Static compression is now shipped, which retires finding (b): `tower-http` is
+built with `compression-br`/`compression-gzip` (`Cargo.toml:86`), the
+`CompressionLayer` wraps only the static fallback router with
+`CompressionLevel::Fastest` and a `SizeAbove::new(1024)` predicate that skips
+SSE, images, fonts, audio and video (`crates/oc-server/src/lib.rs:668-690`), and
+every static response carries `Vary: accept-encoding`
+(`crates/oc-server/src/static_files.rs:99`). `/api` stays outside that router so
+SSE is never compressed or buffered, as [13](13-ui.md) requires.
+
+### Shipped UI performance behaviour (this wave)
+
+- **Startup paint no longer waits on the locale chunk.** `entry.tsx` renders
+  synchronously with `initialLocaleHint()` and only then removes the static
+  splash (`src/entry.tsx:117`); `loadInitialLocale()` runs after paint and a
+  rejected chunk keeps the English base (`:118`). The splash itself is static
+  markup with inline critical CSS (`index.html:26-107`), so the first frame
+  needs no stylesheet or script fetch. Cost: entry grew from 766,741 B to
+  ~768,201 B staged (+1,460 B raw) in the verifier's build — no payload win is
+  claimed, only that first paint is unblocked.
+- **No agent-panel polling storm.** The subagent tree uses
+  `refetchOnMount:true` + `staleTime: 2_000` with SSE-driven debounced refetches
+  (`src/session/agent-panels/agent-queries.ts:66-70,120-132`); repairs and goal
+  are `refetchOnMount:false`/`staleTime: 30_000` (`:173-174`, `:226-227`), and
+  only the observer budget keeps a slow 15 s poll (`:200-204`) because no event
+  carries its counter. This retires finding (c)'s "four 3 s polls".
+- **Queue strip render cost is bounded.** `queuePanelRowIDs` is a pure array
+  union over `shown`/`live` recomputed in one memo
+  (`src/session/composer/queue-panel.tsx:25,42`); the list is capped at four
+  32 px rows plus a half-row hint before it scrolls
+  (`queue-panel.tsx:132-140`, `queue-panel.css`), and rows are keyed by inbox ID
+  so a store update moves elements instead of remounting them (which would kill
+  an in-flight drag).
+- **Hydration is one read, not a subscription.** `pending.hydrate` invalidates
+  the sync key and delegates to `pending.sync` once
+  (`packages/client/src/solid/data.ts:1713-1716`); a second call is a normal
+  completed read, not a duplicate subscription.
+- **Transcript history stays lazy.** `shouldLoadHistory`
+  (`virtualizer.tsx:150-164`) rejects every `restore`/`correction` intent, so a
+  remount or anchor correction costs zero `?before=`/`?cursor=` requests; the
+  built e2e asserts that request log is unchanged across a programmatic write
+  (`e2e/verify/startup-scroll-harness.spec.ts:233`).
+
+### Still open after this wave
+
+| Item | Evidence |
+|---|---|
+| Health failure never reaches a retry surface; an all-API abort sits on `Loading…` | `startup-scroll-harness.spec.ts:98`, 20 s timeout, built run 2026-11-25 |
+| Tab-away/back does not restore the reading offset (`scrollTop` 0 on return) | `mobile-agent-queue.spec.ts:85`, built run 2026-11-25 |
+| Older-page content-visibility assertions fail after the request-log clauses pass | `queue-delivery.spec.ts:203` (Prompt 11), `startup-scroll-harness.spec.ts:243` (Prompt 23) |
+| No DOM-mount regression for `SessionQueuePanel` | Bun emits an unresolved hoisted JSX helper (`jsx_*` is not defined) when mounting that `.tsx` under the `solid-js/h` preload; the panel fix is covered by pure + real-Solid memo tests only |
+| Finding (d) `effect@4.0.6` in the startup graph, (e) per-code-block Solid root, (f) PWA precache scope | Unchanged; still reported, not fixed |
+| No real-device / iOS Safari / safe-area proof | Headless Chromium only |
 
 ## Budgets
 

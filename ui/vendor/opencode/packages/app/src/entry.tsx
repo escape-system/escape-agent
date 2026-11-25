@@ -4,7 +4,7 @@ import "@/runtime/polyfills"
 import { init } from "@sentry/solid"
 import { render } from "solid-js/web"
 import { AppBaseProviders, AppInterface } from "@/app"
-import { loadInitialLocale } from "@/runtime/i18n/language"
+import { initialLocaleHint, loadInitialLocale } from "@/runtime/i18n/language"
 import { PlatformProvider } from "@/runtime/platform/platform"
 import { createWebPlatform } from "@/runtime/platform/web"
 import { isStandalone, PwaRoutePersistence, restorePwaRoute } from "@/runtime/platform/pwa"
@@ -76,40 +76,44 @@ if (import.meta.env.VITE_SENTRY_DSN) {
 if (root instanceof HTMLElement && root.dataset.opencodeMounted === undefined) {
   // Lazy chunks can import the entry chunk back under a distinct URL, so claim the root before async startup.
   root.dataset.opencodeMounted = ""
-  void loadInitialLocale().then((locale) => {
-    const auth = authFromToken(new URLSearchParams(location.search).get("auth_token"))
-    clearAuthToken()
-    const standalone = isStandalone()
-    root.dataset.standalone = String(standalone)
+  const auth = authFromToken(new URLSearchParams(location.search).get("auth_token"))
+  clearAuthToken()
+  const standalone = isStandalone()
+  root.dataset.standalone = String(standalone)
 
-    if (standalone) restorePwaRoute()
+  if (standalone) restorePwaRoute()
 
-    const server: ServerConnection.Http | undefined = web.currentServerUrl
-      ? {
-          type: "http",
-          authToken: !!auth,
-          http: {
-            url: web.currentServerUrl,
-            ...auth,
-          },
-        }
-      : undefined
+  const server: ServerConnection.Http | undefined = web.currentServerUrl
+    ? {
+        type: "http",
+        authToken: !!auth,
+        http: {
+          url: web.currentServerUrl,
+          ...auth,
+        },
+      }
+    : undefined
 
-    render(
-      () => (
-        <PlatformProvider value={web.platform}>
-          <AppBaseProviders locale={locale}>
-            <AppInterface
-              canonicalLocalServer={server ? ServerConnection.key(server) : undefined}
-              servers={server ? [server] : []}
-            >
-              <KeyboardInsets />
-              {standalone && <PwaRoutePersistence />}
-            </AppInterface>
-          </AppBaseProviders>
-        </PlatformProvider>
-      ),
-      root,
-    )
-  })
+  // The first frame uses the stored/detected locale itself, not its dictionary: a locale chunk used to be awaited
+  // here, which held the entire app behind a dynamic import (a black screen on a cold or mobile connection).
+  render(
+    () => (
+      <PlatformProvider value={web.platform}>
+        <AppBaseProviders locale={initialLocaleHint()}>
+          <AppInterface
+            canonicalLocalServer={server ? ServerConnection.key(server) : undefined}
+            servers={server ? [server] : []}
+          >
+            <KeyboardInsets />
+            {standalone && <PwaRoutePersistence />}
+          </AppInterface>
+        </AppBaseProviders>
+      </PlatformProvider>
+    ),
+    root,
+  )
+  // The commit above is synchronous, so the static splash has done its job; dropping it now cannot flash an empty
+  // root. A rejected chunk must not take the app down either: the base dictionary stays and the shell keeps running.
+  root.querySelector("[data-opencode-splash]")?.remove()
+  void loadInitialLocale().catch(() => undefined)
 }

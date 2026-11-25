@@ -1,5 +1,7 @@
 //! Message rows (`session_message`) and keyset pagination over `seq`.
 
+use std::sync::LazyLock;
+
 use rusqlite::types::Value as SqlValue;
 use rusqlite::{OptionalExtension, Row, params, params_from_iter};
 use serde::{Deserialize, Serialize};
@@ -73,6 +75,10 @@ struct MessageCursor {
     direction: Direction,
 }
 
+static GET_MESSAGE_SQL: LazyLock<String> = LazyLock::new(|| {
+    format!("SELECT {MESSAGE_COLUMNS} FROM session_message WHERE id = ?1 AND session_id = ?2")
+});
+
 impl Store {
     /// Appends a message and allocates its dense per-session `seq`.
     pub async fn append_message(&self, new: NewMessage) -> Result<Value, StoreError> {
@@ -135,13 +141,9 @@ impl Store {
         let session_id = session_id.to_owned();
         let id = id.to_owned();
         self.read(move |connection| {
-            let sql = format!(
-                "SELECT {MESSAGE_COLUMNS} FROM session_message WHERE id = ?1 AND session_id = ?2"
-            );
-            let row = connection
-                .query_row(&sql, params![&id, &session_id], |row| {
-                    Ok(message_value(row))
-                })
+            let mut statement = connection.prepare_cached(&GET_MESSAGE_SQL)?;
+            let row = statement
+                .query_row(params![&id, &session_id], |row| Ok(message_value(row)))
                 .optional()?;
             row.transpose()
         })
@@ -202,67 +204,66 @@ impl Store {
             order
         };
 
-        let anchor_seq = match &anchor_id {
-            Some(anchor_id) => {
-                let session_id = query.session_id.clone();
-                let anchor_id = anchor_id.clone();
-                self.read(move |connection| {
-                    let seq: Option<i64> = connection
-                        .query_row(
-                            "SELECT seq FROM session_message WHERE session_id = ?1 AND id = ?2",
-                            params![&session_id, &anchor_id],
-                            |row| row.get(0),
-                        )
-                        .optional()?;
-                    Ok(seq)
-                })
-                .await?
-            }
-            None => None,
-        };
-        if anchor_id.is_some() && anchor_seq.is_none() {
-            return Ok(MessagePage {
-                items: Vec::new(),
-                cursor: Cursor::default(),
-            });
-        }
-
-        let mut conditions = vec!["session_id = ?".to_owned()];
-        let mut values: Vec<SqlValue> = vec![SqlValue::Text(query.session_id.clone())];
-        if let Some(kind) = &query.kind {
-            conditions.push("type = ?".to_owned());
-            values.push(SqlValue::Text(kind.clone()));
-        }
-        if let Some(seq) = anchor_seq {
-            let condition = if effective == Order::Asc {
-                "seq > ?"
-            } else {
-                "seq < ?"
-            };
-            conditions.push(condition.to_owned());
-            values.push(SqlValue::Integer(seq));
-        }
-        values.push(SqlValue::Integer(
-            i64::try_from(limit + 1).unwrap_or(i64::MAX),
-        ));
-
-        let sql = format!(
-            "SELECT {MESSAGE_COLUMNS} FROM session_message WHERE {} ORDER BY seq {} LIMIT ?",
-            conditions.join(" AND "),
-            effective.sql()
-        );
+        let has_anchor = anchor_id.is_some();
         let rows = self
             .read(move |connection| {
-                let mut statement = connection.prepare(&sql)?;
+                let anchor_seq = match &anchor_id {
+                    Some(anchor_id) => {
+                        let mut stmt = connection.prepare_cached(
+                            "SELECT seq FROM session_message WHERE session_id = ?1 AND id = ?2",
+                        )?;
+                        let seq: Option<i64> =
+                            stmt.query_row(params![&query.session_id, anchor_id], |row| row.get(0))
+                                .optional()?;
+                        if seq.is_none() {
+                            return Ok(None);
+                        }
+                        seq
+                    }
+                    None => None,
+                };
+
+                let mut conditions = vec!["session_id = ?".to_owned()];
+                let mut values: Vec<SqlValue> = vec![SqlValue::Text(query.session_id.clone())];
+                if let Some(ref kind) = query.kind {
+                    conditions.push("type = ?".to_owned());
+                    values.push(SqlValue::Text(kind.clone()));
+                }
+                if let Some(seq) = anchor_seq {
+                    let condition = if effective == Order::Asc {
+                        "seq > ?"
+                    } else {
+                        "seq < ?"
+                    };
+                    conditions.push(condition.to_owned());
+                    values.push(SqlValue::Integer(seq));
+                }
+                values.push(SqlValue::Integer(
+                    i64::try_from(limit + 1).unwrap_or(i64::MAX),
+                ));
+
+                let sql = format!(
+                    "SELECT {MESSAGE_COLUMNS} FROM session_message WHERE {} ORDER BY seq {} LIMIT ?",
+                    conditions.join(" AND "),
+                    effective.sql()
+                );
+                let mut statement = connection.prepare_cached(&sql)?;
                 let mut mapped = statement.query(params_from_iter(values.iter()))?;
                 let mut items: Vec<(String, Value)> = Vec::new();
                 while let Some(row) = mapped.next()? {
                     let id: String = row.get(0)?;
                     items.push((id, message_value(row)?));
                 }
-                Ok(items)
+                Ok(Some(items))
             })
             .await?;
+
+        let Some(rows) = rows else {
+            return Ok(MessagePage {
+                items: Vec::new(),
+                cursor: Cursor::default(),
+            });
+        };
 
         let has_more = rows.len() > limit;
         let mut rows = rows;
@@ -292,7 +293,7 @@ impl Store {
             };
             let previous = match direction {
                 Direction::Next => {
-                    if anchor_id.is_some() {
+                    if has_anchor {
                         Some(encode(&first.0, Direction::Previous)?)
                     } else {
                         None

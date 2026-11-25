@@ -116,7 +116,7 @@ impl Tool for TalkTool {
             .enqueue_and_emit(NewInbox {
                 id: message_id.clone(),
                 session_id: to.clone(),
-                kind: "peer".to_owned(),
+                kind: "synthetic".to_owned(),
                 payload: json!({
                     "text": text,
                     "kind": kind,
