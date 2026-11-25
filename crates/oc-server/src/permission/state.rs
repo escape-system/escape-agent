@@ -356,12 +356,17 @@ impl State {
             if !durable {
                 state.remember(&entry);
             }
+            // Read saved rules and release `store` before publishing so
+            // subscribers reacting to `permission.replied` (including
+            // restart-style store reopens) never race this task's `Arc<Store>`
+            // drop against the exclusive DB lock file.
+            let rules = state.rules(Some(&store), &entry.session_id).await;
+            drop(store);
             State::publish(
                 &tx,
                 "permission.replied",
                 replied(&entry, PermissionReply::Always, durable),
             );
-            let rules = state.rules(Some(&store), &entry.session_id).await;
             state.auto_resolve(&tx, &entry.session_id, &rules);
         });
     }
