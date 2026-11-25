@@ -41,6 +41,39 @@ export async function takeOverWaitingBuild(worker: ServiceWorker) {
   return true
 }
 
+// The first install has no controller: that page already loaded this build, so there is nothing to replace.
+function activate(worker: ServiceWorker | null | undefined) {
+  if (!worker || !navigator.serviceWorker.controller) return
+
+  void takeOverWaitingBuild(worker)
+}
+
+/** Wires update notifications for a service-worker registration, ignoring blocked/undefined registrations. */
+export function attachRegistration(registration: ServiceWorkerRegistration | undefined) {
+  if (!registration) return
+
+  // A worker that installed while this tab was closed is already waiting.
+  activate(registration.waiting)
+
+  registration.addEventListener("updatefound", () => {
+    const installing = registration.installing
+
+    if (!installing) return
+
+    installing.addEventListener("statechange", () => {
+      if (installing.state === "installed") activate(registration.waiting ?? installing)
+    })
+  })
+
+  // Checks for a newly deployed build on every load and when the tab returns to the foreground.
+  const update = () => void registration.update().catch(() => {})
+
+  window.addEventListener("load", update, { once: true })
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") update()
+  })
+}
+
 /**
  * Registers the service worker and switches to a newer deployed build as soon as one installs, instead of leaving the
  * tab on the shell it was opened with. Does nothing outside a production build or a browser without service workers.
@@ -48,36 +81,8 @@ export async function takeOverWaitingBuild(worker: ServiceWorker) {
 export function registerServiceWorker() {
   if (!import.meta.env.PROD || !("serviceWorker" in navigator)) return
 
-  // The first install has no controller: that page already loaded this build, so there is nothing to replace.
-  const activate = (worker: ServiceWorker | null | undefined) => {
-    if (!worker || !navigator.serviceWorker.controller) return
-
-    void takeOverWaitingBuild(worker)
-  }
-
   void navigator.serviceWorker
     .register("/sw.js")
-    .then((registration) => {
-      // A worker that installed while this tab was closed is already waiting.
-      activate(registration.waiting)
-
-      registration.addEventListener("updatefound", () => {
-        const installing = registration.installing
-
-        if (!installing) return
-
-        installing.addEventListener("statechange", () => {
-          if (installing.state === "installed") activate(registration.waiting ?? installing)
-        })
-      })
-
-      // Checks for a newly deployed build on every load and when the tab returns to the foreground.
-      const update = () => void registration.update().catch(() => {})
-
-      window.addEventListener("load", update, { once: true })
-      document.addEventListener("visibilitychange", () => {
-        if (document.visibilityState === "visible") update()
-      })
-    })
+    .then(attachRegistration)
     .catch((error: unknown) => console.error("[pwa] service worker registration failed", error))
 }

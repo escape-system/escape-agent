@@ -1,6 +1,7 @@
 //! Source-to-catalog conversion: protocols, models, modalities, and costs.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use serde_json::{Map, Value};
 
@@ -69,7 +70,7 @@ pub(super) fn model_info(
             Value::String(provider_id.to_string()),
         );
     }
-    let compatibility = route.compatibility.clone();
+    let compatibility = route.compatibility.clone().map(Box::new);
     let limit = source.limit.as_ref();
     ModelInfo {
         id: source.id.clone(),
@@ -81,7 +82,7 @@ pub(super) fn model_info(
         family: source.family.clone(),
         compatibility,
         package: (route.package != provider_package).then(|| route.package.clone()),
-        settings: (!settings.is_empty()).then_some(settings),
+        settings: (!settings.is_empty()).then(|| Arc::new(settings)),
         headers: None,
         body: None,
         capabilities: Capabilities {

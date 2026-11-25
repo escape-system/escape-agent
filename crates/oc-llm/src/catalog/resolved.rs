@@ -25,7 +25,12 @@ impl ResolvedModel {
     /// Deep-merged settings: provider, then model, then variant.
     #[must_use]
     pub fn settings(&self) -> Map<String, Value> {
-        let mut merged = self.provider.settings.clone().unwrap_or_default();
+        let mut merged = self
+            .provider
+            .settings
+            .as_deref()
+            .cloned()
+            .unwrap_or_default();
         if let Some(model) = &self.model.settings {
             merge_map(&mut merged, model);
         }
@@ -57,12 +62,12 @@ impl ResolvedModel {
     pub fn headers(&self) -> BTreeMap<String, String> {
         let mut merged = self.provider.headers.clone().unwrap_or_default();
         if let Some(headers) = &self.model.headers {
-            merged.extend(headers.clone());
+            merged.extend(headers.as_ref().clone());
         }
         if let Some(variant) = &self.variant
             && let Some(headers) = &variant.headers
         {
-            merged.extend(headers.clone());
+            merged.extend(headers.as_ref().clone());
         }
         merged
     }

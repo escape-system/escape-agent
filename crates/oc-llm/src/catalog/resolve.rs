@@ -37,16 +37,14 @@ impl Catalog {
 
     #[must_use]
     pub fn provider(&self, id: &str) -> Option<&ProviderInfo> {
-        self.provider_index
-            .get(id)
-            .and_then(|index| self.providers.get(*index))
+        self.provider_pos(id)
+            .and_then(|index| self.providers.get(index))
     }
 
     #[must_use]
     pub fn model(&self, provider_id: &str, id: &str) -> Option<&ModelInfo> {
-        self.model_index
-            .get(&(provider_id.to_string(), id.to_string()))
-            .and_then(|index| self.models.get(*index))
+        self.model_pos(provider_id, id)
+            .and_then(|index| self.models.get(index))
     }
 
     /// Resolve `provider/id[#variant]`.

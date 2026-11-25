@@ -47,10 +47,10 @@ pub fn build_cloud_code_request(
 
     // Respect variant raw settings/body thinkingConfig / thinkingLevel / thinkingBudget options if supplied.
     if let Some(var) = request.model.variant.as_ref() {
-        if let Some(settings) = var.settings.as_ref() {
+        if let Some(settings) = var.settings.as_deref() {
             apply_catalog_variant_options(&mut resolved, settings);
         }
-        if let Some(body) = var.body.as_ref() {
+        if let Some(body) = var.body.as_deref() {
             apply_catalog_variant_options(&mut resolved, body);
         }
     }

@@ -1,6 +1,7 @@
 //! Configuration overlays applied on top of a parsed snapshot.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use serde_json::{Map, Value};
 
@@ -41,7 +42,7 @@ impl Catalog {
         let object = config.as_object().ok_or_else(|| LlmError::Config {
             message: format!("provider `{provider_id}` must be a JSON object"),
         })?;
-        let existing = self.provider_index.get(provider_id).copied();
+        let existing = self.provider_pos(provider_id);
         let mut provider = match existing {
             Some(index) => self.providers[index].clone(),
             None => ProviderInfo {
@@ -101,7 +102,10 @@ impl Catalog {
                 .merge(&overlay);
         }
         if let Some(settings) = object.get("settings").and_then(Value::as_object) {
-            merge_map(provider.settings.get_or_insert_with(Map::new), settings);
+            merge_map(
+                Arc::make_mut(provider.settings.get_or_insert_with(Default::default)),
+                settings,
+            );
         }
         if let Some(headers) = object.get("headers").and_then(Value::as_object) {
             let merged = provider.headers.get_or_insert_with(BTreeMap::new);
@@ -118,9 +122,9 @@ impl Catalog {
         if let Some(index) = existing {
             self.providers[index] = provider;
         } else {
-            self.provider_index
-                .insert(provider.id.clone(), self.providers.len());
+            let index = self.providers.len();
             self.providers.push(provider);
+            self.insert_provider_sorted(index);
         }
 
         if let Some(models) = object.get("models").and_then(Value::as_object) {
@@ -144,10 +148,7 @@ impl Catalog {
         let object = config.as_object().ok_or_else(|| LlmError::Config {
             message: format!("model `{provider_id}/{model_id}` must be a JSON object"),
         })?;
-        let existing = self
-            .model_index
-            .get(&(provider_id.to_string(), model_id.to_string()))
-            .copied();
+        let existing = self.model_pos(provider_id, model_id);
         let mut model = match existing {
             Some(index) => self.models[index].clone(),
             None => ModelInfo::default_for(provider_id, model_id),
@@ -188,14 +189,17 @@ impl Catalog {
             let overlay = compatibility_from_value(value);
             model
                 .compatibility
-                .get_or_insert_with(Compatibility::default)
+                .get_or_insert_with(Default::default)
                 .merge(&overlay);
         }
         if let Some(value) = object.get("settings").and_then(Value::as_object) {
-            merge_map(model.settings.get_or_insert_with(Map::new), value);
+            merge_map(
+                Arc::make_mut(model.settings.get_or_insert_with(Default::default)),
+                value,
+            );
         }
         if let Some(value) = object.get("headers").and_then(Value::as_object) {
-            let merged = model.headers.get_or_insert_with(BTreeMap::new);
+            let merged = model.headers.get_or_insert_with(Default::default);
             for (key, header) in value {
                 if let Some(header) = header.as_str() {
                     merged.insert(key.clone(), header.to_string());
@@ -203,7 +207,7 @@ impl Catalog {
             }
         }
         if let Some(value) = object.get("body").and_then(Value::as_object) {
-            merge_map(model.body.get_or_insert_with(Map::new), value);
+            merge_map(model.body.get_or_insert_with(Default::default), value);
         }
         if let Some(value) = object.get("capabilities").and_then(Value::as_object) {
             if let Some(tools) = value.get("tools").and_then(Value::as_bool) {
@@ -264,10 +268,13 @@ impl Catalog {
                     |index| model.variants[index].clone(),
                 );
                 if let Some(settings) = entry.get("settings").and_then(Value::as_object) {
-                    merge_map(variant.settings.get_or_insert_with(Map::new), settings);
+                    merge_map(
+                        Arc::make_mut(variant.settings.get_or_insert_with(Default::default)),
+                        settings,
+                    );
                 }
                 if let Some(headers) = entry.get("headers").and_then(Value::as_object) {
-                    let merged = variant.headers.get_or_insert_with(BTreeMap::new);
+                    let merged = variant.headers.get_or_insert_with(Default::default);
                     for (key, header) in headers {
                         if let Some(header) = header.as_str() {
                             merged.insert(key.clone(), header.to_string());
@@ -275,7 +282,7 @@ impl Catalog {
                     }
                 }
                 if let Some(body) = entry.get("body").and_then(Value::as_object) {
-                    merge_map(variant.body.get_or_insert_with(Map::new), body);
+                    merge_map(variant.body.get_or_insert_with(Default::default), body);
                 }
                 match index {
                     Some(index) => model.variants[index] = variant,
@@ -293,11 +300,9 @@ impl Catalog {
         if let Some(index) = existing {
             self.models[index] = model;
         } else {
-            self.model_index.insert(
-                (provider_id.to_string(), model_id.to_string()),
-                self.models.len(),
-            );
+            let index = self.models.len();
             self.models.push(model);
+            self.insert_model_sorted(index);
         }
         Ok(())
     }
@@ -319,7 +324,7 @@ impl Catalog {
             let Ok(parsed) = parse_reference(reference) else {
                 continue;
             };
-            let Some(index) = self.model_index.get(&(parsed.provider, parsed.id)).copied() else {
+            let Some(index) = self.model_pos(&parsed.provider, &parsed.id) else {
                 continue;
             };
             let model = &mut self.models[index];
@@ -333,19 +338,26 @@ impl Catalog {
     }
 
     pub(super) fn reindex(&mut self) {
-        self.provider_index.clear();
-        for (index, provider) in self.providers.iter().enumerate() {
-            self.provider_index.insert(provider.id.clone(), index);
-        }
-        self.model_index.clear();
-        for (index, model) in self.models.iter().enumerate() {
-            self.model_index
-                .insert((model.provider_id.clone(), model.id.clone()), index);
-        }
+        self.sorted_providers.clear();
+        self.sorted_providers.extend(0..self.providers.len());
+        self.sorted_providers
+            .sort_unstable_by(|&a, &b| self.providers[a].id.cmp(&self.providers[b].id));
+        self.sorted_providers
+            .dedup_by(|&mut a, &mut b| self.providers[a].id == self.providers[b].id);
+        self.sorted_models.clear();
+        self.sorted_models.extend(0..self.models.len());
+        self.sorted_models.sort_unstable_by(|&a, &b| {
+            (&self.models[a].provider_id, &self.models[a].id)
+                .cmp(&(&self.models[b].provider_id, &self.models[b].id))
+        });
+        self.sorted_models.dedup_by(|&mut a, &mut b| {
+            self.models[a].provider_id == self.models[b].provider_id
+                && self.models[a].id == self.models[b].id
+        });
         self.providers.shrink_to_fit();
         self.models.shrink_to_fit();
-        self.provider_index.shrink_to_fit();
-        self.model_index.shrink_to_fit();
+        self.sorted_providers.shrink_to_fit();
+        self.sorted_models.shrink_to_fit();
     }
 }
 

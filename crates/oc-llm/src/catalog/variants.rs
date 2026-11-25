@@ -1,5 +1,7 @@
 //! Reasoning variant synthesis per protocol.
 
+use std::sync::Arc;
+
 use serde_json::{Map, Value};
 
 use super::cost::unsigned;
@@ -84,7 +86,7 @@ pub(super) fn variants_for(
 fn settings_variant(id: &str, settings: &Value) -> Variant {
     Variant {
         id: id.to_string(),
-        settings: settings.as_object().cloned(),
+        settings: settings.as_object().map(|map| Arc::new(map.clone())),
         headers: None,
         body: None,
     }

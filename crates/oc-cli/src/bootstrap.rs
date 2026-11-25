@@ -360,40 +360,7 @@ pub(crate) fn start_background_tasks(
         tokio::spawn(async move { service::watch(path, id, shutdown).await });
     }
     if let Some(cell) = state.catalog_cell() {
-        spawn_nous_refresh_loop(std::sync::Arc::clone(cell), state.clone());
-        spawn_opencode_go_refresh_loop(std::sync::Arc::clone(cell), state.clone());
-        // A published catalog is authoritative, so the swap rebuilds the whole
-        // generation: parse, gate on plausibility, re-apply the same overlays the
-        // boot path applies, then replace and announce. Dropping the handle
-        // detaches the loop; shutdown ends the process.
-        let cell = std::sync::Arc::clone(cell);
-        let state = state.clone();
-        let _refresh = oc_llm::catalog::refresh::spawn_refresh_loop(move |body| {
-            let mut live = oc_llm::catalog::refresh::parse_live(body).map_err(|e| e.to_string())?;
-            if !oc_llm::catalog::refresh::is_plausible(&live) {
-                return Err(format!(
-                    "published catalog has only {} models",
-                    live.models().len()
-                ));
-            }
-            oc_llm::catalog::refresh::apply_builtin_providers(&mut live);
-            apply_cached_nous_models(&mut live);
-            if let Some(config) = state.config()
-                && let Some(providers) = config.merged().get("providers")
-            {
-                live.apply_config(providers).map_err(|e| e.to_string())?;
-            }
-            if let Some(antigravity) = state.antigravity() {
-                antigravity.overlay_catalog(&mut live);
-            }
-            cell.replace(live);
-            oc_alloc::purge_idle_memory();
-            state.publish(oc_types::EventEnvelope::now(
-                "models-dev.refreshed",
-                serde_json::json!({}),
-            ));
-            Ok(())
-        });
+        spawn_catalog_refresh_loop(std::sync::Arc::clone(cell), state.clone(), shutdown.clone());
     }
     spawn_schedule_runner(state.clone(), shutdown.clone())
 }
@@ -439,18 +406,15 @@ fn apply_cached_opencode_go_models(catalog: &mut oc_llm::Catalog) -> bool {
     true
 }
 
-/// Refresh the `opencode-go` provider model list on the same cadence as the
-/// published catalog: 30 s after boot, then every 6 h.
-///
-/// This is what makes a newly released model appear without a rebuild or a
-/// manual `POST /api/model/refresh`. The provider list is authoritative for
-/// membership (verified live: `models.dev` still lists models the subscription
-/// no longer includes), so the loop applies upserts *and* withdrawals.
-fn spawn_opencode_go_refresh_loop(cell: Arc<oc_llm::CatalogCell>, state: AppState) {
+/// Run all background catalog refreshes (`models.dev`, `opencode-go`, `nous`) in
+/// one serialized loop so concurrent `Catalog` clones cannot spike peak RSS and
+/// no idle HTTP/TLS client pool stays resident between 6-hour ticks.
+fn spawn_catalog_refresh_loop(
+    cell: Arc<oc_llm::CatalogCell>,
+    state: AppState,
+    shutdown: CancellationToken,
+) {
     tokio::spawn(async move {
-        let url = oc_llm::catalog::refresh::opencode_go_models_url();
-        let cache = oc_llm::catalog::refresh::opencode_go_cache_path();
-        let mut client = None;
         let mut first = true;
         loop {
             let delay = if first {
@@ -459,86 +423,137 @@ fn spawn_opencode_go_refresh_loop(cell: Arc<oc_llm::CatalogCell>, state: AppStat
                 oc_llm::catalog::refresh::REFRESH_INTERVAL
             };
             first = false;
-            tokio::time::sleep(delay).await;
-            let client = client.get_or_insert_with(oc_llm::catalog::refresh::client);
-            match oc_llm::catalog::refresh::fetch_opencode_go_models_with_body(client, &url).await {
-                Ok((body, models)) => {
-                    if let Err(error) = oc_llm::catalog::refresh::write_cache(&cache, &body) {
-                        tracing::debug!(%error, "opencode-go model list cache write failed");
-                    }
-                    let mut next = cell.current().as_ref().clone();
-                    let (upserted, removed) = oc_llm::catalog::refresh::apply_provider_models(
-                        &mut next,
-                        oc_llm::catalog::refresh::OPENCODE_GO_PROVIDER_ID,
-                        models,
-                    );
-                    if let Some(config) = state.config()
-                        && let Some(providers) = config.merged().get("providers")
-                        && let Err(error) = next.apply_config(providers)
-                    {
-                        tracing::warn!(%error, "opencode-go catalog config reapply failed");
-                        continue;
-                    }
-                    if let Some(antigravity) = state.antigravity() {
-                        antigravity.overlay_catalog(&mut next);
-                    }
-                    cell.replace(next);
-                    oc_alloc::purge_idle_memory();
-                    tracing::info!(upserted, removed, "opencode-go model list refreshed");
-                    state.publish(oc_types::EventEnvelope::now(
-                        "models-dev.refreshed",
-                        serde_json::json!({}),
-                    ));
-                }
-                Err(error) => tracing::debug!(%error, "opencode-go model list refresh failed"),
+            tokio::select! {
+                () = tokio::time::sleep(delay) => {}
+                () = shutdown.cancelled() => break,
             }
+            refresh_catalog_once(&cell, &state).await;
+            // Let dropped HTTP driver tasks settle before sweeping heaps back to the OS.
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            oc_alloc::purge_idle_memory();
         }
     });
 }
 
-fn spawn_nous_refresh_loop(cell: Arc<oc_llm::CatalogCell>, state: AppState) {
-    tokio::spawn(async move {
-        let mut client = None;
-        let mut first = true;
-        loop {
-            let delay = if first {
-                oc_llm::catalog::refresh::BOOT_DELAY
-            } else {
-                oc_llm::catalog::refresh::REFRESH_INTERVAL
-            };
-            first = false;
-            tokio::time::sleep(delay).await;
-            let client = client.get_or_insert_with(oc_llm::catalog::refresh::client);
-            match oc_llm::catalog::refresh::fetch_nous_models_now(client).await {
-                Ok((body, models)) => {
-                    if let Err(error) = oc_llm::catalog::refresh::write_cache(
-                        &oc_llm::catalog::refresh::nous_cache_path(),
-                        &body,
-                    ) {
-                        tracing::debug!(%error, "nous catalog cache write failed");
-                    }
-                    let mut next = cell.current().as_ref().clone();
-                    next.upsert_provider(oc_llm::catalog::refresh::default_nous_provider());
-                    next.upsert_provider_models(models);
-                    if let Some(config) = state.config()
-                        && let Some(providers) = config.merged().get("providers")
-                        && let Err(error) = next.apply_config(providers)
-                    {
-                        tracing::warn!(%error, "nous catalog config reapply failed");
-                        continue;
-                    }
-                    if let Some(antigravity) = state.antigravity() {
-                        antigravity.overlay_catalog(&mut next);
-                    }
-                    cell.replace(next);
-                    oc_alloc::purge_idle_memory();
-                    state.publish(oc_types::EventEnvelope::now(
-                        "models-dev.refreshed",
-                        serde_json::json!({}),
-                    ));
+async fn fetch_refresh_payloads(
+    models_url: &str,
+) -> (
+    Option<oc_llm::Catalog>,
+    Option<Vec<oc_llm::ModelInfo>>,
+    Option<Vec<oc_llm::ModelInfo>>,
+) {
+    let models_cache = oc_llm::catalog::refresh::cache_path();
+    let go_url = oc_llm::catalog::refresh::opencode_go_models_url();
+    let go_cache = oc_llm::catalog::refresh::opencode_go_cache_path();
+    let client = oc_llm::catalog::refresh::transient_client();
+    let live_catalog = match oc_llm::catalog::refresh::fetch_live(&client, models_url).await {
+        Ok(body) => {
+            if let Err(error) = oc_llm::catalog::refresh::write_cache(&models_cache, &body) {
+                tracing::warn!(%error, "model catalog cache write failed");
+            }
+            match oc_llm::catalog::refresh::parse_live(&body) {
+                Ok(live) if oc_llm::catalog::refresh::is_plausible(&live) => Some(live),
+                Ok(live) => {
+                    tracing::warn!(
+                        models = live.models().len(),
+                        "model catalog publish rejected: too few models"
+                    );
+                    None
                 }
-                Err(error) => tracing::debug!(%error, "nous model catalog refresh failed"),
+                Err(error) => {
+                    tracing::warn!(%error, "model catalog publish rejected");
+                    None
+                }
             }
         }
-    });
+        Err(error) => {
+            tracing::debug!(%error, "model catalog refresh failed");
+            None
+        }
+    };
+    let go_models = match oc_llm::catalog::refresh::fetch_opencode_go_models_with_body(
+        &client, &go_url,
+    )
+    .await
+    {
+        Ok((body, models)) => {
+            if let Err(error) = oc_llm::catalog::refresh::write_cache(&go_cache, &body) {
+                tracing::debug!(%error, "opencode-go model list cache write failed");
+            }
+            Some(models)
+        }
+        Err(error) => {
+            tracing::debug!(%error, "opencode-go model list refresh failed");
+            None
+        }
+    };
+    let nous_models = match oc_llm::catalog::refresh::fetch_nous_models_now(&client).await {
+        Ok((body, models)) => {
+            if let Err(error) = oc_llm::catalog::refresh::write_cache(
+                &oc_llm::catalog::refresh::nous_cache_path(),
+                &body,
+            ) {
+                tracing::debug!(%error, "nous catalog cache write failed");
+            }
+            Some(models)
+        }
+        Err(error) => {
+            tracing::debug!(%error, "nous model catalog refresh failed");
+            None
+        }
+    };
+    (live_catalog, go_models, nous_models)
+}
+
+async fn refresh_catalog_once(cell: &Arc<oc_llm::CatalogCell>, state: &AppState) {
+    let models_url = oc_llm::catalog::refresh::models_url();
+    // Client lives strictly inside `fetch_refresh_payloads` so TLS/pool state drops before catalog assembly.
+    let (live_catalog, go_models, nous_models) = fetch_refresh_payloads(&models_url).await;
+
+    if live_catalog.is_none() && go_models.is_none() && nous_models.is_none() {
+        return;
+    }
+
+    let mut next = if let Some(mut live) = live_catalog {
+        oc_llm::catalog::refresh::apply_builtin_providers(&mut live);
+        if go_models.is_none() {
+            apply_cached_opencode_go_models(&mut live);
+        }
+        if nous_models.is_none() {
+            apply_cached_nous_models(&mut live);
+        }
+        tracing::info!("model catalog refreshed from {models_url}");
+        live
+    } else {
+        cell.current().as_ref().clone()
+    };
+
+    if let Some(models) = go_models {
+        let (upserted, removed) = oc_llm::catalog::refresh::apply_provider_models(
+            &mut next,
+            oc_llm::catalog::refresh::OPENCODE_GO_PROVIDER_ID,
+            models,
+        );
+        tracing::info!(upserted, removed, "opencode-go model list refreshed");
+    }
+    if let Some(models) = nous_models {
+        next.upsert_provider(oc_llm::catalog::refresh::default_nous_provider());
+        next.upsert_provider_models(models);
+    }
+
+    if let Some(config) = state.config()
+        && let Some(providers) = config.merged().get("providers")
+        && let Err(error) = next.apply_config(providers)
+    {
+        tracing::warn!(%error, "catalog config reapply failed");
+        return;
+    }
+    if let Some(antigravity) = state.antigravity() {
+        antigravity.overlay_catalog(&mut next);
+    }
+    cell.replace(next);
+    state.publish(oc_types::EventEnvelope::now(
+        "models-dev.refreshed",
+        serde_json::json!({}),
+    ));
 }

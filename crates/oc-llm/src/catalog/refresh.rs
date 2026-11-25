@@ -16,6 +16,7 @@
 //! not an upstream decision.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use reqwest::Client;
 use serde_json::{Map, Value};
@@ -425,7 +426,7 @@ pub fn default_nous_provider() -> ProviderInfo {
         activation: Activation::Auto,
         package: "@ai-sdk/openai-compatible".to_owned(),
         compatibility: None,
-        settings: Some(settings),
+        settings: Some(Arc::new(settings)),
         headers: None,
         body: None,
         env: vec!["NOUS_API_KEY".to_owned()],
@@ -580,7 +581,7 @@ fn base_nous_model(id: &str, name: &str) -> ModelInfo {
     name.clone_into(&mut model.name);
     model.package = Some("@ai-sdk/openai-compatible".to_owned());
     model.protocol = Protocol::OpenAiChat;
-    model.settings = Some(settings);
+    model.settings = Some(Arc::new(settings));
     model
 }
 
@@ -809,6 +810,16 @@ pub fn client() -> Client {
     Client::new()
 }
 
+/// Short-lived HTTP client without idle connection pooling, used for infrequent
+/// background refreshes so sockets and TLS state tear down right after the tick.
+#[must_use]
+pub fn transient_client() -> Client {
+    Client::builder()
+        .pool_max_idle_per_host(0)
+        .build()
+        .unwrap_or_else(|_| Client::new())
+}
+
 /// Fetch, cache and apply the published catalog exactly once.
 ///
 /// The URL is explicit: callers must not rely on process-global environment
@@ -845,9 +856,6 @@ where
     F: Fn(&str) -> Result<(), String> + Send + 'static,
 {
     tokio::spawn(async move {
-        let Ok(client) = Client::builder().build() else {
-            return;
-        };
         let url = models_url();
         let cache = cache_path();
         let mut first = true;
@@ -855,8 +863,12 @@ where
             let delay = if first { BOOT_DELAY } else { REFRESH_INTERVAL };
             first = false;
             tokio::time::sleep(delay).await;
+            let Ok(client) = Client::builder().pool_max_idle_per_host(0).build() else {
+                continue;
+            };
             match fetch_live(&client, &url).await {
                 Ok(body) => {
+                    drop(client);
                     if let Err(error) = write_cache(&cache, &body) {
                         tracing::warn!(%error, "model catalog cache write failed");
                     }

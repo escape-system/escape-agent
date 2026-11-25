@@ -2,9 +2,37 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+
+mod arc_map_serde {
+    use std::sync::Arc;
+
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use serde_json::{Map, Value};
+
+    #[allow(
+        clippy::ref_option,
+        reason = "serde `with` serialize signature passes &Option<T>"
+    )]
+    pub(super) fn serialize<S: Serializer>(
+        value: &Option<Arc<Map<String, Value>>>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        match value {
+            Some(map) => map.serialize(serializer),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<Arc<Map<String, Value>>>, D::Error> {
+        Option::<Map<String, Value>>::deserialize(deserializer).map(|opt| opt.map(Arc::new))
+    }
+}
 
 /// Provider activation state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -170,12 +198,16 @@ pub type PriceOverrideMap = BTreeMap<String, PriceOverride>;
 #[serde(rename_all = "camelCase")]
 pub struct Variant {
     pub id: String,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "arc_map_serde"
+    )]
+    pub settings: Option<Arc<Map<String, Value>>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub settings: Option<Map<String, Value>>,
+    pub headers: Option<Box<BTreeMap<String, String>>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub headers: Option<BTreeMap<String, String>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub body: Option<Map<String, Value>>,
+    pub body: Option<Box<Map<String, Value>>>,
 }
 
 /// One catalog model.
@@ -195,15 +227,19 @@ pub struct ModelInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub family: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub compatibility: Option<Compatibility>,
+    pub compatibility: Option<Box<Compatibility>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub package: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "arc_map_serde"
+    )]
+    pub settings: Option<Arc<Map<String, Value>>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub settings: Option<Map<String, Value>>,
+    pub headers: Option<Box<BTreeMap<String, String>>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub headers: Option<BTreeMap<String, String>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub body: Option<Map<String, Value>>,
+    pub body: Option<Box<Map<String, Value>>>,
     pub capabilities: Capabilities,
     pub variants: Vec<Variant>,
     pub time: ModelTime,
@@ -262,8 +298,12 @@ pub struct ProviderInfo {
     pub package: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compatibility: Option<Compatibility>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub settings: Option<Map<String, Value>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "arc_map_serde"
+    )]
+    pub settings: Option<Arc<Map<String, Value>>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub headers: Option<BTreeMap<String, String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

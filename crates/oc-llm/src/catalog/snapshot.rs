@@ -1,6 +1,7 @@
 //! Snapshot parsing and provider/model aggregation into a catalog.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use serde_json::{Map, Value};
 
@@ -15,6 +16,30 @@ use super::util::most_common;
 use super::v1::to_v2;
 use super::variants::{ReasoningSupport, variants_for};
 
+fn intern_settings(
+    intern: &mut HashMap<String, Arc<Map<String, Value>>>,
+    slot: &mut Option<Arc<Map<String, Value>>>,
+) {
+    let Some(current) = slot.as_ref() else {
+        return;
+    };
+    if let Ok(key) = serde_json::to_string(current.as_ref()) {
+        if let Some(shared) = intern.get(&key) {
+            *slot = Some(Arc::clone(shared));
+        } else {
+            intern.insert(key, Arc::clone(current));
+        }
+    }
+}
+
+fn common_base_url(routes: &[(SourceModel, Route)]) -> Option<String> {
+    let urls: Vec<&str> = routes
+        .iter()
+        .map(|(_, route)| route.base_url.as_deref())
+        .collect::<Option<Vec<&str>>>()?;
+    most_common(&urls).map(str::to_string)
+}
+
 impl Catalog {
     /// Parse a models.dev snapshot (v1 or v2).
     pub fn from_snapshot(json: &str) -> Result<Self, LlmError> {
@@ -28,11 +53,13 @@ impl Catalog {
             parsed.0
         };
 
+        let mut intern: HashMap<String, Arc<Map<String, Value>>> = HashMap::new();
+
         let mut catalog = Catalog {
             providers: Vec::new(),
             models: Vec::new(),
-            provider_index: HashMap::new(),
-            model_index: HashMap::new(),
+            sorted_providers: Vec::new(),
+            sorted_models: Vec::new(),
         };
 
         for (key, source) in providers {
@@ -64,19 +91,9 @@ impl Catalog {
                 .map(|(_, route)| route.package.clone())
                 .collect();
             let package = most_common(&route_packages).unwrap_or_default();
-            let base_url = {
-                let urls: Vec<Option<String>> = routes
-                    .iter()
-                    .map(|(_, route)| route.base_url.clone())
-                    .collect();
-                if urls.iter().all(Option::is_some) {
-                    most_common(&urls.into_iter().flatten().collect::<Vec<_>>())
-                } else {
-                    None
-                }
-            };
+            let base_url = common_base_url(&routes);
 
-            let provider = ProviderInfo {
+            let mut provider = ProviderInfo {
                 id: provider_id.clone(),
                 canonical: None,
                 name: source.name,
@@ -86,12 +103,13 @@ impl Catalog {
                 settings: base_url.as_ref().map(|url| {
                     let mut map = Map::new();
                     map.insert("baseURL".to_string(), Value::String(url.clone()));
-                    map
+                    Arc::new(map)
                 }),
                 headers: None,
                 body: None,
                 env: source.env,
             };
+            intern_settings(&mut intern, &mut provider.settings);
 
             for (source_model, route) in routes {
                 let base_cost = source_model
@@ -107,17 +125,18 @@ impl Catalog {
                     &route,
                     base_cost,
                 );
-                let variants = variants_for(
+                let mut variants = variants_for(
                     &info,
                     route.protocol,
                     &ReasoningSupport::from_source(&source_model.capabilities.reasoning),
                 );
+                for variant in &mut variants {
+                    intern_settings(&mut intern, &mut variant.settings);
+                }
+                intern_settings(&mut intern, &mut info.settings);
                 info.variants = variants;
                 catalog.models.push(info);
             }
-            catalog
-                .provider_index
-                .insert(provider.id.clone(), catalog.providers.len());
             catalog.providers.push(provider);
         }
 

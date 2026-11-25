@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test"
-import { takeOverWaitingBuild } from "./pwa-update"
+import { attachRegistration, takeOverWaitingBuild } from "./pwa-update"
 
 type Fake = { keys: string[]; deleted: string[]; unregistered: number; reloads: number }
 
@@ -98,5 +98,11 @@ describe("takeOverWaitingBuild", () => {
 
     expect(await takeOverWaitingBuild(worker)).toBe(true)
     expect(fake.reloads).toBe(1)
+  })
+})
+
+describe("attachRegistration", () => {
+  test("ignores blocked or undefined registrations without throwing", () => {
+    expect(() => attachRegistration(undefined)).not.toThrow()
   })
 })

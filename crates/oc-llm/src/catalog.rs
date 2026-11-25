@@ -22,7 +22,6 @@ mod util;
 mod v1;
 mod variants;
 
-use std::collections::HashMap;
 use std::fmt;
 use std::sync::LazyLock;
 
@@ -86,32 +85,73 @@ impl<T> Default for Ordered<T> {
 pub struct Catalog {
     providers: Vec<ProviderInfo>,
     models: Vec<ModelInfo>,
-    provider_index: HashMap<String, usize>,
-    model_index: HashMap<(String, String), usize>,
+    /// Indices into `providers` sorted by `provider.id` (avoids duplicating id `String`s).
+    sorted_providers: Vec<usize>,
+    /// Indices into `models` sorted by `(model.provider_id, model.id)`.
+    sorted_models: Vec<usize>,
 }
 
 impl Catalog {
+    pub(super) fn provider_pos(&self, id: &str) -> Option<usize> {
+        let pos = self
+            .sorted_providers
+            .binary_search_by(|&index| self.providers[index].id.as_str().cmp(id))
+            .ok()?;
+        Some(self.sorted_providers[pos])
+    }
+
+    pub(super) fn model_pos(&self, provider_id: &str, id: &str) -> Option<usize> {
+        let pos = self
+            .sorted_models
+            .binary_search_by(|&index| {
+                let model = &self.models[index];
+                (model.provider_id.as_str(), model.id.as_str()).cmp(&(provider_id, id))
+            })
+            .ok()?;
+        Some(self.sorted_models[pos])
+    }
+
+    pub(super) fn insert_provider_sorted(&mut self, index: usize) {
+        let id = self.providers[index].id.as_str();
+        if let Err(pos) = self
+            .sorted_providers
+            .binary_search_by(|&existing| self.providers[existing].id.as_str().cmp(id))
+        {
+            self.sorted_providers.insert(pos, index);
+        }
+    }
+
+    pub(super) fn insert_model_sorted(&mut self, index: usize) {
+        let target = &self.models[index];
+        let key = (target.provider_id.as_str(), target.id.as_str());
+        if let Err(pos) = self.sorted_models.binary_search_by(|&existing| {
+            let item = &self.models[existing];
+            (item.provider_id.as_str(), item.id.as_str()).cmp(&key)
+        }) {
+            self.sorted_models.insert(pos, index);
+        }
+    }
+
     /// Insert or replace a provider definition while preserving index lookups.
     pub fn upsert_provider(&mut self, provider: ProviderInfo) {
-        if let Some(&index) = self.provider_index.get(&provider.id) {
+        if let Some(index) = self.provider_pos(&provider.id) {
             self.providers[index] = provider;
         } else {
             let index = self.providers.len();
-            self.provider_index.insert(provider.id.clone(), index);
             self.providers.push(provider);
+            self.insert_provider_sorted(index);
         }
     }
 
     /// Insert or replace models for `provider_id`, keeping lookup indices synced.
     pub fn upsert_provider_models(&mut self, models: Vec<ModelInfo>) {
         for model in models {
-            let key = (model.provider_id.clone(), model.id.clone());
-            if let Some(&index) = self.model_index.get(&key) {
+            if let Some(index) = self.model_pos(&model.provider_id, &model.id) {
                 self.models[index] = model;
             } else {
                 let index = self.models.len();
-                self.model_index.insert(key, index);
                 self.models.push(model);
+                self.insert_model_sorted(index);
             }
         }
     }
