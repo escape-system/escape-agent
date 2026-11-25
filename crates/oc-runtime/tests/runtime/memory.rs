@@ -65,7 +65,7 @@ fn write_skill(
 }
 
 async fn wait_for_memories(store: &Store, source: &str) -> Vec<Value> {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + EVENT_WAIT;
     loop {
         let rows: Vec<Value> = all_memories(store)
             .await
@@ -511,7 +511,7 @@ async fn auto_scribe_true_runs_the_turn_end_scribe() {
 
     harness.prompt("read hello.txt").await;
 
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + EVENT_WAIT;
     while prompts.prompts.lock().expect("prompts").is_empty() {
         assert!(Instant::now() < deadline, "scribe never ran");
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -577,7 +577,7 @@ async fn invalid_scribe_json_does_not_fail_the_turn() {
 
     harness.prompt("read hello.txt").await;
 
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + EVENT_WAIT;
     while prompts.prompts.lock().expect("prompts").is_empty() {
         assert!(Instant::now() < deadline, "scribe never ran");
         tokio::time::sleep(Duration::from_millis(10)).await;

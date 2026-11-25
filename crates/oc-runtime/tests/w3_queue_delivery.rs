@@ -23,6 +23,11 @@ use oc_types::{EventEnvelope, MessageId};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
+/// Liveness net for `wait_idle`: large enough that a contended CI runner can
+/// never trip it. A turn settles after its awaited auto-title request, which
+/// carries its own 10s cap, so this must stay far above that.
+const IDLE_WAIT: Duration = Duration::from_secs(60);
+
 const CATALOG: &str = r#"{
   "test": {
     "id": "test", "name": "Test Provider", "env": ["TEST_API_KEY"],
@@ -334,7 +339,7 @@ async fn queue_row_via_session_write_wakes_idle_child_and_delivers() {
 
     harness
         .runtime
-        .wait_idle(&child, Duration::from_secs(10))
+        .wait_idle(&child, IDLE_WAIT)
         .await
         .expect("child finishes queued turn");
 
@@ -392,7 +397,7 @@ async fn queue_then_steer_deliver_fifo_without_stranding() {
     harness.runtime.notify(&child).await.expect("notify");
     harness
         .runtime
-        .wait_idle(&child, Duration::from_secs(10))
+        .wait_idle(&child, IDLE_WAIT)
         .await
         .expect("idle");
 

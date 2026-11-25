@@ -1,7 +1,6 @@
 //! Core turn-loop behaviour: persistence, tools, permissions, steps and compaction.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use oc_llm::{LlmEvent, Role};
 use oc_store::{Delivery, NewCredential, NewInbox, NewMessage};
@@ -244,7 +243,7 @@ async fn interrupt_mid_stream_runs_the_finalizer() {
     );
     harness
         .runtime
-        .wait_idle(&harness.session, Duration::from_secs(10))
+        .wait_idle(&harness.session, IDLE_WAIT)
         .await
         .expect("idle");
 
@@ -344,7 +343,7 @@ async fn explicit_ceiling_guards_even_when_auto_is_false() {
         .expect("notify");
     harness
         .runtime
-        .wait_idle(&harness.session, Duration::from_secs(10))
+        .wait_idle(&harness.session, IDLE_WAIT)
         .await
         .expect("idle");
 
@@ -390,7 +389,7 @@ async fn buffer_moves_the_trigger_earlier() {
     small.runtime.notify(&small.session).await.expect("notify");
     small
         .runtime
-        .wait_idle(&small.session, Duration::from_secs(10))
+        .wait_idle(&small.session, IDLE_WAIT)
         .await
         .expect("idle");
     assert_eq!(
@@ -431,7 +430,7 @@ async fn buffer_moves_the_trigger_earlier() {
     large.runtime.notify(&large.session).await.expect("notify");
     large
         .runtime
-        .wait_idle(&large.session, Duration::from_secs(10))
+        .wait_idle(&large.session, IDLE_WAIT)
         .await
         .expect("idle");
     assert_eq!(
@@ -842,7 +841,7 @@ async fn two_prompts_serialize() {
         .expect("notify");
     harness
         .runtime
-        .wait_idle(&harness.session, Duration::from_secs(10))
+        .wait_idle(&harness.session, IDLE_WAIT)
         .await
         .expect("idle");
 
@@ -885,7 +884,7 @@ async fn reopened_runtime_sees_prior_context() {
     harness.enqueue("second prompt").await;
     reopened.notify(&harness.session).await.expect("notify");
     reopened
-        .wait_idle(&harness.session, Duration::from_secs(10))
+        .wait_idle(&harness.session, IDLE_WAIT)
         .await
         .expect("idle");
 
@@ -969,7 +968,7 @@ async fn host_materialized_prompt_is_not_duplicated() {
         .expect("notify");
     harness
         .runtime
-        .wait_idle(&harness.session, Duration::from_secs(10))
+        .wait_idle(&harness.session, IDLE_WAIT)
         .await
         .expect("idle");
 
@@ -1016,7 +1015,7 @@ async fn oversized_context_compacts_before_the_request() {
         .expect("notify");
     harness
         .runtime
-        .wait_idle(&harness.session, Duration::from_secs(10))
+        .wait_idle(&harness.session, IDLE_WAIT)
         .await
         .expect("idle");
 
@@ -1077,7 +1076,7 @@ async fn auto_false_writes_no_compaction_row() {
         .expect("notify");
     harness
         .runtime
-        .wait_idle(&harness.session, Duration::from_secs(10))
+        .wait_idle(&harness.session, IDLE_WAIT)
         .await
         .expect("idle");
 
@@ -1125,7 +1124,7 @@ async fn auto_compaction_records_reason_auto() {
         .expect("notify");
     harness
         .runtime
-        .wait_idle(&harness.session, Duration::from_secs(10))
+        .wait_idle(&harness.session, IDLE_WAIT)
         .await
         .expect("idle");
 
@@ -1245,7 +1244,7 @@ async fn auto_compaction_publishes_durable_lifecycle_events() {
         .expect("notify");
     harness
         .runtime
-        .wait_idle(&harness.session, Duration::from_secs(10))
+        .wait_idle(&harness.session, IDLE_WAIT)
         .await
         .expect("idle");
 
@@ -1375,7 +1374,7 @@ async fn crash_recovery_repairs_rows_and_wakes_inbox() {
     harness.runtime.start().await.expect("start");
     harness
         .runtime
-        .wait_idle(&harness.session, Duration::from_secs(10))
+        .wait_idle(&harness.session, IDLE_WAIT)
         .await
         .expect("idle");
 
@@ -1558,7 +1557,7 @@ async fn shutdown_preserves_a_queued_row_for_the_restarted_runtime() {
     let restarted = harness.restart();
     restarted.start().await.expect("start after shutdown");
     restarted
-        .wait_idle(&harness.session, Duration::from_secs(10))
+        .wait_idle(&harness.session, IDLE_WAIT)
         .await
         .expect("idle");
 

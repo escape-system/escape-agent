@@ -463,10 +463,7 @@ async fn step_streamed_is_published_only_after_the_stamp_is_committed() {
         .await
         .expect("enqueued");
     runtime.notify(&session).await.expect("notify");
-    runtime
-        .wait_idle(&session, std::time::Duration::from_secs(10))
-        .await
-        .expect("idle");
+    runtime.wait_idle(&session, IDLE_WAIT).await.expect("idle");
 
     let observed = checking.observed.lock().expect("observed").clone();
     assert_eq!(

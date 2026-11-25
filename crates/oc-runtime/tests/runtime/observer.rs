@@ -30,7 +30,7 @@ impl RepairExecutor for NeverExecutor {
 }
 
 async fn wait_for_observer_inbox(harness: &Harness) -> Value {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + EVENT_WAIT;
     loop {
         let inbox = harness
             .store
@@ -90,7 +90,7 @@ async fn observer_records_tool_strip() {
     harness.enqueue("go").await;
     runtime.notify(&harness.session).await.expect("notify");
     runtime
-        .wait_idle(&harness.session, Duration::from_secs(10))
+        .wait_idle(&harness.session, IDLE_WAIT)
         .await
         .expect("idle");
 
@@ -189,12 +189,12 @@ async fn failed_execution_reaches_the_observer() {
     harness.enqueue("boom").await;
     runtime.notify(&harness.session).await.expect("notify");
     runtime
-        .wait_idle(&harness.session, Duration::from_secs(10))
+        .wait_idle(&harness.session, IDLE_WAIT)
         .await
         .expect("idle");
     assert!(harness.sink.has("session.execution.failed"));
 
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + EVENT_WAIT;
     while !notifier.has_unavailable() {
         assert!(
             Instant::now() < deadline,
@@ -243,7 +243,7 @@ async fn repair_worker_interrupts_the_execution() {
         })
         .expect("send interrupt");
     runtime
-        .wait_idle(&harness.session, Duration::from_secs(10))
+        .wait_idle(&harness.session, IDLE_WAIT)
         .await
         .expect("idle");
 
@@ -370,7 +370,7 @@ async fn permission_wait_does_not_open_flight_strip_until_approved() {
 
     release.notify_one();
     runtime
-        .wait_idle(&harness.session, Duration::from_secs(10))
+        .wait_idle(&harness.session, IDLE_WAIT)
         .await
         .expect("idle");
 
@@ -472,7 +472,7 @@ async fn cancel_tool_cancels_the_running_tool_without_interrupting_the_turn() {
         .expect("send cancel_tool");
 
     runtime
-        .wait_idle(&harness.session, Duration::from_secs(10))
+        .wait_idle(&harness.session, IDLE_WAIT)
         .await
         .expect("idle");
 
@@ -545,7 +545,7 @@ async fn observer_sees_the_live_turn_step() {
     harness.enqueue("go").await;
     runtime.notify(&harness.session).await.expect("notify");
     runtime
-        .wait_idle(&harness.session, Duration::from_secs(10))
+        .wait_idle(&harness.session, IDLE_WAIT)
         .await
         .expect("idle");
 

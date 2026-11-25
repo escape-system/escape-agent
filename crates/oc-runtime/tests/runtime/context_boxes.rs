@@ -4,7 +4,7 @@
 //! Every test is offline: temp SQLite, temp config tree, scripted model.
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use oc_runtime::BoxTools;
 use oc_store::{BoxQuery, Delivery, NewBox, NewInbox};
@@ -42,7 +42,7 @@ async fn run_tool(
 /// explicit count makes that state distinguishable from completion, and it also
 /// turns a duplicate row into a timeout instead of a silent extra row.
 async fn wait_compaction(harness: &Harness, expected: usize) -> Vec<Value> {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + EVENT_WAIT;
     loop {
         let rows: Vec<Value> = harness
             .messages()
@@ -60,8 +60,15 @@ async fn wait_compaction(harness: &Harness, expected: usize) -> Vec<Value> {
         if settled && harness.inbox().await.is_empty() {
             return rows;
         }
-        assert!(Instant::now() < deadline, "timed out: {rows:?}");
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        let inbox = harness.inbox().await;
+        assert!(
+            Instant::now() < deadline,
+            "timed out after {EVENT_WAIT:?} waiting for {expected} settled compaction \
+             row(s) and an empty inbox; saw {} row(s) {rows:?} and {} inbox row(s) {inbox:?}",
+            rows.len(),
+            inbox.len()
+        );
+        tokio::time::sleep(POLL).await;
     }
 }
 
@@ -214,7 +221,7 @@ async fn explore_is_read_only_and_a_write_only_agent_cannot_list_boxes() {
     harness.runtime.notify(&explore).await.expect("notify");
     harness
         .runtime
-        .wait_idle(&explore, Duration::from_secs(10))
+        .wait_idle(&explore, IDLE_WAIT)
         .await
         .expect("idle");
 
@@ -266,7 +273,7 @@ async fn explore_is_read_only_and_a_write_only_agent_cannot_list_boxes() {
     harness.runtime.notify(&writer).await.expect("notify");
     harness
         .runtime
-        .wait_idle(&writer, Duration::from_secs(10))
+        .wait_idle(&writer, IDLE_WAIT)
         .await
         .expect("idle");
 
@@ -701,7 +708,7 @@ async fn box_writes_do_not_bust_the_pinned_instruction_prefix() {
         .expect("enqueued");
     restart.notify(&harness.session).await.expect("notify");
     restart
-        .wait_idle(&harness.session, Duration::from_secs(10))
+        .wait_idle(&harness.session, IDLE_WAIT)
         .await
         .expect("idle");
     let third = harness
@@ -834,7 +841,7 @@ async fn wake_child_prompt(harness: &Harness, child: &str, text: &str) {
     harness.runtime.notify(child).await.expect("notify child");
     harness
         .runtime
-        .wait_idle(child, Duration::from_secs(10))
+        .wait_idle(child, IDLE_WAIT)
         .await
         .expect("child idle");
 }

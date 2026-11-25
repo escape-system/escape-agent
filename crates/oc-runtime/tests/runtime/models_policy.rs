@@ -660,7 +660,7 @@ async fn rate_limit_failure_does_not_fallback_to_chain() {
 /// Waits until the inbox row is consumed and every compaction row settled,
 /// returning the compaction rows.
 async fn wait_compaction(harness: &Harness) -> Vec<Value> {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + EVENT_WAIT;
     loop {
         let rows = compaction_rows(harness).await;
         let settled = rows.iter().all(|row| {
@@ -672,8 +672,15 @@ async fn wait_compaction(harness: &Harness) -> Vec<Value> {
         if settled && harness.inbox().await.is_empty() && !rows.is_empty() {
             return rows;
         }
-        assert!(std::time::Instant::now() < deadline, "timed out: {rows:?}");
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let inbox = harness.inbox().await;
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out after {EVENT_WAIT:?} waiting for a settled compaction row and an \
+             empty inbox; saw {} row(s) {rows:?} and {} inbox row(s) {inbox:?}",
+            rows.len(),
+            inbox.len()
+        );
+        tokio::time::sleep(POLL).await;
     }
 }
 

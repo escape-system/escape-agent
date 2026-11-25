@@ -102,7 +102,7 @@ impl LaneRunner for GatedRunner {
 /// Polls until the runner has begun; a missing start is a test failure, not a
 /// hang.
 async fn wait_started(runner: &GatedRunner, wanted: usize) {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + EVENT_WAIT;
     while runner.started() < wanted {
         assert!(Instant::now() < deadline, "the runner never started");
         tokio::time::sleep(Duration::from_millis(5)).await;
@@ -188,7 +188,7 @@ async fn a_timed_out_subscriber_keeps_the_owner_run_alive() {
 
     runner.release();
     let finished = service
-        .wait(&ticket_id, Duration::from_secs(10))
+        .wait(&ticket_id, IDLE_WAIT)
         .await
         .expect("the released run finishes");
     assert_eq!(finished.state, TicketState::Succeeded { exit: 0 });

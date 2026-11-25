@@ -310,7 +310,7 @@ async fn crash_recovery_settles_an_interrupted_background_child_once() {
 
     let runtime = harness.restart();
     runtime.start().await.expect("start after crash");
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + EVENT_WAIT;
     let synthetics = loop {
         let messages = harness.messages().await;
         let synthetics: Vec<Value> = messages

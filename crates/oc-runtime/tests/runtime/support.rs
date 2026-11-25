@@ -31,6 +31,28 @@ use oc_types::{EventEnvelope, MessageId};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
+/// Upper bound for any test waiter that polls for a durable row or a published
+/// event.
+///
+/// These waits are event/row driven, so the value is only a liveness net: a
+/// correct run returns as soon as the condition holds. It must stay far above
+/// the worst case of a heavily contended GitHub Actions runner (2 cores, many
+/// test binaries in parallel) because a suite that fails on a slow runner is a
+/// broken suite. Five seconds — the previous value — was not enough there.
+pub(crate) const EVENT_WAIT: Duration = Duration::from_secs(60);
+
+/// Poll interval for the waiters above: short enough to stay snappy, long
+/// enough not to spin a starved runner.
+pub(crate) const POLL: Duration = Duration::from_millis(15);
+
+/// Budget for `wait_idle` in tests.
+///
+/// A turn now settles *after* the awaited auto-title request, whose own cap is
+/// `oc_runtime::turn::title::TITLE_FINISH_WAIT` (10s). A test deadline equal to
+/// that cap can expire in the same instant the title request times out, so the
+/// idle wait must be strictly larger than every in-turn budget it can absorb.
+pub(crate) const IDLE_WAIT: Duration = Duration::from_secs(60);
+
 pub(crate) const CATALOG: &str = r#"{
   "test": {
     "id": "test",
@@ -458,7 +480,7 @@ impl Harness {
         self.enqueue(text).await;
         self.runtime.notify(&self.session).await.expect("notify");
         self.runtime
-            .wait_idle(&self.session, Duration::from_secs(10))
+            .wait_idle(&self.session, IDLE_WAIT)
             .await
             .expect("idle");
     }
@@ -505,10 +527,15 @@ impl Harness {
     }
 
     pub(crate) async fn wait_for_event(&self, kind: &str) {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + EVENT_WAIT;
         while !self.sink.has(kind) {
-            assert!(Instant::now() < deadline, "timed out waiting for {kind}");
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            assert!(
+                Instant::now() < deadline,
+                "timed out after {EVENT_WAIT:?} waiting for {kind}; \
+                 saw kinds {:#?}",
+                self.sink.kinds()
+            );
+            tokio::time::sleep(POLL).await;
         }
     }
 
@@ -518,14 +545,16 @@ impl Harness {
     /// that observes a committed row may still be ahead of the event that
     /// describes it.
     pub(crate) async fn wait_for_events(&self, kind: &str, count: usize) {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + EVENT_WAIT;
         while self.sink.count(kind) < count {
             assert!(
                 Instant::now() < deadline,
-                "timed out waiting for {count} {kind} events, saw {}",
-                self.sink.count(kind)
+                "timed out after {EVENT_WAIT:?} waiting for {count} {kind} events, \
+                 saw {} of {kind} (all kinds {:#?})",
+                self.sink.count(kind),
+                self.sink.kinds()
             );
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            tokio::time::sleep(POLL).await;
         }
     }
 }

@@ -184,7 +184,7 @@ async fn permission_ask_is_answered_once() {
         .unwrap();
 
     let asked = subscription
-        .until(Duration::from_secs(10), |event| {
+        .until(Duration::from_secs(60), |event| {
             event["type"] == "permission.asked"
         })
         .await
@@ -428,9 +428,12 @@ async fn run_cli_auto_approves_by_default_and_rejects_non_tty_with_ask_permissio
             .env("OPENCODE_CONFIG_CONTENT", " ")
             .env("PATH", std::env::var_os("PATH").unwrap_or_default());
 
-        let out = tokio::time::timeout(Duration::from_secs(15), cmd.output())
+        // Liveness net, not an assertion: `run` performs two model turns plus
+        // the awaited auto-title request, so on a contended CI runner a cold
+        // binary start can exceed a tight wall-clock bound. Keep it generous.
+        let out = tokio::time::timeout(Duration::from_secs(120), cmd.output())
             .await
-            .expect("opencode run finished within 15s")
+            .expect("opencode run finished within 120s")
             .unwrap();
         assert!(
             out.status.success(),

@@ -149,7 +149,7 @@ async fn subagent_background_returns_running_and_the_watcher_reports() {
     assert_eq!(status["status"], "running");
     let child = status["sessionID"].as_str().expect("child id").to_owned();
 
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + EVENT_WAIT;
     loop {
         let messages = session_messages(&harness.store, &harness.session).await;
         if let Some(message) = messages.iter().find(|message| {
@@ -182,7 +182,7 @@ async fn subagent_background_returns_running_and_the_watcher_reports() {
 
     harness
         .runtime
-        .wait_idle(&harness.session, Duration::from_secs(5))
+        .wait_idle(&harness.session, IDLE_WAIT)
         .await
         .expect("parent settles after the synthetic message");
     let delivered: Vec<Value> = session_messages(&harness.store, &harness.session)
@@ -228,7 +228,7 @@ async fn subagent_reports_a_deleted_child_as_failed() {
         .await
     });
 
-    let child = tokio::time::timeout(Duration::from_secs(5), async {
+    let child = tokio::time::timeout(EVENT_WAIT, async {
         loop {
             for id in child_sessions(&harness.store, &harness.session).await {
                 if !session_messages(&harness.store, &id).await.is_empty() {
@@ -248,7 +248,7 @@ async fn subagent_reports_a_deleted_child_as_failed() {
 
     // A deleted child is a FAILURE for the parent: an `Ok(ToolResult)` here
     // would be published as `session.tool.success` even though no result exists.
-    let error = tokio::time::timeout(Duration::from_secs(5), handle)
+    let error = tokio::time::timeout(EVENT_WAIT, handle)
         .await
         .expect("wait_child notices the deleted session")
         .expect("tool task")
@@ -294,7 +294,7 @@ async fn subagent_background_watcher_reports_a_timeout() {
     assert_eq!(status["status"], "running");
     let child = status["sessionID"].as_str().expect("child id").to_owned();
 
-    let message = tokio::time::timeout(Duration::from_secs(10), async {
+    let message = tokio::time::timeout(EVENT_WAIT, async {
         loop {
             if let Some(message) = session_messages(&harness.store, &harness.session)
                 .await
@@ -321,7 +321,7 @@ async fn subagent_background_watcher_reports_a_timeout() {
     // The timeout cancels the child instead of leaving a zombie behind.
     harness
         .runtime
-        .wait_idle(&child, Duration::from_secs(5))
+        .wait_idle(&child, IDLE_WAIT)
         .await
         .expect("timed-out child settles");
     assert!(
@@ -430,7 +430,7 @@ async fn subagent_foreground_timeout_cancels_the_child_once() {
 
     harness
         .runtime
-        .wait_idle(&child, Duration::from_secs(5))
+        .wait_idle(&child, IDLE_WAIT)
         .await
         .expect("timed-out child settles");
     assert!(
@@ -621,7 +621,7 @@ async fn subagent_timeout_drops_a_pending_permission_ask() {
 
     harness
         .runtime
-        .wait_idle(&child, Duration::from_secs(5))
+        .wait_idle(&child, IDLE_WAIT)
         .await
         .expect("timed-out child settles");
     assert!(
@@ -1470,7 +1470,7 @@ async fn subagent_tool_is_filtered_out_for_agents_that_cannot_spawn() {
     harness.runtime.notify(&session).await.expect("notify");
     harness
         .runtime
-        .wait_idle(&session, Duration::from_secs(10))
+        .wait_idle(&session, IDLE_WAIT)
         .await
         .expect("idle");
 

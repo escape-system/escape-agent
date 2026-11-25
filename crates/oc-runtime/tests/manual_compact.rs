@@ -26,6 +26,11 @@ use oc_types::{EventEnvelope, MessageId};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
+/// Liveness net for `wait_idle`: large enough that a contended CI runner can
+/// never trip it. A turn settles after its awaited auto-title request, which
+/// carries its own 10s cap, so this must stay far above that.
+const IDLE_WAIT: Duration = Duration::from_secs(60);
+
 const CATALOG: &str = r#"{
   "test": {
     "id": "test",
@@ -372,7 +377,7 @@ async fn manual_compaction_consumes_row_and_completes() {
 
     harness
         .runtime
-        .wait_idle(&harness.session, Duration::from_secs(10))
+        .wait_idle(&harness.session, IDLE_WAIT)
         .await
         .expect("session idle after compaction");
     assert!(
@@ -427,7 +432,7 @@ async fn manual_compaction_is_active_while_running() {
     assert_eq!(rows[0]["status"], "completed");
     harness
         .runtime
-        .wait_idle(&harness.session, Duration::from_secs(10))
+        .wait_idle(&harness.session, IDLE_WAIT)
         .await
         .expect("session idle after compaction");
 }
@@ -464,7 +469,7 @@ async fn failed_compaction_consumes_row_without_retrying() {
 
     harness
         .runtime
-        .wait_idle(&harness.session, Duration::from_secs(10))
+        .wait_idle(&harness.session, IDLE_WAIT)
         .await
         .expect("session idle after failed compaction");
 
@@ -582,7 +587,7 @@ async fn compaction_keeps_the_active_turn_in_the_next_context() {
         .expect("notify next");
     harness
         .runtime
-        .wait_idle(&harness.session, Duration::from_secs(10))
+        .wait_idle(&harness.session, IDLE_WAIT)
         .await
         .expect("idle");
 

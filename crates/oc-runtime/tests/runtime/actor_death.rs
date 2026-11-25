@@ -64,9 +64,7 @@ async fn tool_panic_does_not_wedge_the_session() {
         .expect("notify");
     let _ = tokio::time::timeout(
         Duration::from_secs(20),
-        harness
-            .runtime
-            .wait_idle(&harness.session, Duration::from_secs(10)),
+        harness.runtime.wait_idle(&harness.session, IDLE_WAIT),
     )
     .await;
 

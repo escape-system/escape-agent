@@ -19,8 +19,14 @@ use tokio::task::JoinHandle;
 use crate::config::TestConfig;
 
 const STDERR_TAIL_LINES: usize = 200;
-const URL_TIMEOUT: Duration = Duration::from_secs(10);
-const READY_TIMEOUT: Duration = Duration::from_secs(5);
+/// Liveness nets for spawning the real `opencode` binary.
+///
+/// These bound a process spawn plus one HTTP probe, not a computation, so they
+/// must absorb a heavily contended CI runner (2 cores, many test binaries in
+/// parallel with `cargo test --workspace`). The previous 5s readiness deadline
+/// was thin enough to lose a cold start there.
+const URL_TIMEOUT: Duration = Duration::from_secs(60);
+const READY_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug)]
 struct Running {

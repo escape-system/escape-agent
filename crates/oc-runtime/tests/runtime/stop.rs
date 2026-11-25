@@ -69,7 +69,7 @@ async fn stop_withdraws_a_queued_compaction() {
         .expect("notify");
     harness
         .runtime
-        .wait_idle(&harness.session, Duration::from_secs(5))
+        .wait_idle(&harness.session, IDLE_WAIT)
         .await
         .expect("idle");
 
@@ -138,7 +138,7 @@ async fn stop_interrupts_a_slow_stream_within_two_seconds() {
     );
     harness
         .runtime
-        .wait_idle(&harness.session, Duration::from_secs(10))
+        .wait_idle(&harness.session, IDLE_WAIT)
         .await
         .expect("idle");
     let elapsed = started.elapsed();

@@ -6,7 +6,6 @@
 //! child agents were told to read files that do not exist in their repo.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use oc_store::{Delivery, NewInbox, NewSession};
 use oc_types::MessageId;
@@ -76,7 +75,7 @@ async fn instructions_follow_the_session_directory_not_the_config_directory() {
     harness.runtime.notify(session).await.expect("notify");
     harness
         .runtime
-        .wait_idle(session, Duration::from_secs(10))
+        .wait_idle(session, IDLE_WAIT)
         .await
         .expect("idle");
 

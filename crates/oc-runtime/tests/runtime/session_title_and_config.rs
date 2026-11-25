@@ -3,7 +3,6 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
 
 use futures_util::StreamExt;
 use futures_util::future::BoxFuture;
@@ -180,10 +179,7 @@ async fn untitled_root_session_auto_renames_and_persists_title() {
         create_session_with_title(&base, sid, None, initial_title, None).await;
         enqueue_prompt(&base, sid, "Please fix auth token refresh").await;
         runtime.notify(sid).await.expect("notify");
-        runtime
-            .wait_idle(sid, Duration::from_secs(10))
-            .await
-            .expect("idle");
+        runtime.wait_idle(sid, IDLE_WAIT).await.expect("idle");
 
         let stored = base
             .store
@@ -236,10 +232,7 @@ async fn child_and_custom_titled_sessions_skip_auto_title() {
     for sid in ["ses_parent_root", "ses_child_untitled"] {
         enqueue_prompt(&base, sid, "hello").await;
         runtime.notify(sid).await.expect("notify");
-        runtime
-            .wait_idle(sid, Duration::from_secs(10))
-            .await
-            .expect("idle");
+        runtime.wait_idle(sid, IDLE_WAIT).await.expect("idle");
         let events = base.store.events_after(sid, 0, 100).await.expect("events");
         assert!(
             events.iter().all(|ev| ev.kind != "session.renamed"),
@@ -280,10 +273,7 @@ async fn concurrent_manual_rename_is_not_overwritten_by_auto_title() {
         .expect("manual patch");
     gate.release();
 
-    runtime
-        .wait_idle(sid, Duration::from_secs(10))
-        .await
-        .expect("idle");
+    runtime.wait_idle(sid, IDLE_WAIT).await.expect("idle");
 
     let stored = base
         .store
@@ -332,10 +322,7 @@ async fn configured_small_model_routes_auto_title() {
     create_session_with_title(&base, sid, None, None, None).await;
     enqueue_prompt(&base, sid, "check small_model routing").await;
     runtime.notify(sid).await.expect("notify");
-    runtime
-        .wait_idle(sid, Duration::from_secs(10))
-        .await
-        .expect("idle");
+    runtime.wait_idle(sid, IDLE_WAIT).await.expect("idle");
 
     let title_reqs = model.title_requests();
     assert_eq!(title_reqs.len(), 1);
@@ -384,7 +371,7 @@ async fn agent_request_overrides_and_snapshots_false_work() {
     harness.runtime.notify(sid).await.expect("notify");
     harness
         .runtime
-        .wait_idle(sid, Duration::from_secs(10))
+        .wait_idle(sid, IDLE_WAIT)
         .await
         .expect("idle");
 
@@ -467,7 +454,7 @@ async fn session_environment_and_tool_output_limits_reach_tools() {
     harness.runtime.notify(sid).await.expect("notify");
     harness
         .runtime
-        .wait_idle(sid, Duration::from_secs(10))
+        .wait_idle(sid, IDLE_WAIT)
         .await
         .expect("idle");
 

@@ -27,6 +27,11 @@ use oc_types::{EventEnvelope, MessageId};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
+/// Liveness net for `wait_idle`: large enough that a contended CI runner can
+/// never trip it. A turn settles after its awaited auto-title request, which
+/// carries its own 10s cap, so this must stay far above that.
+const IDLE_WAIT: Duration = Duration::from_secs(60);
+
 const CATALOG: &str = r#"{
   "test": {
     "id": "test",
@@ -480,7 +485,7 @@ async fn interrupt_during_foreground_subagent_wait_cancels_the_child() {
         .expect("interrupt the root");
     harness
         .runtime
-        .wait_idle(&harness.session, Duration::from_secs(5))
+        .wait_idle(&harness.session, IDLE_WAIT)
         .await
         .expect("the root must settle");
     // Without the cancellation guard this waits the child's full 30s stream.
