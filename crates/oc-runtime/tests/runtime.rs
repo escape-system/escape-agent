@@ -15,6 +15,8 @@ mod instruction_scope;
 mod key_pool;
 #[path = "runtime/lane_subscriber.rs"]
 mod lane_subscriber;
+#[path = "runtime/materialized_delivery.rs"]
+mod materialized_delivery;
 #[path = "runtime/memory.rs"]
 mod memory;
 #[path = "runtime/models_policy.rs"]

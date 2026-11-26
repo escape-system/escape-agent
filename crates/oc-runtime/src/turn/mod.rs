@@ -70,6 +70,58 @@ impl oc_types::payload::EventPayload for SessionExecutionStepExtended {
     const VERSION: u32 = 1;
 }
 
+/// Whether an existing transcript row is a materialised-but-undelivered peer
+/// message that still owes a delivery.
+///
+/// `Store::enqueue_materialized` (used by `talk` and `session_write`) commits
+/// the transcript row at admission time with `metadata.delivered = false` and
+/// `metadata.inboxID = <inbox id>`, so the row is readable in history before
+/// any turn serves it. Such a row is *not* a doorbell: its delivery marker
+/// must still flip and its text must still reach the model.
+fn is_undelivered_materialized(row: &Value, inbox_id: &str) -> bool {
+    let metadata = row.get("metadata");
+    metadata
+        .and_then(|metadata| metadata.get("inboxID"))
+        .and_then(Value::as_str)
+        == Some(inbox_id)
+        && metadata
+            .and_then(|metadata| metadata.get("delivered"))
+            .and_then(Value::as_bool)
+            != Some(true)
+}
+
+/// Retires an inbox row whose transcript message already exists.
+///
+/// Two shapes reach here and they must be told apart:
+///
+/// * A **materialised, not yet delivered** peer message
+///   ([`is_undelivered_materialized`]). The turn must run and the row must be
+///   flipped to `delivered`, so it goes through [`oc_store::Store::promote_inbox`],
+///   which consumes the doorbell and marks the existing row in place —
+///   preserving its admission-time `seq`.
+/// * **Anything else** (a host that materialised its own message, or an
+///   already-delivered row) is a pure doorbell: consume it without touching
+///   the message, so a delivered peer row is never repainted as cancelled.
+///   The sentinel `Some(Value::Null)` tells [`begin_execution`] to proceed.
+async fn retire_existing_message(
+    store: &oc_store::Store,
+    session: &str,
+    inbox_id: &str,
+    existing: Value,
+) -> Result<Option<Value>, RuntimeError> {
+    if !is_undelivered_materialized(&existing, inbox_id) {
+        store.consume_inbox(session, inbox_id).await?;
+        return Ok(Some(Value::Null));
+    }
+    match store.promote_inbox(session, inbox_id).await? {
+        Some(delivered) => Ok(Some(delivered)),
+        // The inbox row vanished between the read and the promote: a
+        // concurrent drain already delivered it, so this execution owes
+        // nothing. `None` is the documented "skip this item" answer.
+        None => Ok(None),
+    }
+}
+
 /// Promotes one inbox row unless the host already wrote the message; a row
 /// that already exists is consumed as a doorbell and reported as the sentinel
 /// `Some(Value::Null)`.
@@ -134,23 +186,15 @@ async fn promote_inbox_row(
     session: &str,
     id: &str,
 ) -> Result<Option<Value>, RuntimeError> {
-    if store.get_message(session, id).await?.is_some() {
-        // The message exists, so the inbox row is only a doorbell: consume it.
-        // `cancel_inbox` would paint a delivered peer message as cancelled.
-        store.consume_inbox(session, id).await?;
-        Ok(Some(Value::Null))
-    } else {
-        match store.promote_inbox(session, id).await {
-            Ok(promoted) => Ok(promoted),
-            Err(error) => {
-                if store.get_message(session, id).await?.is_some() {
-                    store.consume_inbox(session, id).await?;
-                    Ok(Some(Value::Null))
-                } else {
-                    Err(error.into())
-                }
-            }
-        }
+    if let Some(existing) = store.get_message(session, id).await? {
+        return retire_existing_message(store, session, id, existing).await;
+    }
+    match store.promote_inbox(session, id).await {
+        Ok(promoted) => Ok(promoted),
+        Err(error) => match store.get_message(session, id).await? {
+            Some(existing) => retire_existing_message(store, session, id, existing).await,
+            None => Err(error.into()),
+        },
     }
 }
 

@@ -18,9 +18,9 @@ use oc_config::{ConfigService, LoadOptions};
 use oc_lsp::{LspConfig, LspServerConfig, LspSupervisor, SupervisorOptions};
 use oc_mcp::McpConfig;
 use oc_plugin::{Plugin, PluginRegistry, RpcError, RpcNamespace, Tier};
-use oc_server::data::lsp_tools::{
-    LspDiagnosticsTool, LspEditDiagnosticsHook, LspSemanticOracle, LspTool,
-};
+use oc_server::data::lsp_tools::{LspDiagnosticsTool, LspTool};
+#[cfg(unix)]
+use oc_server::data::lsp_tools::{LspEditDiagnosticsHook, LspSemanticOracle};
 use oc_server::data::mcp::McpManager;
 use oc_server::data::mcp_tools::{McpToolAdapter, McpToolProvider};
 use oc_server::{AppState, router};

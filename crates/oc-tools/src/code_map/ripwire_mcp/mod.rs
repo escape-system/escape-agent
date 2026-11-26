@@ -162,7 +162,10 @@ for raw in sys.stdin:
         )
         .await
         .unwrap_err();
-        assert!(matches!(err, McpCallError::CliOnly { .. }));
+        assert!(
+            matches!(err, McpCallError::CliOnly { .. }),
+            "unexpected error variant: {err:?}"
+        );
     }
 
     #[tokio::test]

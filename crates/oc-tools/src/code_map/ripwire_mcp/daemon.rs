@@ -64,10 +64,7 @@ impl McpDaemon {
             }
         }
 
-        let mut child = cmd.spawn().map_err(|err| McpCallError::Io {
-            message: format!("failed to spawn {} --mcp: {err}", binary.display()),
-            stderr: Vec::new(),
-        })?;
+        let mut child = spawn_retrying_busy_executable(&mut cmd, binary, cancel).await?;
 
         let stdin = child.stdin.take().ok_or_else(|| McpCallError::Io {
             message: "ripwire --mcp missing stdin pipe".to_string(),
@@ -343,6 +340,56 @@ impl McpDaemon {
         }
 
         Ok(McpToolOutput { text, stderr })
+    }
+}
+
+/// Spawns the MCP child, retrying a transient `ETXTBSY`.
+///
+/// `execve` fails with `ETXTBSY` ("Text file busy") while any process still
+/// holds the target open for writing. That is not a hypothetical: `ripwire` is
+/// rebuilt by the release/test pipeline, and a freshly written or freshly
+/// copied executable can be briefly undroppable while the writer's descriptor
+/// is open. It is also reproducible under load in this workspace's own test
+/// suite (observed as `failed to spawn … --mcp: Text file busy (os error 26)`
+/// in 3 of 40 runs).
+///
+/// The condition is momentary, so retrying briefly is the correct response; a
+/// binary that is *genuinely* not runnable fails fast with a different errno
+/// (`EACCES`, `ENOEXEC`, `ENOENT`) and is surfaced unchanged as `Io`, exactly as
+/// before. A deadlock is impossible: the loop is bounded and cancellation is
+/// honoured on every iteration.
+async fn spawn_retrying_busy_executable(
+    cmd: &mut Command,
+    binary: &Path,
+    cancel: &CancellationToken,
+) -> Result<Child, McpCallError> {
+    /// Total attempts for a busy executable, including the first.
+    const BUSY_EXEC_ATTEMPTS: u32 = 40;
+    /// Backoff between `ETXTBSY` attempts. Short enough that a healthy spawn is
+    /// imperceptibly delayed, long enough for a finishing writer to close.
+    const BUSY_EXEC_BACKOFF: Duration = Duration::from_millis(5);
+
+    let mut attempt = 0_u32;
+    loop {
+        attempt += 1;
+        match cmd.spawn() {
+            Ok(child) => return Ok(child),
+            Err(err)
+                if err.kind() == std::io::ErrorKind::ExecutableFileBusy
+                    && attempt < BUSY_EXEC_ATTEMPTS =>
+            {
+                tokio::select! {
+                    () = cancel.cancelled() => return Err(McpCallError::Cancelled),
+                    () = tokio::time::sleep(BUSY_EXEC_BACKOFF) => {}
+                }
+            }
+            Err(err) => {
+                return Err(McpCallError::Io {
+                    message: format!("failed to spawn {} --mcp: {err}", binary.display()),
+                    stderr: Vec::new(),
+                });
+            }
+        }
     }
 }
 
