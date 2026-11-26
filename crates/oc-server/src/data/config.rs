@@ -127,20 +127,23 @@ fn executable(file: &str) -> Option<PathBuf> {
     which(file)
 }
 
+// One definition per platform: a shared body with an `if !path.is_file() {
+// return false; }` guard followed by a bare `true` collapses to a bool literal
+// under `#[cfg(not(unix))]` and trips `clippy::needless_bool`, which is
+// `-D warnings` on the Windows CI leg. Each arm is a single expression here, so
+// no arm can be reduced to a literal and the lint cannot fire on either host.
+#[cfg(unix)]
 fn runnable(path: &Path) -> bool {
-    if !path.is_file() {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        path.metadata()
+    use std::os::unix::fs::PermissionsExt;
+    path.is_file()
+        && path
+            .metadata()
             .is_ok_and(|metadata| metadata.permissions().mode() & 0o111 != 0)
-    }
-    #[cfg(not(unix))]
-    {
-        true
-    }
+}
+
+#[cfg(not(unix))]
+fn runnable(path: &Path) -> bool {
+    path.is_file()
 }
 
 fn which(program: &str) -> Option<PathBuf> {
