@@ -21,7 +21,7 @@
 //! the message).
 
 use oc_store::{Delivery, MessageQuery, NewInbox, Order};
-use oc_types::payload::EventPayload;
+use oc_types::payload::{CompactionTrigger, EventPayload, SessionCompactionSuggested};
 use oc_types::{InboxKind, MessageId, SessionId, now_millis};
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -251,22 +251,8 @@ impl Runtime {
             },
             "time": { "created": now },
         });
-        self.enqueue_and_emit(NewInbox {
-            id: MessageId::new().into_inner(),
-            session_id: session.to_owned(),
-            kind: inbox_kind(InboxKind::Observer),
-            payload,
-            delivery: Delivery::Steer,
-        })
-        .await?;
-        if let Err(error) = self.notify_local(session).await {
-            tracing::warn!(
-                session = %session,
-                %error,
-                "compaction advice: wake failed; leaving the cooldown unset so the next tick retries"
-            );
-            return Err(error);
-        }
+        // Read the directory before either emit so both events carry the
+        // session's own location rather than the process default.
         let directory = self
             .inner
             .config
@@ -280,6 +266,53 @@ impl Runtime {
                     .map(str::to_owned)
             })
             .unwrap_or_default();
+        self.enqueue_and_emit(NewInbox {
+            id: MessageId::new().into_inner(),
+            session_id: session.to_owned(),
+            kind: inbox_kind(InboxKind::Observer),
+            payload,
+            delivery: Delivery::Steer,
+        })
+        .await?;
+        // Durable `session.compaction.suggested`, published only after the
+        // advisory row committed. It carries the same numbers the gate used
+        // (`context_pressure` is the threshold path's own computation), so a
+        // reloading client can render the advisory row with its "Compact now"
+        // action from the event log alone. This is advice, not a command: no
+        // compaction row is enqueued and no turn is reserved.
+        if let Err(error) = self
+            .emit(
+                session,
+                &directory,
+                SessionCompactionSuggested {
+                    session_id: SessionId::from_wire(session.to_owned()),
+                    trigger: CompactionTrigger::Observer,
+                    estimate_tokens: pressure.estimated,
+                    trigger_tokens: pressure.trigger,
+                    // The gate refuses a zero ceiling (`AdviceSkip::NoCeiling`),
+                    // so this is a measurement the adviser actually used.
+                    ceiling_tokens: Some(pressure.ceiling),
+                },
+            )
+            .await
+        {
+            // The row is already durable and `session.inbox.enqueued` already
+            // travelled; a failed advisory annotation must not turn the advice
+            // into a retry loop that enqueues a second row.
+            tracing::warn!(
+                session = %session,
+                %error,
+                "compaction advice: session.compaction.suggested emit failed"
+            );
+        }
+        if let Err(error) = self.notify_local(session).await {
+            tracing::warn!(
+                session = %session,
+                %error,
+                "compaction advice: wake failed; leaving the cooldown unset so the next tick retries"
+            );
+            return Err(error);
+        }
         if let Err(error) = self
             .emit(
                 session,

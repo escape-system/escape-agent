@@ -7,8 +7,8 @@
 //! eight concurrent notifications.
 
 use oc_types::message::ToolContent;
-use oc_types::payload::SessionExecutionInterrupted;
-use oc_types::{InterruptReason, StructuredError};
+use oc_types::payload::{CompactionTrigger, SessionCompactionFailed, SessionExecutionInterrupted};
+use oc_types::{InterruptReason, MessageId, StructuredError};
 use serde_json::{Map, Value, json};
 
 use crate::runtime::{Runtime, RuntimeError};
@@ -22,6 +22,7 @@ const TERMINAL_EXECUTIONS: [&str; 3] = [
 ];
 
 impl Runtime {
+    #[allow(clippy::too_many_lines)] // boot repair: rows + terminals + settle + wake
     pub(crate) async fn recover(&self) -> Result<(), RuntimeError> {
         let sessions = self.list_all_sessions().await?;
         let mut repaired = Vec::new();
@@ -43,12 +44,54 @@ impl Runtime {
                     _ => None,
                 };
                 if let Some(body) = repaired {
+                    // Capture the evidence a `session.compaction.failed` needs
+                    // before the body is consumed by the commit below.
+                    let compaction_event = (message.get("type").and_then(Value::as_str)
+                        == Some("compaction"))
+                    .then(|| {
+                        (
+                            body.get("reason")
+                                .and_then(Value::as_str)
+                                .unwrap_or("auto")
+                                .to_owned(),
+                            body.get("trigger").and_then(|value| {
+                                serde_json::from_value::<CompactionTrigger>(value.clone()).ok()
+                            }),
+                            body.get("inboxID")
+                                .and_then(Value::as_str)
+                                .map(|inbox| MessageId::from_wire(inbox.to_owned())),
+                        )
+                    });
+                    let repaired_id = message_id(&message).to_owned();
                     self.inner
                         .config
                         .store
-                        .update_message(id, message_id(&message), body)
+                        .update_message(id, &repaired_id, body)
                         .await?;
                     changed = true;
+                    // The failed status is durable before the event describes
+                    // it: a kill -9 between the two leaves a terminal event on
+                    // the next boot instead of a row that silently flipped.
+                    if let Some((reason, trigger, inbox_id)) = compaction_event {
+                        self.emit(
+                            id,
+                            &directory,
+                            SessionCompactionFailed {
+                                session_id: Self::session_id(id),
+                                reason,
+                                error: StructuredError::new(
+                                    "CompactionAbortedError",
+                                    "The server restarted while compaction was running.",
+                                ),
+                                input_id: Some(MessageId::from_wire(repaired_id)),
+                                cost: None,
+                                tokens: None,
+                                inbox_id,
+                                trigger,
+                            },
+                        )
+                        .await?;
+                    }
                 }
             }
             if changed {

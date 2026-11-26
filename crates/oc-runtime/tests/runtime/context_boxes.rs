@@ -467,6 +467,73 @@ async fn compact_context_enqueues_a_queued_row_instead_of_compacting_inline() {
     assert_eq!(rows[0]["status"], "completed");
 }
 
+/// One pending `compaction` row per session: a second `compact_context` joins
+/// the queued request instead of stacking a duplicate.
+///
+/// The pending row is seeded directly through the store and never wakes the
+/// actor, so both tool calls observe the same row and the assertion cannot race
+/// the compaction itself.
+#[tokio::test]
+async fn compact_context_coalesces_onto_a_pending_row() {
+    let harness = Harness::new(vec![], Arc::new(AllowAll), json!({}), None).await;
+    let pending_id = oc_types::MessageId::new().into_inner();
+    let doorbells = harness.sink.count("session.inbox.enqueued");
+    harness
+        .store
+        .enqueue(NewInbox {
+            id: pending_id.clone(),
+            session_id: harness.session.clone(),
+            kind: "compaction".to_owned(),
+            payload: json!({
+                "time": {"created": oc_types::now_millis()},
+                "status": "pending",
+                "reason": "manual"
+            }),
+            delivery: Delivery::Queue,
+        })
+        .await
+        .expect("pending compaction");
+
+    let tool = box_tool(&harness, "compact_context");
+    for note in ["first ask", "second ask"] {
+        let result = tool
+            .execute(
+                &tool_context(&harness, &harness.session),
+                json!({ "note": note }),
+            )
+            .await
+            .expect("a pending compaction is coalesced, not an error");
+        let metadata = result.metadata.expect("coalescing reports its row");
+        assert_eq!(metadata["coalesced"], true, "{note}: {metadata:?}");
+        assert_eq!(metadata["inboxID"], pending_id, "{note}: {metadata:?}");
+        let output = result.output.expect("output");
+        assert!(output.contains(&pending_id), "{note}: {output}");
+        assert!(output.contains("Coalesced"), "{note}: {output}");
+    }
+
+    let inbox = harness.inbox().await;
+    assert_eq!(inbox.len(), 1, "no duplicate row: {inbox:?}");
+    assert_eq!(inbox[0]["id"], pending_id);
+    // The coalesced calls do not rewrite the queued request either.
+    assert!(
+        inbox[0]["payload"].get("note").is_none(),
+        "the pending payload is untouched: {inbox:?}"
+    );
+    assert_eq!(
+        harness.sink.count("session.inbox.enqueued"),
+        doorbells,
+        "a coalesced request emits no second doorbell"
+    );
+    assert!(
+        harness
+            .messages()
+            .await
+            .iter()
+            .all(|row| row.get("type").and_then(Value::as_str) != Some("compaction")),
+        "coalescing must not run the compaction inside the tool call"
+    );
+}
+
 #[tokio::test]
 async fn compact_context_tool_call_compacts_the_callers_own_session_at_the_next_boundary() {
     let harness = Harness::new(

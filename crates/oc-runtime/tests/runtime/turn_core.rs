@@ -1460,6 +1460,15 @@ async fn recovery_fails_a_running_compaction_and_preserves_its_reason() {
         "the interrupted event is not republished"
     );
     assert_eq!(harness.model.calls(), 0);
+
+    // Gap 4: the failed status commits, then exactly one durable
+    // `session.compaction.failed` names that row. Recovery used to flip the
+    // status silently, so a reloading client never saw the terminal.
+    let failed = harness.sink.data("session.compaction.failed");
+    assert_eq!(failed.len(), 1, "exactly one compaction.failed: {failed:?}");
+    assert_eq!(failed[0]["reason"], "auto");
+    assert_eq!(failed[0]["inputID"], "msg_running_compaction");
+    assert_eq!(failed[0]["error"]["type"], "CompactionAbortedError");
 }
 
 #[tokio::test]

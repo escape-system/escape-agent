@@ -1191,6 +1191,31 @@ impl Tool for CompactContextTool {
     }
 
     async fn execute(&self, ctx: &ToolContext, input: Value) -> Result<ToolResult, ToolError> {
+        // Coalescing: one pending `compaction` row per session. A second
+        // request returns the row already queued instead of stacking another,
+        // so `/compact` + this tool + an observer repair never run twice.
+        let pending = self
+            .runtime
+            .inner
+            .config
+            .store
+            .list_inbox(&ctx.session_id)
+            .await
+            .map_err(|error| store_error(&error))?
+            .into_iter()
+            .find(|item| item.get("type").and_then(Value::as_str) == Some("compaction"));
+        if let Some(item) = pending {
+            let inbox_id = item
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            return Ok(ToolResult::text(format!(
+                "Compaction already queued as `{inbox_id}`; it runs at the next turn boundary, \
+                 after this turn ends. Coalesced with the pending request."
+            ))
+            .with_metadata(json!({ "inboxID": inbox_id, "coalesced": true })));
+        }
         let mut payload = Map::new();
         payload.insert("time".to_owned(), json!({ "created": now_millis() }));
         payload.insert("status".to_owned(), Value::String("pending".to_owned()));

@@ -242,6 +242,118 @@ async fn talk_publishes_the_peer_message_event_after_the_inbox_row() {
 }
 
 #[tokio::test]
+async fn peer_reply_to_round_trips_and_is_omitted_when_absent() {
+    let harness = Harness::new(
+        vec![],
+        Arc::new(AllowAll),
+        json!({"subagents": {"siblings": {"enabled": true}}}),
+        None,
+    )
+    .await;
+    let a = create_child(&harness, &harness.session, "ses_reply_a", "general").await;
+    let b = create_child(&harness, &harness.session, "ses_reply_b", "general").await;
+
+    subagent_tool(&harness, "talk")
+        .execute(
+            &tool_context(&harness, &a),
+            json!({
+                "to": b,
+                "kind": "question",
+                "text": "status?",
+                "reply_to": "msg_question_1",
+            }),
+        )
+        .await
+        .expect("question with a reply target");
+
+    let inbox = harness.store.list_inbox(&b).await.expect("inbox");
+    let asked = inbox[0]["id"].as_str().expect("inbox id").to_owned();
+    let materialized = harness
+        .store
+        .get_message(&b, &asked)
+        .await
+        .expect("read materialized")
+        .expect("materialized row");
+    // Caller-supplied correlation, echoed into the transcript row the timeline
+    // reads; never invented server-side.
+    assert_eq!(materialized["metadata"]["replyTo"], "msg_question_1");
+    assert!(
+        !serde_json::to_string(&materialized)
+            .expect("json")
+            .contains("\"replyTo\":null"),
+        "optional fields are omitted, never null"
+    );
+
+    // `session_write` has the same parity, and omits the key when no target is
+    // named.
+    subagent_tool(&harness, "session_write")
+        .execute(
+            &tool_context(&harness, &harness.session),
+            json!({"session_id": b, "text": "keep going", "delivery": "queue"}),
+        )
+        .await
+        .expect("write without a reply target");
+    let inbox = harness.store.list_inbox(&b).await.expect("inbox");
+    let wrote = inbox
+        .iter()
+        .find(|item| item["payload"]["text"] == "keep going")
+        .expect("write row")
+        .clone();
+    assert_eq!(wrote["payload"]["metadata"]["kind"], "note");
+    assert!(
+        wrote["payload"]["metadata"].get("replyTo").is_none(),
+        "absent reply target omits the key: {wrote:?}"
+    );
+    let wrote_id = wrote["id"].as_str().expect("write id").to_owned();
+    let wrote_row = harness
+        .store
+        .get_message(&b, &wrote_id)
+        .await
+        .expect("read write")
+        .expect("materialized write");
+    assert!(wrote_row["metadata"].get("replyTo").is_none());
+
+    // A non-default `kind` and a reply target round-trip through
+    // `session_write` exactly as they do through `talk`.
+    subagent_tool(&harness, "session_write")
+        .execute(
+            &tool_context(&harness, &harness.session),
+            json!({
+                "session_id": b,
+                "text": "done",
+                "kind": "answer",
+                "reply_to": asked,
+            }),
+        )
+        .await
+        .expect("answer with a reply target");
+    let inbox = harness.store.list_inbox(&b).await.expect("inbox");
+    let answer = inbox
+        .iter()
+        .find(|item| item["payload"]["text"] == "done")
+        .expect("answer row")
+        .clone();
+    assert_eq!(answer["payload"]["metadata"]["kind"], "answer");
+    assert_eq!(answer["payload"]["metadata"]["replyTo"], asked.as_str());
+    assert_eq!(answer["payload"]["kind"], "answer");
+
+    // An unknown kind is rejected before anything is written.
+    let error = subagent_tool(&harness, "session_write")
+        .execute(
+            &tool_context(&harness, &harness.session),
+            json!({"session_id": b, "text": "nope", "kind": "broadcast"}),
+        )
+        .await
+        .expect_err("unknown kinds are rejected");
+    assert!(error.message.contains("kind must be"), "{}", error.message);
+    assert_eq!(
+        harness.store.list_inbox(&b).await.expect("inbox").len(),
+        2,
+        "the rejected write created no row"
+    );
+}
+
+#[tokio::test]
 async fn patch_authorizes_every_target_and_a_denied_one_fails_the_call() {
     let harness = Harness::new(
         vec![

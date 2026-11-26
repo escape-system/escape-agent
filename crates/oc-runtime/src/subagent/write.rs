@@ -37,7 +37,9 @@ impl Tool for WriteSessionTool {
                 "session_id": { "type": "string", "description": "Target session id." },
                 "text": { "type": "string" },
                 "delivery": { "type": "string", "enum": ["steer", "queue"], "description": "steer (default) wakes the target or joins its active turn at the next step boundary; queue wakes an idle target or runs as the next turn after a busy turn finishes." },
-                "interrupt": { "type": "boolean", "description": "Interrupt the target's current execution first." }
+                "interrupt": { "type": "boolean", "description": "Interrupt the target's current execution first." },
+                "kind": { "type": "string", "enum": ["note", "question", "answer"], "description": "Peer message kind (default `note`), matching `talk`'s vocabulary." },
+                "reply_to": { "type": "string", "description": "Message id of the peer message this one answers. Echoed into the row's metadata as `metadata.replyTo`, which the timeline uses to pair an answer with its question." }
             },
             "required": ["session_id", "text"],
             "additionalProperties": false
@@ -56,6 +58,17 @@ impl Tool for WriteSessionTool {
             None => required_str(&input, "session_id")?,
         };
         let text = required_str(&input, "text")?;
+        let kind = match optional_str(&input, "kind").as_deref() {
+            None | Some("note") => "note".to_owned(),
+            Some("question") => "question".to_owned(),
+            Some("answer") => "answer".to_owned(),
+            Some(other) => {
+                return Err(ToolError::new(format!(
+                    "InvalidToolInput: kind must be note, question or answer, got {other:?}"
+                )));
+            }
+        };
+        let reply_to = optional_str(&input, "reply_to");
         let settings = settings_for_session(runtime, &caller).await;
         let delivery = match optional_str(&input, "delivery").as_deref() {
             None | Some("steer") => Delivery::Steer,
@@ -111,6 +124,17 @@ impl Tool for WriteSessionTool {
                 .map_err(|error| runtime_error(&error))?;
         }
         let item_id = MessageId::new().into_inner();
+        let mut metadata = json!({
+            "source": "peer",
+            "from": caller,
+            "agent": from_node.agent,
+            "kind": kind,
+        });
+        if let Some(reply_to) = &reply_to {
+            // Same caller-supplied correlation `talk` records; omitted, never
+            // `null`, when the caller names no reply target.
+            metadata["replyTo"] = json!(reply_to);
+        }
         // Materialised at admission (same as `talk`), so a queued write is
         // readable in the target's history before it is delivered.
         runtime
@@ -120,12 +144,10 @@ impl Tool for WriteSessionTool {
                 kind: "synthetic".to_owned(),
                 payload: json!({
                     "text": text,
-                    "metadata": {
-                        "source": "peer",
-                        "from": caller,
-                        "agent": from_node.agent,
-                        "kind": "note",
-                    },
+                    "kind": kind,
+                    "from": caller,
+                    "agent": from_node.agent,
+                    "metadata": metadata,
                 }),
                 delivery,
             })
@@ -142,7 +164,7 @@ impl Tool for WriteSessionTool {
                     session_id: to.clone(),
                     from: caller.clone(),
                     agent: from_node.agent.clone(),
-                    kind: "note".to_owned(),
+                    kind: kind.clone(),
                     text: text.clone(),
                     request_reply: false,
                     message_id: item_id.clone(),

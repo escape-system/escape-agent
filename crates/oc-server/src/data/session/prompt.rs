@@ -457,6 +457,21 @@ async fn admit_compaction(
         .ok_or_else(|| session_not_found(session_id))?;
 
     let delivery = delivery_from_wire(delivery.as_deref())?;
+    // Coalescing: admission is idempotent per session while a `compaction` row
+    // is pending. Minting a second id would stack identical queued rows and a
+    // second `session.inbox.enqueued`, and the runtime consumes the row before
+    // it runs, so `/compact` + `/compress` + a retry still execute exactly one
+    // compaction. A caller-supplied `id` is moot here: the pending row already
+    // owns the identity the client's badge is keyed by.
+    let pending = store
+        .list_inbox(session_id)
+        .await?
+        .into_iter()
+        .find(|item| item.get("type").and_then(Value::as_str) == Some("compaction"));
+    if let Some(mut existing) = pending {
+        existing["coalesced"] = json!(true);
+        return Ok(existing);
+    }
     let id = id
         .filter(|id| !id.is_empty())
         .unwrap_or_else(|| MessageId::new().into_inner());
@@ -471,6 +486,10 @@ async fn admit_compaction(
         .await?;
     publish_enqueued(state, session_id, &id, &item).await?;
     notify(state, session_id).await?;
+    let mut item = item;
+    // Always present so a client can branch on one field instead of on a
+    // missing one; the inbox row itself is unchanged.
+    item["coalesced"] = json!(false);
     Ok(item)
 }
 

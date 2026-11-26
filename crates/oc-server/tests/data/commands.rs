@@ -214,6 +214,7 @@ async fn compress_command_and_prompt_alias_admit_compaction() {
     assert_eq!(status, StatusCode::NO_CONTENT);
     assert!(body.is_none());
 
+    // The row `/compress` admitted; the later admission must return its id.
     let (status, body) = call(
         &app,
         Method::POST,
@@ -222,7 +223,15 @@ async fn compress_command_and_prompt_alias_admit_compaction() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body.unwrap()["data"]["type"], "compaction");
+    let body = body.unwrap();
+    assert_eq!(body["data"]["type"], "compaction");
+    // Coalescing: the builtin `/compress` above already queued a compaction, so
+    // this admission returns that same row instead of minting a second one.
+    assert_eq!(
+        body["data"]["coalesced"], true,
+        "the second admission must coalesce: {body:?}"
+    );
+    let prompt_id = body["data"]["id"].as_str().expect("prompt id").to_owned();
 
     let (_, body) = call(
         &app,
@@ -232,13 +241,23 @@ async fn compress_command_and_prompt_alias_admit_compaction() {
     )
     .await;
     let inbox = body.unwrap();
-    let compactions = inbox["data"]
+    let pending: Vec<&serde_json::Value> = inbox["data"]
         .as_array()
         .unwrap()
         .iter()
         .filter(|item| item["type"] == "compaction")
-        .count();
-    assert_eq!(compactions, 2, "{inbox:?}");
+        .collect();
+    assert_eq!(
+        pending.len(),
+        1,
+        "exactly one pending compaction row after two admissions: {inbox:?}"
+    );
+    // Same identity, not a fresh row with a coincidentally equal type: the
+    // client's queued badge is keyed by this id.
+    assert_eq!(
+        pending[0]["id"], prompt_id,
+        "the coalesced admission returns the pending row's id: {inbox:?}"
+    );
 
     let (_, body) = call(
         &app,
@@ -258,6 +277,70 @@ async fn compress_command_and_prompt_alias_admit_compaction() {
                 })
         }),
         "the raw /compress alias must not be persisted as a user prompt: {messages:?}"
+    );
+}
+
+/// Coalescing is identity-preserving and silent: while a `compaction` row is
+/// pending, a second admission returns that same id and publishes no second
+/// `session.inbox.enqueued`.
+#[tokio::test]
+async fn compaction_admissions_coalesce_onto_the_pending_row() {
+    let harness = harness().await;
+    let app = router(harness.state.clone());
+    let sid = session_id(&create_session(&app, json!({})).await);
+
+    let (status, body) = call(
+        &app,
+        Method::POST,
+        &format!("/api/session/{sid}/compact"),
+        Some(json!({"id": "msg_compact_1"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    let first = body.unwrap();
+    assert_eq!(first["data"]["id"], "msg_compact_1");
+    assert_eq!(first["data"]["coalesced"], false, "the first admits");
+
+    // A caller-supplied id on the second admission is moot: the pending row
+    // already owns the identity the queued badge is keyed by.
+    let (status, body) = call(
+        &app,
+        Method::POST,
+        &format!("/api/session/{sid}/compact"),
+        Some(json!({"id": "msg_compact_2"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    let second = body.unwrap();
+    assert_eq!(
+        second["data"]["id"], first["data"]["id"],
+        "the coalesced admission returns the pending row's id: {second:?}"
+    );
+    assert_eq!(second["data"]["coalesced"], true, "{second:?}");
+
+    let store = harness.state.store().expect("store");
+    let inbox = store.list_inbox(&sid).await.expect("inbox");
+    assert_eq!(
+        inbox
+            .iter()
+            .filter(|item| item["type"] == "compaction")
+            .count(),
+        1,
+        "no second row: {inbox:?}"
+    );
+
+    // Read the durable log, not the sink: it proves the coalesced admission
+    // published no duplicate doorbell for a row that already exists.
+    let enqueued = store
+        .events_after(&sid, 0, 1_000)
+        .await
+        .expect("event log")
+        .into_iter()
+        .filter(|event| event.kind == "session.inbox.enqueued")
+        .count();
+    assert_eq!(
+        enqueued, 1,
+        "coalescing must not publish a second session.inbox.enqueued"
     );
 }
 

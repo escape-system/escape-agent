@@ -37,7 +37,8 @@ impl Tool for TalkTool {
                 "to": { "type": "string", "description": "Target session id." },
                 "kind": { "type": "string", "enum": ["note", "question", "answer"] },
                 "text": { "type": "string" },
-                "request_reply": { "type": "boolean", "description": "Ask the target to answer when it replies." }
+                "request_reply": { "type": "boolean", "description": "Ask the target to answer when it replies." },
+                "reply_to": { "type": "string", "description": "Message id of the peer message this one answers. Echoed into the row's metadata as `metadata.replyTo`, which the timeline uses to pair an answer with its question." }
             },
             "required": ["to", "kind", "text"],
             "additionalProperties": false
@@ -112,10 +113,23 @@ impl Tool for TalkTool {
         }
 
         let message_id = MessageId::new().into_inner();
+        let reply_to = optional_str(&input, "reply_to");
         // Materialised at admission: the inbox doorbell and the `synthetic`
         // transcript row commit in one transaction, so the peer message is
         // already readable in history (with `metadata.delivered = false`) before
         // any turn promotes it.
+        let mut metadata = json!({
+            "source": "peer",
+            "from": caller,
+            "agent": from_node.agent,
+            "kind": kind,
+        });
+        if let Some(reply_to) = &reply_to {
+            // Caller-supplied correlation only: the answer names the question's
+            // message id, and the timeline pairs the two. Absent means absent —
+            // never `null` (optional fields are omitted).
+            metadata["replyTo"] = json!(reply_to);
+        }
         runtime
             .enqueue_materialized(NewInbox {
                 id: message_id.clone(),
@@ -129,12 +143,7 @@ impl Tool for TalkTool {
                     "sender_session_id": caller,
                     "sender_agent": from_node.agent,
                     "request_reply": request_reply,
-                    "metadata": {
-                        "source": "peer",
-                        "from": caller,
-                        "agent": from_node.agent,
-                        "kind": kind,
-                    },
+                    "metadata": metadata,
                 }),
                 delivery: Delivery::Steer,
             })

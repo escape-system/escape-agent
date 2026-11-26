@@ -438,15 +438,24 @@ pub fn is_executable_file(path: &Path) -> bool {
     if !metadata.is_file() {
         return false;
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        metadata.permissions().mode() & 0o111 != 0
-    }
-    #[cfg(not(unix))]
-    {
-        true
-    }
+    has_execute_permission(&metadata)
+}
+
+/// The platform's execute rule for an already-known regular file.
+///
+/// Split out so neither target collapses into `clippy::needless_bool`: on
+/// non-unix the rule is just "it is a regular file", and an inline `true` tail
+/// after the `is_file` guard would be flagged there.
+#[cfg(unix)]
+fn has_execute_permission(metadata: &fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt as _;
+    metadata.permissions().mode() & 0o111 != 0
+}
+
+/// Windows has no POSIX execute bit, so a regular file is spawnable as-is.
+#[cfg(not(unix))]
+fn has_execute_permission(metadata: &fs::Metadata) -> bool {
+    metadata.is_file()
 }
 
 /// Pure discovery core: every environment input is a parameter so the search

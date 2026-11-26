@@ -143,6 +143,18 @@ async fn pressure_produces_one_advisory_row_and_event() {
     assert!(events[0]["estimateTokens"].as_u64().unwrap_or(0) > 0);
     assert!(events[0]["ceilingTokens"].as_u64().unwrap_or(0) > 0);
     assert!(events[0]["triggerTokens"].as_u64().is_some());
+
+    // Gap 2: the adviser also publishes the durable suggestion the UI folds
+    // into its "suggested" phase, carrying the real numbers it decided on (the
+    // same `context_pressure` estimate the threshold path uses) and the true
+    // cause. Exactly one per advice; it is never emitted for other advice.
+    let suggested = harness.sink.data("session.compaction.suggested");
+    assert_eq!(suggested.len(), 1, "exactly one suggested: {suggested:?}");
+    assert_eq!(suggested[0]["sessionID"], harness.session.as_str());
+    assert_eq!(suggested[0]["trigger"], "observer");
+    assert!(suggested[0]["estimateTokens"].as_u64().unwrap_or(0) > 0);
+    assert!(suggested[0]["triggerTokens"].as_u64().unwrap_or(0) > 0);
+    assert!(suggested[0]["ceilingTokens"].as_u64().unwrap_or(0) > 0);
 }
 
 // The cooldown is proven by `observer::advice::tests::cooldown_boundary_is_exclusive`:

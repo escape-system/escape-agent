@@ -1391,11 +1391,21 @@ async fn subagent_schemas_match_the_documented_keys() {
             "spawn"
         ]
     );
-    assert_eq!(keys("talk"), ["kind", "request_reply", "text", "to"]);
+    assert_eq!(
+        keys("talk"),
+        ["kind", "reply_to", "request_reply", "text", "to"]
+    );
     assert_eq!(keys("roster"), ["wait_seconds"]);
     assert_eq!(
         keys("session_write"),
-        ["delivery", "interrupt", "session_id", "text"]
+        [
+            "delivery",
+            "interrupt",
+            "kind",
+            "reply_to",
+            "session_id",
+            "text"
+        ]
     );
     assert_eq!(
         keys("digest"),
