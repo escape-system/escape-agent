@@ -112,8 +112,6 @@ if (root instanceof HTMLElement && root.dataset.opencodeMounted === undefined) {
     ),
     root,
   )
-  // The commit above is synchronous, so the static splash has done its job; dropping it now cannot flash an empty
-  // root. A rejected chunk must not take the app down either: the base dictionary stays and the shell keeps running.
-  root.querySelector("[data-opencode-splash]")?.remove()
+  // A rejected locale chunk must not take the app down: the base dictionary stays and the shell keeps running.
   void loadInitialLocale().catch(() => undefined)
 }

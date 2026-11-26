@@ -270,3 +270,17 @@ All of this is one transaction per session, then one event per change.
 | host compaction adviser | deterministic per-tick token-pressure check; publishes `observer.advised`, never a hook and never the LLM observer |
 | `tool.execute.before/after` | permission, lanes, expectation settlement |
 | `instructions` source | memory, goal, skill index, digest |
+
+## Transport resilience and credential preference
+
+- **`ModelRef.credentialID`**: optional explicit key selection carried from the main agent's composer / session model or passed into a subagent via `subagent(key=...)`. `Runtime::credential_pool_for` places that preferred credential (or `"env"` when `"env"` is requested) first in the attempt order while keeping healthy backup keys on the same provider+model available for same-model rotation on quota, rate-limit, or transport failure (`Auth` / `Quota` update the durable `credential.active` pointer; `RateLimit` / `Transport` / `EmptyResponse` only enter in-memory cooldown).
+- **Stream close / transport retries**: premature EOF (`provider failure (transport): provider stream closed before completion`) and `EmptyResponse` retry across healthy keys and up to `TRANSPORT_MAX_ATTEMPTS = 3` bounded jittered backoff attempts before settling as a turn error. When a partial draft assistant message had streamed text before closing with zero executed tool calls, that partial failure draft is marked superseded/dropped from the clean retry transcript so the retry attempt resumes cleanly.
+
+## Harness Mechanics & Consequences (system prompt guidance)
+
+`append_capability_routing` in `crates/oc-runtime/src/prompt/mod.rs` injects a tool-filtered concise guide inside `system_prefix` so built-in agents (including `engineer`, `architect`, `general`, `ui`, which override `default_system_prompt` via `system`) accurately know harness mechanics and side effects:
+- `shell`: commands inherit the server cgroup unless detached; never run `systemctl stop/restart/reload` on the host service directly in `shell` (use `systemd-run --on-active=1 ...` or external handoff).
+- `subagent`: spawns execute in the background by default; main agents can supply `key` (`credentialID` or `"env"`) to pin a specific provider credential (subagents inherit parent `credentialID` when `ModelSource::Parent` applies); avoid passing unconfigured model names.
+- `roster`: waits for *active* children (`status == "busy"`) and wakes on transition to any terminal status (`completed`, `failed`, `interrupted`, `archived`, `suspended`, `idle`) or *newly arrived* unread inbox messages, without polling every 200ms in a tight loop on stale queued items.
+- `talk` / `session_write`: `talk` enqueues a waking peer message; `session_write` injects a peer/instruction turn into a child/sibling and immediately wakes an idle target (`subagents.siblings.wake`). Both materialize on the target's main timeline.
+- `box_*` / `compact_context` / `verify_on_stop` / `key_health`: summarized concisely filtered by the caller's enabled tool set.

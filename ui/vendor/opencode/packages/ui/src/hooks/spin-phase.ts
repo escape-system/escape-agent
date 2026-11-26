@@ -15,7 +15,15 @@ const visibility =
     ? undefined
     : new IntersectionObserver((entries) =>
         entries.forEach((entry) => {
-          entry.target.toggleAttribute("data-offscreen", !entry.isIntersecting)
+          const rect = entry.boundingClientRect
+          const bounds = entry.rootBounds
+          // Do not mark transiently collapsed (0x0) or pre-layout elements as offscreen so animations start running.
+          const trulyOffscreen =
+            !entry.isIntersecting &&
+            bounds !== null &&
+            (rect.height > 0 || rect.width > 0) &&
+            (rect.bottom < bounds.top || rect.top > bounds.bottom)
+          entry.target.toggleAttribute("data-offscreen", trulyOffscreen)
           pinVisible(entry.target)
         }),
       )

@@ -245,10 +245,14 @@ the model itself can read the credential axis through `key_health`
 - `GET /api/quotas` — each provider entry carries `keys[]`, one entry per stored
   credential in rotation order, so `keys[0]` is the key a request tries first:
   `credentialID`, `label`, `active`, `limited`, `cooldownUntilMs?`, `kind?`,
-  `failures?`, `usedCostUsd`, `usedRequests`. The array is omitted (never `null`)
-  when the provider owns no credential row
-  (`crates/oc-server/src/data/quotas/types.rs:66-71`,
-  `crates/oc-server/src/data/quotas/aggregate.rs:180-212`).
+  `failures?`, `usedCostUsd`, `usedRequests`, plus optional per-key live probe
+  fields (`status?`, `fetchedAtMs?`, `cached?`, `windows?`, `balances?`,
+  `spendSummary?`, `warnings?`, `error?`) for `LiveApi` providers when the
+  credential holds a usable secret. The array is omitted (never `null`) when
+  the provider owns no credential row
+  (`crates/oc-server/src/data/quotas/types.rs`,
+  `crates/oc-server/src/data/quotas/aggregate.rs`,
+  `crates/oc-server/src/data/quotas/providers.rs`).
 - `GET /api/models/registry` — a top-level `keyHealth[]` of
   `{providerID, credentialID?, untilMs, kind, failures}`, omitted when every key
   is healthy. This is the credential axis: it never hides a model, it only takes
@@ -283,9 +287,13 @@ guessing.
   key it switched to. Capped at 300 characters; a wider aggregate falls back to
   the single-line form. It never contains a credential id or key material.
 
-Limitation, deliberate and documented in the code: `usedCostUsd` and
-`usedRequests` are **always 0** (`crates/oc-server/src/data/quotas/aggregate.rs:206`).
-The usage rollup keys on `model.providerID` alone, so no per-key attribution
-exists; the fields stay on the wire so a client can render the column without a
-second shape once attribution lands. A zero is reported rather than a guessed
-split.
+Per-key local usage attribution (`usedCostUsd` and `usedRequests`) rolls up
+recorded assistant messages carrying `model.credentialID` (`oc_store::local_key_usage`,
+`crates/oc-server/src/data/quotas/usage.rs`), while historical rows without
+`credentialID` contribute only to provider totals rather than being split by guess.
+
+## Updates: Explicit `credentialID` preference and transport resilience
+
+- **`ModelRef.credentialID`**: optional `"env"` or stored credential id carried on `SessionInfo.model` and `LlmOptions.credential_id`. `Runtime::credential_pool_for` moves the preferred key first in the rotation order (`env` or matching `cred_id`) while retaining remaining healthy keys for same-model backup rotation (`RateLimit`, `Quota`, `Auth`, `Transport`, `EmptyResponse`), and forwards `LlmOptions.credential_id` to `oc-antigravity` gateway account selection.
+- **Durable pointer discipline**: only persistent credential-level failures (`FailureKind::Auth` and `FailureKind::Quota`) update the durable `credential.active` pointer in SQLite; transient `RateLimit`, `Transport`, and `EmptyResponse` failures apply in-memory cooldowns in `KeyPool` without mutating user/session default active credentials.
+- **Stream EOF / transport retries**: `stream.rs` retries `FailureKind::Transport` (`provider stream closed before completion`) and `FailureKind::EmptyResponse` across alternate healthy keys AND with bounded jittered exponential backoff (`TRANSPORT_MAX_ATTEMPTS = 3`), cleaning up partial empty-tool drafts before retrying so multi-step turns survive transient proxy/socket EOFs.

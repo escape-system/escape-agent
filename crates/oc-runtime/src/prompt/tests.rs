@@ -178,6 +178,7 @@ fn model_references_parse_both_shapes() {
             provider_id: "test".to_owned(),
             id: "alpha".to_owned(),
             variant: Some("fast".to_owned()),
+            credential_id: None,
         })
     );
     assert_eq!(
@@ -186,6 +187,31 @@ fn model_references_parse_both_shapes() {
             provider_id: "test".to_owned(),
             id: "alpha".to_owned(),
             variant: None,
+            credential_id: None,
         })
     );
+}
+
+#[test]
+fn harness_mechanics_guidance_filters_by_enabled_tools() {
+    let shell_tools = vec![
+        "shell".to_owned(),
+        "subagent".to_owned(),
+        "roster".to_owned(),
+    ];
+    let parts = system_prefix(
+        Some("Custom agent prompt"),
+        &shell_tools,
+        "/tmp/work",
+        false,
+        "",
+    );
+    assert!(parts[0].contains("## Harness Mechanics & Consequences"));
+    assert!(parts[0].contains("systemctl stop"));
+    assert!(parts[0].contains("roster(wait_seconds=...)"));
+
+    let readonly = vec!["read".to_owned()];
+    let ro_parts = system_prefix(Some("Custom readonly"), &readonly, "/tmp/work", false, "");
+    assert!(!ro_parts[0].contains("## Harness Mechanics & Consequences"));
+    assert!(!ro_parts[0].contains("systemctl stop"));
 }

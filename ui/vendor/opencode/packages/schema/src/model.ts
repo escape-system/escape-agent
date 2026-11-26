@@ -20,6 +20,7 @@ export const Ref = Schema.Struct({
   id: ID,
   providerID: Provider.ID,
   variant: VariantID.pipe(optional),
+  credentialID: Schema.String.pipe(optional),
 })
   .annotate({ identifier: "Model.Ref" })
   .pipe(

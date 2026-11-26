@@ -10,6 +10,9 @@ import { useModels } from "@/providers/models/models"
 import { cycleModelVariant, getConfiguredAgentVariant, resolveModelVariant } from "@/providers/models/variant"
 import { useComposerState } from "./persistence"
 import { useConfiguredModel } from "@/providers/models/configured"
+import { useIntegrations } from "@/providers/catalog/integrations"
+import { listProviderKeys, resolveIntegrationForProvider } from "@/providers/models/keys"
+import { useModelsRegistry } from "@/settings/models/api"
 import { useGlobal } from "@/runtime/server/runtime"
 import { composerModelLabelKey, composerModelLabels, composerProviderName } from "./model-label"
 
@@ -18,6 +21,8 @@ export function createComposerControls(input: { model?: ModelSelection } = {}) {
   const sdk = useWorkspaceLocation()
   const data = useData()
   const providers = useProviders(() => sdk().directory)
+  const integrations = useIntegrations(() => sdk().directory)
+  const registry = useModelsRegistry()
   const models = useGlobal().models
 
   const modelLabels = createMemo(() =>
@@ -93,6 +98,22 @@ export function createComposerControls(input: { model?: ModelSelection } = {}) {
   return createMemo<ComposerControls>(() => {
     const selection = input.model ?? local.model
     const key = selection.key()
+    const provider = key ? providers.all().get(key.providerID) : undefined
+    const integration = key
+      ? resolveIntegrationForProvider(integrations.list(), {
+          providerID: key.providerID,
+          integrationID: provider?.integrationID,
+        })
+      : undefined
+    const keyHealth = registry.query.data?.available ? registry.query.data.registry.keyHealth : undefined
+    const keyOptions = key
+      ? listProviderKeys({
+          integration,
+          providerID: key.providerID,
+          providerName: provider?.name,
+          keyHealth,
+        })
+      : []
 
     return {
       agents: {
@@ -112,6 +133,9 @@ export function createComposerControls(input: { model?: ModelSelection } = {}) {
             providers.connected().map((provider) => provider.id),
           ),
         label: key && modelLabels().get(composerModelLabelKey(key.providerID, key.modelID)),
+        integrationID: integration?.id ?? provider?.integrationID ?? key?.providerID,
+        directory: sdk().directory,
+        keys: keyOptions,
         paid: providers.paid().length > 0,
         // The session's model applies only to its agent, so resolve agents before showing a model.
         loading: loading(),
@@ -137,7 +161,16 @@ export function createComposerModelSelection(input: {
         if (!name || !previous || name === previous) return
         batch(() => {
           const model = prompt.model.current()
-          setRemembered(previous, model ? { providerID: model.providerID, modelID: model.modelID } : undefined)
+          setRemembered(
+            previous,
+            model
+              ? {
+                  providerID: model.providerID,
+                  modelID: model.modelID,
+                  ...(model.credentialID ? { credentialID: model.credentialID } : {}),
+                }
+              : undefined,
+          )
           prompt.model.set(remembered[name] ? { ...remembered[name] } : undefined)
         })
       },
@@ -216,9 +249,25 @@ export function createComposerModelSelection(input: {
       batch(() => {
         if (item && !valid(item)) return
         const previous = current()
+        const currentKey = key()
         const same = item && previous?.provider.id === item.providerID && previous.id === item.modelID
+        const sameProvider = item && previous?.provider.id === item.providerID
+        const credentialID = item
+          ? "credentialID" in item
+            ? item.credentialID
+            : sameProvider
+              ? currentKey?.credentialID
+              : undefined
+          : undefined
+        const nextModel = item
+          ? {
+              providerID: item.providerID,
+              modelID: item.modelID,
+              ...(credentialID ? { credentialID } : {}),
+            }
+          : undefined
         prompt.model.set(
-          item ? { ...item, variant: same ? (selection.variant.current() ?? null) : undefined } : undefined,
+          nextModel ? { ...nextModel, variant: same ? (selection.variant.current() ?? null) : undefined } : undefined,
         )
 
         if (!item) return
@@ -226,6 +275,30 @@ export function createComposerModelSelection(input: {
 
         if (options?.recent) models.recent.push(item)
       })
+    },
+    credential: {
+      current(item?: ModelKey) {
+        if (item && "credentialID" in item) return item.credentialID
+        const currentKey = key()
+        const selected = current()
+
+        if (!selected || !currentKey || currentKey.providerID !== selected.provider.id) return undefined
+
+        return currentKey.credentialID
+      },
+      set(credentialID: string | undefined) {
+        batch(() => {
+          const selected = current()
+
+          if (!selected) return
+          prompt.model.set({
+            providerID: selected.provider.id,
+            modelID: selected.id,
+            ...(credentialID ? { credentialID } : {}),
+            variant: selection.variant.current() ?? null,
+          })
+        })
+      },
     },
     visible: models.visible,
     setVisibility: models.setVisibility,
@@ -271,7 +344,13 @@ export function createComposerModelSelection(input: {
           const model = current()
 
           if (!model) return
-          prompt.model.set({ providerID: model.provider.id, modelID: model.id, variant: value ?? null })
+          const credentialID = key()?.credentialID
+          prompt.model.set({
+            providerID: model.provider.id,
+            modelID: model.id,
+            ...(credentialID ? { credentialID } : {}),
+            variant: value ?? null,
+          })
           models.variant.set({ providerID: model.provider.id, modelID: model.id }, value)
         })
       },

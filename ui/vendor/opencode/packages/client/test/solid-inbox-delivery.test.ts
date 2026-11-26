@@ -417,3 +417,31 @@ test("pending.status tracks synthetic peer inputs and message.hydrate bypasses s
     setup.dispose()
   }
 })
+
+test("session.inbox.delivered fetches timeline when delivered row was never seen in pending store", async () => {
+  const setup = fixture(async (request) => {
+    const path = new URL(request.url).pathname
+    if (path.endsWith("/message")) {
+      return Response.json({
+        data: [
+          {
+            id: "msg_missed_peer",
+            type: "user",
+            text: "Peer delivered while drawer closed",
+            time: { created: 20 },
+          },
+        ],
+        cursor: {},
+      })
+    }
+    return Response.json({ data: [], cursor: {} })
+  })
+  try {
+    setup.emit(delivered("msg_missed_peer", 20))
+    await wait(() => setup.requests.some((url) => url.pathname.endsWith("/message")))
+    await wait(() => setup.data.session.message.list(SESSION).some((m) => m.id === "msg_missed_peer"))
+    expect(setup.data.session.message.list(SESSION).map((item) => item.id)).toContain("msg_missed_peer")
+  } finally {
+    setup.dispose()
+  }
+})

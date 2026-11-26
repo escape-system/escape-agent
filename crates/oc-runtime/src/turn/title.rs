@@ -373,6 +373,7 @@ fn select_minimal_same_model(
         id: turn_ref.id.clone(),
         provider_id: turn_ref.provider_id.clone(),
         variant: Some(minimal),
+        credential_id: turn_ref.credential_id.clone(),
     };
     client
         .resolve_model(catalog, &minimal_ref.to_reference())

@@ -238,6 +238,7 @@ as `state="failed"` instead of hanging the parent.
   "description": "short label shown in the tree",
   "prompt": "task text",
   "model": "provider/model#variant",   // optional
+  "key": "cred_… | label | env",       // optional: pin credential for this child (main agent picks)
   "sessionID": "ses_…",                // continue a direct child / descendant
   "background": true,
   "role": "worker",                    // worker | coordinator
@@ -509,3 +510,10 @@ is `opencode-go/hy4-flash-free` unless the user explicitly approves a change.
 | Sibling storm | `max_messages_per_min` per sender, after `can_message`; exhaustion is a tool **error** (`BudgetError: rate limit reached …`), not a queued warning |
 | Write storm | `max_writes_per_min` per sender, consumed after `can_write` and before any enqueue/interrupt; exhaustion is the same structured `BudgetError` and no inbox row is written |
 | Lane runner interrupted | On boot a `running` ticket becomes `failed` (`exit: -1`, restart reason); queued tickets replay, ids are never reused |
+
+## Roster semantics (updated)
+
+- Active status check: only `status == "busy"` is treated as active; `"completed"`, `"failed"`, `"interrupted"`, `"archived"`, `"suspended"`, and `"idle"` are settled terminal states.
+- `roster(wait_seconds=...)` snapshots active (`status == "busy"`) children (or optional `target` sessions) and existing caller inbox ids on entry. It wakes only when a watched active session leaves `"busy"` OR a **new** unread inbox item arrives (preventing 0 ms busy-loops on pre-existing queued rows), driven by runtime event bus notifications rather than tight 200 ms SQLite polling.
+- Enriched `roster` entries include `status`, `parentID`, `depth`, `role`, `idleOutcome`, `idleReason`, `lastError`, `model`, `childCount`, `pendingInbox`, and `time`, alongside `counts`, `wakeReason`, and `settledIDs` on the outer response. No transcript body is exposed through `roster`.
+- Main-agent `subagent(..., key=...)`: main agents can select a specific provider key (`credentialID`, label, or `"env"`) per spawn, stored on the child's `SessionInfo.model.credentialID`. When omitted under `ModelSource::Parent`, the child inherits the parent session's `credentialID` if provider matches. Subagent peer messages posted through `POST /api/experimental/subagent/:SID/message` use materialized inbox delivery (`enqueue_materialized`) just like `talk` and `session_write`, guaranteeing timeline persistence across reloads.

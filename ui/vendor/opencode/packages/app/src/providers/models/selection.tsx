@@ -22,6 +22,7 @@ const ModelKeySchema = Schema.Struct({
   providerID: Schema.String,
   modelID: Schema.String,
   variant: Schema.optional(Schema.String),
+  credentialID: Schema.optional(Schema.String),
 })
 
 export type ModelKey = typeof ModelKeySchema.Type
@@ -284,7 +285,11 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
       return (
         scope()?.model ??
         (session?.model && (!session.agent || session.agent === agent.current()?.name)
-          ? { providerID: session.model.providerID, modelID: session.model.id }
+          ? {
+              providerID: session.model.providerID,
+              modelID: session.model.id,
+              ...(session.model.credentialID ? { credentialID: session.model.credentialID } : {}),
+            }
           : undefined) ??
         firstModel(() => agent.current()?.model, fallback)
       )
@@ -310,7 +315,11 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
       if (!session?.model || (draft?.agent && draft.agent !== session.agent)) return
 
       return {
-        model: { providerID: session.model.providerID, modelID: session.model.id },
+        model: {
+          providerID: session.model.providerID,
+          modelID: session.model.id,
+          ...(session.model.credentialID ? { credentialID: session.model.credentialID } : {}),
+        },
         selected: session.model.variant ?? null,
       }
     }
@@ -347,10 +356,19 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
 
     const snapshot = () => {
       const selected = current()
+      const currentKey = key()
 
       return {
         agent: agent.current()?.name,
-        model: selected ? { providerID: selected.provider.id, modelID: selected.id } : undefined,
+        model: selected
+          ? {
+              providerID: selected.provider.id,
+              modelID: selected.id,
+              ...(currentKey?.providerID === selected.provider.id && currentKey.credentialID
+                ? { credentialID: currentKey.credentialID }
+                : {}),
+            }
+          : undefined,
         variant: selected ? (model.variant.current() ?? null) : undefined,
       } satisfies State
     }
@@ -389,6 +407,7 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
       a.agent === b.agent &&
       a.model?.providerID === b.model?.providerID &&
       a.model?.modelID === b.model?.modelID &&
+      (a.model?.credentialID ?? undefined) === (b.model?.credentialID ?? undefined) &&
       (a.variant ?? "default") === (b.variant ?? "default")
 
     const reconcile = (sessionID: string) => {
@@ -400,7 +419,11 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
       if (
         !sameSelection(expected, {
           agent: session.agent,
-          model: { providerID: session.model.providerID, modelID: session.model.id },
+          model: {
+            providerID: session.model.providerID,
+            modelID: session.model.id,
+            ...(session.model.credentialID ? { credentialID: session.model.credentialID } : {}),
+          },
           variant: session.model.variant,
         })
       )
@@ -459,8 +482,24 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
         batch(() => {
           if (item && !validModel(item)) return
           const previous = current()
+          const previousKey = key()
           const same = item && previous?.provider.id === item.providerID && previous.id === item.modelID
-          write({ model: item, variant: same ? (model.variant.current() ?? null) : undefined })
+          const sameProvider = item && previous?.provider.id === item.providerID
+          const credentialID = item
+            ? "credentialID" in item
+              ? item.credentialID
+              : sameProvider
+                ? previousKey?.credentialID
+                : undefined
+            : undefined
+          const nextModel = item
+            ? {
+                providerID: item.providerID,
+                modelID: item.modelID,
+                ...(credentialID ? { credentialID } : {}),
+              }
+            : undefined
+          write({ model: nextModel, variant: same ? (model.variant.current() ?? null) : undefined })
 
           if (!item) return
 
@@ -471,6 +510,32 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
           if (!options?.recent) return
           models.recent.push(item)
         })
+      },
+      credential: {
+        current(item?: ModelKey) {
+          if (item && "credentialID" in item) return item.credentialID
+          const currentKey = key()
+          const selected = current()
+
+          if (!selected || !currentKey || currentKey.providerID !== selected.provider.id) return undefined
+
+          return currentKey.credentialID
+        },
+        set(credentialID: string | undefined) {
+          batch(() => {
+            const selected = current()
+
+            if (!selected) return
+            write({
+              model: {
+                providerID: selected.provider.id,
+                modelID: selected.id,
+                ...(credentialID ? { credentialID } : {}),
+              },
+              variant: model.variant.current() ?? null,
+            })
+          })
+        },
       },
       visible(item: ModelKey) {
         return models.visible(item)
@@ -504,7 +569,15 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
             const model = current()
 
             if (!model) return
-            write({ model: { providerID: model.provider.id, modelID: model.id }, variant: value ?? null })
+            const credentialID = key()?.credentialID
+            write({
+              model: {
+                providerID: model.provider.id,
+                modelID: model.id,
+                ...(credentialID ? { credentialID } : {}),
+              },
+              variant: value ?? null,
+            })
             models.variant.set({ providerID: model.provider.id, modelID: model.id }, value)
           })
         },
@@ -545,7 +618,11 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
             selection &&
             sameSelection(next, {
               agent: created.agent,
-              model: { providerID: selection.providerID, modelID: selection.id },
+              model: {
+                providerID: selection.providerID,
+                modelID: selection.id,
+                ...(selection.credentialID ? { credentialID: selection.credentialID } : {}),
+              },
               variant: selection.variant,
             })
               ? { choices: next.choices }
@@ -587,5 +664,8 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
   },
 })
 
-export type ModelSelection = Omit<ReturnType<typeof useLocal>["model"], "trackSessionCommit" | "preview"> &
-  Partial<Pick<ReturnType<typeof useLocal>["model"], "trackSessionCommit" | "preview">>
+export type ModelSelection = Omit<
+  ReturnType<typeof useLocal>["model"],
+  "trackSessionCommit" | "preview" | "credential"
+> &
+  Partial<Pick<ReturnType<typeof useLocal>["model"], "trackSessionCommit" | "preview" | "credential">>

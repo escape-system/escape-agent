@@ -671,6 +671,7 @@ async fn apply_command_selection(
                 variant: parsed
                     .variant
                     .filter(|v| !v.eq_ignore_ascii_case("default")),
+                credential_id: None,
             };
             let previous = session
                 .get("model")

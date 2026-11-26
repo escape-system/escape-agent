@@ -45,6 +45,9 @@ import { useOpenSessionRoute } from "../session-identity-header"
 import { resolveSessionComposerSelection } from "./selection"
 import { composerModelLabelKey, composerModelLabels, composerProviderName } from "@/composer/model-label"
 import { useProviders } from "@/providers/catalog/providers"
+import { useIntegrations } from "@/providers/catalog/integrations"
+import { listProviderKeys, resolveIntegrationForProvider, resolveSubagentKeyLabel } from "@/providers/models/keys"
+import { useModelsRegistry } from "@/settings/models/api"
 import { SubagentBar } from "./subagent-bar"
 import { createPeerFeed } from "../agent-panels/agent-events"
 import { SessionGoalChip } from "../agent-panels/goal-chip"
@@ -305,8 +308,16 @@ export function createActiveSessionRegion(input: {
     model: () => {
       const selection = controls().model.selection
       const model = selection.current()
+      const credentialID = selection.credential?.current()
 
-      return model ? { id: model.id, providerID: model.provider.id, variant: selection.variant.current() } : undefined
+      return model
+        ? {
+            id: model.id,
+            providerID: model.provider.id,
+            variant: selection.variant.current(),
+            ...(credentialID ? { credentialID } : {}),
+          }
+        : undefined
     },
   })
   command.register("palette", () => [
@@ -527,6 +538,8 @@ export function ActiveSessionComposerRegion(props: {
   }
 
   const providers = useProviders(() => props.session.data.info()?.location.directory)
+  const integrations = useIntegrations(() => props.session.data.info()?.location.directory)
+  const registry = useModelsRegistry()
 
   const modelLabels = createMemo(() =>
     composerModelLabels(
@@ -542,6 +555,19 @@ export function ActiveSessionComposerRegion(props: {
 
     if (!ref) return
     const label = modelLabels().get(composerModelLabelKey(ref.providerID, ref.id))
+    const provider = providers.all().get(ref.providerID)
+    const integration = resolveIntegrationForProvider(integrations.list(), {
+      providerID: ref.providerID,
+      integrationID: provider?.integrationID,
+    })
+    const keyHealth = registry.query.data?.available ? registry.query.data.registry.keyHealth : undefined
+    const keys = listProviderKeys({
+      integration,
+      providerID: ref.providerID,
+      providerName: provider?.name,
+      keyHealth,
+    })
+    const key = resolveSubagentKeyLabel({ credentialID: ref.credentialID, keys })
 
     return {
       provider: label
@@ -553,6 +579,7 @@ export function ActiveSessionComposerRegion(props: {
           ),
       name: label?.model ?? ref.id,
       variant: ref.variant,
+      key,
     }
   }
 

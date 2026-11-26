@@ -82,7 +82,7 @@ function topRow(scroller: ReturnType<typeof timelineScroller>) {
 
 test.use({ viewport: { width: 390, height: 844 }, hasTouch: true, isMobile: true, serviceWorkers: "block" })
 
-test("the static splash is visible before JS and is replaced by the app shell", async ({ page }) => {
+test("the app boots directly into the composer without a static splash", async ({ page }) => {
   const workspace = await mockWorkspace(page, {
     name: "VerifyStartup",
     sessions: [{ id: sessionID, title: "Verify startup" }],
@@ -94,10 +94,9 @@ test("the static splash is visible before JS and is replaced by the app shell", 
   const started = Date.now()
   await page.goto(sessionHref(sessionID, workspace.server), { waitUntil: "commit" })
   const splash = page.locator("[data-opencode-splash]")
-  await expect(splash).toBeVisible({ timeout: 5_000 })
-  await page.screenshot({ path: test.info().outputPath("startup-splash.png") })
+  await expect(splash).toHaveCount(0)
 
-  // The app replaces the splash with the real composer; no permanent empty #root.
+  // The app renders the real composer directly without any full-screen loading gate.
   const editor = page.locator('[data-component="composer-editor"]')
   await expect(editor).toBeVisible({ timeout: 30_000 })
   await expect(splash).toHaveCount(0)

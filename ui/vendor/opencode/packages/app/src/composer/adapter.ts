@@ -7,6 +7,7 @@ import type { SessionMessageHandoff } from "@/session/handoff"
 import type { ComposerStateTarget } from "./submission-state"
 import type { createComposerSubmission } from "./submission-state"
 import type { ComposerModelLabel } from "./model-label"
+import type { ProviderKeyOption } from "@/providers/models/keys"
 
 export type ComposerControls = {
   agents: {
@@ -20,6 +21,9 @@ export type ComposerControls = {
     selection: ModelSelection
     providerName?: string
     label?: ComposerModelLabel
+    integrationID?: string
+    directory?: string
+    keys?: ProviderKeyOption[]
     paid: boolean
     loading: boolean
     /** While loading, the expected model's names from a catalog already loaded for another Location. */
@@ -29,7 +33,7 @@ export type ComposerControls = {
 
 export type ComposerSelection = {
   agent: string
-  model: { providerID: string; modelID: string }
+  model: { providerID: string; modelID: string; credentialID?: string }
   variant?: string
 }
 
@@ -94,7 +98,7 @@ export type ComposerSession = {
   current: Accessor<
     | {
         agent?: string
-        model?: { id: string; providerID: string; variant?: string }
+        model?: { id: string; providerID: string; variant?: string; credentialID?: string }
         revert?: { messageID: string }
       }
     | undefined

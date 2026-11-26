@@ -17,97 +17,13 @@
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
     <meta property="og:image" content="/social-share.png" />
     <meta property="twitter:image" content="/social-share.png" />
-    <!--
-      Critical splash styles are inline so the first paint is branded before any stylesheet request resolves. The
-      splash lives in the static document and entry.tsx drops it right after the first Solid commit (index.html has
-      no other boot UI, so an empty #root used to be a black screen for the whole locale/health probe).
-    -->
-    <style>
-      [data-opencode-splash] {
-        position: fixed;
-        inset: 0;
-        z-index: 2147483647;
-        display: grid;
-        place-items: center;
-        background: radial-gradient(120% 80% at 50% 0%, #16130d 0%, #050505 62%);
-        color: #e9e4d8;
-        font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
-      }
-      [data-opencode-splash] .oc-splash-stack {
-        display: flex;
-        flex-direction: column;
-        align-items: center;
-        gap: 18px;
-        padding: 24px;
-        text-align: center;
-      }
-      [data-opencode-splash] .oc-splash-mark {
-        width: 56px;
-        height: 56px;
-        object-fit: contain;
-        opacity: 0.95;
-      }
-      [data-opencode-splash] .oc-splash-wordmark {
-        font-size: 13px;
-        font-weight: 600;
-        letter-spacing: 0.42em;
-        text-indent: 0.42em;
-        color: #e8dcc0;
-      }
-      [data-opencode-splash] .oc-splash-bar {
-        position: relative;
-        width: 148px;
-        height: 2px;
-        overflow: hidden;
-        border-radius: 999px;
-        background: rgba(232, 220, 192, 0.14);
-      }
-      [data-opencode-splash] .oc-splash-bar::after {
-        content: "";
-        position: absolute;
-        inset: 0;
-        width: 40%;
-        border-radius: inherit;
-        background: linear-gradient(90deg, rgba(232, 220, 192, 0), #d8b46a, rgba(232, 220, 192, 0));
-        animation: oc-splash-slide 1.15s ease-in-out infinite;
-      }
-      [data-opencode-splash] .oc-splash-hint {
-        font-size: 11px;
-        letter-spacing: 0.08em;
-        color: rgba(233, 228, 216, 0.55);
-      }
-      @keyframes oc-splash-slide {
-        0% {
-          transform: translateX(-120%);
-        }
-        100% {
-          transform: translateX(320%);
-        }
-      }
-      @media (prefers-reduced-motion: reduce) {
-        [data-opencode-splash] .oc-splash-bar::after {
-          animation: none;
-          width: 100%;
-          opacity: 0.5;
-        }
-      }
-    </style>
     <script id="oc-theme-preload-script" src="/oc-theme-preload.js"></script>
   </head>
   <body
     class="antialiased overscroll-none font-(family-name:--font-family-text) text-[13px] font-[440] overflow-hidden bg-v2-background-bg-deep"
   >
     <noscript>You need to enable JavaScript to run this app.</noscript>
-    <div id="root" class="flex flex-col h-dvh bg-v2-background-bg-deep p-px">
-      <div data-opencode-splash role="status" aria-live="polite" aria-label="Escape Agent is loading">
-        <div class="oc-splash-stack">
-          <img class="oc-splash-mark" src="/brand/escape-agent-mark.png" alt="" width="56" height="56" />
-          <div class="oc-splash-wordmark">ESCAPE AGENT</div>
-          <div class="oc-splash-bar" aria-hidden="true"></div>
-          <div class="oc-splash-hint">Loading…</div>
-        </div>
-      </div>
-    </div>
+    <div id="root" class="flex flex-col h-dvh bg-v2-background-bg-deep p-px"></div>
     <script src="/src/entry.tsx" type="module"></script>
   </body>
 </html>

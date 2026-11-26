@@ -22,6 +22,7 @@ export const CredentialInfo = Schema.Struct({
   label: Schema.String,
   /** Whether the connection stores a key, an OAuth grant, or an external credential-source reference. */
   method: Schema.Literals(["key", "oauth", "external"]),
+  active: optional(Schema.Boolean),
   status: optional(Status),
 }).annotate({ identifier: "Connection.CredentialInfo" })
 

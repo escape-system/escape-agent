@@ -1,6 +1,6 @@
 import type { SessionInfo } from "@opencode/client/promise"
 import { Key } from "@solid-primitives/keyed"
-import { createEffect, createMemo, createSignal, For, Index, onCleanup, Show } from "solid-js"
+import { createMemo, For, Index, onCleanup, Show } from "solid-js"
 import { createStore, type SetStoreFunction } from "solid-js/store"
 import { InlineInput } from "@opencode/ui/inline-input"
 import { Loader } from "@opencode/ui/loader"
@@ -9,7 +9,6 @@ import { Icon } from "@opencode/ui/icon"
 import { IconButton } from "@opencode/ui/icon-button"
 import { Menu } from "@opencode/ui/menu"
 import { Tooltip } from "@opencode/ui/tooltip"
-import { prefersReducedMotion } from "@opencode/ui/motion"
 import { useLanguage } from "@/runtime/i18n/language"
 import { ServerConnection } from "@/runtime/server/registry"
 import { SessionTabAvatarView } from "@/shell/layout/session-tab-avatar"
@@ -32,14 +31,6 @@ const HOME_SECTION_LABEL = "text-v2-text-text-muted [font-weight:440]"
 const HOME_SESSION_SEARCH_RESULTS_ID = "home-session-search-results"
 
 const HOME_SESSION_LONG_PRESS_MS = 500
-
-const HOME_SESSION_PLACEHOLDER_DELAY_MS = 250
-
-// Matches the list's reveal animation in view.css.
-const HOME_SESSION_REVEAL_MS = 200
-
-// Title widths for the placeholder rows, as a share of the row's label area.
-const HOME_SESSION_PLACEHOLDER_WIDTHS = [56, 38, 66, 46, 30, 52]
 
 // Middle-click or Cmd+click on macOS (Ctrl+click elsewhere) opens a session
 // tab in the background without navigating, matching browser conventions.
@@ -108,17 +99,6 @@ export function HomeSessionsView(props: HomeSessionsViewProps) {
   const [rowUI, setRowUI] = createStore<HomeSessionRowUI>({ menu: undefined, editor: undefined })
   const [hover, setHover] = createStore<{ sessionID: string | undefined }>({ sessionID: undefined })
   const showLocations = createAltHold(props.desktop, props.onRevealLocations)
-  // A list that arrives within the delay paints directly; slower loads show placeholder rows until it does, which stay
-  // mounted while the list fades in over them.
-  const [placeholder, setPlaceholder] = createSignal(false)
-
-  createEffect(() => {
-    const timer = props.loading
-      ? setTimeout(() => setPlaceholder(true), HOME_SESSION_PLACEHOLDER_DELAY_MS)
-      : setTimeout(() => setPlaceholder(false), prefersReducedMotion() ? 0 : HOME_SESSION_REVEAL_MS)
-
-    onCleanup(() => clearTimeout(timer))
-  })
 
   return (
     <section
@@ -161,18 +141,10 @@ export function HomeSessionsView(props: HomeSessionsViewProps) {
       </div>
       <div
         data-slot="home-sessions-list"
-        data-reveal={placeholder() || undefined}
         class="relative -mr-3 min-h-[calc(100cqh-64px)] md:min-h-[calc(100cqh-72px)] lg:min-h-[calc(100cqh-96px)]"
         aria-busy={props.loading}
       >
-        <Show when={placeholder()}>
-          <HomeSessionSkeleton
-            visible={props.loading}
-            showProjectName={props.showProjectName}
-            desktop={props.desktop}
-          />
-        </Show>
-        <Show when={!props.loading}>
+        <Show when={!props.loading || props.groups.length > 0}>
           <Show
             when={props.groups.length > 0}
             fallback={
@@ -937,35 +909,6 @@ function HomeSessionsEmpty(props: { onNewSession?: () => void; language: ReturnT
           </Button>
         )}
       </Show>
-    </div>
-  )
-}
-
-function HomeSessionSkeleton(props: { visible: boolean; showProjectName: boolean; desktop: boolean }) {
-  return (
-    <div
-      data-component="home-session-skeleton"
-      data-visible={props.visible || undefined}
-      aria-hidden="true"
-      class="pointer-events-none absolute inset-x-0 top-0 pt-1 pr-3 md:pt-3"
-    >
-      <div class="h-7" />
-      <div class="flex min-w-0 flex-col gap-px pt-2 md:pt-4">
-        <For each={HOME_SESSION_PLACEHOLDER_WIDTHS}>
-          {(width) => (
-            <div
-              class="flex h-10 min-w-0 items-center ps-1.5 pe-3 md:ps-3 md:pe-10"
-              classList={{ "gap-1.5": props.desktop, "gap-2": !props.desktop, "max-md:h-12": props.showProjectName }}
-            >
-              <span class="size-4 shrink-0 rounded-[4px] bg-v2-background-bg-layer-02" />
-              <span class="h-2 rounded-full bg-v2-background-bg-layer-02" style={{ width: `${width}%` }} />
-              <Show when={props.showProjectName}>
-                <span class="h-2 w-16 shrink-0 rounded-full bg-v2-background-bg-layer-01" />
-              </Show>
-            </div>
-          )}
-        </For>
-      </div>
     </div>
   )
 }

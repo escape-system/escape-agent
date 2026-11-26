@@ -49,7 +49,7 @@ pub(super) async fn build_unified_quotas(
         None => BTreeSet::new(),
     };
 
-    let usage_map = if allow_probe {
+    let usage = if allow_probe {
         usage_for(state, now_ms, force_refresh).await?
     } else {
         usage_cached(state, now_ms).await
@@ -82,9 +82,9 @@ pub(super) async fn build_unified_quotas(
         // Every id in this set came from `active_provider_ids`, so the entry is
         // connected by construction; nothing re-adds an inactive provider.
         let connected = active_ids.contains(&id);
-        let usage = usage_map.get(&id).cloned();
+        let provider_usage = usage.providers.get(&id).cloned();
         let rate_limit = rate_limit_map.remove(&id);
-        let probe = probe_results.get(&id);
+        let probe = probe_results.providers.get(&id);
         let entry = build_provider_entry(ProviderEntryInput {
             provider_id: id,
             connected,
@@ -94,14 +94,21 @@ pub(super) async fn build_unified_quotas(
             ag_refresh: ag_refresh.as_ref(),
             probe,
             rate_limit,
-            usage,
+            usage: provider_usage,
             openrouter_mgmt,
             openrouter_source,
         });
         providers.push(entry);
     }
 
-    attach_provider_keys(state, now_ms, &mut providers).await;
+    attach_provider_keys(
+        state,
+        now_ms,
+        &mut providers,
+        &probe_results.keys,
+        &usage.keys,
+    )
+    .await;
 
     providers.sort_by(|a, b| {
         provider_sort_rank(a)
@@ -176,19 +183,18 @@ fn collect_rate_limits(state: &AppState) -> BTreeMap<String, ProviderRateLimit> 
     map
 }
 
-/// Join every provider's stored credentials with its per-key rotation state.
+/// Join every provider's stored credentials with its per-key rotation state,
+/// per-key live quota probe (when available), and attributed local usage.
 ///
 /// Order is the store's rotation order (active first, then ids ascending), so
 /// `keys[0]` is the key a request would try first. Providers that own no
 /// credential row keep an empty list, which the wire omits entirely.
-///
-/// `usedCostUsd` / `usedRequests` stay `0.0`/`0`: the usage rollup keys on
-/// `model.providerID` only (`quotas/usage.rs`), so a per-key split does not
-/// exist. Reporting a share of the provider total here would be invented data.
 async fn attach_provider_keys(
     state: &AppState,
     now_ms: i64,
     providers: &mut [super::types::ProviderQuotaEntry],
+    key_probes: &BTreeMap<(String, String), (oc_llm::ProviderQuotaProbeResult, bool)>,
+    key_usage: &super::types::KeyUsageMap,
 ) {
     let Some(store) = state.store() else {
         return;
@@ -214,20 +220,57 @@ async fn attach_provider_keys(
                     item.provider == provider_key
                         && item.credential_id.as_deref() == Some(row.id.as_str())
                 });
-                super::types::ProviderKeyEntry {
-                    credential_id: row.id,
-                    label: row.label,
-                    active: row.active,
-                    limited: cooling.is_some(),
-                    cooldown_until_ms: cooling.map(|item| item.until_ms),
-                    kind: cooling.map(|item| item.kind.as_str().to_owned()),
-                    failures: cooling.map(|item| item.failures),
-                    // No per-key usage attribution exists yet: the rollup is
-                    // keyed by provider only. Zero, not a guessed split.
-                    used_cost_usd: 0.0,
-                    used_requests: 0,
-                }
+                let cache_key = (entry.provider_id.clone(), row.id.clone());
+                let (used_cost_usd, used_requests) =
+                    key_usage.get(&cache_key).copied().unwrap_or((0.0, 0));
+                let probe = key_probes.get(&cache_key);
+                build_provider_key_entry(
+                    row.id,
+                    row.label,
+                    row.active,
+                    cooling,
+                    used_cost_usd,
+                    used_requests,
+                    probe,
+                )
             })
             .collect();
+    }
+}
+
+fn build_provider_key_entry(
+    credential_id: String,
+    label: String,
+    active: bool,
+    cooling: Option<&oc_llm::KeyHealthEntry>,
+    used_cost_usd: f64,
+    used_requests: u64,
+    probe: Option<&(oc_llm::ProviderQuotaProbeResult, bool)>,
+) -> super::types::ProviderKeyEntry {
+    super::types::ProviderKeyEntry {
+        credential_id,
+        label,
+        active,
+        limited: cooling.is_some(),
+        cooldown_until_ms: cooling.map(|item| item.until_ms),
+        kind: cooling.map(|item| item.kind.as_str().to_owned()),
+        failures: cooling.map(|item| item.failures),
+        used_cost_usd,
+        used_requests,
+        status: probe.map(|(p, _)| super::types::probe_status(p)),
+        fetched_at_ms: probe.map(|(p, _)| p.fetched_at_ms),
+        cached: probe.map(|(_, cached)| *cached),
+        windows: probe
+            .map(|(p, _)| {
+                p.windows
+                    .iter()
+                    .map(super::types::QuotaWindowEntry::from_probe)
+                    .collect()
+            })
+            .unwrap_or_default(),
+        balances: probe.map(|(p, _)| p.balances.clone()).unwrap_or_default(),
+        spend_summary: probe.and_then(|(p, _)| p.spend_summary.clone()),
+        warnings: probe.map(|(p, _)| p.warnings.clone()).unwrap_or_default(),
+        error: probe.and_then(|(p, _)| p.error.clone()),
     }
 }

@@ -14,7 +14,7 @@ export type SubagentStatus = "running" | "succeeded" | "failed" | "interrupted"
 // the run's state and duration, the agent, model and variant, and the way back.
 export function SubagentBar(props: {
   agent?: string
-  model?: { provider?: string; name: string; variant?: string }
+  model?: { provider?: string; name: string; variant?: string; key?: string }
   status?: SubagentStatus
   started: number
   ended?: number
@@ -98,6 +98,17 @@ export function SubagentBar(props: {
                           <>
                             <span class="sr-only">{" "}</span>
                             <span class="ms-1 shrink-0 capitalize opacity-[0.66]">{variant()}</span>
+                          </>
+                        )}
+                      </Show>
+                      <Show when={model().key}>
+                        {(key) => (
+                          <>
+                            <Slash gap={4} />
+                            <span class="sr-only">{" / "}</span>
+                            <span data-slot="subagent-model-key" class="truncate opacity-[0.82]">
+                              {key()}
+                            </span>
                           </>
                         )}
                       </Show>

@@ -69,6 +69,13 @@ impl Runtime {
             .await?;
             changed = true;
         }
+        if changed {
+            self.inner
+                .subagents
+                .lock()
+                .expect("subagent state")
+                .clear_queue_ids_seen(session);
+        }
         Ok(changed)
     }
 

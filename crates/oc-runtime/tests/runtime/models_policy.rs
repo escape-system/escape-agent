@@ -574,11 +574,18 @@ async fn assert_turn_fails_without_fallback(
     message: &str,
     models_cfg: Value,
 ) {
-    let harness = Harness::new(
-        vec![Script::Failure {
+    let expected_attempts = match kind {
+        oc_llm::FailureKind::Transport | oc_llm::FailureKind::EmptyResponse => 3,
+        _ => 1,
+    };
+    let scripts = (0..expected_attempts)
+        .map(|_| Script::Failure {
             kind,
             message: message.to_owned(),
-        }],
+        })
+        .collect();
+    let harness = Harness::new(
+        scripts,
         Arc::new(AllowAll),
         json!({ "models": models_cfg }),
         None,
@@ -587,8 +594,18 @@ async fn assert_turn_fails_without_fallback(
     harness.prompt("hi").await;
     harness.wait_for_event("session.execution.failed").await;
 
-    assert_eq!(harness.model.calls(), 1, "only the chosen model is tried");
-    assert_eq!(harness.model.requests()[0].model.model.model_id, "alpha");
+    let requests = harness.model.requests();
+    assert_eq!(
+        requests.len(),
+        expected_attempts,
+        "only bounded same-model attempts are tried: {requests:?}"
+    );
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.model.model.model_id == "alpha"),
+        "every attempt stayed on chosen model alpha without chain fallback: {requests:?}"
+    );
     assert_eq!(harness.sink.count("session.model.fallback"), 0);
     assert!(!harness.sink.has("session.execution.succeeded"));
 
@@ -655,6 +672,35 @@ async fn rate_limit_failure_does_not_fallback_to_chain() {
         }),
     )
     .await;
+}
+
+#[tokio::test]
+async fn transport_stream_closed_recovers_on_retry_within_same_model() {
+    let harness = Harness::new(
+        vec![
+            Script::Failure {
+                kind: oc_llm::FailureKind::Transport,
+                message: "provider stream closed before completion".to_owned(),
+            },
+            text_script("recovered after drop"),
+        ],
+        Arc::new(AllowAll),
+        json!({ "models": { "chain": ["test/alpha", "test/beta"] } }),
+        None,
+    )
+    .await;
+    harness.prompt("hi").await;
+    harness.wait_for_event("session.execution.succeeded").await;
+
+    let requests = harness.model.requests();
+    assert_eq!(requests.len(), 2, "retried once on transient drop");
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.model.model.model_id == "alpha"),
+        "retry stayed on chosen model alpha: {requests:?}"
+    );
+    assert_eq!(harness.sink.count("session.model.fallback"), 0);
 }
 
 /// Waits until the inbox row is consumed and every compaction row settled,

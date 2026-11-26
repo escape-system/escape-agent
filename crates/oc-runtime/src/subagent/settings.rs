@@ -775,6 +775,7 @@ pub(super) fn model_value(
         id: resolved.model.id.clone(),
         provider_id: resolved.model.provider_id.clone(),
         variant: resolved.variant.as_ref().map(|variant| variant.id.clone()),
+        credential_id: None,
     };
     let mut value = Map::new();
     value.insert("id".to_owned(), Value::String(model_ref.id));

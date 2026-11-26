@@ -1087,4 +1087,45 @@ describe("Composer submission", () => {
       expect(statuses).toEqual(["idle", "running"])
     })
   })
+
+  test("submits selected credentialID via switchModel and skips redundant switch when unchanged", async () => {
+    const calls: unknown[] = []
+    const keyedSelection: ModelSelection = {
+      ...selection,
+      credential: {
+        current: () => "cred_2",
+        set() {},
+      },
+    }
+    const keyedControls = (): ComposerControls => ({
+      ...controls(),
+      model: { selection: keyedSelection, paid: true, loading: false },
+    })
+    let savedCred: string | undefined = "cred_1"
+
+    const target = session({
+      calls: [],
+      current: () => ({
+        agent: "build",
+        model: { id: "model-1", providerID: "provider-1", variant: "balanced", credentialID: savedCred },
+      }),
+      switchModel: async (req) => {
+        calls.push(req)
+        savedCred = req.model.credentialID
+      },
+    })
+
+    const state1 = createMemoryComposerState({ prompt: "hello" }).capture()
+    await submitInput(active(state1, target, keyedControls)).submit(new Event("submit"))
+    expect(calls).toEqual([
+      {
+        sessionID: "session-1",
+        model: { providerID: "provider-1", id: "model-1", variant: "balanced", credentialID: "cred_2" },
+      },
+    ])
+
+    const state2 = createMemoryComposerState({ prompt: "again" }).capture()
+    await submitInput(active(state2, target, keyedControls)).submit(new Event("submit"))
+    expect(calls).toHaveLength(1)
+  })
 })

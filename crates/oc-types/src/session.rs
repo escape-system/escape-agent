@@ -56,6 +56,10 @@ pub struct ModelRef {
     pub provider_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub variant: Option<String>,
+    /// Explicit provider credential preference (`credentialID` or `"env"`).
+    /// Omitted when the default active/env resolution applies.
+    #[serde(rename = "credentialID", skip_serializing_if = "Option::is_none")]
+    pub credential_id: Option<String>,
 }
 
 impl ModelRef {
@@ -65,6 +69,7 @@ impl ModelRef {
             id: id.into(),
             provider_id: provider_id.into(),
             variant: None,
+            credential_id: None,
         }
     }
 

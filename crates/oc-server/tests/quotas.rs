@@ -178,17 +178,20 @@ fn mock_opencode_go_routes(counters: MockProviderCounters) -> Router {
         get(move |headers: HeaderMap| {
             let ctr = Arc::clone(&usage_ctr);
             async move {
-                if headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok())
-                    != Some("Bearer oc-go-test-key")
-                {
-                    return (
-                        StatusCode::UNAUTHORIZED,
-                        axum::Json(json!({
-                            "type": "error",
-                            "error": {"type": "AuthError", "message": "Unauthorized"}
-                        })),
-                    );
-                }
+                let auth = headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok());
+                let (rolling, weekly, monthly) = match auth {
+                    Some("Bearer oc-go-test-key") => (0, 79, 46),
+                    Some("Bearer oc-go-test-key-2") => (35, 12, 8),
+                    _ => {
+                        return (
+                            StatusCode::UNAUTHORIZED,
+                            axum::Json(json!({
+                                "type": "error",
+                                "error": {"type": "AuthError", "message": "Unauthorized"}
+                            })),
+                        );
+                    }
+                };
                 ctr.fetch_add(1, Ordering::SeqCst);
                 (
                     StatusCode::OK,
@@ -196,17 +199,17 @@ fn mock_opencode_go_routes(counters: MockProviderCounters) -> Router {
                         "usage": {
                             "rolling": {
                                 "status": "ok",
-                                "percent": 0,
+                                "percent": rolling,
                                 "resetsAt": "2026-11-14T17:47:39.000Z"
                             },
                             "weekly": {
                                 "status": "ok",
-                                "percent": 79,
+                                "percent": weekly,
                                 "resetsAt": "2026-11-16T00:00:00.000Z"
                             },
                             "monthly": {
                                 "status": "ok",
-                                "percent": 46,
+                                "percent": monthly,
                                 "resetsAt": "2026-12-08T00:59:56.000Z"
                             }
                         }
@@ -1414,4 +1417,143 @@ async fn quotas_surface_nous_research_rate_limits_and_local_usage() {
         nous["localUsage"]["topModels"][0]["modelID"],
         "google/gemini-4-hydrogen"
     );
+}
+
+async fn seed_attributed_go_keys(parts: &HarnessParts) {
+    parts
+        .store
+        .create_credential(NewCredential {
+            id: Some("cred_go".to_owned()),
+            integration_id: "opencode-go".to_owned(),
+            label: Some("OpenCode Go".to_owned()),
+            value: json!({ "type": "key", "key": "oc-go-test-key" }),
+            active: Some(true),
+        })
+        .await
+        .unwrap();
+    parts
+        .store
+        .create_credential(NewCredential {
+            id: Some("cred_go_2".to_owned()),
+            integration_id: "opencode-go".to_owned(),
+            label: Some("OpenCode Go".to_owned()),
+            value: json!({ "type": "key", "key": "oc-go-test-key-2" }),
+            active: Some(false),
+        })
+        .await
+        .unwrap();
+    parts
+        .store
+        .create_credential(NewCredential {
+            id: Some("cred_go_bad".to_owned()),
+            integration_id: "opencode-go".to_owned(),
+            label: Some("OpenCode Go".to_owned()),
+            value: json!({ "type": "key", "key": "oc-go-invalid" }),
+            active: Some(false),
+        })
+        .await
+        .unwrap();
+
+    let now = now_millis();
+    for (idx, (cred_id, cost)) in [
+        (Some("cred_go"), 1.25),
+        (Some("cred_go_2"), 0.35),
+        (None, 0.50),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut model = json!({ "providerID": "opencode-go", "id": "glm-5" });
+        if let Some(cid) = cred_id {
+            model["credentialID"] = json!(cid);
+        }
+        let created = now - 60_000 + i64::try_from(idx).unwrap() * 1_000;
+        parts
+            .store
+            .append_message(NewMessage {
+                id: format!("msg_go_attr_{idx}"),
+                session_id: "ses_quota_history".to_owned(),
+                kind: "assistant".to_owned(),
+                data: json!({
+                    "model": model,
+                    "tokens": { "input": 100, "output": 50, "reasoning": 0, "cache": { "read": 0, "write": 0 } },
+                    "cost": cost,
+                    "time": { "created": created }
+                }),
+                time_created: created,
+            })
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn quotas_probe_multiple_credentials_and_attribute_key_usage() {
+    let parts = harness_parts().await;
+    seed_attributed_go_keys(&parts).await;
+
+    let app = router(state_from(&parts));
+    let (status, body) = call(&app, Method::POST, "/api/quotas/refresh", None).await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    let body = body.unwrap();
+    assert_no_nulls(&body, "$");
+
+    let go = find_provider(&body, "opencode-go");
+    assert_eq!(go["status"], "ok", "{go}");
+    assert_eq!(go["windows"][1]["id"], "weekly");
+    assert_eq!(go["windows"][1]["usedPercent"], 79.0);
+
+    let keys = go["keys"].as_array().expect("opencode-go keys");
+    assert_eq!(keys.len(), 3, "{go}");
+    assert_eq!(keys[0]["credentialID"], "cred_go");
+    assert_eq!(keys[0]["active"], true);
+    assert_eq!(keys[0]["status"], "ok");
+    assert_eq!(keys[0]["usedRequests"], 1);
+    assert!((keys[0]["usedCostUsd"].as_f64().unwrap() - 1.25).abs() < 1e-6);
+    assert_eq!(keys[0]["windows"][1]["usedPercent"], 79.0);
+    assert_eq!(keys[0]["windows"][1]["remainingPercent"], 21.0);
+
+    let k2 = keys
+        .iter()
+        .find(|k| k["credentialID"] == "cred_go_2")
+        .expect("cred_go_2 present");
+    assert_eq!(k2["active"], false);
+    assert_eq!(k2["status"], "ok", "{k2}");
+    assert_eq!(k2["usedRequests"], 1);
+    assert!((k2["usedCostUsd"].as_f64().unwrap() - 0.35).abs() < 1e-6);
+    assert_eq!(k2["windows"][0]["usedPercent"], 35.0);
+    assert_eq!(k2["windows"][0]["remainingPercent"], 65.0);
+    assert_eq!(k2["windows"][1]["usedPercent"], 12.0);
+    assert_eq!(k2["windows"][1]["remainingPercent"], 88.0);
+    assert_eq!(k2["windows"][2]["usedPercent"], 8.0);
+    assert_eq!(k2["windows"][2]["remainingPercent"], 92.0);
+
+    let bad = keys
+        .iter()
+        .find(|k| k["credentialID"] == "cred_go_bad")
+        .expect("cred_go_bad present");
+    assert_eq!(bad["status"], "error", "{bad}");
+    assert!(
+        bad["error"].as_str().is_some_and(|s| !s.is_empty()),
+        "{bad}"
+    );
+    assert_eq!(bad["usedRequests"], 0);
+    assert_eq!(bad["usedCostUsd"], 0.0);
+
+    // Activating cred_go_2 via the HTTP control plane invalidates the cache
+    // and promotes cred_go_2 to keys[0] + provider primary windows.
+    let (status, _) = call(
+        &app,
+        Method::POST,
+        "/api/credential/cred_go_2/activate",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, after) = call(&app, Method::GET, "/api/quotas?refresh=true", None).await;
+    assert_eq!(status, StatusCode::OK, "{after:?}");
+    let after = after.unwrap();
+    let go_after = find_provider(&after, "opencode-go");
+    assert_eq!(go_after["keys"][0]["credentialID"], "cred_go_2");
+    assert_eq!(go_after["windows"][1]["usedPercent"], 12.0);
 }

@@ -65,6 +65,15 @@ pub struct LocalModelUsageRow {
     pub all_time: WindowSum,
 }
 
+/// Cumulative local usage grouped by `(provider_id, credential_id)` in SQLite.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LocalKeyUsageRow {
+    pub provider_id: String,
+    pub credential_id: String,
+    pub requests: u64,
+    pub cost_usd: f64,
+}
+
 const SQL: &str = "
 SELECT json_extract(m.data,'$.model.providerID') provider_id,
        json_extract(m.data,'$.model.id') model_id,
@@ -145,6 +154,35 @@ FROM rows
 WHERE ts >= session_created
 GROUP BY provider_id, model_id";
 
+const LOCAL_KEY_USAGE_SQL: &str = "
+WITH rows AS (
+  SELECT
+    json_extract(m.data, '$.model.providerID') AS provider_id,
+    json_extract(m.data, '$.model.credentialID') AS credential_id,
+    CASE
+      WHEN json_type(m.data, '$.time') IS NULL THEN m.time_created
+      WHEN json_type(m.data, '$.time.created') IN ('integer', 'real') THEN CAST(json_extract(m.data, '$.time.created') AS INTEGER)
+      ELSE 0
+    END AS ts,
+    s.time_created AS session_created,
+    CASE WHEN json_type(m.data, '$.cost') IN ('integer', 'real') THEN CAST(json_extract(m.data, '$.cost') AS REAL) ELSE 0.0 END AS cost_val
+  FROM session_message m
+  JOIN session_v2 s ON s.id = m.session_id
+  WHERE m.type = 'assistant'
+    AND json_type(m.data, '$.model.providerID') = 'text'
+    AND json_extract(m.data, '$.model.providerID') != ''
+    AND json_type(m.data, '$.model.credentialID') = 'text'
+    AND json_extract(m.data, '$.model.credentialID') != ''
+)
+SELECT
+  provider_id,
+  credential_id,
+  CAST(COUNT(*) AS INTEGER),
+  CAST(SUM(cost_val) AS REAL)
+FROM rows
+WHERE ts >= session_created
+GROUP BY provider_id, credential_id";
+
 /// Roll up assistant messages created at or after `since_ms` (epoch ms).
 ///
 /// `since_ms` is an absolute lower bound, not a window length: callers compute
@@ -212,6 +250,27 @@ pub fn local_provider_usage(
     Ok(out)
 }
 
+/// Roll up all-time requests and cost per `(provider_id, credential_id)`.
+///
+/// Only assistant messages explicitly carrying `model.credentialID` contribute
+/// here; historical messages without a credential id are omitted instead of
+/// attributed by guess.
+pub fn local_key_usage(connection: &Connection) -> Result<Vec<LocalKeyUsageRow>, StoreError> {
+    let mut statement = connection.prepare_cached(LOCAL_KEY_USAGE_SQL)?;
+    let mut rows = statement.query([])?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        let requests: i64 = row.get(2)?;
+        out.push(LocalKeyUsageRow {
+            provider_id: row.get(0)?,
+            credential_id: row.get(1)?,
+            requests: u64::try_from(requests).unwrap_or(0),
+            cost_usd: row.get(3)?,
+        });
+    }
+    Ok(out)
+}
+
 impl Store {
     /// Per-model usage since `since_ms` (epoch ms), highest cost first.
     pub async fn model_usage(&self, since_ms: i64) -> Result<Vec<ModelUsageRow>, StoreError> {
@@ -226,6 +285,11 @@ impl Store {
     ) -> Result<Vec<LocalModelUsageRow>, StoreError> {
         self.read(move |connection| local_provider_usage(connection, now_ms))
             .await
+    }
+
+    /// All-time local usage rollup grouped by `(provider_id, credential_id)`.
+    pub async fn local_key_usage(&self) -> Result<Vec<LocalKeyUsageRow>, StoreError> {
+        self.read(|connection| local_key_usage(connection)).await
     }
 
     /// Per-model usage since `since_ms` restricted to `session_ids`.
@@ -602,5 +666,83 @@ mod tests {
             .expect("scoped fork");
         assert_eq!(scoped_fork.len(), 1);
         assert_eq!(scoped_fork[0].model_id, "gpt-5");
+    }
+
+    #[tokio::test]
+    async fn local_key_usage_groups_by_credential_and_skips_unattributed_rows() {
+        let store = Store::open_memory().await.expect("memory store");
+        let now_ms = 5_000_000_000_i64;
+        seed_window_test_data(&store, now_ms).await;
+
+        store
+            .append_message(NewMessage {
+                id: "msg_cred_1".to_owned(),
+                session_id: "ses_primary".to_owned(),
+                kind: "assistant".to_owned(),
+                data: json!({
+                    "model": {
+                        "providerID": "opencode-go",
+                        "id": "glm-5",
+                        "credentialID": "cred_go_1"
+                    },
+                    "cost": 1.25,
+                    "time": { "created": now_ms - 10_000 }
+                }),
+                time_created: now_ms - 10_000,
+            })
+            .await
+            .expect("append cred 1");
+        store
+            .append_message(NewMessage {
+                id: "msg_cred_2".to_owned(),
+                session_id: "ses_primary".to_owned(),
+                kind: "assistant".to_owned(),
+                data: json!({
+                    "model": {
+                        "providerID": "opencode-go",
+                        "id": "glm-5",
+                        "credentialID": "cred_go_2"
+                    },
+                    "cost": 0.40,
+                    "time": { "created": now_ms - 5_000 }
+                }),
+                time_created: now_ms - 5_000,
+            })
+            .await
+            .expect("append cred 2");
+        store
+            .append_message(NewMessage {
+                id: "msg_cred_none".to_owned(),
+                session_id: "ses_primary".to_owned(),
+                kind: "assistant".to_owned(),
+                data: json!({
+                    "model": {
+                        "providerID": "opencode-go",
+                        "id": "glm-5"
+                    },
+                    "cost": 9.99,
+                    "time": { "created": now_ms - 2_000 }
+                }),
+                time_created: now_ms - 2_000,
+            })
+            .await
+            .expect("append unattributed");
+
+        let rows = store.local_key_usage().await.expect("key usage");
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        let k1 = rows
+            .iter()
+            .find(|r| r.credential_id == "cred_go_1")
+            .expect("cred_go_1");
+        assert_eq!(k1.provider_id, "opencode-go");
+        assert_eq!(k1.requests, 1);
+        assert!((k1.cost_usd - 1.25).abs() < 1e-6);
+
+        let k2 = rows
+            .iter()
+            .find(|r| r.credential_id == "cred_go_2")
+            .expect("cred_go_2");
+        assert_eq!(k2.requests, 1);
+        assert!((k2.cost_usd - 0.40).abs() < 1e-6);
     }
 }

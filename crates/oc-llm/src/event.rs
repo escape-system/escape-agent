@@ -216,6 +216,8 @@ pub struct LlmOptions {
     pub max_output_tokens: Option<u64>,
     /// Explicit credential. When absent the client checks the provider's env vars.
     pub api_key: Option<String>,
+    /// Explicit stored credential identifier (or `"env"`) requested by caller.
+    pub credential_id: Option<String>,
     /// Extra request headers. Provider/model/variant overlays are applied first, these last.
     pub headers: BTreeMap<String, String>,
     /// `auto`, `none`, `required`, or a specific tool name.

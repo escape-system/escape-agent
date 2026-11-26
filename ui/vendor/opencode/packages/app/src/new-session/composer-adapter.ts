@@ -100,6 +100,7 @@ export function createNewSessionComposerAdapter(props: {
           id: selection.model.modelID,
           providerID: selection.model.providerID,
           variant: selection.variant,
+          ...(selection.model.credentialID ? { credentialID: selection.model.credentialID } : {}),
         },
         location: { directory: sessionDirectory },
       })

@@ -7,7 +7,8 @@ use std::collections::BTreeMap;
 
 use oc_antigravity::AccountStatusSummary;
 use oc_llm::{
-    ProviderApiSpend, ProviderBalanceSummary, ProviderRateLimit, QuotaCapability, QuotaWindow,
+    ProviderApiSpend, ProviderBalanceSummary, ProviderQuotaProbeResult, ProviderRateLimit,
+    QuotaCapability, QuotaWindow,
 };
 use serde::Serialize;
 
@@ -82,17 +83,37 @@ pub(super) struct ProviderQuotaEntry {
     pub(super) error: Option<String>,
 }
 
-/// One stored credential of a provider, joined with its rotation state.
+/// Normalize a probe result's wire `status` string.
+pub(super) fn probe_status(probe: &ProviderQuotaProbeResult) -> String {
+    if probe.error.is_some() {
+        "error".to_owned()
+    } else if probe.status == "ok" && !probe.warnings.is_empty() {
+        "partial".to_owned()
+    } else {
+        probe.status.clone()
+    }
+}
+
+/// All-time `(cost_usd, requests)` per `(provider_id, credential_id)`.
+pub(super) type KeyUsageMap = BTreeMap<(String, String), (f64, u64)>;
+
+/// Cached local usage snapshot covering both provider windows and per-key totals.
+#[derive(Debug, Clone, Default)]
+pub(super) struct UsageSnapshot {
+    pub(super) providers: BTreeMap<String, ProviderLocalUsage>,
+    pub(super) keys: KeyUsageMap,
+}
+
+/// One stored credential of a provider, joined with its rotation state, live
+/// per-key quota probe (for `LiveApi` providers), and attributed local usage.
 ///
 /// `limited`/`cooldown_until_ms`/`kind`/`failures` come from the runtime-owned
 /// [`oc_llm::KeyPool`]; `active` is the stored selection from `oc_store`. A
 /// provider with several credentials lists them in rotation order, so `keys[0]`
 /// is the key a request would try first.
 ///
-/// `used_cost_usd` / `used_requests` are always `0`: the usage rollup keys on
-/// `model.providerID` alone (see `quotas/usage.rs`), so per-key attribution does
-/// not exist yet. They stay on the wire so a client can render the column
-/// without a second shape once attribution lands.
+/// `used_cost_usd` / `used_requests` reflect assistant messages carrying this
+/// `credentialID` in `model.credentialID`.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct ProviderKeyEntry {
@@ -111,6 +132,22 @@ pub(super) struct ProviderKeyEntry {
     pub(super) used_cost_usd: f64,
     #[serde(rename = "usedRequests")]
     pub(super) used_requests: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) status: Option<String>,
+    #[serde(rename = "fetchedAtMs", skip_serializing_if = "Option::is_none")]
+    pub(super) fetched_at_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) cached: Option<bool>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(super) windows: Vec<QuotaWindowEntry>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(super) balances: Vec<ProviderBalanceSummary>,
+    #[serde(rename = "spendSummary", skip_serializing_if = "Option::is_none")]
+    pub(super) spend_summary: Option<ProviderApiSpend>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(super) warnings: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) error: Option<String>,
 }
 
 /// Where the `OpenRouter` management key the probe uses comes from.

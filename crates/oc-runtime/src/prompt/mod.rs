@@ -250,6 +250,54 @@ fn append_workspace_and_workflow_routing(prompt: &mut String, tool_names: &[Stri
              60-70% of the model's context window, or before starting a long multi-step task.\n",
         );
     }
+    append_harness_mechanics(prompt, tool_names);
+}
+
+fn append_harness_mechanics(prompt: &mut String, tool_names: &[String]) {
+    let mut notes: Vec<&'static str> = Vec::new();
+    if has_tool(tool_names, "shell") {
+        notes.push(
+            "- `shell` process & cgroup rules: shell commands inherit the server cgroup and turn cancellation token. \
+             NEVER run `systemctl stop`, `systemctl restart`, or `systemctl reload` on the host service directly in `shell` (it terminates the server and kills your own shell mid-command under `KillMode=control-group`); for service restarts use `systemd-run --on-active=1 ...` or hand off to the user. Avoid spawning unmanaged background daemons or `sleep` polling loops.",
+        );
+    }
+    if has_tool(tool_names, "subagent") {
+        notes.push(
+            "- `subagent` consequences: runs in the background by default unless `background: false`. Only pass `model` when intentionally choosing a catalog-verified model; omit it to follow configured defaults/parent model. When you have multiple keys on a provider (check `key_health`), pass `key` (credential id, label, or `\"env\"`) to pin a child to a specific key; omit `key` to inherit the parent session key.",
+        );
+    }
+    if has_tool(tool_names, "roster") {
+        notes.push(
+            "- `roster(wait_seconds=...)`: waits only for active (`status == \"busy\"`) children or newly arrived unread inbox items, and returns terminal states (`completed`, `failed`, `interrupted`), `idleReason`, `lastError`, `counts`, `wakeReason`, and `callerInbox` without reading transcripts (use `digest` to read a child's output/transcript). If `wakeReason == \"inbox\"` or `callerInbox` lists pending queue items while children remain busy, finish your step instead of spinning on `roster` so queued messages can deliver.",
+        );
+    }
+    if has_tool(tool_names, "talk") || has_tool(tool_names, "session_write") {
+        notes.push(
+            "- Peer messaging (`talk` / `session_write`): messages materialize immediately onto the recipient's main timeline (`metadata.source = \"peer\"`) and wake idle recipients automatically (`subagents.siblings.wake`). Respect write/message rate limits (`max_writes_per_min` / `max_messages_per_min`); `session_write` targets descendants only.",
+        );
+    }
+    if has_tool(tool_names, "box_write") || has_tool(tool_names, "box_read") {
+        notes.push(
+            "- Shared context boxes (`box_*`): scoped to the root session tree (not persistent cross-session memory). Call `box_list` before creating new keys, and persist verified file findings/plans concisely rather than large raw dumps.",
+        );
+    }
+    if has_tool(tool_names, "verify_on_stop") {
+        notes.push(
+            "- Stop verification (`verify_on_stop`): commands registered here execute automatically before the session settles idle (`finish: \"stop\"`); if any check fails, the turn re-enters repair instead of stopping cleanly.",
+        );
+    }
+    if has_tool(tool_names, "key_health") {
+        notes.push(
+            "- Credential health (`key_health`): lists active/backup credentials and in-memory cooldowns without exposing secrets; transient transport/rate-limit errors rotate/retry automatically without changing your durable primary key unless `auth` or `quota` is hit.",
+        );
+    }
+    if !notes.is_empty() {
+        prompt.push_str("\n## Harness Mechanics & Consequences\n");
+        for note in notes {
+            prompt.push_str(note);
+            prompt.push('\n');
+        }
+    }
 }
 
 /// The two-part system prefix: base prompt, then the builtin instructions.

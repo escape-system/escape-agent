@@ -379,7 +379,7 @@ export type LocationPublicInfo = {
   project: { id: ProjectID; directory: AbsolutePath; canonical: AbsolutePath }
 }
 
-export type ModelRef = { id: string; providerID: ProviderID; variant?: string }
+export type ModelRef = { id: string; providerID: ProviderID; variant?: string; credentialID?: string }
 
 export type ProviderCache = { ttl?: ProviderCacheTTL }
 
@@ -741,6 +741,7 @@ export type ConnectionCredentialInfo = {
   id: CredentialID
   label: string
   method: "key" | "oauth" | "external"
+  active?: boolean
   status?: ConnectionStatus
 }
 
@@ -3196,7 +3197,15 @@ export type SessionCreateInput = {
   readonly parentID?: string | null | undefined
   readonly title?: string | null | undefined
   readonly agent?: string | null | undefined
-  readonly model?: { readonly id: string; readonly providerID: string; readonly variant?: string } | null | undefined
+  readonly model?:
+    | {
+        readonly id: string
+        readonly providerID: string
+        readonly variant?: string
+        readonly credentialID?: string
+      }
+    | null
+    | undefined
   readonly location?: { readonly directory: string } | null | undefined
   readonly metadata?: { readonly [x: string]: JsonValue } | null | undefined
   readonly permissions?:
@@ -3227,7 +3236,12 @@ export type SessionSwitchAgentOutput = void
 
 export type SessionSwitchModelInput = {
   readonly sessionID: string
-  readonly model: { readonly id: string; readonly providerID: string; readonly variant?: string }
+  readonly model: {
+    readonly id: string
+    readonly providerID: string
+    readonly variant?: string
+    readonly credentialID?: string
+  }
 }
 
 export type SessionSwitchModelOutput = void
@@ -3673,7 +3687,12 @@ export type ExperimentalSessionImportInput = {
     }
     readonly projectID: string
     readonly agent?: string
-    readonly model?: { readonly id: string; readonly providerID: string; readonly variant?: string }
+    readonly model?: {
+      readonly id: string
+      readonly providerID: string
+      readonly variant?: string
+      readonly credentialID?: string
+    }
     readonly cost: number
     readonly tokens: {
       readonly input: number

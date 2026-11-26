@@ -221,6 +221,12 @@ pub(crate) async fn run_execution(
     if !begin_execution(runtime, session, &directory, inbox_id, handle).await? {
         return Ok(());
     }
+    runtime
+        .inner
+        .subagents
+        .lock()
+        .expect("subagent state")
+        .clear_queue_ids_seen(session);
 
     let mut turn = match runtime.resolve_turn(&info, &directory).await {
         Ok(turn) => turn,
@@ -259,6 +265,12 @@ pub(crate) async fn run_execution(
     // has many `?` early returns, so any epilogue inside it is bypassable.
     // This is the single point every `run_steps` exit flows through.
     runtime.reset_step_budget(session);
+    runtime
+        .inner
+        .subagents
+        .lock()
+        .expect("subagent state")
+        .clear_queue_ids_seen(session);
     let outcome = outcome?;
     // A step-limited turn still answered on its final, tool-less request; it is
     // treated like a success for memory/scribe, but settles with the qualifier.

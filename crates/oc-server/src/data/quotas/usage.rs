@@ -10,13 +10,16 @@ use crate::AppState;
 use crate::error::ErrorResponse;
 
 use super::CACHE_TTL_MS;
-use super::types::{ModelUsageRow, ProviderLocalUsage, ProviderUsageAccum, UsageWindowTotals};
+use super::types::{
+    KeyUsageMap, ModelUsageRow, ProviderLocalUsage, ProviderUsageAccum, UsageSnapshot,
+    UsageWindowTotals,
+};
 
 /// In-process rollup of the session/message scan the UI polls every 60 s.
 #[derive(Debug, Default)]
 pub(super) struct UsageCache {
     computed_at_ms: i64,
-    providers: BTreeMap<String, ProviderLocalUsage>,
+    snapshot: UsageSnapshot,
 }
 
 impl UsageCache {
@@ -25,37 +28,35 @@ impl UsageCache {
     }
 }
 
-/// Local usage per provider, from the 60 s cache unless a refresh was asked for.
+/// Local usage per provider and per credential, from the 60 s cache unless a
+/// refresh was asked for.
 pub(super) async fn usage_for(
     state: &AppState,
     now_ms: i64,
     force_refresh: bool,
-) -> Result<BTreeMap<String, ProviderLocalUsage>, ErrorResponse> {
+) -> Result<UsageSnapshot, ErrorResponse> {
     if !force_refresh {
         let cache = state.quota_cache().read().await;
         if cache.usage.is_fresh(now_ms) {
-            return Ok(cache.usage.providers.clone());
+            return Ok(cache.usage.snapshot.clone());
         }
     }
-    let providers = scan_local_usage(state.store(), now_ms).await?;
+    let snapshot = scan_local_usage(state.store(), now_ms).await?;
     state.quota_cache().write().await.usage = UsageCache {
         computed_at_ms: now_ms,
-        providers: providers.clone(),
+        snapshot: snapshot.clone(),
     };
-    Ok(providers)
+    Ok(snapshot)
 }
 
-/// Local usage from a fresh cache only: a stale or empty cache yields an empty
-/// map, so a cache-first GET never scans the store either.
-pub(super) async fn usage_cached(
-    state: &AppState,
-    now_ms: i64,
-) -> BTreeMap<String, ProviderLocalUsage> {
+/// Local usage from a fresh cache only: a stale or empty cache yields empty
+/// maps, so a cache-first GET never scans the store either.
+pub(super) async fn usage_cached(state: &AppState, now_ms: i64) -> UsageSnapshot {
     let cache = state.quota_cache().read().await;
     if cache.usage.is_fresh(now_ms) {
-        cache.usage.providers.clone()
+        cache.usage.snapshot.clone()
     } else {
-        BTreeMap::new()
+        UsageSnapshot::default()
     }
 }
 
@@ -79,11 +80,12 @@ fn add_window(target: &mut UsageWindowTotals, src: WindowSum) {
 async fn scan_local_usage(
     store: Option<&Arc<Store>>,
     now_ms: i64,
-) -> Result<BTreeMap<String, ProviderLocalUsage>, ErrorResponse> {
+) -> Result<UsageSnapshot, ErrorResponse> {
     let Some(store) = store else {
-        return Ok(BTreeMap::new());
+        return Ok(UsageSnapshot::default());
     };
     let rows = store.local_provider_usage(now_ms).await?;
+    let key_rows = store.local_key_usage().await?;
     let mut accums: BTreeMap<String, ProviderUsageAccum> = BTreeMap::new();
     for row in rows {
         let entry = accums.entry(row.provider_id).or_default();
@@ -107,10 +109,24 @@ async fn scan_local_usage(
         }
     }
 
-    Ok(accums
+    let providers = accums
         .into_iter()
         .map(|(provider_id, acc)| (provider_id, finalize_provider_usage(acc)))
-        .collect())
+        .collect();
+    let mut keys: KeyUsageMap = KeyUsageMap::new();
+    for row in key_rows {
+        let cost_usd = if row.cost_usd.is_finite() {
+            row.cost_usd
+        } else {
+            0.0
+        };
+        keys.insert(
+            (row.provider_id, row.credential_id),
+            (cost_usd, row.requests),
+        );
+    }
+
+    Ok(UsageSnapshot { providers, keys })
 }
 
 fn finalize_provider_usage(acc: ProviderUsageAccum) -> ProviderLocalUsage {

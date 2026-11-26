@@ -338,9 +338,35 @@ export function createData(config: CreateDataInput) {
     else consumedInbox.set(sessionID, new Set([inboxID]))
   }
 
+  const knownChildren = new Set<string>()
+  const snapshotActive = new Set<string>()
+
+  function isSettledSessionInfo(session: SessionInfo | undefined): boolean {
+    if (!session) return false
+    if (session.time?.archived !== undefined) return true
+    const busy = session.time?.busy
+    const idle = session.time?.idle
+    // A session mid-turn has busy > idle even if an earlier turn left an outcome.
+    if (busy !== undefined && (idle === undefined || busy > idle)) return false
+    if (idle !== undefined && busy !== undefined && idle >= busy) return true
+    if (snapshotActive.has(session.id)) return false
+    return session.outcome !== undefined
+  }
+
   function setSessionActive(sessionID: string, status: DataSessionStatus) {
     activeUpdates?.set(sessionID, status)
+    if (status === "idle") snapshotActive.delete(sessionID)
     setStore("session", "active", sessionID, status)
+  }
+
+  function reconcileSessionActiveFromInfo(sessions: SessionInfo[]) {
+    for (const session of sessions) {
+      if (!session?.id) continue
+      if (session.parentID) knownChildren.add(session.id)
+      if (!isSettledSessionInfo(session)) continue
+      if (activeUpdates && activeUpdates.get(session.id) === "running") continue
+      if (store.session.active[session.id] === "running") setSessionActive(session.id, "idle")
+    }
   }
 
   // Session IDs the user asked to stop before any execution boundary confirmed it. `status` reports them as idle so
@@ -759,6 +785,9 @@ export function createData(config: CreateDataInput) {
     switch (event.type) {
       case "server.connected": {
         livePending.clear()
+        const previousRunning = Object.entries(store.session.active).flatMap(([id, status]) =>
+          status === "running" ? [id] : [],
+        )
         const updates = new Map<string, DataSessionStatus | undefined>()
         activeUpdates = updates
         refresh(() =>
@@ -773,7 +802,19 @@ export function createData(config: CreateDataInput) {
                 snapshot.set(id, status)
               })
               activeUpdates = undefined
+              snapshotActive.clear()
+              snapshot.forEach((status, id) => {
+                if (status === "running") snapshotActive.add(id)
+              })
               setStore("session", "active", reconcile(Object.fromEntries(snapshot)))
+              // Reconcile any previously running sessions absent from `/api/session/active`
+              // so finished turns (`finish: "stop"`) sync immediately after SSE reconnects.
+              for (const id of previousRunning) {
+                if (snapshot.has(id)) continue
+                result.session.invalidate(id)
+                refresh(() => result.session.sync(id))
+                if (store.session.message[id]) refresh(() => result.session.message.sync(id))
+              }
               // Sessions created before this connection (while disconnected, or before the client started)
               // never delivered `session.created`; without their info a running child never joins its root's family.
               snapshot.forEach((status, id) => {
@@ -805,6 +846,7 @@ export function createData(config: CreateDataInput) {
         refresh(() => result.session.sync(event.data.sessionID))
         const parentID = event.data.parentID
         if (parentID) {
+          knownChildren.add(event.data.sessionID)
           result.session.invalidate(parentID)
           // The family sync is keyed apart from the plain session sync. Without invalidating it, a parent whose
           // family was already loaded answers `sync(parent, { children: true })` from the completed key and the
@@ -816,8 +858,12 @@ export function createData(config: CreateDataInput) {
         // Fetching pending inputs and projected messages separately lets promotion move an input between snapshots,
         // causing both requests to miss it and overwrite event-built state. Skip those racy initial reads until
         // hydration can load pending and projected messages atomically.
-        sync.complete(`session.pending:${event.data.sessionID}`)
-        sync.complete(`session.message:${event.data.sessionID}`)
+        // For child sessions spawned in background, keep initial message/pending keys uncompleted
+        // so opening the subagent always hydrates its initial prompt and peer history cleanly.
+        if (!parentID) {
+          sync.complete(`session.pending:${event.data.sessionID}`)
+          sync.complete(`session.message:${event.data.sessionID}`)
+        }
         return
       case "session.deleted":
         removeSession(event.data.sessionID)
@@ -984,7 +1030,16 @@ export function createData(config: CreateDataInput) {
             existing.time.created = event.created
             return
           }
-          if (!admitted || !pending) return
+          if (!pending) {
+            if (position === undefined) {
+              refresh(() => {
+                sync.invalidate(`session.message:${event.data.sessionID}`)
+                return result.session.message.sync(event.data.sessionID)
+              })
+            }
+            return
+          }
+          if (!admitted && pending.type !== "synthetic" && pending.type !== "user") return
           if (pending.type !== "user" && pending.type !== "synthetic") return
           const row =
             pending.type === "user"
@@ -1252,6 +1307,16 @@ export function createData(config: CreateDataInput) {
         message.editAssistant(event.data.sessionID, event.data.assistantMessageID, (assistant) => {
           assistant.retry = { attempt: event.data.attempt, at: event.data.at, error: event.data.error }
         })
+        return
+      case "session.status": {
+        const nextStatus: DataSessionStatus = event.data.status.type === "idle" ? "idle" : "running"
+        if (nextStatus === "idle") clearStopRequested(event.data.sessionID)
+        setSessionActive(event.data.sessionID, nextStatus)
+        return
+      }
+      case "session.idle":
+        clearStopRequested(event.data.sessionID)
+        setSessionActive(event.data.sessionID, "idle")
         return
       case "session.execution.started":
         // The server owns the state again: a requested stop that this execution outlived no longer applies.
@@ -1965,6 +2030,7 @@ export function createData(config: CreateDataInput) {
                 for (const session of sessions) draft[session.id] = session
               }),
             )
+            reconcileSessionActiveFromInfo(sessions)
             for (const session of sessions) {
               sync.complete(`session:${session.id}`)
               registerSession(session.id)
@@ -1986,9 +2052,11 @@ export function createData(config: CreateDataInput) {
         },
         sync(sessionID: string) {
           return sync.run(`session.message:${sessionID}`, async () => {
+            const isChildSession = knownChildren.has(sessionID) || !!store.session.info[sessionID]?.parentID
+            const baseLimit = config.initialMessageLimit?.() ?? messagePageLimit
             const response = await api().message.list({
               sessionID,
-              limit: config.initialMessageLimit?.() ?? messagePageLimit,
+              limit: isChildSession ? Math.max(baseLimit, 100) : baseLimit,
               order: "desc",
             })
             const fetched = response.data.toReversed().map(stored)

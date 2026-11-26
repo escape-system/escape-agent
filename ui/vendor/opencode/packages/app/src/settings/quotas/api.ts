@@ -123,6 +123,14 @@ export interface ProviderKeyEntry {
   failures?: number
   usedCostUsd?: number
   usedRequests?: number
+  status?: string
+  fetchedAtMs?: number
+  cached?: boolean
+  windows?: QuotaWindow[]
+  balances?: ProviderBalanceSummary[]
+  spendSummary?: ProviderApiSpend
+  warnings?: string[]
+  error?: string
 }
 
 export interface UsageWindowTotals {
@@ -231,14 +239,36 @@ export function parseProviderKeys(value: unknown): ProviderKeyEntry[] {
     const failures = optionalNumber(item.failures)
     const usedCostUsd = optionalNumber(item.usedCostUsd)
     const usedRequests = optionalNumber(item.usedRequests)
+    const status = typeof item.status === "string" && item.status.length > 0 ? item.status : undefined
+    const fetchedAtMs = optionalNumber(item.fetchedAtMs)
+    const cached = typeof item.cached === "boolean" ? item.cached : undefined
+    const windows = Array.isArray(item.windows)
+      ? (item.windows.filter(isRecord) as unknown as QuotaWindow[])
+      : undefined
+    const balances = Array.isArray(item.balances)
+      ? (item.balances.filter(isRecord) as unknown as ProviderBalanceSummary[])
+      : undefined
+    const spendSummary = isRecord(item.spendSummary)
+      ? (item.spendSummary as unknown as ProviderApiSpend)
+      : undefined
+    const warnings = Array.isArray(item.warnings)
+      ? item.warnings.filter((w): w is string => typeof w === "string" && w.length > 0)
+      : undefined
+    const error = typeof item.error === "string" && item.error.length > 0 ? item.error : undefined
 
     if (cooldownUntilMs !== undefined) key.cooldownUntilMs = cooldownUntilMs
     if (kind) key.kind = kind
     if (failures !== undefined) key.failures = failures
-    // Kept verbatim, never rendered: the server publishes 0 because per-key
-    // attribution does not exist, so showing it would report a fake spend.
     if (usedCostUsd !== undefined) key.usedCostUsd = usedCostUsd
     if (usedRequests !== undefined) key.usedRequests = usedRequests
+    if (status) key.status = status
+    if (fetchedAtMs !== undefined) key.fetchedAtMs = fetchedAtMs
+    if (cached !== undefined) key.cached = cached
+    if (windows && windows.length > 0) key.windows = windows
+    if (balances && balances.length > 0) key.balances = balances
+    if (spendSummary) key.spendSummary = spendSummary
+    if (warnings && warnings.length > 0) key.warnings = warnings
+    if (error) key.error = error
 
     return [key]
   })

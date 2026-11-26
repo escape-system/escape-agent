@@ -1500,6 +1500,100 @@ test("projects background user shell metadata from durable shell data", () => {
   }
 })
 
+test("reconciles stuck running sessions to idle on settled session.sync, session.idle, and missing reconnect snapshot", async () => {
+  const settled: SessionInfo = {
+    ...session(0),
+    id: "ses_settled",
+    parentID: "ses_root",
+    outcome: "succeeded",
+    time: { created: 1, updated: 10, busy: 5, idle: 10, viewed: 0 },
+  }
+  const setup = activityFixture(() => Response.json({ data: {} }), [settled])
+  try {
+    setup.data.session.setStatus("ses_settled", "running")
+    expect(setup.data.session.status("ses_settled")).toBe("running")
+    await setup.data.session.sync("ses_settled")
+    expect(setup.data.session.status("ses_settled")).toBe("idle")
+
+    setup.emit({
+      id: "evt_status_busy",
+      created: 11,
+      type: "session.status",
+      durable: { aggregateID: "ses_status", seq: 1, version: 1 },
+      data: { sessionID: "ses_status", status: { type: "busy" } },
+    } as unknown as OpenCodeEvent)
+    expect(setup.data.session.status("ses_status")).toBe("running")
+
+    setup.emit({
+      id: "evt_status_idle",
+      created: 12,
+      type: "session.idle",
+      durable: { aggregateID: "ses_status", seq: 2, version: 1 },
+      data: { sessionID: "ses_status" },
+    } as unknown as OpenCodeEvent)
+    expect(setup.data.session.status("ses_status")).toBe("idle")
+
+    setup.data.session.setStatus("ses_ghost", "running")
+    setup.emit({ type: "server.connected", data: {} })
+    await wait(() => setup.data.session.status("ses_ghost") === "idle")
+    expect(setup.data.session.status("ses_ghost")).toBe("idle")
+  } finally {
+    setup.dispose()
+  }
+})
+
+test("subagent session.created leaves message.sync ready and requests at least 100 initial messages", async () => {
+  const requests: string[] = []
+  const listeners = new Set<Parameters<CreateDataInput["event"]["listen"]>[0]>()
+  const api = OpenCode.make({
+    baseUrl: "http://opencode.local",
+    fetch: async (input, init) => {
+      const url = new URL((input instanceof Request ? input : new Request(input, init)).url)
+      requests.push(`${url.pathname}?${url.searchParams}`)
+      if (url.pathname === "/api/session/ses_child_init/message") {
+        return Response.json({
+          data: [{ id: "msg_peer_0", type: "user", text: "Initial peer task", time: { created: 1 } }],
+          cursor: {},
+        })
+      }
+      return Response.json({ data: {}, cursor: {} })
+    },
+  })
+  const setup = createRoot((dispose) => ({
+    data: createData({
+      api: () => api,
+      directory: "/project",
+      initialMessageLimit: () => 40,
+      event: {
+        on: () => () => {},
+        listen(handler) {
+          listeners.add(handler)
+          return () => listeners.delete(handler)
+        },
+      },
+    }),
+    emit: (details: OpenCodeEvent) => listeners.forEach((listener) => listener({ name: details.type, details })),
+    dispose,
+  }))
+  try {
+    setup.emit({
+      id: "evt_child_created",
+      created: 1,
+      type: "session.created",
+      durable: { aggregateID: "ses_child_init", seq: 1, version: 1 },
+      data: {
+        sessionID: "ses_child_init",
+        parentID: "ses_root",
+      },
+    } as unknown as OpenCodeEvent)
+    await setup.data.session.message.sync("ses_child_init")
+    expect(requests).toContain("/api/session/ses_child_init/message?limit=100&order=desc")
+    expect(setup.data.session.message.list("ses_child_init").map((m) => m.id)).toEqual(["msg_peer_0"])
+  } finally {
+    setup.dispose()
+  }
+})
+
 function modelInfo(name: string): ModelInfo {
   return {
     id: "chat",

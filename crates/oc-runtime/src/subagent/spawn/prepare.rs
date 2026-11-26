@@ -323,11 +323,32 @@ pub(super) async fn prepare_spawn_context(
         }
         rejected_models.push(skip.clone());
     }
-    let model_value = model_value(
+    let parent_info = load_info(runtime, caller).await?;
+    let mut model_value = model_value(
         &choice.reference,
         &runtime.inner.config.catalog.current(),
         &runtime.inner.config.client,
     )?;
+    let requested_key = optional_str(input, "key").or_else(|| optional_str(input, "credentialID"));
+    let chosen_provider = model_value
+        .get("providerID")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let chosen_credential = runtime
+        .resolve_spawn_credential(
+            &chosen_provider,
+            requested_key.as_deref(),
+            parent_info.model.as_ref(),
+            choice.source == oc_subagents::ModelSource::Parent,
+        )
+        .await
+        .map_err(ToolError::new)?;
+    if let Some(cid) = chosen_credential
+        && let Some(obj) = model_value.as_object_mut()
+    {
+        obj.insert("credentialID".to_owned(), Value::String(cid));
+    }
     let created_model: Option<oc_types::ModelRef> =
         serde_json::from_value(model_value.clone()).ok();
     // Key cooldowns for the chosen model's provider, so the caller can see that
@@ -399,7 +420,6 @@ pub(super) async fn prepare_spawn_context(
         }
         _ => None,
     };
-    let parent_info = load_info(runtime, caller).await?;
     let role = requested_role(input, settings, agent);
     let lane = optional_str(input, "lane");
     let group = optional_str(input, "group").and_then(|g| {

@@ -9,15 +9,14 @@ const keyframes = "spinner-radar"
 
 const dots = radarDots()
 
-// The keyframes are added to the document once, the first time a spinner renders.
-let added = false
+const STYLE_ID = "oc-spinner-radar-styles"
 
 export function Spinner(props: ComponentProps<"svg"> & { "data-component"?: string }) {
   const [local, rest] = splitProps(props, ["class", "classList", "data-component"])
 
-  if (!added) {
-    added = true
+  if (typeof document !== "undefined" && !document.getElementById(STYLE_ID)) {
     const style = document.createElement("style")
+    style.id = STYLE_ID
     style.textContent = radarKeyframes(keyframes)
     document.head.append(style)
   }

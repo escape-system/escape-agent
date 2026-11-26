@@ -13,6 +13,7 @@ pub(crate) struct SubagentState {
     pub(super) digests: DigestCache,
     pub(super) digest_rate: std::collections::HashMap<String, VecDeque<i64>>,
     pub(super) active_watchers: HashSet<(String, String)>,
+    pub(super) seen_queue_inbox_ids: std::collections::HashMap<String, HashSet<String>>,
 }
 
 impl SubagentState {
@@ -43,6 +44,30 @@ impl SubagentState {
         self.writes
             .entry(session.to_owned())
             .or_insert_with(|| WriteBudget::from_limits(limits))
+    }
+
+    pub(super) fn has_unseen_queue_ids(&self, session: &str, ids: &[String]) -> bool {
+        let Some(seen) = self.seen_queue_inbox_ids.get(session) else {
+            return !ids.is_empty();
+        };
+        ids.iter().any(|id| !seen.contains(id))
+    }
+
+    pub(super) fn mark_queue_ids_seen(&mut self, session: &str, ids: &[String]) {
+        if ids.is_empty() {
+            return;
+        }
+        let seen = self
+            .seen_queue_inbox_ids
+            .entry(session.to_owned())
+            .or_default();
+        for id in ids {
+            seen.insert(id.clone());
+        }
+    }
+
+    pub(crate) fn clear_queue_ids_seen(&mut self, session: &str) {
+        self.seen_queue_inbox_ids.remove(session);
     }
 }
 

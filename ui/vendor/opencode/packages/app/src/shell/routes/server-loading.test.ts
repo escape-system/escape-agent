@@ -207,23 +207,30 @@ describe("ServerStatusPane", () => {
 })
 
 describe("ServerProvider", () => {
-  test("renders a visible connecting pane, never an empty node, while health is undefined", () => {
+  test("mounts children immediately while health is undefined without blocking behind a connecting pane", () => {
     setHealth({})
     const { host } = mount(() => createComponent(ServerProvider, { conn, children: (() => "session-content") as never }))
 
+    expect(host.querySelector('[data-testid="server-connecting"]')).toBeNull()
+    expect(host.textContent ?? "").toContain("session-content")
+  })
+
+  test("unauthorized credentials still hold children behind ServerStatusPane", () => {
+    setHealth({ "http://localhost:4096": { healthy: false, unauthorized: true } })
+    const { host } = mount(() => createComponent(ServerProvider, { conn, children: (() => "session-content") as never }))
+
     expect(host.querySelector('[data-testid="server-connecting"]')).not.toBeNull()
-    expect((host.textContent ?? "").trim().length).toBeGreaterThan(0)
     expect(host.textContent ?? "").not.toContain("session-content")
   })
 
-  test("healthy false renders retry and clicking it calls global.servers.retry", () => {
+  test("healthy false keeps children mounted and renders non-blocking retry banner calling global.servers.retry", () => {
     setHealth({ "http://localhost:4096": { healthy: false } })
     const { host } = mount(() => createComponent(ServerProvider, { conn, children: (() => "session-content") as never }))
 
-    expect(host.querySelector('[data-testid="server-unreachable"]')).not.toBeNull()
+    expect(host.textContent ?? "").toContain("session-content")
+    expect(host.querySelector('[data-testid="server-unreachable-banner"]')).not.toBeNull()
     host.querySelector<HTMLButtonElement>('button[data-testid="server-retry"]')?.click()
     expect(fake.retries).toBe(1)
-    expect(host.textContent ?? "").not.toContain("session-content")
   })
 
   test("a successful health check renders children once and no status pane", () => {
@@ -243,10 +250,11 @@ describe("ServerProvider", () => {
     expect((providedCtx as { ctx?: unknown } | undefined)?.ctx).toBe(fake.ctx)
     expect(host.textContent ?? "").toContain("session-content")
     expect(host.querySelector('[data-testid="server-status"]')).toBeNull()
+    expect(host.querySelector('[data-testid="server-unreachable-banner"]')).toBeNull()
     expect(mounts).toBe(1)
   })
 
-  test("pending -> healthy swaps the pane for children exactly once", async () => {
+  test("pending -> healthy keeps children mounted once without a connecting swap", async () => {
     setHealth({})
     let mounts = 0
     const { host } = mount(() =>
@@ -260,7 +268,8 @@ describe("ServerProvider", () => {
       }),
     )
 
-    expect(host.querySelector('[data-testid="server-connecting"]')).not.toBeNull()
+    expect(host.querySelector('[data-testid="server-connecting"]')).toBeNull()
+    expect(host.textContent ?? "").toContain("session-content")
     setHealth({ "http://localhost:4096": { healthy: true } })
     await Promise.resolve()
 
@@ -269,7 +278,7 @@ describe("ServerProvider", () => {
     expect(mounts).toBe(1)
   })
 
-  test("a later failed poll keeps the mounted children, so a live session is not torn down", async () => {
+  test("a later failed poll keeps the mounted children and shows the non-blocking retry banner", async () => {
     setHealth({ "http://localhost:4096": { healthy: true } })
     let mounts = 0
     const { host } = mount(() =>
@@ -288,6 +297,7 @@ describe("ServerProvider", () => {
 
     expect(host.textContent ?? "").toContain("session-content")
     expect(host.querySelector('[data-testid="server-status"]')).toBeNull()
+    expect(host.querySelector('[data-testid="server-unreachable-banner"]')).not.toBeNull()
     expect(mounts).toBe(1)
   })
 

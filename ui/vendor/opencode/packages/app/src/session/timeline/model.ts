@@ -21,11 +21,12 @@ export function createTimelineModel(input: { session: Pick<SessionModel, "identi
       if (!id) return
       const owner = input.session.ownership.capture()
       const child = !!data.session.get(id)?.parentID
+      const uncached = data.session.message.list(id).length === 0
       const messageHydrate = (data.session.message as { hydrate?: (sessionID: string) => Promise<void> }).hydrate
       const pendingHydrate = (data.session.pending as { hydrate?: (sessionID: string) => Promise<void> }).hydrate
       await Promise.all([
-        child && messageHydrate ? messageHydrate(id) : data.session.message.sync(id),
-        child && pendingHydrate ? pendingHydrate(id) : data.session.pending.sync(id),
+        (child || uncached) && messageHydrate ? messageHydrate(id) : data.session.message.sync(id),
+        (child || uncached) && pendingHydrate ? pendingHydrate(id) : data.session.pending.sync(id),
       ])
       await enrichLeadingTurn({
         current: owner.current,

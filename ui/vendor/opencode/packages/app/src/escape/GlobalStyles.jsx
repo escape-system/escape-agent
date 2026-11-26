@@ -227,8 +227,8 @@ body {
     radial-gradient(60% 150% at 50% 0%, rgb(var(--ea-gold-rgb) / 0.07), transparent 72%);
   border-bottom: 0;
   box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.05), inset 0 -1px 0 var(--ea-hairline);
-  backdrop-filter: blur(30px) saturate(1.35);
-  -webkit-backdrop-filter: blur(30px) saturate(1.35);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
 }
 :root[data-color-scheme="light"] [data-slot="titlebar-v2"] {
   background-image:
@@ -328,8 +328,8 @@ body {
   border-radius: 16px;
   background-color: rgb(255 255 255 / 0.035);
   box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.07), 0 14px 38px rgb(0 0 0 / 0.16);
-  backdrop-filter: blur(24px) saturate(1.3);
-  -webkit-backdrop-filter: blur(24px) saturate(1.3);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
   pointer-events: none;
   user-select: none;
 }
@@ -434,8 +434,8 @@ body {
   background-color: rgb(8 8 8 / 0.38);
   background-image: linear-gradient(90deg, rgb(var(--ea-gold-rgb) / 0.08), transparent 34%);
   box-shadow: inset 0 -1px 0 var(--ea-hairline);
-  backdrop-filter: blur(28px) saturate(1.35);
-  -webkit-backdrop-filter: blur(28px) saturate(1.35);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
   color: var(--ea-text);
 }
 :root[data-color-scheme="light"] [data-session-title] > div:first-child {
@@ -483,10 +483,12 @@ body {
     inset 0 1px 0 rgb(255 255 255 / 0.10),
     inset 0 0 0 1px rgb(255 255 255 / 0.05);
 }
+/* Avoid full-panel backdrop-filter blurs so scrolling and transitions stay 60fps across compositor layers. */
 [data-slot="home-panel"],
 [data-component="new-session"] {
-  backdrop-filter: blur(46px) saturate(1.4);
-  -webkit-backdrop-filter: blur(46px) saturate(1.4);
+  background-color: rgb(10 10 9 / 0.90);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
 }
 /* Avoid a full-viewport backdrop-filter blur over the virtualized timeline scroll container so scroll frames stay smooth. */
 [data-slot="session-chat-panel"] {
@@ -615,8 +617,8 @@ form[data-component="composer"],
     0 1px 0 rgb(255 255 255 / 0.02),
     inset 0 1px 0 rgb(255 255 255 / 0.09),
     inset 0 0 0 1px rgb(255 255 255 / 0.035);
-  backdrop-filter: blur(36px) saturate(1.4);
-  -webkit-backdrop-filter: blur(36px) saturate(1.4);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
   transition: box-shadow 220ms var(--ea-ease);
 }
 :root[data-color-scheme="light"] form[data-component="composer"],
@@ -683,8 +685,8 @@ form[data-component="composer"]:focus-within,
   background-color: var(--ea-glass-strong);
   border: 0;
   box-shadow: 0 24px 70px rgb(0 0 0 / 0.48), var(--ea-sheen);
-  backdrop-filter: blur(34px) saturate(1.35);
-  -webkit-backdrop-filter: blur(34px) saturate(1.35);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
 }
 /* Focus paints the results panel; an empty query must not paint a dark slab
    behind the field. */
@@ -728,8 +730,8 @@ form[data-component="composer"]:focus-within,
     0 30px 90px rgb(0 0 0 / 0.52),
     var(--ea-sheen),
     inset 0 0 0 1px rgb(255 255 255 / 0.05);
-  backdrop-filter: blur(38px) saturate(1.4);
-  -webkit-backdrop-filter: blur(38px) saturate(1.4);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
 }
 :root[data-color-scheme="light"] [data-slot="dialog-content"],
 :root[data-color-scheme="light"] [data-component="menu-v2-content"],
@@ -778,8 +780,8 @@ form[data-component="composer"]:focus-within,
     0 40px 120px rgb(0 0 0 / 0.55),
     inset 0 1px 0 rgb(255 255 255 / 0.09),
     inset 0 0 0 1px rgb(255 255 255 / 0.05);
-  backdrop-filter: blur(40px) saturate(1.4);
-  -webkit-backdrop-filter: blur(40px) saturate(1.4);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
 }
 :root[data-color-scheme="light"] [data-component="connect-server"] {
   background-image:
@@ -1017,15 +1019,13 @@ form[data-component="composer"]:focus-within,
 /* ═══════════════════════════════════════════════════════════════════
    Motion
    ═══════════════════════════════════════════════════════════════════ */
-@media (prefers-reduced-motion: reduce) {
-  *,
-  *::before,
-  *::after {
-    animation-duration: 0.01ms !important;
-    animation-iteration-count: 1 !important;
-    transition-duration: 0.01ms !important;
-    scroll-behavior: auto !important;
-  }
+:root[data-motion="reduce"] *,
+:root[data-motion="reduce"] *::before,
+:root[data-motion="reduce"] *::after {
+  animation-duration: 0.01ms !important;
+  animation-iteration-count: 1 !important;
+  transition-duration: 0.01ms !important;
+  scroll-behavior: auto !important;
 }
 
 /* ═══════════════════════════════════════════════════════════════════

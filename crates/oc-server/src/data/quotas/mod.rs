@@ -53,6 +53,7 @@ pub(super) const CACHE_TTL_MS: i64 = 60_000;
 #[derive(Debug, Default)]
 pub struct QuotaCache {
     pub(in crate::data::quotas) probes: BTreeMap<String, ProviderQuotaProbeResult>,
+    pub(in crate::data::quotas) key_probes: BTreeMap<(String, String), ProviderQuotaProbeResult>,
     pub(in crate::data::quotas) usage: UsageCache,
     /// When the last full probe pass finished (epoch ms); `0` means the cache
     /// has never been filled. Only a full pass writes it.
@@ -92,6 +93,7 @@ impl QuotaCache {
     /// Remove a cached provider entry so the next read re-probes upstream.
     pub fn invalidate(&mut self, provider_id: &str) {
         self.probes.remove(provider_id);
+        self.key_probes.retain(|(pid, _), _| pid != provider_id);
         self.computed_at_ms = 0;
     }
 
@@ -99,6 +101,7 @@ impl QuotaCache {
     /// recomputes both halves.
     pub fn invalidate_all(&mut self) {
         self.probes.clear();
+        self.key_probes.clear();
         self.usage = UsageCache::default();
         self.computed_at_ms = 0;
     }

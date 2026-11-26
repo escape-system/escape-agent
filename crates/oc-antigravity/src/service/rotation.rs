@@ -16,9 +16,17 @@ impl AntigravityService {
         style: HeaderStyle,
         model: &str,
         excluded: &[usize],
+        preferred_credential_id: Option<&str>,
     ) -> Result<Option<SelectedAccount>> {
         let mut mgr = lock_accounts(&self.inner.accounts)?;
-        Ok(mgr.select_for_request(family, style, model, now_ms(), excluded))
+        Ok(mgr.select_for_request_preferred(
+            family,
+            style,
+            model,
+            now_ms(),
+            excluded,
+            preferred_credential_id,
+        ))
     }
 
     pub(crate) fn min_wait_ms(

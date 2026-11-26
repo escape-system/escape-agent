@@ -200,6 +200,7 @@ export function createComposerSubmit(input: ComposerSubmitInput) {
                 id: value.selection.model.modelID,
                 providerID: value.selection.model.providerID,
                 variant: value.selection.variant,
+                ...(value.selection.model.credentialID ? { credentialID: value.selection.model.credentialID } : {}),
               },
             },
           })
@@ -457,10 +458,15 @@ function currentSelection(input: ComposerSubmitInput): ComposerSelection | undef
   const agent = controls.agents.current
 
   if (!model || !agent) return
+  const credentialID = controls.model.selection.credential?.current()
 
   return {
     agent,
-    model: { modelID: model.id, providerID: model.provider.id },
+    model: {
+      modelID: model.id,
+      providerID: model.provider.id,
+      ...(credentialID ? { credentialID } : {}),
+    },
     variant: controls.model.selection.variant.current(),
   }
 }
@@ -621,8 +627,10 @@ async function applySelection(
 
     // Skip an unchanged model so a send never waits on that request. An agent switch or a revert can move the
     // model, and cached SSE state may lag this client's earlier switch, which must also match.
-    const model = `${selection.model.providerID}/${selection.model.modelID}/${selection.variant ?? ""}`
-    const saved = current?.model && `${current.model.providerID}/${current.model.id}/${current.model.variant ?? ""}`
+    const model = `${selection.model.providerID}/${selection.model.modelID}/${selection.variant ?? ""}/${selection.model.credentialID ?? ""}`
+    const saved =
+      current?.model &&
+      `${current.model.providerID}/${current.model.id}/${current.model.variant ?? ""}/${current.model.credentialID ?? ""}`
 
     if (
       current?.agent === selection.agent &&
@@ -633,7 +641,12 @@ async function applySelection(
       return
     await session.api.switchModel({
       sessionID: session.id,
-      model: { id: selection.model.modelID, providerID: selection.model.providerID, variant: selection.variant },
+      model: {
+        id: selection.model.modelID,
+        providerID: selection.model.providerID,
+        variant: selection.variant,
+        ...(selection.model.credentialID ? { credentialID: selection.model.credentialID } : {}),
+      },
     })
     switched.set(session.id, model)
   } catch (error) {

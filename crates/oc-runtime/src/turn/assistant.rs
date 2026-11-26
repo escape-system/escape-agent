@@ -125,6 +125,21 @@ impl AssistantState {
         }
     }
 
+    /// Clear a partial empty-tool streamed draft before retrying the same step
+    /// on another key or after a transport stream drop.
+    pub(super) fn clear_draft_for_retry(&mut self) {
+        self.content.clear();
+        self.streamed = None;
+        self.completed = None;
+        self.finish = None;
+        self.raw_finish = None;
+        self.tokens = None;
+        self.cost = None;
+        self.error = None;
+        self.open_text = None;
+        self.open_reasoning = None;
+    }
+
     pub(super) fn append_reasoning(&mut self, delta: &str) {
         let (index, _) = self.ensure_reasoning();
         if let Some(AssistantPart::Reasoning(part)) = self.content.get_mut(index) {

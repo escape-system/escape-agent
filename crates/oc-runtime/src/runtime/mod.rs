@@ -110,6 +110,7 @@ pub(crate) struct Inner {
     pub(crate) observer_advised: Mutex<HashMap<String, i64>>,
     pub(crate) shutdown: CancelToken,
     pub(crate) idle: Notify,
+    pub(crate) roster_wake: Notify,
     pub(crate) started: AtomicBool,
 }
 
@@ -146,6 +147,7 @@ impl Runtime {
                 observer_advised: Mutex::new(HashMap::new()),
                 shutdown: CancelToken::new(),
                 idle: Notify::new(),
+                roster_wake: Notify::new(),
                 started: AtomicBool::new(false),
             }),
         }
@@ -580,6 +582,9 @@ impl Runtime {
             });
         }
         self.inner.config.sink.publish(envelope);
+        if P::TYPE.starts_with("session.") {
+            self.inner.roster_wake.notify_waiters();
+        }
         Ok(())
     }
 

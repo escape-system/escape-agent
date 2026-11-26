@@ -145,6 +145,7 @@ export const PromptModel = Persistence.struct({
   providerID: Schema.String,
   modelID: Schema.String,
   variant: Persistence.optional(Schema.NullOr(Schema.String)),
+  credentialID: Persistence.optional(Schema.String),
 })
 
 export type PromptModel = typeof PromptModel.Type

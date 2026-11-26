@@ -129,34 +129,60 @@ pub(super) fn resolve_provider_api_key(
 /// A deactivated credential must never be used as a probe key, so there is no
 /// fallback to it: callers get `None` and the provider is simply not probed.
 pub(super) fn credential_key_for(provider_id: &str, credentials: &[Value]) -> Option<String> {
+    credentials
+        .iter()
+        .filter(|entry| {
+            entry.get("integrationID").and_then(Value::as_str) == Some(provider_id)
+                && entry.get("active").and_then(Value::as_bool) == Some(true)
+        })
+        .find_map(|entry| entry.get("value").and_then(extract_credential_secret))
+}
+
+/// All stored credentials for `provider_id` that hold a usable secret, ordered
+/// identically to `Store::credential_pool` (`active DESC, id ASC`).
+pub(super) fn credential_secrets_for(
+    provider_id: &str,
+    credentials: &[Value],
+) -> Vec<(String, bool, String)> {
+    let mut out = Vec::new();
     for entry in credentials {
         if entry.get("integrationID").and_then(Value::as_str) != Some(provider_id) {
             continue;
         }
-        if entry.get("active").and_then(Value::as_bool) != Some(true) {
-            continue;
-        }
-        let Some(value) = entry.get("value") else {
+        let Some(id) = entry
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
             continue;
         };
-        let key = match value.get("type").and_then(Value::as_str) {
-            Some("oauth") => value
-                .get("access")
-                .or_else(|| value.get("access_token"))
-                .or_else(|| value.get("key")),
-            _ => value
-                .get("key")
-                .or_else(|| value.get("access"))
-                .or_else(|| value.get("access_token")),
-        }
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
-        if let Some(key) = key {
-            return Some(key.to_owned());
-        }
+        let active = entry.get("active").and_then(Value::as_bool) == Some(true);
+        let Some(secret) = entry.get("value").and_then(extract_credential_secret) else {
+            continue;
+        };
+        out.push((id.to_owned(), active, secret));
     }
-    None
+    out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    out
+}
+
+/// Extract a non-empty token/key secret from one `Credential.Value` JSON payload.
+pub(super) fn extract_credential_secret(value: &Value) -> Option<String> {
+    match value.get("type").and_then(Value::as_str) {
+        Some("oauth") => value
+            .get("access")
+            .or_else(|| value.get("access_token"))
+            .or_else(|| value.get("key")),
+        _ => value
+            .get("key")
+            .or_else(|| value.get("access"))
+            .or_else(|| value.get("access_token")),
+    }
+    .and_then(Value::as_str)
+    .map(str::trim)
+    .filter(|s| !s.is_empty())
+    .map(str::to_owned)
 }
 
 pub(super) fn resolve_provider_base_url(

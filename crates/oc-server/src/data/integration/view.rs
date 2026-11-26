@@ -103,12 +103,18 @@ fn credential_connection(credential: &Value) -> Option<Value> {
     if !matches!(method, "key" | "oauth" | "external") {
         return None;
     }
-    Some(json!({
+    let mut entry = json!({
         "type": "credential",
         "id": credential.get("id")?.as_str()?,
         "label": credential.get("label")?.as_str()?,
         "method": method,
-    }))
+    });
+    if credential.get("active").and_then(Value::as_bool) == Some(true)
+        && let Some(obj) = entry.as_object_mut()
+    {
+        obj.insert("active".to_owned(), Value::Bool(true));
+    }
+    Some(entry)
 }
 
 /// One row by id, or the documented `IntegrationNotFoundError`.

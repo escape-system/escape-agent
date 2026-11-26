@@ -489,6 +489,21 @@ impl AccountManager {
         now_ms: i64,
         excluded_indices: &[usize],
     ) -> Option<SelectedAccount> {
+        self.select_for_request_preferred(family, style, model, now_ms, excluded_indices, None)
+    }
+
+    /// Select an eligible account, preferring the one linked to `preferred_credential_id`
+    /// when it is eligible and not in `excluded_indices`.
+    #[allow(clippy::too_many_lines)]
+    pub fn select_for_request_preferred(
+        &mut self,
+        family: ModelFamily,
+        style: HeaderStyle,
+        model: &str,
+        now_ms: i64,
+        excluded_indices: &[usize],
+        preferred_credential_id: Option<&str>,
+    ) -> Option<SelectedAccount> {
         self.clear_expired_rate_limits(now_ms);
         if self.storage.accounts.is_empty() {
             return None;
@@ -564,61 +579,70 @@ impl AccountManager {
             return None;
         }
 
-        let picked = match self.cfg.account_selection_strategy {
-            AccountSelectionStrategy::Sticky => {
-                if eligible.contains(&sticky) {
-                    sticky
-                } else {
-                    eligible[0]
-                }
-            }
-            AccountSelectionStrategy::RoundRobin => {
-                let start = (sticky + 1) % self.storage.accounts.len();
-                let mut found = eligible[0];
-                for offset in 0..self.storage.accounts.len() {
-                    let cand = (start + offset) % self.storage.accounts.len();
-                    if eligible.contains(&cand) {
-                        found = cand;
-                        break;
+        let preferred_pick = preferred_credential_id.and_then(|pref| {
+            eligible.iter().copied().find(|&idx| {
+                self.storage.accounts[idx].store_credential_id.as_deref() == Some(pref)
+            })
+        });
+        let picked = if let Some(pref_idx) = preferred_pick {
+            pref_idx
+        } else {
+            match self.cfg.account_selection_strategy {
+                AccountSelectionStrategy::Sticky => {
+                    if eligible.contains(&sticky) {
+                        sticky
+                    } else {
+                        eligible[0]
                     }
                 }
-                found
-            }
-            AccountSelectionStrategy::Hybrid => {
-                // Keep sticky account in `cache-first` unless unhealthy or starved.
-                if self.cfg.scheduling_mode == SchedulingMode::CacheFirst
-                    && eligible.contains(&sticky)
-                    && self
-                        .health
-                        .is_usable(&self.storage.accounts[sticky].token_hash, now_ms)
-                    && self
-                        .buckets
-                        .available(&self.storage.accounts[sticky].token_hash, now_ms)
-                        >= 1.0
-                {
-                    sticky
-                } else {
-                    let candidates: Vec<HybridCandidate<'_>> = eligible
-                        .iter()
-                        .map(|&idx| {
-                            let acct = &self.storage.accounts[idx];
-                            HybridCandidate {
-                                index: idx,
-                                key: acct.token_hash.as_str(),
-                                last_used_ms: acct.last_used,
-                                is_sticky: idx == sticky,
-                            }
-                        })
-                        .collect();
-                    select_hybrid_account(
-                        &candidates,
-                        &mut self.health,
-                        &mut self.buckets,
-                        self.cfg.health_score.max_score,
-                        self.cfg.token_bucket.max_tokens,
-                        now_ms,
-                    )
-                    .unwrap_or(eligible[0])
+                AccountSelectionStrategy::RoundRobin => {
+                    let start = (sticky + 1) % self.storage.accounts.len();
+                    let mut found = eligible[0];
+                    for offset in 0..self.storage.accounts.len() {
+                        let cand = (start + offset) % self.storage.accounts.len();
+                        if eligible.contains(&cand) {
+                            found = cand;
+                            break;
+                        }
+                    }
+                    found
+                }
+                AccountSelectionStrategy::Hybrid => {
+                    // Keep sticky account in `cache-first` unless unhealthy or starved.
+                    if self.cfg.scheduling_mode == SchedulingMode::CacheFirst
+                        && eligible.contains(&sticky)
+                        && self
+                            .health
+                            .is_usable(&self.storage.accounts[sticky].token_hash, now_ms)
+                        && self
+                            .buckets
+                            .available(&self.storage.accounts[sticky].token_hash, now_ms)
+                            >= 1.0
+                    {
+                        sticky
+                    } else {
+                        let candidates: Vec<HybridCandidate<'_>> = eligible
+                            .iter()
+                            .map(|&idx| {
+                                let acct = &self.storage.accounts[idx];
+                                HybridCandidate {
+                                    index: idx,
+                                    key: acct.token_hash.as_str(),
+                                    last_used_ms: acct.last_used,
+                                    is_sticky: idx == sticky,
+                                }
+                            })
+                            .collect();
+                        select_hybrid_account(
+                            &candidates,
+                            &mut self.health,
+                            &mut self.buckets,
+                            self.cfg.health_score.max_score,
+                            self.cfg.token_bucket.max_tokens,
+                            now_ms,
+                        )
+                        .unwrap_or(eligible[0])
+                    }
                 }
             }
         };
@@ -1112,5 +1136,49 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn select_for_request_preferred_picks_requested_credential_and_falls_back() {
+        let mut first = sample_account("first@example.com", "rt-1");
+        first.store_credential_id = Some("cred_1".to_owned());
+        let mut second = sample_account("second@example.com", "rt-2");
+        second.store_credential_id = Some("cred_2".to_owned());
+        let storage = AccountStorageV4 {
+            version: 4,
+            accounts: vec![first, second],
+            active_index: 0,
+            active_index_by_family: HashMap::new(),
+        };
+        let cfg = AntigravityConfig {
+            account_selection_strategy: AccountSelectionStrategy::Sticky,
+            ..Default::default()
+        };
+        let mut mgr = AccountManager::from_storage(None, storage, cfg);
+        let now = 2_000_000;
+
+        let chosen = mgr
+            .select_for_request_preferred(
+                ModelFamily::Claude,
+                HeaderStyle::Antigravity,
+                "antigravity-claude-sonnet-4-5",
+                now,
+                &[],
+                Some("cred_2"),
+            )
+            .expect("preferred account chosen");
+        assert_eq!(chosen.index, 1);
+
+        let fallback = mgr
+            .select_for_request_preferred(
+                ModelFamily::Claude,
+                HeaderStyle::Antigravity,
+                "antigravity-claude-sonnet-4-5",
+                now,
+                &[1],
+                Some("cred_2"),
+            )
+            .expect("falls back when preferred account is excluded");
+        assert_eq!(fallback.index, 0);
     }
 }

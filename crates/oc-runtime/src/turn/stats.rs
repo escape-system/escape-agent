@@ -230,6 +230,7 @@ mod tests {
                 provider_id: "test".to_owned(),
                 id: "alpha".to_owned(),
                 variant: None,
+                credential_id: None,
             },
             1,
         );
@@ -289,6 +290,7 @@ mod tests {
                 provider_id: "test".to_owned(),
                 id: "alpha".to_owned(),
                 variant: None,
+                credential_id: None,
             },
             3,
         );

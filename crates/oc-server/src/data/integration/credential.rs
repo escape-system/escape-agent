@@ -157,15 +157,21 @@ pub async fn credential_create(
                 .with("resource", json!(id)),
         ));
     }
+    let integration_id = body.integration_id;
     let entry = store
         .create_credential(NewCredential {
             id: body.id,
-            integration_id: body.integration_id,
+            integration_id: integration_id.clone(),
             label: body.label,
             value,
             active: body.activate,
         })
         .await?;
+    state
+        .quota_cache()
+        .write()
+        .await
+        .invalidate(&integration_id);
     Ok(Json(DataEnvelope::new(entry)))
 }
 
@@ -177,7 +183,7 @@ pub async fn credential_update(
 ) -> Result<Response, ErrorResponse> {
     let Json(body) = body.map_err(|error| ErrorResponse::from(schema_error(error)))?;
     let store = require_store(&state)?;
-    store
+    let updated = store
         .update_credential(
             &id,
             CredentialPatch {
@@ -186,6 +192,13 @@ pub async fn credential_update(
             },
         )
         .await?;
+    if let Some(pid) = updated
+        .as_ref()
+        .and_then(|row| row.get("integrationID"))
+        .and_then(Value::as_str)
+    {
+        state.quota_cache().write().await.invalidate(pid);
+    }
     Ok(no_content())
 }
 
@@ -195,7 +208,15 @@ pub async fn credential_remove(
     State(state): State<AppState>,
 ) -> Result<Response, ErrorResponse> {
     let store = require_store(&state)?;
+    let existing = store.get_credential(&id).await?;
     store.delete_credential(&id).await?;
+    if let Some(pid) = existing
+        .as_ref()
+        .and_then(|row| row.get("integrationID"))
+        .and_then(Value::as_str)
+    {
+        state.quota_cache().write().await.invalidate(pid);
+    }
     if let Some(svc) = state.antigravity() {
         svc.remove_by_credential_id(&id);
     }
@@ -210,7 +231,10 @@ pub async fn credential_activate(
 ) -> Result<Response, ErrorResponse> {
     let store = require_store(&state)?;
     match store.activate_credential(&id).await {
-        Ok(_) => {
+        Ok(entry) => {
+            if let Some(pid) = entry.get("integrationID").and_then(Value::as_str) {
+                state.quota_cache().write().await.invalidate(pid);
+            }
             if let Some(svc) = state.antigravity() {
                 svc.select_by_credential_id(&id);
             }

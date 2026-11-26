@@ -44,6 +44,18 @@ impl Runtime {
         provider: &str,
         now_ms: i64,
     ) -> Vec<oc_llm::PoolKey> {
+        self.credential_pool_for(provider, None, now_ms).await
+    }
+
+    /// Every usable credential for `provider`, optionally preferring one explicit
+    /// `credential_id` (`"env"` or stored credential id) before the remaining
+    /// pool rotation order while keeping backup keys available on failure.
+    pub(super) async fn credential_pool_for(
+        &self,
+        provider: &str,
+        preferred_credential_id: Option<&str>,
+        now_ms: i64,
+    ) -> Vec<oc_llm::PoolKey> {
         let mut keys: Vec<oc_llm::PoolKey> = Vec::new();
         match self.inner.config.store.credential_pool(provider).await {
             Ok(rows) => {
@@ -75,7 +87,31 @@ impl Runtime {
             });
         }
 
-        self.key_pool().select(provider, keys, now_ms)
+        let ordered = self.key_pool().select(provider, keys, now_ms);
+        let Some(pref) = preferred_credential_id
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+        else {
+            return ordered;
+        };
+        let pos = if pref == "env" {
+            ordered
+                .iter()
+                .position(|entry| entry.credential_id.is_none())
+        } else {
+            ordered
+                .iter()
+                .position(|entry| entry.credential_id.as_deref() == Some(pref))
+        };
+        if let Some(idx) = pos
+            && idx > 0
+        {
+            let mut reordered = ordered;
+            let chosen = reordered.remove(idx);
+            reordered.insert(0, chosen);
+            return reordered;
+        }
+        ordered
     }
 
     /// The provider's environment credential, resolved through the catalog's
@@ -88,6 +124,83 @@ impl Runtime {
             .env
             .iter()
             .find_map(|name| std::env::var(name).ok().filter(|value| !value.is_empty()))
+    }
+
+    /// Resolve a child spawn's credential selection from an explicit `key`
+    /// argument (credential id, label, or `"env"`) or by inheriting the
+    /// parent's `credential_id` on `ModelSource::Parent` when providers match.
+    pub(crate) async fn resolve_spawn_credential(
+        &self,
+        provider: &str,
+        requested_key: Option<&str>,
+        parent_model: Option<&ModelRef>,
+        inherit_parent: bool,
+    ) -> Result<Option<String>, String> {
+        if let Some(raw) = requested_key.map(str::trim).filter(|s| !s.is_empty()) {
+            let rows = self
+                .inner
+                .config
+                .store
+                .credential_pool(provider)
+                .await
+                .unwrap_or_default();
+            let has_env = self.env_credential_key(provider).is_some();
+            if raw.eq_ignore_ascii_case("env") {
+                if has_env {
+                    return Ok(Some("env".to_owned()));
+                }
+                return Err(format!(
+                    "InvalidKeyError: provider `{provider}` has no environment key set"
+                ));
+            }
+            if let Some(exact) = rows.iter().find(|r| r.id == raw) {
+                return Ok(Some(exact.id.clone()));
+            }
+            let mut label_matches: Vec<&oc_store::CredentialRow> = rows
+                .iter()
+                .filter(|r| {
+                    let trimmed = r.label.trim();
+                    !trimmed.is_empty() && trimmed.eq_ignore_ascii_case(raw)
+                })
+                .collect();
+            if label_matches.len() == 1 {
+                return Ok(Some(label_matches.remove(0).id.clone()));
+            }
+            if label_matches.len() > 1 {
+                let ids: Vec<&str> = label_matches.iter().map(|r| r.id.as_str()).collect();
+                return Err(format!(
+                    "AmbiguousKeyError: multiple credentials for `{provider}` match label `{raw}` ({}); pass the credentialID instead",
+                    ids.join(", ")
+                ));
+            }
+            let mut available: Vec<String> = rows
+                .iter()
+                .map(|r| {
+                    let trimmed = r.label.trim();
+                    if trimmed.is_empty() {
+                        r.id.clone()
+                    } else {
+                        format!("{} ({trimmed})", r.id)
+                    }
+                })
+                .collect();
+            if has_env {
+                available.push("env".to_owned());
+            }
+            return Err(format!(
+                "InvalidKeyError: unknown key `{raw}` for provider `{provider}`; available: [{}]",
+                available.join(", ")
+            ));
+        }
+
+        if inherit_parent
+            && let Some(pm) = parent_model
+            && pm.provider_id == provider
+            && let Some(cid) = pm.credential_id.as_deref().filter(|s| !s.is_empty())
+        {
+            return Ok(Some(cid.to_owned()));
+        }
+        Ok(None)
     }
 
     /// Resolve the turn's agent id and its config entry.
@@ -136,6 +249,7 @@ impl Runtime {
                         id: model.id,
                         provider_id: model.provider_id,
                         variant: None,
+                        credential_id: None,
                     })
             })
             .ok_or_else(|| RuntimeError::ModelUnavailable("no model configured".to_owned()))?;

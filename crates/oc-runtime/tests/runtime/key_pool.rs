@@ -217,3 +217,103 @@ async fn rotate_uses_the_same_model_reference() {
     );
     assert_eq!(requests[1].model.model.model_id, "alpha");
 }
+
+#[tokio::test]
+async fn explicit_credential_id_routes_selected_key_first_with_backup_rotation() {
+    let harness = Harness::new(
+        vec![quota_failure(), text_script("rotated to primary backup")],
+        Arc::new(AllowAll),
+        json!({}),
+        None,
+    )
+    .await;
+    seed_key(&harness, "cred_primary", "sk-primary", true).await;
+    seed_key(&harness, "cred_second", "sk-second", false).await;
+
+    harness
+        .store
+        .patch_session(
+            &harness.session,
+            oc_store::SessionPatch {
+                model: Some(json!({
+                    "providerID": "test",
+                    "id": "alpha",
+                    "credentialID": "cred_second"
+                })),
+                ..oc_store::SessionPatch::default()
+            },
+        )
+        .await
+        .expect("patch session model with credentialID");
+
+    harness.prompt("use key 2").await;
+    assert!(harness.sink.has("session.execution.succeeded"));
+    let requests = harness.model.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].options.api_key.as_deref(), Some("sk-second"));
+    assert_eq!(
+        requests[0].options.credential_id.as_deref(),
+        Some("cred_second")
+    );
+    assert_eq!(requests[1].options.api_key.as_deref(), Some("sk-primary"));
+}
+
+#[tokio::test]
+async fn stream_closed_before_completion_rotates_and_retries_single_key() {
+    let eof_event = oc_llm::LlmEvent::ProviderError {
+        message: "provider stream closed before completion".to_owned(),
+    };
+    let harness = Harness::new(
+        vec![
+            Script::Events(vec![eof_event.clone()]),
+            Script::Events(vec![eof_event]),
+            text_script("recovered after transport drops"),
+        ],
+        Arc::new(AllowAll),
+        json!({}),
+        None,
+    )
+    .await;
+    seed_key(&harness, "cred_only", "sk-only", true).await;
+
+    harness.prompt("recover stream").await;
+    assert!(
+        harness.sink.has("session.execution.succeeded"),
+        "{:?}",
+        harness.sink.kinds()
+    );
+    assert_eq!(harness.model.calls(), 3);
+    let messages = harness.messages().await;
+    let rows = assistants(&messages);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["finish"], "stop");
+    assert!(rows[0].get("error").is_none(), "{}", rows[0]);
+
+    // Transport rotation across two keys must not rewrite durable primary pointer.
+    let two_key = Harness::new(
+        vec![
+            Script::Events(vec![oc_llm::LlmEvent::ProviderError {
+                message: "provider stream closed before completion".to_owned(),
+            }]),
+            text_script("backup succeeded"),
+        ],
+        Arc::new(AllowAll),
+        json!({}),
+        None,
+    )
+    .await;
+    seed_key(&two_key, "cred_first", "sk-1", true).await;
+    seed_key(&two_key, "cred_second", "sk-2", false).await;
+
+    two_key.prompt("hi").await;
+    assert!(two_key.sink.has("session.execution.succeeded"));
+    let ids: Vec<String> = two_key
+        .store
+        .credential_pool("test")
+        .await
+        .expect("pool")
+        .into_iter()
+        .map(|r| r.id)
+        .collect();
+    assert_eq!(ids, vec!["cred_first", "cred_second"]);
+}

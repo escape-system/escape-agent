@@ -1274,4 +1274,10 @@ export const dict = {
   "settings.quotas.openrouter.mgmtEnvPlaceholder": "Bir ortam değişkeni tarafından yönetiliyor",
   "usage.quotas.title": "Sağlayıcı Kotaları ve Harcama",
   "usage.quotas.openSettings": "Tüm Kotalar ve Kullanımı Aç",
+  "composer.key.choose": "Anahtar seç",
+  "composer.key.auto": "Otomatik",
+  "composer.key.autoDescription": "Otomatik (havuz)",
+  "composer.key.active": "Aktif",
+  "composer.key.cooldown": "Bekleme {{seconds}}sn",
+  "composer.key.add": "Anahtar ekle…",
 } satisfies Partial<Record<Keys, string>>

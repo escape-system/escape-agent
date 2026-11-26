@@ -28,6 +28,7 @@ fn same_effective_model(previous: &ModelRef, next: &ModelRef) -> bool {
         && previous.id == next.id
         && normalized_variant(previous.variant.as_deref())
             == normalized_variant(next.variant.as_deref())
+        && previous.credential_id == next.credential_id
 }
 
 /// `POST /api/session/:sid/agent`
@@ -88,6 +89,45 @@ pub async fn select_agent(
     Ok(no_content())
 }
 
+async fn validate_selected_credential(
+    state: &AppState,
+    store: &oc_store::Store,
+    model: &ModelRef,
+) -> Result<(), ErrorResponse> {
+    let Some(cred_id) = model.credential_id.as_deref() else {
+        return Ok(());
+    };
+    if cred_id == "env" {
+        let has_env = state.catalog().is_some_and(|catalog| {
+            catalog.provider(&model.provider_id).is_some_and(|p| {
+                p.env
+                    .iter()
+                    .any(|name| std::env::var(name).is_ok_and(|v| !v.is_empty()))
+            })
+        });
+        if !has_env {
+            return Err(ApiError::bad_request(format!(
+                "Environment credential is not set for provider {}",
+                model.provider_id
+            ))
+            .into());
+        }
+        return Ok(());
+    }
+    let credential = store.get_credential(cred_id).await?;
+    let integration = credential
+        .as_ref()
+        .and_then(|c| c.get("integrationID").and_then(Value::as_str));
+    if integration != Some(model.provider_id.as_str()) {
+        return Err(ApiError::bad_request(format!(
+            "Credential {cred_id} does not belong to provider {}",
+            model.provider_id
+        ))
+        .into());
+    }
+    Ok(())
+}
+
 /// `POST /api/session/:sid/model`
 pub async fn select_model(
     Path(session_id): Path<String>,
@@ -136,6 +176,18 @@ pub async fn select_model(
         .into());
     }
     let store = require_store(&state)?;
+    let mut selected_model = body.model;
+    selected_model.variant = selected_model
+        .variant
+        .take()
+        .map(|v| v.trim().to_owned())
+        .filter(|v| !v.is_empty() && !v.eq_ignore_ascii_case("default"));
+    selected_model.credential_id = selected_model
+        .credential_id
+        .take()
+        .map(|c| c.trim().to_owned())
+        .filter(|c| !c.is_empty());
+    validate_selected_credential(&state, store, &selected_model).await?;
     let existing = store
         .get_session(&session_id)
         .await?
@@ -148,7 +200,7 @@ pub async fn select_model(
         .patch_session(
             &session_id,
             SessionPatch {
-                model: Some(json!(&body.model)),
+                model: Some(json!(&selected_model)),
                 ..SessionPatch::default()
             },
         )
@@ -159,14 +211,14 @@ pub async fn select_model(
     // session timeline with `session.model.selected` notices.
     if previous
         .as_ref()
-        .is_some_and(|prev| same_effective_model(prev, &body.model))
+        .is_some_and(|prev| same_effective_model(prev, &selected_model))
     {
         tracing::debug!(session = %session_id, "model selection unchanged; skipping session.model.selected event");
         return Ok(no_content());
     }
     let payload = SessionModelSelected {
         session_id: SessionId::from_wire(session_id.as_str()),
-        model: body.model,
+        model: selected_model,
         previous,
     };
     publish_durable(

@@ -1380,6 +1380,7 @@ async fn subagent_schemas_match_the_documented_keys() {
             "background",
             "description",
             "group",
+            "key",
             "lane",
             "model",
             "partition_count",
@@ -1691,4 +1692,189 @@ async fn subagent_partition_batch_enforces_child_limit_atomically() {
         .await
         .expect("children");
     assert_eq!(children.len(), 0, "no partial children may be created");
+}
+
+#[tokio::test]
+async fn roster_treats_completed_children_as_settled_and_avoids_stale_queue_spin() {
+    let harness = Harness::new(vec![], Arc::new(AllowAll), json!({}), None).await;
+    let done_child = create_child(&harness, &harness.session, "ses_roster_done", "general").await;
+    harness
+        .store
+        .mark_session_busy(&done_child, 1_000)
+        .await
+        .expect("mark child busy");
+    harness
+        .store
+        .mark_session_idle(&done_child, 2_000, "succeeded")
+        .await
+        .expect("mark child completed");
+
+    let roster = subagent_tool(&harness, "roster");
+    let started = std::time::Instant::now();
+    let result = roster
+        .execute(
+            &tool_context(&harness, &harness.session),
+            json!({"wait_seconds": 5}),
+        )
+        .await
+        .expect("roster returns immediately for settled child");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "completed child must not stall roster(wait_seconds)"
+    );
+    let body: Value = serde_json::from_str(&result.output.expect("output")).expect("json");
+    assert_eq!(body["wakeReason"], "no_active_children");
+    assert_eq!(body["children"][0]["status"], "completed");
+    assert_eq!(body["children"][0]["idleOutcome"], "succeeded");
+    assert_eq!(body["counts"]["completed"], 1);
+    assert_eq!(body["counts"]["busy"], 0);
+
+    // Enqueue one `queue` item while a second child is busy: first `roster(wait_seconds=2)`
+    // wakes once immediately with `callerInbox`; second `roster(wait_seconds=1)` does NOT
+    // 0ms busy-spin on that same already-reported queue row.
+    let busy_child = create_child(&harness, &harness.session, "ses_roster_busy", "general").await;
+    harness
+        .store
+        .mark_session_busy(&busy_child, 3_000)
+        .await
+        .expect("mark child busy");
+    harness
+        .store
+        .enqueue_materialized(&oc_store::NewInbox {
+            id: "msg_stale_q".to_owned(),
+            session_id: harness.session.clone(),
+            kind: "synthetic".to_owned(),
+            payload: json!({"text": "queued note", "metadata": {"source": "peer", "from": busy_child}}),
+            delivery: oc_store::Delivery::Queue,
+        })
+        .await
+        .expect("queue item");
+
+    let first_start = std::time::Instant::now();
+    let first = roster
+        .execute(
+            &tool_context(&harness, &harness.session),
+            json!({"wait_seconds": 2}),
+        )
+        .await
+        .expect("first roster wakes on unseen queue");
+    assert!(first_start.elapsed() < std::time::Duration::from_millis(800));
+    let first_body: Value = serde_json::from_str(&first.output.expect("out")).expect("json");
+    assert_eq!(first_body["wakeReason"], "inbox");
+    assert_eq!(first_body["callerInbox"][0]["id"], "msg_stale_q");
+
+    let second_start = std::time::Instant::now();
+    let second = roster
+        .execute(
+            &tool_context(&harness, &harness.session),
+            json!({"wait_seconds": 1}),
+        )
+        .await
+        .expect("second roster waits cleanly instead of 0ms spin");
+    assert!(
+        second_start.elapsed() >= std::time::Duration::from_millis(700),
+        "already-reported queue row must not 0ms-spin roster: {:?}",
+        second_start.elapsed()
+    );
+    let second_body: Value = serde_json::from_str(&second.output.expect("out")).expect("json");
+    assert_eq!(second_body["wakeReason"], "timeout");
+}
+
+#[tokio::test]
+async fn subagent_key_pins_credential_and_inherits_parent_credential() {
+    let harness = Harness::new(
+        vec![
+            text_script("child pinned output"),
+            text_script("inherited child output"),
+        ],
+        Arc::new(AllowAll),
+        json!({"subagents": {"background_default": false}}),
+        None,
+    )
+    .await;
+    harness
+        .store
+        .create_credential(oc_store::NewCredential {
+            id: Some("cred_parent".to_owned()),
+            integration_id: "test".to_owned(),
+            label: Some("OpenCode 1".to_owned()),
+            value: json!({"type": "key", "key": "sk-parent"}),
+            active: Some(true),
+        })
+        .await
+        .expect("cred 1");
+    harness
+        .store
+        .create_credential(oc_store::NewCredential {
+            id: Some("cred_worker".to_owned()),
+            integration_id: "test".to_owned(),
+            label: Some("OpenCode 2".to_owned()),
+            value: json!({"type": "key", "key": "sk-worker"}),
+            active: Some(false),
+        })
+        .await
+        .expect("cred 2");
+    harness
+        .store
+        .patch_session(
+            &harness.session,
+            oc_store::SessionPatch {
+                model: Some(json!({
+                    "providerID": "test",
+                    "id": "alpha",
+                    "credentialID": "cred_parent"
+                })),
+                ..oc_store::SessionPatch::default()
+            },
+        )
+        .await
+        .expect("patch parent model");
+
+    let spawn = subagent_tool(&harness, "subagent");
+    // Explicit label matches `cred_worker`
+    spawn
+        .execute(
+            &tool_context(&harness, &harness.session),
+            json!({
+                "description": "pinned key child",
+                "prompt": "use key 2",
+                "key": "OpenCode 2",
+                "background": false,
+            }),
+        )
+        .await
+        .expect("spawn with explicit key");
+    // Omitted `key` inherits parent's `cred_parent` via ModelSource::Parent
+    spawn
+        .execute(
+            &tool_context(&harness, &harness.session),
+            json!({
+                "description": "inherited key child",
+                "prompt": "use parent key",
+                "background": false,
+            }),
+        )
+        .await
+        .expect("spawn inheriting parent key");
+
+    let requests = harness.model.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].options.api_key.as_deref(), Some("sk-worker"));
+    assert_eq!(requests[1].options.api_key.as_deref(), Some("sk-parent"));
+
+    // Invalid key returns clear error listing available keys
+    let err = spawn
+        .execute(
+            &tool_context(&harness, &harness.session),
+            json!({
+                "description": "bad key",
+                "prompt": "fail",
+                "key": "nonexistent_key",
+                "background": false,
+            }),
+        )
+        .await
+        .expect_err("unknown key fails");
+    assert!(err.message.contains("InvalidKeyError"), "{}", err.message);
+    assert!(err.message.contains("cred_worker"), "{}", err.message);
 }

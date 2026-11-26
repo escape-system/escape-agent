@@ -450,6 +450,9 @@ impl Runtime {
                 id: model.model.id.clone(),
                 provider_id: model.model.provider_id.clone(),
                 variant: model.variant.as_ref().map(|variant| variant.id.clone()),
+                credential_id: (turn.model_ref.provider_id == model.model.provider_id)
+                    .then(|| turn.model_ref.credential_id.clone())
+                    .flatten(),
             };
             let attempt = CompactionAttempt {
                 session,
@@ -717,8 +720,11 @@ impl Runtime {
             system,
             cancel,
         } = *attempt;
+        let preferred_key = (turn.model_ref.provider_id == model.provider.id)
+            .then_some(turn.model_ref.credential_id.as_deref())
+            .flatten();
         let pool = self
-            .credential_pool(&model.provider.id, oc_types::now_millis())
+            .credential_pool_for(&model.provider.id, preferred_key, oc_types::now_millis())
             .await;
         let credential = pool.into_iter().next();
         let api_key = credential.as_ref().map(|entry| entry.key.clone());
@@ -729,6 +735,10 @@ impl Runtime {
             tools: turn.tools.clone(),
             options: LlmOptions {
                 api_key: api_key.clone(),
+                credential_id: credential
+                    .as_ref()
+                    .and_then(|entry| entry.credential_id.clone())
+                    .or_else(|| preferred_key.map(ToOwned::to_owned)),
                 tool_choice: Some("none".to_owned()),
                 cache_key: Some(session.to_owned()),
                 ..LlmOptions::default()

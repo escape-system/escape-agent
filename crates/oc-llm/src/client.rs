@@ -43,6 +43,7 @@ impl LlmClient {
             .user_agent(concat!("opencode/", env!("CARGO_PKG_VERSION")))
             .connect_timeout(Duration::from_secs(30))
             .tcp_keepalive(Duration::from_secs(30))
+            .pool_idle_timeout(Some(Duration::from_secs(30)))
             .http2_keep_alive_interval(Some(Duration::from_secs(30)))
             .http2_keep_alive_timeout(Duration::from_secs(15))
             .http2_keep_alive_while_idle(true)

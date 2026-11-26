@@ -118,6 +118,7 @@ fn model_ref_from_resolved(resolved: &oc_llm::ResolvedModel) -> ModelRef {
         id: resolved.model.id.clone(),
         provider_id: resolved.provider.id.clone(),
         variant: resolved.variant.as_ref().map(|variant| variant.id.clone()),
+        credential_id: None,
     }
 }
 
@@ -293,6 +294,7 @@ mod tests {
                 id: "alpha".to_owned(),
                 provider_id: "test".to_owned(),
                 variant: None,
+                credential_id: None,
             }
         );
         let variant = catalog.resolve("test/alpha#low").expect("variant resolves");
@@ -302,6 +304,7 @@ mod tests {
                 id: "alpha".to_owned(),
                 provider_id: "test".to_owned(),
                 variant: Some("low".to_owned()),
+                credential_id: None,
             }
         );
     }

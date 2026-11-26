@@ -101,38 +101,66 @@ fn final_call(base_request: &LlmRequest) -> bool {
 }
 
 /// Upper bound on credential attempts for one model candidate.
-///
-/// A pool larger than this is a configuration accident; the cap keeps one step
-/// from turning into an unbounded provider loop while still covering every
-/// realistic backup-key count (contract §3).
 pub(super) const MAX_KEY_ATTEMPTS: usize = 8;
 
-/// The failure class that justifies rotating to another credential, if any.
+/// Maximum bounded rounds for transient `Transport` / `EmptyResponse` recovery
+/// (covers both single-key setups and full-pool transient stream drops).
+pub(super) const TRANSPORT_MAX_ATTEMPTS: usize = 3;
+
+const TRANSPORT_RETRY_BASE_MS: u64 = 600;
+
+fn is_transport_retryable(error: &oc_llm::LlmError) -> bool {
+    matches!(
+        error,
+        oc_llm::LlmError::Failure {
+            kind: oc_llm::FailureKind::Transport | oc_llm::FailureKind::EmptyResponse,
+            ..
+        } | oc_llm::LlmError::Transport { .. }
+            | oc_llm::LlmError::Timeout { .. }
+    )
+}
+
+/// The failure class that justifies rotating or retrying a credential/attempt.
 ///
-/// Only key-level classes rotate: `Auth`, `Quota` and `RateLimit` say the
-/// credential cannot serve now, while `ModelUnavailable` / `InvalidRequest` /
-/// `EmptyResponse` / `Unknown` say nothing about the key (a different key would
-/// repeat the same answer), so those keep today's model-chain behavior.
-/// `Http` statuses are mapped as a defensive fallback for transports that report
-/// the status before it is classified.
+/// Key-level classes (`Auth`, `Quota`, `RateLimit`) and transient transport/empty
+/// stream failures rotate across remaining healthy keys (and transport/empty
+/// failures additionally retry with bounded backoff when all keys exhaust).
 pub(super) fn is_key_rotatable(error: &oc_llm::LlmError) -> Option<oc_llm::FailureKind> {
     match error {
         oc_llm::LlmError::Failure { kind, .. } => matches!(
             kind,
-            oc_llm::FailureKind::Auth | oc_llm::FailureKind::Quota | oc_llm::FailureKind::RateLimit
+            oc_llm::FailureKind::Auth
+                | oc_llm::FailureKind::Quota
+                | oc_llm::FailureKind::RateLimit
+                | oc_llm::FailureKind::Transport
+                | oc_llm::FailureKind::EmptyResponse
         )
         .then_some(*kind),
         oc_llm::LlmError::Http { status, .. } => match status {
             401..=403 => Some(oc_llm::FailureKind::Auth),
             429 => Some(oc_llm::FailureKind::RateLimit),
+            408 | 425 | 500..=599 => Some(oc_llm::FailureKind::Transport),
             _ => None,
         },
+        oc_llm::LlmError::Transport { .. } | oc_llm::LlmError::Timeout { .. } => {
+            Some(oc_llm::FailureKind::Transport)
+        }
         _ => None,
     }
 }
 
 fn key_failure_kind(failure: &StreamFailure) -> Option<oc_llm::FailureKind> {
-    is_key_rotatable(&failure.error)
+    is_key_rotatable(&failure.error).or_else(|| {
+        matches!(
+            failure.kind,
+            oc_llm::FailureKind::Auth
+                | oc_llm::FailureKind::Quota
+                | oc_llm::FailureKind::RateLimit
+                | oc_llm::FailureKind::Transport
+                | oc_llm::FailureKind::EmptyResponse
+        )
+        .then_some(failure.kind)
+    })
 }
 
 impl Runtime {
@@ -244,7 +272,88 @@ impl Runtime {
     /// which surfaces it to the caller without switching models.
     /// `MAX_KEY_ATTEMPTS` bounds the work even if a pool somehow reports more
     /// keys than that.
-    #[allow(clippy::too_many_arguments)]
+    async fn prepare_retry_draft(
+        &self,
+        session: &str,
+        turn: &ResolvedTurn,
+        failure: StreamFailure,
+        transport_retryable: bool,
+    ) -> Result<Option<AssistantState>, RuntimeError> {
+        if failure.reusable {
+            return Ok(Some(failure.state));
+        }
+        let has_tools = failure
+            .state
+            .content
+            .iter()
+            .any(|part| matches!(part, AssistantPart::Tool(_)));
+        if transport_retryable && !has_tools {
+            let mut state = failure.state;
+            state.clear_draft_for_retry();
+            self.persist_assistant(session, &state).await?;
+            return Ok(Some(state));
+        }
+        let original = RuntimeError::Llm(failure.error);
+        let tokens = failure.state.tokens.clone();
+        let cost = failure.state.cost.unwrap_or(0.0);
+        let structured = original.structured();
+        self.fail_step(session, turn, failure.state, structured, tokens, cost)
+            .await?;
+        Ok(None)
+    }
+
+    async fn sleep_transport_backoff(
+        &self,
+        session: &str,
+        provider: &str,
+        round: usize,
+        error_text: &str,
+        cancel: &Arc<CancelToken>,
+    ) -> Result<(), RuntimeError> {
+        let wait_ms = TRANSPORT_RETRY_BASE_MS * u64::try_from(round + 1).unwrap_or(1);
+        tracing::warn!(
+            session = %session,
+            provider = %provider,
+            attempt = round + 1,
+            wait_ms,
+            error = %error_text,
+            "retrying stream step after transient transport/empty failure"
+        );
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => Err(RuntimeError::Cancelled),
+            () = self.inner.shutdown.cancelled() => Err(RuntimeError::Shutdown),
+            () = tokio::time::sleep(std::time::Duration::from_millis(wait_ms)) => Ok(()),
+        }
+    }
+
+    fn build_step_request(
+        turn: &ResolvedTurn,
+        session: &str,
+        model: &oc_llm::ResolvedModel,
+        model_ref: &ModelRef,
+        messages: &[LlmMessage],
+        final_call: bool,
+    ) -> LlmRequest {
+        LlmRequest {
+            model: model.clone(),
+            system: turn.system.clone(),
+            messages: messages.to_vec(),
+            tools: turn.tools.clone(),
+            options: LlmOptions {
+                api_key: None,
+                credential_id: model_ref.credential_id.clone(),
+                temperature: turn.agent_request.temperature,
+                top_p: turn.agent_request.top_p,
+                headers: turn.agent_request.headers.clone(),
+                tool_choice: final_call.then(|| "none".to_owned()),
+                cache_key: Some(session.to_owned()),
+                ..LlmOptions::default()
+            },
+        }
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     async fn stream_model_attempts(
         &self,
         session: &str,
@@ -260,25 +369,9 @@ impl Runtime {
         let provider = model.provider.id.clone();
         let now_ms = oc_types::now_millis();
         // The request is built once, here, so the transport-hook probe below and
-        // the dispatch in `stream_once` cannot disagree about it. The credential
-        // is the only field left to the pool/rotation loop, so the probe carries
-        // `api_key: None` — a hook that inspects `options`, `messages`, `tools`
-        // or `system` now sees exactly what dispatch will send.
-        let base_request = LlmRequest {
-            model: model.clone(),
-            system: turn.system.clone(),
-            messages: messages.to_vec(),
-            tools: turn.tools.clone(),
-            options: LlmOptions {
-                api_key: None,
-                temperature: turn.agent_request.temperature,
-                top_p: turn.agent_request.top_p,
-                headers: turn.agent_request.headers.clone(),
-                tool_choice: final_call.then(|| "none".to_owned()),
-                cache_key: Some(session.to_owned()),
-                ..LlmOptions::default()
-            },
-        };
+        // the dispatch in `stream_once` cannot disagree about it.
+        let base_request =
+            Self::build_step_request(turn, session, model, model_ref, messages, final_call);
         let hook_owns_pool = self
             .inner
             .config
@@ -288,72 +381,92 @@ impl Runtime {
         let pool = if hook_owns_pool {
             Vec::new()
         } else {
-            self.credential_pool(&provider, now_ms).await
+            self.credential_pool_for(&provider, model_ref.credential_id.as_deref(), now_ms)
+                .await
         };
-        // An empty pool means "no stored credential and no environment key": the
-        // client resolves the provider's environment on its own, so the request
-        // is attempted exactly once with `api_key: None` — today's behavior.
         let attempts: Vec<Option<oc_llm::PoolKey>> = if pool.is_empty() {
             vec![None]
         } else {
             pool.into_iter().take(MAX_KEY_ATTEMPTS).map(Some).collect()
         };
         let total = attempts.len();
+        let mut eligible = vec![true; total];
         let mut last: Option<StreamFailure> = None;
-        for (index, candidate) in attempts.into_iter().enumerate() {
-            let api_key = candidate.as_ref().map(|entry| entry.key.clone());
-            let attempt = self
-                .stream_once(
-                    session,
-                    turn,
-                    model_ref,
-                    &base_request,
-                    cancel,
-                    reuse.take(),
-                    api_key,
-                    envelope.clone(),
-                )
-                .await?;
-            let failure = match attempt {
-                StepAttempt::Done(run) => return Ok(StepAttempt::Done(run)),
-                StepAttempt::Retry(failure) => failure,
-            };
-            let Some(credential) = candidate.as_ref() else {
-                // No key to rotate away from: keep the historical behavior.
-                return Ok(StepAttempt::Retry(failure));
-            };
-            let rotated = key_failure_kind(&failure).is_some();
-            if !rotated {
-                return Ok(StepAttempt::Retry(failure));
-            }
-            let kind = failure.kind;
-            self.mark_key_failure(&provider, credential.credential_id.as_deref(), kind, now_ms)
-                .await;
-            let last_attempt = index + 1 >= total;
-            // The row is reusable only while nothing reached the provider
-            // surface; once a key did stream output the row is durable as a
-            // failed attempt (`reusable == false`) and the next key starts a new
-            // one. Either way the *step* stays the same and no model switch is
-            // announced.
-            if !failure.reusable {
-                if last_attempt {
-                    last = Some(failure);
-                    break;
-                }
-                let original = RuntimeError::Llm(failure.error);
-                let tokens = failure.state.tokens.clone();
-                let cost = failure.state.cost.unwrap_or(0.0);
-                let structured = original.structured();
-                self.fail_step(session, turn, failure.state, structured, tokens, cost)
-                    .await?;
-                *reuse = None;
-                continue;
-            }
-            if last_attempt {
-                last = Some(failure);
+
+        'rounds: for transport_round in 0..TRANSPORT_MAX_ATTEMPTS {
+            let round_now_ms = oc_types::now_millis();
+            let active_indices: Vec<usize> = (0..total).filter(|&i| eligible[i]).collect();
+            if active_indices.is_empty() {
                 break;
             }
-            *reuse = Some(failure.state);
+            let active_len = active_indices.len();
+            for (pos, index) in active_indices.into_iter().enumerate() {
+                let candidate = &attempts[index];
+                let api_key = candidate.as_ref().map(|entry| entry.key.clone());
+                let credential_id = candidate
+                    .as_ref()
+                    .and_then(|entry| entry.credential_id.clone());
+                let attempt = self
+                    .stream_once(
+                        session,
+                        turn,
+                        model_ref,
+                        &base_request,
+                        cancel,
+                        reuse.take(),
+                        api_key,
+                        credential_id,
+                        envelope.clone(),
+                    )
+                    .await?;
+                let failure = match attempt {
+                    StepAttempt::Done(run) => return Ok(StepAttempt::Done(run)),
+                    StepAttempt::Retry(failure) => failure,
+                };
+                let transport_retryable = is_transport_retryable(&failure.error);
+                let error_text = failure.error.to_string();
+                if let Some(credential) = candidate.as_ref() {
+                    let Some(kind) = key_failure_kind(&failure) else {
+                        return Ok(StepAttempt::Retry(failure));
+                    };
+                    if !transport_retryable {
+                        eligible[index] = false;
+                    }
+                    self.mark_key_failure(
+                        &provider,
+                        credential.credential_id.as_deref(),
+                        kind,
+                        round_now_ms,
+                    )
+                    .await;
+                } else if !transport_retryable {
+                    return Ok(StepAttempt::Retry(failure));
+                }
+
+                let more_keys = pos + 1 < active_len;
+                let more_transport_rounds =
+                    eligible.iter().any(|&ok| ok) && (transport_round + 1 < TRANSPORT_MAX_ATTEMPTS);
+                if !more_keys && (!transport_retryable || !more_transport_rounds) {
+                    last = Some(failure);
+                    break 'rounds;
+                }
+
+                *reuse = self
+                    .prepare_retry_draft(session, turn, failure, transport_retryable)
+                    .await?;
+
+                if !more_keys && more_transport_rounds {
+                    self.sleep_transport_backoff(
+                        session,
+                        &provider,
+                        transport_round,
+                        &error_text,
+                        cancel,
+                    )
+                    .await?;
+                    continue 'rounds;
+                }
+            }
         }
         Ok(StepAttempt::Retry(last.expect(
             "a pool with at least one usable key yields a failure or a success",
@@ -362,10 +475,9 @@ impl Runtime {
 
     /// Record a key-level failure and keep the durable primary pointer healthy.
     ///
-    /// The store's pool is the source of truth for order, so the pointer only
-    /// moves when the failing key *was* primary: a restart would otherwise pick
-    /// the dead key first again. `set_credential_primary` reuses
-    /// `activate_credential`'s transaction, so kill -9 safety is unchanged.
+    /// Only permanent key-level failures (`Auth`, `Quota`) rewrite the durable
+    /// `credential.active` pointer in SQLite; transient `RateLimit`, `Transport`,
+    /// and `EmptyResponse` failures stay in-memory in `KeyPool`.
     pub(super) async fn mark_key_failure(
         &self,
         provider: &str,
@@ -374,6 +486,9 @@ impl Runtime {
         now_ms: i64,
     ) {
         self.key_pool().mark(provider, credential_id, kind, now_ms);
+        if !matches!(kind, oc_llm::FailureKind::Auth | oc_llm::FailureKind::Quota) {
+            return;
+        }
         let Some(failed) = credential_id else {
             return;
         };
@@ -425,20 +540,29 @@ impl Runtime {
         cancel: &Arc<CancelToken>,
         reuse: Option<AssistantState>,
         api_key: Option<String>,
+        credential_id: Option<String>,
         envelope: RequestEnvelopeSeed,
     ) -> Result<StepAttempt, RuntimeError> {
         let created = oc_types::now_millis();
+        // Record the actual credential selected for this attempt on the
+        // assistant message so per-key usage rollups track key rotation too.
+        let effective_model = ModelRef {
+            credential_id: credential_id
+                .clone()
+                .or_else(|| model_ref.credential_id.clone()),
+            ..model_ref.clone()
+        };
         // Nothing streamed on the previous attempt: the row is rewritten for
         // the new model instead of appending a second assistant message.
         let mut state = if let Some(mut state) = reuse {
-            state.model = model_ref.clone();
+            state.model = effective_model.clone();
             self.persist_assistant(session, &state).await?;
             state
         } else {
             let state = AssistantState::new(
                 MessageId::new(),
                 turn.agent_id.clone(),
-                model_ref.clone(),
+                effective_model.clone(),
                 created,
             );
             self.inner
@@ -459,7 +583,7 @@ impl Runtime {
                     session_id: Runtime::session_id(session),
                     assistant_message_id: state.id.clone(),
                     agent: turn.agent_id.clone(),
-                    model: model_ref.clone(),
+                    model: effective_model,
                     snapshot: None,
                     started: created,
                 },
@@ -502,6 +626,7 @@ impl Runtime {
         let request = LlmRequest {
             options: LlmOptions {
                 api_key,
+                credential_id: credential_id.or_else(|| base_request.options.credential_id.clone()),
                 ..base_request.options.clone()
             },
             ..base_request.clone()

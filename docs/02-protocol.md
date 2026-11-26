@@ -208,6 +208,10 @@ same resolution per judge call; a declared-but-unset `provider.env` no longer
 disables it, and a judge call with no usable credential fails open by
 publishing `observer.unavailable`.
 
+Extension fields on existing objects (optional, omitted when absent):
+- `ModelRef` adds optional `credentialID?: string` (`"env"` or stored credential id) so main-agent sessions and explicit `subagent(key=...)` calls can pin a preferred credential while still permitting same-model backup rotation on failure.
+- `Connection.CredentialInfo` includes `active?: boolean` on the active credential row so UI selectors can label named credentials (`OpenCode Go 1`, `OpenCode Go 2`) and highlight the active default without an extra fetch.
+
 Several credentials per provider are legal — they are backup keys. Each
 `POST /api/integration/{id}/connect/key` appends another `cred_…` row for that
 integration and makes it active (`crates/oc-server/src/data/integration/connect.rs:52-61`:
@@ -224,19 +228,23 @@ Shipped, additive and omit-when-absent (never `null`): three read-only surfaces
 report rotation state. `GET /api/quotas` provider entries carry `keys[]` — one
 entry per stored credential in rotation order, `credentialID`, `label`, `active`,
 `limited`, `cooldownUntilMs?`, `kind?`, `failures?`, `usedCostUsd`,
-`usedRequests` — omitted when the provider owns no credential row
-(`crates/oc-server/src/data/quotas/types.rs:66-115`,
-`crates/oc-server/src/data/quotas/aggregate.rs:180-212`). `GET /api/models/registry`
+`usedRequests`, plus optional per-key live probe fields (`status?`,
+`fetchedAtMs?`, `cached?`, `windows?`, `balances?`, `spendSummary?`,
+`warnings?`, `error?`, omitted when absent/empty) for `live_api` providers —
+omitted when the provider owns no credential row
+(`crates/oc-server/src/data/quotas/types.rs`,
+`crates/oc-server/src/data/quotas/aggregate.rs`). `GET /api/models/registry`
 carries a top-level `keyHealth[]` of
 `{providerID, credentialID?, untilMs, kind, failures}`, omitted when every key is
 healthy (`crates/oc-server/src/data/models_registry.rs:88-116`). Each account on
 `GET /api/antigravity/accounts` carries `cooldownUntilMs?`, the maximum deadline
 still in the future, omitted for a healthy account
 (`crates/oc-server/src/data/antigravity.rs:151-160`). `usedCostUsd` /
-`usedRequests` are always `0` by design: the usage rollup keys on
-`model.providerID` alone, so per-key attribution does not exist yet.
-`keyHealth` is the credential axis and never hides a model; the model axis stays
-`modelHealth[]` / per-model `unavailable`. See [27](27-key-pool.md).
+`usedRequests` reflect real per-key local usage aggregated from assistant
+messages carrying `model.credentialID` (rows without `credentialID` contribute
+only to provider totals, never split by guess). `keyHealth` is the credential axis
+and never hides a model; the model axis stays `modelHealth[]` / per-model
+`unavailable`. See [27](27-key-pool.md).
 
 ### Model control plane
 

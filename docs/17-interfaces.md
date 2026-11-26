@@ -860,7 +860,7 @@ pub struct EventId, SessionId, MessageId, ProjectId, PermissionRequestId, SavedP
 pub struct SessionInfo { /* exact wire Session.Info */ }
 pub struct SessionTimes { pub created: i64, pub updated: i64, /* optional */ }
 pub struct Tokens { pub input: i64, pub output: i64, pub reasoning: i64, pub cache: CacheTokens }
-pub struct ModelRef { pub provider_id: String, pub id: String, pub variant: Option<String> }
+pub struct ModelRef { pub provider_id: String, pub id: String, pub variant: Option<String>, #[serde(skip_serializing_if = "Option::is_none")] pub credential_id: Option<String> }
 pub struct LocationInfo { pub directory: String, pub project: ProjectRef, pub subpath: Option<String> }
 
 // message.rs
@@ -1054,6 +1054,7 @@ impl Catalog {
 
 pub struct LlmRequest { pub model: ResolvedModel, pub system: Vec<String>, pub messages: Vec<LlmMessage>,
     pub tools: Vec<ToolDef>, pub options: LlmOptions }
+    // `LlmOptions` includes `pub credential_id: Option<String>` (explicit key preference or `"env"`, passed through `Runtime::credential_pool_for` and `oc-antigravity`).
 pub struct LlmClient { /* reqwest */ }
 impl LlmClient {
     pub fn new() -> Result<Self, LlmError>;

@@ -260,12 +260,58 @@ describe("parseProviderKeys", () => {
       usedCostUsd: 0,
       usedRequests: 0,
     })
-    // A healthy key carries none of the cooldown fields at all.
+    // A healthy key carries none of the cooldown or optional probe fields at all.
     const [healthy] = parseProviderKeys([{ credentialID: "cred_2", label: "Home" }])
 
     expect(healthy.cooldownUntilMs).toBeUndefined()
     expect(healthy.kind).toBeUndefined()
     expect(healthy.failures).toBeUndefined()
+    expect(healthy.windows).toBeUndefined()
+    expect(healthy.error).toBeUndefined()
+  })
+
+  test("preserves per-key live quota windows, balances, status, error, and usage", () => {
+    const parsed = parseProviderKeys([
+      {
+        credentialID: "cred_go_1",
+        label: "OpenCode Go",
+        active: true,
+        limited: false,
+        usedCostUsd: 1.25,
+        usedRequests: 4,
+        status: "ok",
+        fetchedAtMs: 1_700_000_000_000,
+        cached: false,
+        windows: [
+          {
+            id: "rolling",
+            label: "5-Hour Rolling",
+            unit: "percent",
+            usedPercent: 10,
+            remainingPercent: 90,
+          },
+        ],
+      },
+      {
+        credentialID: "cred_go_2",
+        label: "OpenCode Go",
+        active: false,
+        limited: false,
+        usedCostUsd: 0.4,
+        usedRequests: 2,
+        status: "error",
+        error: "HTTP 401",
+      },
+    ])
+
+    expect(parsed).toHaveLength(2)
+    expect(parsed[0].status).toBe("ok")
+    expect(parsed[0].usedCostUsd).toBe(1.25)
+    expect(parsed[0].usedRequests).toBe(4)
+    expect(parsed[0].windows?.[0].remainingPercent).toBe(90)
+    expect(parsed[1].status).toBe("error")
+    expect(parsed[1].error).toBe("HTTP 401")
+    expect(parsed[1].windows).toBeUndefined()
   })
 })
 

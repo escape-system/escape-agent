@@ -484,3 +484,120 @@ async fn execution_started_events(harness: &Harness) -> usize {
         .filter(|event| event["type"] == "session.execution.started")
         .count()
 }
+
+#[tokio::test]
+async fn model_select_validates_credential_and_exposes_active_integration() {
+    let harness = Harness::new(vec![], None).await;
+    harness
+        .store
+        .create_credential(oc_store::NewCredential {
+            id: Some("cred_1".to_owned()),
+            integration_id: "test".to_owned(),
+            label: Some("Test 1".to_owned()),
+            value: json!({"type": "key", "key": "sk-1"}),
+            active: Some(true),
+        })
+        .await
+        .expect("cred 1");
+    harness
+        .store
+        .create_credential(oc_store::NewCredential {
+            id: Some("cred_2".to_owned()),
+            integration_id: "test".to_owned(),
+            label: Some("Test 2".to_owned()),
+            value: json!({"type": "key", "key": "sk-2"}),
+            active: Some(false),
+        })
+        .await
+        .expect("cred 2");
+
+    let (status, int_body) = call(&harness.app, Method::GET, "/api/integration", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let integrations = int_body.expect("integrations")["data"]
+        .as_array()
+        .expect("array")
+        .clone();
+    let conns = integrations
+        .iter()
+        .find(|i| i["id"] == "test")
+        .expect("test integration")["connections"]
+        .as_array()
+        .expect("connections")
+        .clone();
+    assert!(
+        conns
+            .iter()
+            .any(|c| c["id"] == "cred_1" && c["active"] == true),
+        "active credential flag missing: {conns:?}"
+    );
+
+    let (bad_status, _) = call(
+        &harness.app,
+        Method::POST,
+        &format!("/api/session/{SESSION}/model"),
+        Some(
+            json!({"model": {"providerID": "test", "id": "alpha", "credentialID": "cred_missing"}}),
+        ),
+    )
+    .await;
+    assert_eq!(bad_status, StatusCode::BAD_REQUEST);
+
+    let (ok_status, _) = call(
+        &harness.app,
+        Method::POST,
+        &format!("/api/session/{SESSION}/model"),
+        Some(json!({"model": {"providerID": "test", "id": "alpha", "credentialID": "cred_2"}})),
+    )
+    .await;
+    assert_eq!(ok_status, StatusCode::NO_CONTENT);
+    harness.runtime.expect("runtime").shutdown().await;
+}
+
+#[tokio::test]
+async fn subagent_message_materializes_into_timeline() {
+    let harness = Harness::new(vec![text_script("child reply")], None).await;
+    let (create_status, created) = call(
+        &harness.app,
+        Method::POST,
+        "/api/session",
+        Some(json!({"parentID": SESSION, "title": "child"})),
+    )
+    .await;
+    assert_eq!(create_status, StatusCode::OK);
+    let created = created.expect("created child");
+    let child_id = created
+        .pointer("/data/id")
+        .or_else(|| created.get("id"))
+        .and_then(Value::as_str)
+        .expect("child id")
+        .to_owned();
+
+    let (msg_status, _) = call(
+        &harness.app,
+        Method::POST,
+        &format!("/api/experimental/subagent/{child_id}/message"),
+        Some(json!({"text": "peer hello from http", "delivery": "queue"})),
+    )
+    .await;
+    assert_eq!(msg_status, StatusCode::OK);
+
+    let (list_status, list_body) = call(
+        &harness.app,
+        Method::GET,
+        &format!("/api/session/{child_id}/message"),
+        None,
+    )
+    .await;
+    assert_eq!(list_status, StatusCode::OK);
+    let items = list_body.expect("messages")["data"]
+        .as_array()
+        .expect("array")
+        .clone();
+    assert!(
+        items
+            .iter()
+            .any(|m| m["text"] == "peer hello from http" && m["metadata"]["source"] == "peer"),
+        "materialized peer message must appear in child timeline: {items:?}"
+    );
+    harness.runtime.expect("runtime").shutdown().await;
+}

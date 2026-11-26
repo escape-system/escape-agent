@@ -1662,6 +1662,12 @@ export const dict = {
   "settings.quotas.openrouter.mgmtEnvPlaceholder": "Managed by an environment variable",
   "usage.quotas.title": "Provider Quotas & Spend",
   "usage.quotas.openSettings": "Open full Quotas & Usage",
+  "composer.key.choose": "Choose credential key",
+  "composer.key.auto": "Auto",
+  "composer.key.autoDescription": "Auto (pool)",
+  "composer.key.active": "Active",
+  "composer.key.cooldown": "Cooldown {{seconds}}s",
+  "composer.key.add": "Add key…",
 }
 
 export default dict

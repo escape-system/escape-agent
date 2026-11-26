@@ -1,14 +1,17 @@
-import { Show, createEffect, createMemo, createSignal } from "solid-js"
+import { For, Show, createEffect, createMemo, createSignal } from "solid-js"
 import { createMediaQuery } from "@solid-primitives/media"
+import { Badge } from "@opencode/ui/badge"
 import { Button } from "@opencode/ui/button"
 import { useDialog } from "@opencode/ui/context/dialog"
 import { Icon } from "@opencode/ui/icon"
 import { Keybind } from "@opencode/ui/keybind"
+import { Menu } from "@opencode/ui/menu"
 import { Slash } from "@opencode/ui/slash"
 import { Tooltip } from "@opencode/ui/tooltip"
 import { ComposerEditor } from "./editor/editor"
 import { DialogSelectModel, ModelSelectorDrawer } from "@/providers/models/select-dialog"
 import { DialogSelectModelUnpaid } from "@/providers/models/unpaid"
+import { resolveSelectedKeyLabel, type ProviderKeyOption } from "@/providers/models/keys"
 import { formatKeybind, useCommand } from "@/shell/commands/command"
 import { useLanguage } from "@/runtime/i18n/language"
 import type { ComposerModel } from "./model"
@@ -49,6 +52,26 @@ export function Composer(props: {
     return { provider: preview ? preview.provider : props.model.model.providerName, model: modelName() }
   }
 
+  const openAddKey = async () => {
+    const { DialogConnectProvider, useProviderConnectController } = await import("@/providers/connect/dialog")
+    const controller = useProviderConnectController()
+    const target = props.model.model.integrationID
+
+    if (target) controller.select(target)
+
+    void dialog.show(
+      () => (
+        <DialogConnectProvider
+          controller={controller}
+          standalone={!!target}
+          directory={props.model.model.directory}
+          selection={props.model.model.selection}
+        />
+      ),
+      props.model.restoreFocus,
+    )
+  }
+
   return (
     <div class="flex flex-col gap-3">
       <ComposerEditor
@@ -63,17 +86,37 @@ export function Composer(props: {
         exitShellKeybind={[formatKeybind("esc", language.t)]}
         suggestionBoundary={props.suggestionBoundary}
         modelControl={
-          <ComposerModelControl
-            loading={props.model.model.loading}
-            preview={!!props.model.model.preview}
-            paid={props.model.model.paid}
-            title={language.t("command.model.choose")}
-            keybind={command.keybindParts("model.choose")}
-            model={props.model.model.selection}
-            label={modelLabel()}
-            onClose={props.model.restoreFocus}
-            onUnpaidClick={() => dialog.show(() => <DialogSelectModelUnpaid model={props.model.model.selection} />)}
-          />
+          <div class="flex min-w-0 items-center">
+            <ComposerModelControl
+              loading={props.model.model.loading}
+              preview={!!props.model.model.preview}
+              paid={props.model.model.paid}
+              title={language.t("command.model.choose")}
+              keybind={command.keybindParts("model.choose")}
+              model={props.model.model.selection}
+              label={modelLabel()}
+              onClose={props.model.restoreFocus}
+              onUnpaidClick={() => dialog.show(() => <DialogSelectModelUnpaid model={props.model.model.selection} />)}
+            />
+            <Show
+              when={
+                !props.model.model.loading &&
+                props.model.model.keys &&
+                props.model.model.keys.length > 0 &&
+                props.model.model.selection.credential
+              }
+            >
+              <Slash />
+              <span class="sr-only">{" / "}</span>
+              <ComposerKeyControl
+                keys={props.model.model.keys!}
+                selected={props.model.model.selection.credential!.current()}
+                onSelect={(credentialID) => props.model.model.selection.credential!.set(credentialID)}
+                onAddKey={() => void openAddKey()}
+                onClose={props.model.restoreFocus}
+              />
+            </Show>
+          </div>
         }
       />
     </div>
@@ -191,5 +234,99 @@ function ComposerModelControl(props: {
         </Show>
       </Tooltip>
     </Show>
+  )
+}
+
+function ComposerKeyControl(props: {
+  keys: readonly ProviderKeyOption[]
+  selected?: string
+  onSelect: (credentialID: string | undefined) => void
+  onAddKey: () => void
+  onClose: () => void
+}) {
+  const language = useLanguage()
+  const mobile = createMediaQuery("(max-width: 767px)")
+
+  const activeKey = createMemo(() => props.keys.find((key) => key.active))
+  const label = createMemo(
+    () =>
+      resolveSelectedKeyLabel({
+        credentialID: props.selected,
+        keys: props.keys,
+        autoLabel: language.t("composer.key.auto"),
+      }) ?? language.t("composer.key.auto"),
+  )
+
+  const cooldownSeconds = (untilMs?: number) => {
+    if (!untilMs) return 0
+    const remaining = Math.ceil((untilMs - Date.now()) / 1000)
+
+    return remaining > 0 ? remaining : 0
+  }
+
+  return (
+    <Tooltip inactive={mobile()} placement="top" value={language.t("composer.key.choose")}>
+      <Menu gutter={6} modal={false} placement="top-start">
+        <Menu.Trigger
+          as={Button}
+          data-action="composer-key"
+          variant="ghost-muted"
+          size="normal"
+          style={{ height: "28px" }}
+          class="min-w-0 max-w-[34cqw] justify-start ![font-weight:440]"
+          aria-label={language.t("composer.key.choose")}
+          onMouseDown={(event: MouseEvent) => event.preventDefault()}
+        >
+          <span class="flex min-w-0 whitespace-nowrap leading-4">
+            <bdi class="min-w-0 truncate">{label()}</bdi>
+          </span>
+          <span class="-ml-0.5 -mr-1 flex shrink-0">
+            <Icon name="chevron-down" />
+          </span>
+        </Menu.Trigger>
+        <Menu.Portal>
+          <Menu.Content onCloseAutoFocus={() => props.onClose()}>
+            <Menu.RadioGroup value={props.selected ?? ""} onChange={(value) => props.onSelect(value || undefined)}>
+              <Menu.RadioItem
+                value=""
+                closeOnSelect
+                badge={
+                  activeKey() ? (
+                    <Badge variant="subtle">{activeKey()!.label}</Badge>
+                  ) : undefined
+                }
+              >
+                <span class="truncate">{language.t("composer.key.autoDescription")}</span>
+              </Menu.RadioItem>
+              <For each={props.keys}>
+                {(item) => {
+                  const cooldown = cooldownSeconds(item.cooldownUntilMs)
+
+                  return (
+                    <Menu.RadioItem
+                      value={item.id}
+                      closeOnSelect
+                      badge={
+                        cooldown > 0 ? (
+                          <Badge variant="neutral">
+                            {language.t("composer.key.cooldown", { seconds: String(cooldown) })}
+                          </Badge>
+                        ) : item.active ? (
+                          <Badge variant="accent">{language.t("composer.key.active")}</Badge>
+                        ) : undefined
+                      }
+                    >
+                      <span class="truncate">{item.label}</span>
+                    </Menu.RadioItem>
+                  )
+                }}
+              </For>
+            </Menu.RadioGroup>
+            <Menu.Separator />
+            <Menu.Item onSelect={props.onAddKey}>{language.t("composer.key.add")}</Menu.Item>
+          </Menu.Content>
+        </Menu.Portal>
+      </Menu>
+    </Tooltip>
   )
 }

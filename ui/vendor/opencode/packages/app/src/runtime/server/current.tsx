@@ -159,10 +159,48 @@ export function ServerPendingPane(props: {
   return wrapper
 }
 
+function createUnreachableBanner(unreachable: () => boolean, onRetry: () => void): HTMLElement {
+  const host = document.createElement("div")
+  host.className = "contents"
+  let mounted: HTMLElement | undefined
+
+  createEffect(() => {
+    if (!unreachable()) {
+      if (mounted) {
+        mounted = undefined
+        host.replaceChildren()
+      }
+
+      return
+    }
+
+    if (mounted) return
+    const banner = document.createElement("div")
+    banner.setAttribute("role", "alert")
+    banner.setAttribute("data-testid", "server-unreachable-banner")
+    banner.className =
+      "fixed bottom-3 right-3 z-50 flex items-center gap-2 rounded-lg border border-white/15 bg-v2-background-bg-base/95 px-3 py-2 text-[12px] text-v2-text-text-base shadow-lg"
+
+    const text = document.createElement("span")
+    text.textContent = copy.unreachable.title
+
+    const button = document.createElement("button")
+    button.type = "button"
+    button.setAttribute("data-testid", "server-retry")
+    button.className = "rounded border border-white/15 bg-white/5 px-2 py-0.5 text-[12px] hover:bg-white/10"
+    button.textContent = "Try again"
+    button.addEventListener("click", onRetry)
+
+    banner.append(text, button)
+    mounted = banner
+    host.replaceChildren(banner)
+  })
+
+  return host
+}
+
 // Must be keyed by connection. A server that rejected our credentials gets a new controller, so the children remount
 // with it. They wait until the server is healthy: a controller created before its new credentials fails every load.
-// The memo starts at `undefined` so the fallback is visible during the first probe instead of an empty document;
-// `previous` then keeps the mounted children through later re-probes, so they are not remounted once healthy.
 export function ServerProvider(props: ParentProps<{ conn: ServerConnection.Any }>): JSX.Element {
   const global = useGlobal()
   const key = ServerConnection.key(props.conn)
@@ -170,29 +208,35 @@ export function ServerProvider(props: ParentProps<{ conn: ServerConnection.Any }
   const ctx = createMemo<ServerCtx | undefined>((previous) => {
     const health = global.servers.health[key]
 
-    // A version mismatch still opens the session pane: its own panel (with Close) owns that screen.
-    // A rejected credential and a failed first probe stay on the pane below.
-    if (health?.incompatible) return global.serverCtx(key) ?? previous
+    // Mount children immediately without blocking behind a connecting splash; rejected credentials still hold.
+    if (health?.unauthorized) return undefined
 
-    return (health?.healthy ? global.serverCtx(key) : undefined) ?? previous
+    return global.serverCtx(key) ?? previous
   }, undefined)
 
   const pane = createMemo(() => {
     const value = ctx()
 
-    if (!value)
+    if (!value) {
       return ServerStatusPane({
         state: pendingState(global.servers.health[key]),
         onRetry: () => void global.servers.retry(),
       })
+    }
 
-    return createComponent(context.provider, {
-      conn: props.conn,
-      ctx: value,
-      get children() {
-        return props.children
-      },
-    })
+    return [
+      createComponent(context.provider, {
+        conn: props.conn,
+        ctx: value,
+        get children() {
+          return props.children
+        },
+      }),
+      createUnreachableBanner(
+        () => pendingState(global.servers.health[key]) === "unreachable",
+        () => void global.servers.retry(),
+      ),
+    ]
   })
 
   // Solid supports a component returning an accessor; the JSX.Element annotation is the public type every call site

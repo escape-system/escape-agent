@@ -22,6 +22,12 @@ pub fn model_ref(value: &Value) -> Option<ModelRef> {
                 id: id.to_owned(),
                 provider_id: provider.to_owned(),
                 variant: normalized_variant(object.get("variant").and_then(Value::as_str)),
+                credential_id: object
+                    .get("credentialID")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|id| !id.is_empty())
+                    .map(ToOwned::to_owned),
             })
         }
         _ => None,
@@ -41,5 +47,6 @@ fn parse_reference(text: &str) -> Option<ModelRef> {
         id: id.to_owned(),
         provider_id: provider.to_owned(),
         variant,
+        credential_id: None,
     })
 }

@@ -679,9 +679,10 @@ Verified workspace suite in that release wave (snapshot 2026-11-13, same commit 
   (`data/quotas/mod.rs:189`).
 - `GET /api/quotas` reports each provider's `keys[]` (rotation order, `active`,
   `limited`, `cooldownUntilMs?`, `kind?`, `failures?`, `usedCostUsd`,
-  `usedRequests`), omitted when the provider has no credential row. `usedCostUsd`
-  / `usedRequests` are always `0` by design — the usage rollup keys on
-  `model.providerID`, so per-key attribution does not exist yet.
+  `usedRequests`, plus optional per-key probe results `status?`, `fetchedAtMs?`,
+  `cached?`, `windows?`, `balances?`, `spendSummary?`, `warnings?`, `error?`),
+  omitted when the provider has no credential row. `usedCostUsd` / `usedRequests`
+  reflect recorded assistant messages bearing `model.credentialID`.
 - `PUT /api/config/models` is live: `ConfigService::set_models` updates the
   `models` cell the runtime re-parses per spawn/turn, so the response carries
   `x-opencode-config-reloaded: models` and **no** `x-opencode-restart`.

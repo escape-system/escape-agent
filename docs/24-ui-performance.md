@@ -284,6 +284,8 @@ SSE is never compressed or buffered, as [13](13-ui.md) requires.
 
 ### Still open after this wave
 
+Wait until the next wave closes splash/skeleton elimination (`ShellSkeleton`, `HomeSessionSkeleton`, `PreparingComposer`, `ServerStatusPane` blocking overlays, `[data-opencode-splash]` removal in favor of immediate synchronous shell render) and heavy full-panel `backdrop-filter: blur(...)` throttling in `GlobalStyles.jsx`.
+
 | Item | Evidence |
 |---|---|
 | Health failure never reaches a retry surface; an all-API abort sits on `Loading…` | `startup-scroll-harness.spec.ts:98`, 20 s timeout, built run 2026-11-25 |

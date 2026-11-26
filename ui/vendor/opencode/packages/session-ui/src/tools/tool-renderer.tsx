@@ -1823,8 +1823,10 @@ ToolRegistry.register({
       const id = childSessionId()
 
       if (!id) return false
+      const liveStatus = data.store.session_status[id]
+      if (liveStatus) return liveStatus.type !== "idle"
 
-      return (data.store.session_status[id]?.type ?? "idle") !== "idle"
+      return props.status === "completed" && metadata().status === "running"
     })
 
     const href = createMemo(() => sessionLink(childSessionId(), data.sessionHref))

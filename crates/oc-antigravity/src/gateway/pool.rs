@@ -14,6 +14,7 @@ use super::DispatchOutcome;
 use super::single::handle_single_attempt;
 use super::stream::send_stream_once;
 
+#[allow(clippy::too_many_lines)]
 pub(super) async fn dispatch_pool_stream(
     svc: &AntigravityService,
     request: &LlmRequest,
@@ -40,7 +41,13 @@ pub(super) async fn dispatch_pool_stream(
     loop {
         let excluded_vec: Vec<usize> = excluded_indices.iter().copied().collect();
         let selected = svc
-            .select_account_for_request(family, style, &request.model.model.id, &excluded_vec)
+            .select_account_for_request(
+                family,
+                style,
+                &request.model.model.id,
+                &excluded_vec,
+                request.options.credential_id.as_deref(),
+            )
             .map_err(|e| to_llm_error(&e))?;
 
         let Some(acct) = selected else {

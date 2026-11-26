@@ -86,6 +86,7 @@ impl Tool for SubagentTool {
                 "description": { "type": "string", "description": "Short label shown in the session tree." },
                 "prompt": { "type": "string", "description": "Task text delivered to the child." },
                 "model": { "type": "string", "description": "Optional model override: provider/id or provider/id#variant. Omit to inherit the agent or parent model." },
+                "key": { "type": "string", "description": "Optional credential id, label, or \"env\" (for main agent routing to pin a specific provider key for this child). Omit to inherit parent key or provider default." },
                 "sessionID": { "type": "string", "description": "Continue an existing direct child or descendant. Omit when spawning a new child." },
                 "background": { "type": "boolean", "description": self.background_description() },
                 "role": { "type": "string", "enum": ["worker", "coordinator"], "description": "Child policy role." },
