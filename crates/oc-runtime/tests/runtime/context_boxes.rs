@@ -33,17 +33,25 @@ async fn run_tool(
     Ok(result.output.unwrap_or_default())
 }
 
-/// Waits until the session has no inbox rows and holds exactly `expected`
-/// settled compaction rows. Returns those rows.
+/// Waits until the session has no inbox rows, holds exactly `expected` settled
+/// compaction rows, and published the matching terminal compaction events.
+/// Returns those rows.
 ///
 /// The count is required, not merely checked afterwards: the runner consumes
 /// the queued compaction item *before* it writes the compaction message, so an
 /// intermediate state with zero rows and an empty inbox is legitimate. Only an
 /// explicit count makes that state distinguishable from completion, and it also
 /// turns a duplicate row into a timeout instead of a silent extra row.
+///
+/// Waiting for the terminal event is part of settling, not an optional extra:
+/// the compaction writes its completed row first, then expires temporary boxes,
+/// and only then publishes `session.compaction.ended` (see
+/// `turn/compaction.rs`). A helper that returned at the row therefore let a
+/// caller observe a temporary box that had not been expired yet. The event is
+/// published last, so requiring it proves the expiry write already happened.
 async fn wait_compaction(harness: &Harness, expected: usize) -> Vec<Value> {
     let deadline = Instant::now() + EVENT_WAIT;
-    loop {
+    let rows: Vec<Value> = loop {
         let rows: Vec<Value> = harness
             .messages()
             .await
@@ -58,7 +66,7 @@ async fn wait_compaction(harness: &Harness, expected: usize) -> Vec<Value> {
                 )
             });
         if settled && harness.inbox().await.is_empty() {
-            return rows;
+            break rows;
         }
         let inbox = harness.inbox().await;
         assert!(
@@ -69,21 +77,26 @@ async fn wait_compaction(harness: &Harness, expected: usize) -> Vec<Value> {
             inbox.len()
         );
         tokio::time::sleep(POLL).await;
-    }
-}
-
-/// Waits until the session has no inbox rows, holds exactly `expected` settled
-/// compaction rows, and published the matching `session.compaction.ended`
-/// events.
-///
-/// A committed row precedes its event, so a test that asserts on the sink must
-/// wait for the sink too instead of reading it the instant the row appears.
-async fn wait_compaction_and_events(harness: &Harness, expected: usize) -> Vec<Value> {
-    let rows = wait_compaction(harness, expected).await;
+    };
+    let completed = rows
+        .iter()
+        .filter(|row| row.get("status").and_then(Value::as_str) == Some("completed"))
+        .count();
     harness
-        .wait_for_events("session.compaction.ended", expected)
+        .wait_for_events("session.compaction.ended", completed)
+        .await;
+    harness
+        .wait_for_events("session.compaction.failed", expected - completed)
         .await;
     rows
+}
+
+/// Alias kept for call sites that also assert on the sink.
+///
+/// `wait_compaction` now waits for the terminal event unconditionally, so this
+/// only documents intent; it must stay a thin wrapper, never a weaker path.
+async fn wait_compaction_and_events(harness: &Harness, expected: usize) -> Vec<Value> {
+    wait_compaction(harness, expected).await
 }
 
 async fn enqueue_compaction(harness: &Harness) {
