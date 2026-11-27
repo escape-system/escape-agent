@@ -35,7 +35,7 @@ impl Runtime {
             .await;
     }
 
-    pub(super) async fn apply_tool_progress(
+    pub(in crate::turn) async fn apply_tool_progress(
         &self,
         session: &str,
         turn: &ResolvedTurn,
@@ -269,6 +269,9 @@ pub(super) fn tool_content_with_limit(
         let ToolContent::Text { text } = part else {
             continue;
         };
+        if let Some(redacted) = oc_tools::sandbox::redact_sensitive_output(text) {
+            *text = redacted;
+        }
         if text.len() <= max_inline_chars {
             continue;
         }
@@ -314,4 +317,17 @@ pub(super) fn metadata_map(value: Option<&Value>) -> Option<Map<String, Value>> 
         .and_then(Value::as_object)
         .filter(|map| !map.is_empty())
         .cloned()
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn redacts_api_keys_and_pem_blocks_without_touching_clean_text() {
+        assert!(oc_tools::sandbox::redact_sensitive_output("cargo test passed cleanly").is_none());
+        let leaked = "GEMINI_API_KEY=AIzaSyDummyKeyValue1234567890ABCDEF and oauth=ya29.a0ARrdaM1234567890abcdef";
+        let scrubbed = oc_tools::sandbox::redact_sensitive_output(leaked).expect("redacted");
+        assert!(!scrubbed.contains("AIzaSy"));
+        assert!(!scrubbed.contains("ya29."));
+        assert!(scrubbed.contains("[REDACTED_SECRET]"));
+    }
 }

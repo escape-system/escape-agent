@@ -413,7 +413,7 @@ impl Runtime {
             &box_index,
             note,
         );
-        let mut messages = context.to_vec();
+        let mut messages = microcompact_stale_tool_results(context, 6, 4_000);
         messages.push(LlmMessage::user(summary_instruction.clone()));
         // Compaction selects a model from `models.chains.compaction` (else
         // `models.chain`), then the turn's current model. Automatic model
@@ -727,7 +727,7 @@ impl Runtime {
             .credential_pool_for(&model.provider.id, preferred_key, oc_types::now_millis())
             .await;
         let credential = pool.into_iter().next();
-        let api_key = credential.as_ref().map(|entry| entry.key.clone());
+        let api_key = credential.as_ref().map(|entry| entry.secret().to_owned());
         let request = LlmRequest {
             model: model.clone(),
             system: system.to_vec(),
@@ -1272,9 +1272,61 @@ fn failure_kind(error: &oc_llm::LlmError) -> oc_llm::FailureKind {
             FailureKind::Transport
         }
         oc_llm::LlmError::Provider { message } => oc_llm::classify_provider_message(message),
+        oc_llm::LlmError::PolicyBlocked { .. } => FailureKind::PolicyBlocked,
+        oc_llm::LlmError::QuotaTerminal { .. } => FailureKind::Quota,
         oc_llm::LlmError::InvalidRequest { .. } => FailureKind::InvalidRequest,
         _ => FailureKind::Unknown,
     }
+}
+
+/// Deterministic zero-LLM microcompaction: replaces oversized stale `ToolResult`
+/// payloads outside the trailing `keep_recent` messages while preserving message
+/// structure and recent outputs verbatim (`docs/30-tos-safe-harness.md`).
+pub(super) fn microcompact_stale_tool_results(
+    context: &[LlmMessage],
+    keep_recent: usize,
+    min_chars: usize,
+) -> Vec<LlmMessage> {
+    let cutoff = context.len().saturating_sub(keep_recent);
+    let mut out = Vec::with_capacity(context.len());
+    for (idx, msg) in context.iter().enumerate() {
+        if idx >= cutoff || !matches!(msg.role, oc_llm::Role::Tool) {
+            out.push(msg.clone());
+            continue;
+        }
+        let mut modified = false;
+        let parts = msg
+            .content
+            .iter()
+            .map(|part| match part {
+                oc_llm::ContentPart::ToolResult {
+                    tool_call_id,
+                    name,
+                    content,
+                    is_error,
+                } if content.len() > min_chars => {
+                    modified = true;
+                    let tool_label = name.as_deref().unwrap_or("tool");
+                    let char_count = content.chars().count();
+                    oc_llm::ContentPart::ToolResult {
+                        tool_call_id: tool_call_id.clone(),
+                        name: name.clone(),
+                        content: format!(
+                            "[microcompacted stale `{tool_label}` output ({char_count} chars); see recent context/summary]"
+                        ),
+                        is_error: *is_error,
+                    }
+                }
+                other => other.clone(),
+            })
+            .collect();
+        if modified {
+            out.push(LlmMessage::new(msg.role, parts));
+        } else {
+            out.push(msg.clone());
+        }
+    }
+    out
 }
 
 /// Compaction `reason` for one trigger.
@@ -1587,5 +1639,37 @@ mod tests {
             shortened[2].content[0].as_text(),
             Some("[omitted image/png attachment (50000 chars) during compaction]")
         );
+    }
+
+    #[test]
+    fn microcompact_stale_tool_results_compacts_stale_and_preserves_recent() {
+        let stale_payload = "A".repeat(5_000);
+        let recent_payload = "B".repeat(5_000);
+        let context = vec![
+            LlmMessage::user("first ask"),
+            LlmMessage::tool_result("call_old", Some("read".to_owned()), stale_payload, false),
+            LlmMessage::assistant("ack old"),
+            LlmMessage::user("recent ask"),
+            LlmMessage::tool_result(
+                "call_recent",
+                Some("read".to_owned()),
+                recent_payload.clone(),
+                false,
+            ),
+            LlmMessage::assistant("ack recent"),
+        ];
+        let compacted = microcompact_stale_tool_results(&context, 3, 4_000);
+        let oc_llm::ContentPart::ToolResult { content: old_c, .. } = &compacted[1].content[0]
+        else {
+            panic!("expected stale ToolResult");
+        };
+        assert!(old_c.contains("[microcompacted stale `read` output (5000 chars)"));
+        let oc_llm::ContentPart::ToolResult {
+            content: recent_c, ..
+        } = &compacted[4].content[0]
+        else {
+            panic!("expected recent ToolResult");
+        };
+        assert_eq!(recent_c, &recent_payload);
     }
 }

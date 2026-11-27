@@ -596,12 +596,231 @@ fn base_nous_model(id: &str, name: &str) -> ModelInfo {
     model
 }
 
-/// Overlay built-in runtime providers (such as Nous Research) onto `catalog`
-/// before user configuration overlays run, so cold-start and offline tests keep
-/// full built-in provider definitions without network access.
+/// Overlay built-in runtime providers (Nous Research plus frontier ToS-safe
+/// `google` Paid Tier and `google-vertex` models) onto `catalog` before user
+/// configuration overlays run, keeping cold-start and offline tests complete.
 pub fn apply_builtin_providers(catalog: &mut Catalog) {
     catalog.upsert_provider(default_nous_provider());
     catalog.upsert_provider_models(default_nous_models());
+    catalog.upsert_provider_models(default_google_frontier_models());
+    catalog.upsert_provider_models(default_vertex_frontier_models());
+}
+
+fn default_google_frontier_models() -> Vec<ModelInfo> {
+    let base_url = "https://generativelanguage.googleapis.com/v1beta";
+    let mut neon = gemini_frontier_model(
+        "google",
+        "gemini-4-neon",
+        "Gemini 4 Neon",
+        base_url,
+        Protocol::Gemini,
+        &["text", "image", "pdf", "audio", "video"],
+        Cost {
+            input: 3.0,
+            output: 15.0,
+            cache: CostCache {
+                read: 0.15,
+                write: 0.0,
+            },
+            ..Cost::default()
+        },
+        &["low", "medium", "high", "xhigh"],
+    );
+    neon.family = Some("gemini".to_owned());
+
+    let carbon = gemini_frontier_model(
+        "google",
+        "gemini-4-carbon",
+        "Gemini 4 Carbon",
+        base_url,
+        Protocol::Gemini,
+        &["text", "image", "pdf", "audio", "video"],
+        Cost {
+            input: 4.0,
+            output: 20.0,
+            cache: CostCache {
+                read: 0.20,
+                write: 0.0,
+            },
+            ..Cost::default()
+        },
+        &["low", "medium", "high", "xhigh"],
+    );
+    let hydrogen = gemini_frontier_model(
+        "google",
+        "gemini-4-hydrogen",
+        "Gemini 4 Hydrogen",
+        base_url,
+        Protocol::Gemini,
+        &["text", "image", "pdf", "audio", "video"],
+        Cost {
+            input: 1.50,
+            output: 7.50,
+            cache: CostCache {
+                read: 0.075,
+                write: 0.0,
+            },
+            ..Cost::default()
+        },
+        &["low", "medium", "high", "xhigh"],
+    );
+    let antigravity_managed = gemini_frontier_model(
+        "google",
+        "antigravity-preview-09-2026",
+        "Antigravity Managed Agent (Interactions API)",
+        base_url,
+        Protocol::GeminiInteractions,
+        &["text", "image", "pdf"],
+        Cost {
+            input: 3.0,
+            output: 15.0,
+            cache: CostCache {
+                read: 0.15,
+                write: 0.0,
+            },
+            ..Cost::default()
+        },
+        &["low", "medium", "high", "xhigh"],
+    );
+    vec![neon, carbon, hydrogen, antigravity_managed]
+}
+
+fn default_vertex_frontier_models() -> Vec<ModelInfo> {
+    let gemini_base = "https://${GOOGLE_VERTEX_ENDPOINT}/v1/projects/${GOOGLE_VERTEX_PROJECT}/locations/${GOOGLE_VERTEX_LOCATION}/publishers/google";
+    let anthropic_base = "https://${GOOGLE_VERTEX_ENDPOINT}/v1/projects/${GOOGLE_VERTEX_PROJECT}/locations/${GOOGLE_VERTEX_LOCATION}/publishers/anthropic/models";
+    vec![
+        gemini_frontier_model(
+            "google-vertex",
+            "gemini-4-neon",
+            "Vertex: Gemini 4 Neon",
+            gemini_base,
+            Protocol::Gemini,
+            &["text", "image", "pdf", "audio", "video"],
+            Cost {
+                input: 3.0,
+                output: 15.0,
+                cache: CostCache {
+                    read: 0.15,
+                    write: 0.0,
+                },
+                ..Cost::default()
+            },
+            &["low", "medium", "high", "xhigh"],
+        ),
+        gemini_frontier_model(
+            "google-vertex",
+            "gemini-4-carbon",
+            "Vertex: Gemini 4 Carbon",
+            gemini_base,
+            Protocol::Gemini,
+            &["text", "image", "pdf", "audio", "video"],
+            Cost {
+                input: 4.0,
+                output: 20.0,
+                cache: CostCache {
+                    read: 0.20,
+                    write: 0.0,
+                },
+                ..Cost::default()
+            },
+            &["low", "medium", "high", "xhigh"],
+        ),
+        gemini_frontier_model(
+            "google-vertex",
+            "gemini-4-hydrogen",
+            "Vertex: Gemini 4 Hydrogen",
+            gemini_base,
+            Protocol::Gemini,
+            &["text", "image", "pdf", "audio", "video"],
+            Cost {
+                input: 1.50,
+                output: 7.50,
+                cache: CostCache {
+                    read: 0.075,
+                    write: 0.0,
+                },
+                ..Cost::default()
+            },
+            &["low", "medium", "high", "xhigh"],
+        ),
+        gemini_frontier_model(
+            "google-vertex",
+            "claude-opus-5-5@default",
+            "Vertex: Claude Opus 5.5",
+            anthropic_base,
+            Protocol::AnthropicMessages,
+            &["text", "image", "pdf"],
+            Cost {
+                input: 4.0,
+                output: 20.0,
+                cache: CostCache {
+                    read: 0.20,
+                    write: 5.0,
+                },
+                ..Cost::default()
+            },
+            &["low", "medium", "high", "xhigh", "max"],
+        ),
+        gemini_frontier_model(
+            "google-vertex",
+            "claude-sonnet-5-5@default",
+            "Vertex: Claude Sonnet 5.5",
+            anthropic_base,
+            Protocol::AnthropicMessages,
+            &["text", "image", "pdf"],
+            Cost {
+                input: 2.0,
+                output: 10.0,
+                cache: CostCache {
+                    read: 0.10,
+                    write: 2.5,
+                },
+                ..Cost::default()
+            },
+            &["low", "medium", "high", "xhigh", "max"],
+        ),
+    ]
+}
+
+#[allow(clippy::too_many_arguments)]
+fn gemini_frontier_model(
+    provider_id: &str,
+    id: &str,
+    name: &str,
+    base_url: &str,
+    protocol: Protocol,
+    input_modalities: &[&str],
+    cost: Cost,
+    efforts: &[&str],
+) -> ModelInfo {
+    let mut settings = Map::new();
+    settings.insert("baseURL".to_owned(), Value::String(base_url.to_owned()));
+    if provider_id == "google-vertex" && protocol == Protocol::AnthropicMessages {
+        settings.insert("vertex".to_owned(), Value::Bool(true));
+    }
+    let mut model = ModelInfo::default_for(provider_id, id);
+    name.clone_into(&mut model.name);
+    model.protocol = protocol;
+    model.package = Some(match protocol {
+        Protocol::AnthropicMessages => "@ai-sdk/google-vertex/anthropic".to_owned(),
+        _ => "@ai-sdk/google".to_owned(),
+    });
+    model.limit.context = 1_048_576;
+    model.limit.output = 131_072;
+    model.capabilities.tools = true;
+    model.capabilities.input = input_modalities.iter().map(|m| (*m).to_owned()).collect();
+    model.capabilities.output = vec!["text".to_owned()];
+    model.cost = vec![cost];
+    model.settings = Some(Arc::new(settings));
+    let support = ReasoningSupport {
+        supported: true,
+        toggle: false,
+        effort: Some(efforts.iter().map(|e| (*e).to_owned()).collect()),
+        budget: None,
+    };
+    let package = model.package.as_deref().unwrap_or("@ai-sdk/google");
+    model.variants = variants_for(&model, package, protocol, &support);
+    model
 }
 
 /// Parse Nous Research's OpenRouter-compatible `/v1/models` payload into

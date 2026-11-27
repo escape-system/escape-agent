@@ -321,6 +321,7 @@ pub enum Protocol {
     OpenAiChat,
     AnthropicMessages,
     Gemini,
+    GeminiInteractions,
     #[default]
     Unsupported,
 }
@@ -332,6 +333,7 @@ impl Protocol {
             Protocol::OpenAiChat => "openai-chat",
             Protocol::AnthropicMessages => "anthropic-messages",
             Protocol::Gemini => "gemini",
+            Protocol::GeminiInteractions => "gemini-interactions",
             Protocol::Unsupported => "unsupported",
         }
     }

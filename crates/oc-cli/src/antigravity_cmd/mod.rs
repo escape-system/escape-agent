@@ -21,7 +21,7 @@ use crate::bootstrap::open_store;
 use crate::cli::{AuthArgs, AuthCommand};
 
 use self::auth::{
-    cmd_login_antigravity, cmd_login_api_key, is_antigravity_provider, normalize_provider_name,
+    cmd_login_antigravity, cmd_login_api_key, is_antigravity_alias, normalize_provider_name,
     open_antigravity, resolve_auth_directory,
 };
 use self::chat::print_chat_ag_help;
@@ -53,8 +53,25 @@ pub(crate) async fn run_auth(args: AuthArgs) -> anyhow::Result<()> {
             label,
             code,
             api_key,
+            allow_consumer_oauth,
         } => {
-            if is_antigravity_provider(&provider) && api_key.is_none() {
+            if is_antigravity_alias(&provider) {
+                if !allow_consumer_oauth {
+                    anyhow::bail!(
+                        "Consumer Antigravity OAuth is disabled by default due to Google ToS 403 ban risk.\n\
+                         Use official API routes instead:\n  \
+                         - Paid Gemini Developer API: `opencode auth login --provider google --api-key <GEMINI_API_KEY>`\n  \
+                         - Vertex AI ADC: set `GOOGLE_VERTEX_PROJECT` + `GOOGLE_APPLICATION_CREDENTIALS`\n  \
+                         - Inverted Antigravity integration: `opencode mcp` in an interactive IDE/app session\n\
+                         Pass `--allow-consumer-oauth` only if you explicitly choose legacy consumer OAuth."
+                    );
+                }
+                let svc = open_antigravity(&store, &dir).await?;
+                cmd_login_antigravity(&svc, project, label, no_browser, code, json_mode).await
+            } else if provider.trim().eq_ignore_ascii_case("google")
+                && allow_consumer_oauth
+                && api_key.is_none()
+            {
                 let svc = open_antigravity(&store, &dir).await?;
                 cmd_login_antigravity(&svc, project, label, no_browser, code, json_mode).await
             } else {

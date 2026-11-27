@@ -1,5 +1,9 @@
+use std::collections::HashSet;
+use std::fmt;
 use std::sync::Arc;
 
+use oc_types::InterruptReason;
+use oc_types::MessageId;
 use oc_types::message::StructuredError;
 use serde_json::{Map, Value};
 use tokio::sync::mpsc;
@@ -8,6 +12,7 @@ use crate::expectation::{self, Expectation};
 use crate::runtime::{CancelToken, Runtime, RuntimeError};
 
 use super::assistant::AssistantState;
+use super::permissions::is_auto_allowed;
 use super::types::{PendingToolCall, ResolvedTurn, ToolOutcome};
 
 mod outcome;
@@ -48,7 +53,7 @@ enum ToolStepWait {
     Joined(Option<Result<(usize, ToolOutcome), tokio::task::JoinError>>),
 }
 
-const MAX_TOOL_PARALLELISM: usize = 8;
+const MAX_TOOL_PARALLELISM: usize = 16;
 /// Maximum characters kept inline inside a single tool text block (~12k tokens).
 /// Larger outputs are spilled to `.opencode/tool-output/<call-id>.txt` and
 /// replaced inline with head + spillover path notice + tail.
@@ -63,18 +68,38 @@ struct StripStartContext {
     open: Arc<std::sync::Mutex<Vec<String>>>,
 }
 
-impl Runtime {
-    pub(super) async fn execute_tools(
-        &self,
+/// Manages tool calls eagerly spawned mid-stream before `execute_tools` begins.
+pub(in crate::turn) struct EagerToolBatch {
+    observer: Option<Arc<oc_observer::ObserverEngine>>,
+    root_id: String,
+    depth: u32,
+    open: Arc<std::sync::Mutex<Vec<String>>>,
+    set: tokio::task::JoinSet<(usize, ToolOutcome)>,
+    progress_tx: mpsc::UnboundedSender<(usize, String, Map<String, Value>)>,
+    progress_rx: mpsc::UnboundedReceiver<(usize, String, Map<String, Value>)>,
+    spawned: HashSet<usize>,
+    eager_cancel: Arc<CancelToken>,
+}
+
+impl fmt::Debug for EagerToolBatch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("EagerToolBatch")
+            .field("root_id", &self.root_id)
+            .field("depth", &self.depth)
+            .field("spawned", &self.spawned)
+            .finish_non_exhaustive()
+    }
+}
+
+impl EagerToolBatch {
+    pub(in crate::turn) async fn new(
+        runtime: &Runtime,
         session: &str,
-        turn: &ResolvedTurn,
-        state: &mut AssistantState,
-        calls: &[PendingToolCall],
-        cancel: &Arc<CancelToken>,
-    ) -> Result<(), RuntimeError> {
-        let observer = self.observer();
+        parent_cancel: &Arc<CancelToken>,
+    ) -> Result<Self, RuntimeError> {
+        let observer = runtime.observer();
         let (root_id, depth) = if observer.is_some() {
-            match self.inner.config.store.session_node(session).await {
+            match runtime.inner.config.store.session_node(session).await {
                 Ok(Some(node)) => (node.root_id, node.depth),
                 Ok(None) => (session.to_owned(), 0),
                 Err(error) => return Err(error.into()),
@@ -82,46 +107,170 @@ impl Runtime {
         } else {
             (String::new(), 0)
         };
-        let open: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let mut set = tokio::task::JoinSet::new();
-        let (progress_tx, mut progress_rx) =
+        let (progress_tx, progress_rx) =
             mpsc::unbounded_channel::<(usize, String, Map<String, Value>)>();
+        Ok(Self {
+            observer,
+            root_id,
+            depth,
+            open: Arc::new(std::sync::Mutex::new(Vec::new())),
+            set: tokio::task::JoinSet::new(),
+            progress_tx,
+            progress_rx,
+            spawned: HashSet::new(),
+            eager_cancel: Arc::new(parent_cancel.child()),
+        })
+    }
+
+    pub(in crate::turn) fn try_spawn_subagent(
+        &mut self,
+        runtime: &Runtime,
+        turn: &ResolvedTurn,
+        message_id: &MessageId,
+        call: &PendingToolCall,
+    ) -> bool {
+        if call.name != "subagent" || call.invalid.is_some() {
+            return false;
+        }
+        if crate::turn::session::is_complex_root_restricted_tool(&call.name)
+            && !turn.tool_names.iter().any(|name| name == &call.name)
+        {
+            return false;
+        }
+        if !is_auto_allowed(runtime, turn, call) {
+            return false;
+        }
+        if self.set.len() >= MAX_TOOL_PARALLELISM || self.spawned.contains(&call.index) {
+            return false;
+        }
+        self.spawned.insert(call.index);
+        spawn_tool_into_set(
+            &mut self.set,
+            runtime,
+            turn,
+            message_id,
+            call,
+            &self.eager_cancel,
+            &self.root_id,
+            self.depth,
+            &self.open,
+            &self.progress_tx,
+        );
+        true
+    }
+
+    pub(in crate::turn) async fn recv_progress(
+        &mut self,
+    ) -> Option<(usize, String, Map<String, Value>)> {
+        self.progress_rx.recv().await
+    }
+
+    pub(in crate::turn) fn drain_progress(&mut self) -> Vec<(usize, String, Map<String, Value>)> {
+        let mut drained = Vec::new();
+        while let Ok(item) = self.progress_rx.try_recv() {
+            drained.push(item);
+        }
+        drained
+    }
+
+    pub(in crate::turn) async fn abort_only(&mut self, reason: InterruptReason) {
+        self.eager_cancel.cancel(reason);
+        self.set.abort_all();
+        while self.set.join_next().await.is_some() {}
+        settle_open(self.observer.as_deref(), &self.open, "cancelled");
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_tool_into_set(
+    set: &mut tokio::task::JoinSet<(usize, ToolOutcome)>,
+    runtime: &Runtime,
+    turn: &ResolvedTurn,
+    message_id: &MessageId,
+    call: &PendingToolCall,
+    cancel: &Arc<CancelToken>,
+    root_id: &str,
+    depth: u32,
+    open: &Arc<std::sync::Mutex<Vec<String>>>,
+    progress_tx: &mpsc::UnboundedSender<(usize, String, Map<String, Value>)>,
+) {
+    let call = call.clone();
+    let index = call.index;
+    let runtime = runtime.clone();
+    let turn = turn.clone();
+    let message_id = message_id.clone();
+    let token = Arc::clone(cancel);
+    let strip_ctx = StripStartContext {
+        root_id: root_id.to_owned(),
+        depth,
+        open: Arc::clone(open),
+    };
+    let sender = ToolProgressSender {
+        index,
+        call_id: call.id.clone(),
+        tx: progress_tx.clone(),
+    };
+    set.spawn(TOOL_PROGRESS.scope(sender, async move {
+        (
+            index,
+            run_tool(runtime, turn, message_id, call, token, strip_ctx).await,
+        )
+    }));
+}
+
+impl Runtime {
+    pub(super) async fn execute_tools(
+        &self,
+        session: &str,
+        turn: &ResolvedTurn,
+        state: &mut AssistantState,
+        calls: &[PendingToolCall],
+        eager: Option<EagerToolBatch>,
+        cancel: &Arc<CancelToken>,
+    ) -> Result<(), RuntimeError> {
+        let mut batch = match eager {
+            Some(batch) => batch,
+            None => match EagerToolBatch::new(self, session, cancel).await {
+                Ok(batch) => batch,
+                Err(error) => {
+                    self.clear_subagent_prewarm(session);
+                    return Err(error);
+                }
+            },
+        };
+        let remaining: Vec<&PendingToolCall> = calls
+            .iter()
+            .filter(|call| !batch.spawned.contains(&call.index))
+            .collect();
         let mut next = 0_usize;
-        while next < calls.len() || !set.is_empty() {
-            while set.len() < MAX_TOOL_PARALLELISM && next < calls.len() {
-                let call = calls[next].clone();
-                let index = call.index;
-                let runtime = self.clone();
-                let turn = turn.clone();
-                let message_id = state.id.clone();
-                let token = Arc::clone(cancel);
-                let strip_ctx = StripStartContext {
-                    root_id: root_id.clone(),
-                    depth,
-                    open: Arc::clone(&open),
-                };
-                let sender = ToolProgressSender {
-                    index,
-                    call_id: call.id.clone(),
-                    tx: progress_tx.clone(),
-                };
-                set.spawn(TOOL_PROGRESS.scope(sender, async move {
-                    (
-                        index,
-                        run_tool(runtime, turn, message_id, call, token, strip_ctx).await,
-                    )
-                }));
+        while next < remaining.len() || !batch.set.is_empty() {
+            while batch.set.len() < MAX_TOOL_PARALLELISM && next < remaining.len() {
+                let call = remaining[next];
+                spawn_tool_into_set(
+                    &mut batch.set,
+                    self,
+                    turn,
+                    &state.id,
+                    call,
+                    &batch.eager_cancel,
+                    &batch.root_id,
+                    batch.depth,
+                    &batch.open,
+                    &batch.progress_tx,
+                );
                 next += 1;
             }
             let wait = tokio::select! {
                 biased;
                 () = cancel.cancelled() => ToolStepWait::Cancelled,
-                Some(progress) = progress_rx.recv() => ToolStepWait::Progress(progress),
-                joined = set.join_next() => ToolStepWait::Joined(joined),
+                Some(progress) = batch.progress_rx.recv() => ToolStepWait::Progress(progress),
+                joined = batch.set.join_next() => ToolStepWait::Joined(joined),
             };
             let joined = match wait {
                 ToolStepWait::Cancelled => {
-                    self.abort_cancelled_tools(session, turn, state, &open, &mut set)
+                    batch.eager_cancel.cancel(cancel.reason());
+                    self.clear_subagent_prewarm(session);
+                    self.abort_cancelled_tools(session, turn, state, &batch.open, &mut batch.set)
                         .await;
                     return Err(RuntimeError::Cancelled);
                 }
@@ -132,25 +281,27 @@ impl Runtime {
                 }
                 ToolStepWait::Joined(joined) => joined,
             };
-            while let Ok((p_index, p_call_id, p_meta)) = progress_rx.try_recv() {
+            while let Ok((p_index, p_call_id, p_meta)) = batch.progress_rx.try_recv() {
                 self.apply_tool_progress(session, turn, state, p_index, p_call_id, p_meta)
                     .await?;
             }
             match joined {
                 Some(Ok((_index, ToolOutcome::Cancelled))) => {
-                    self.abort_cancelled_tools(session, turn, state, &open, &mut set)
+                    batch.eager_cancel.cancel(cancel.reason());
+                    self.clear_subagent_prewarm(session);
+                    self.abort_cancelled_tools(session, turn, state, &batch.open, &mut batch.set)
                         .await;
                     return Err(RuntimeError::Cancelled);
                 }
                 Some(Ok((index, outcome))) => {
                     settle_flight_strip(
-                        observer.as_deref(),
-                        &root_id,
+                        batch.observer.as_deref(),
+                        &batch.root_id,
                         session,
                         &turn.agent_id,
-                        depth,
+                        batch.depth,
                         calls,
-                        &open,
+                        &batch.open,
                         index,
                         &outcome,
                     );
@@ -158,13 +309,16 @@ impl Runtime {
                         .await?;
                 }
                 Some(Err(error)) => {
-                    settle_open(observer.as_deref(), &open, "task failed");
+                    batch.eager_cancel.cancel(InterruptReason::Shutdown);
+                    self.clear_subagent_prewarm(session);
+                    settle_open(batch.observer.as_deref(), &batch.open, "task failed");
                     self.clear_background_request(session);
                     return Err(RuntimeError::Task(error.to_string()));
                 }
                 None => break,
             }
         }
+        self.clear_subagent_prewarm(session);
         self.clear_background_request(session);
         Ok(())
     }

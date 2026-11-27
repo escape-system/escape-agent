@@ -324,6 +324,16 @@ export function createData(config: CreateDataInput) {
   const sync = createSync()
   let activeUpdates: Map<string, DataSessionStatus | undefined> | undefined
   const pendingUpdates = new Map<string, Map<string, SessionInboxInfo | SessionInbox.Delivery | undefined>>()
+  // Track message IDs mutated by live SSE events while `session.message.sync` is in flight so a
+  // stale HTTP snapshot never wipes in-progress assistant steps, tool calls, or streamed text.
+  const messageUpdates = new Map<string, Set<string>>()
+  const missingMessageResyncs = new Map<string, Set<string>>()
+  const scheduledMessageHydrates = new Set<string>()
+  onCleanup(() => {
+    messageUpdates.clear()
+    missingMessageResyncs.clear()
+    scheduledMessageHydrates.clear()
+  })
   // Live SSE admissions kept until either their session reconnects (`server.connected`) or the
   // durable snapshot/terminal inbox event observes them, so a racing `pending.hydrate` cannot wipe
   // a live `session.inbox.enqueued` before the server snapshot reflects it.
@@ -553,8 +563,35 @@ export function createData(config: CreateDataInput) {
     })
   }
 
+  function recordLiveMessageTouch(sessionID: string, messageID?: string) {
+    if (!messageID) return
+    messageUpdates.get(sessionID)?.add(messageID)
+  }
+
+  function scheduleMissingMessageHydrate(sessionID: string, messageID: string) {
+    // Even if the transcript is not loaded yet, invalidate any completed sync key so
+    // opening or switching to this session fetches the latest messages cleanly.
+    sync.invalidate(`session.message:${sessionID}`)
+    if (store.session.message[sessionID] === undefined) return
+    let seen = missingMessageResyncs.get(sessionID)
+    if (!seen) {
+      seen = new Set()
+      missingMessageResyncs.set(sessionID, seen)
+    }
+    if (seen.has(messageID)) return
+    seen.add(messageID)
+    if (scheduledMessageHydrates.has(sessionID)) return
+    scheduledMessageHydrates.add(sessionID)
+    queueMicrotask(() => {
+      scheduledMessageHydrates.delete(sessionID)
+      if (disposed || store.session.message[sessionID] === undefined) return
+      refresh(() => result.session.message.hydrate(sessionID))
+    })
+  }
+
   function materializeInboxMessage(item: SessionInboxInfo) {
     if (item.type !== "user" && item.type !== "synthetic") return
+    recordLiveMessageTouch(item.sessionID, item.id)
     message.update(item.sessionID, (draft, index) => {
       const row =
         item.type === "user"
@@ -608,12 +645,18 @@ export function createData(config: CreateDataInput) {
       messages.push(item)
     },
     insert(sessionID: string, item: SessionMessageInfo) {
+      recordLiveMessageTouch(sessionID, item.id)
       message.update(sessionID, (draft, index) => message.append(draft, index, item))
     },
     // Streaming events target one assistant message and, within it, the latest part of a kind.
-    // A missing target means the row was never loaded or was evicted; the event is dropped.
+    // A missing target means the row was never loaded, missed a step.started event, or was
+    // evicted; invalidate cached sync state and coalesce a hydration when loaded.
     editAssistant(sessionID: string, messageID: string, fn: (assistant: SessionMessageAssistant) => void) {
-      if (!messageIndex.get(sessionID)?.has(messageID)) return
+      recordLiveMessageTouch(sessionID, messageID)
+      if (!messageIndex.get(sessionID)?.has(messageID)) {
+        scheduleMissingMessageHydrate(sessionID, messageID)
+        return
+      }
       message.update(sessionID, (draft, index) => {
         const position = index.get(messageID)
         const item = position === undefined ? undefined : draft[position]
@@ -727,6 +770,9 @@ export function createData(config: CreateDataInput) {
   function evictSession(sessionID: string) {
     if (sessionOutbox.has(sessionID)) return
     livePending.delete(sessionID)
+    messageUpdates.delete(sessionID)
+    missingMessageResyncs.delete(sessionID)
+    scheduledMessageHydrates.delete(sessionID)
     sync.invalidate(`session.pending:${sessionID}`)
     sync.invalidate(`session.message:${sessionID}`)
     messageLoads.delete(sessionID)
@@ -785,6 +831,10 @@ export function createData(config: CreateDataInput) {
     switch (event.type) {
       case "server.connected": {
         livePending.clear()
+        missingMessageResyncs.clear()
+        const loadedMessages = Object.keys(store.session.message)
+        const loadedPending = Object.keys(store.session.pending)
+        const loadedFamilies = Object.keys(store.session.family)
         const previousRunning = Object.entries(store.session.active).flatMap(([id, status]) =>
           status === "running" ? [id] : [],
         )
@@ -807,19 +857,61 @@ export function createData(config: CreateDataInput) {
                 if (status === "running") snapshotActive.add(id)
               })
               setStore("session", "active", reconcile(Object.fromEntries(snapshot)))
-              // Reconcile any previously running sessions absent from `/api/session/active`
-              // so finished turns (`finish: "stop"`) sync immediately after SSE reconnects.
+              const hydratedMessages = new Set<string>()
+              const hydratedPending = new Set<string>()
+              const hydrateLoadedSession = (id: string) => {
+                if (
+                  store.session.message[id] &&
+                  sync.has(`session.message:${id}`) &&
+                  !hydratedMessages.has(id)
+                ) {
+                  hydratedMessages.add(id)
+                  refresh(() => result.session.message.hydrate(id))
+                }
+                if (
+                  store.session.pending[id] &&
+                  sync.has(`session.pending:${id}`) &&
+                  !hydratedPending.has(id)
+                ) {
+                  hydratedPending.add(id)
+                  refresh(() => result.session.pending.hydrate(id))
+                }
+              }
+              // Reconcile any previously running sessions, both finished (`finish: "stop"`) and
+              // still-running across an SSE lag-close or reconnect.
               for (const id of previousRunning) {
-                if (snapshot.has(id)) continue
-                result.session.invalidate(id)
-                refresh(() => result.session.sync(id))
-                if (store.session.message[id]) refresh(() => result.session.message.sync(id))
+                if (!snapshot.has(id)) {
+                  result.session.invalidate(id)
+                  refresh(() => result.session.sync(id))
+                }
+                hydrateLoadedSession(id)
               }
               // Sessions created before this connection (while disconnected, or before the client started)
               // never delivered `session.created`; without their info a running child never joins its root's family.
               snapshot.forEach((status, id) => {
                 if (status === "running" && !store.session.info[id]) refresh(() => result.session.sync(id))
+                else if (status === "running" && !previousRunning.includes(id)) {
+                  result.session.invalidate(id)
+                  refresh(() => result.session.sync(id))
+                }
+                hydrateLoadedSession(id)
               })
+              // Refresh known parent families (so subagents spawned while disconnected appear) and
+              // any open/cached session transcripts & pending queues.
+              const parentSyncs = new Set<string>(loadedFamilies)
+              for (const rootID of loadedFamilies) {
+                for (const memberID of store.session.family[rootID] ?? []) {
+                  const parentID = store.session.info[memberID]?.parentID
+                  if (parentID) parentSyncs.add(parentID)
+                }
+              }
+              for (const parentID of parentSyncs) {
+                result.session.invalidate(parentID)
+                sync.invalidate(`session.family:${parentID}`)
+                refresh(() => result.session.sync(parentID, { children: true }))
+              }
+              for (const id of loadedMessages) hydrateLoadedSession(id)
+              for (const id of loadedPending) hydrateLoadedSession(id)
             })
             .catch(() => {
               if (activeUpdates === updates) activeUpdates = undefined
@@ -1012,6 +1104,7 @@ export function createData(config: CreateDataInput) {
         // delivery whose row was evicted while it waited still materializes from the pending payload.
         const pending = store.session.pending[event.data.sessionID]?.find((item) => item.id === event.data.inboxID)
         removePending(event.data.sessionID, event.data.inboxID)
+        recordLiveMessageTouch(event.data.sessionID, event.data.inboxID)
         message.update(event.data.sessionID, (draft, index) => {
           const position = index.get(event.data.inboxID)
           const existing = position === undefined ? undefined : draft[position]
@@ -1131,6 +1224,7 @@ export function createData(config: CreateDataInput) {
         })
         return
       case "session.step.started":
+        recordLiveMessageTouch(event.data.sessionID, event.data.assistantMessageID)
         message.update(event.data.sessionID, (draft, index) => {
           const position = index.get(event.data.assistantMessageID)
           const existing = position === undefined ? undefined : draft[position]
@@ -1150,6 +1244,7 @@ export function createData(config: CreateDataInput) {
           }
           const currentAssistant = message.activeAssistant(draft)
           if (currentAssistant) {
+            recordLiveMessageTouch(event.data.sessionID, currentAssistant.id)
             currentAssistant.retry = undefined
             currentAssistant.time.completed = event.created
           }
@@ -2052,51 +2147,73 @@ export function createData(config: CreateDataInput) {
         },
         sync(sessionID: string) {
           return sync.run(`session.message:${sessionID}`, async () => {
-            const isChildSession = knownChildren.has(sessionID) || !!store.session.info[sessionID]?.parentID
-            const baseLimit = config.initialMessageLimit?.() ?? messagePageLimit
-            const response = await api().message.list({
-              sessionID,
-              limit: isChildSession ? Math.max(baseLimit, 100) : baseLimit,
-              order: "desc",
-            })
-            const fetched = response.data.toReversed().map(stored)
-            // Same protection as the pending sync: a re-fetch racing an
-            // admission must not wipe its local transcript row.
-            const ids = new Set(fetched.map((item) => item.id))
-            const admitted = new Set(
-              (store.session.pending[sessionID] ?? []).flatMap((item) =>
-                item.type === "user" || item.type === "synthetic" ? [item.id] : [],
-              ),
-            )
-            const existing = store.session.message[sessionID] ?? []
-            const local = existing.filter(
-              (item) => !ids.has(item.id) && (outbox.has(item.id) || admitted.has(item.id)),
-            )
-            // A first page says nothing about pages `loadMore` already fetched. Rows older than the
-            // oldest fetched message and absent from the response are that history; dropping them
-            // rekeys the virtualizer and throws the reader back to the top.
-            const oldest = fetched[0]?.time.created
-            const preserved =
-              oldest === undefined
-                ? []
-                : existing.filter(
-                    (item) => !ids.has(item.id) && item.time.created < oldest && !local.includes(item),
-                  )
-            const messages = [...preserved, ...fetched, ...local]
-            batch(() => {
-              messageIndex.set(sessionID, new Map(messages.map((message, index) => [message.id, index])))
-              setStore("session", "message", sessionID, reconcile(messages))
-              // The first page's cursor points at the second page; with older pages loaded the kept
-              // cursor still walks the rest of the history down to it.
-              setStore(
-                "session",
-                "messageCursor",
+            const touched = new Set<string>()
+            messageUpdates.set(sessionID, touched)
+            try {
+              const isChildSession = knownChildren.has(sessionID) || !!store.session.info[sessionID]?.parentID
+              const baseLimit = config.initialMessageLimit?.() ?? messagePageLimit
+              const response = await api().message.list({
                 sessionID,
-                preserved.length > 0
-                  ? store.session.messageCursor[sessionID]
-                  : (response.cursor.next ?? undefined),
+                limit: isChildSession ? Math.max(baseLimit, 100) : baseLimit,
+                order: "desc",
+              })
+              const rawFetched = response.data.toReversed().map(stored)
+              // Same protection as the pending sync: a re-fetch racing an
+              // admission or live SSE assistant step must not wipe local transcript rows
+              // or overwrite streamed assistant text/tool deltas that landed mid-request.
+              const ids = new Set(rawFetched.map((item) => item.id))
+              const admitted = new Set(
+                (store.session.pending[sessionID] ?? []).flatMap((item) =>
+                  item.type === "user" || item.type === "synthetic" ? [item.id] : [],
+                ),
               )
-            })
+              const existing = store.session.message[sessionID] ?? []
+              const existingById = new Map(existing.map((item) => [item.id, item]))
+              const fetched = rawFetched.map((item) => {
+                if (item.type !== "assistant" || !touched.has(item.id)) return item
+                const prev = existingById.get(item.id)
+                if (!prev || prev.type !== "assistant") return item
+                if (item.time.completed !== undefined && prev.time.completed === undefined) return item
+                return prev
+              })
+              const activeSession = store.session.active[sessionID] === "running" || snapshotActive.has(sessionID)
+              const local = existing.filter(
+                (item) =>
+                  !ids.has(item.id) &&
+                  (outbox.has(item.id) ||
+                    admitted.has(item.id) ||
+                    touched.has(item.id) ||
+                    (item.type === "assistant" && item.time.completed === undefined && activeSession)),
+              )
+              // A first page says nothing about pages `loadMore` already fetched. Rows older than the
+              // oldest fetched message and absent from the response are that history; dropping them
+              // rekeys the virtualizer and throws the reader back to the top.
+              const oldest = fetched[0]?.time.created
+              const preserved =
+                oldest === undefined
+                  ? []
+                  : existing.filter(
+                      (item) => !ids.has(item.id) && item.time.created < oldest && !local.includes(item),
+                    )
+              const messages = [...preserved, ...fetched, ...local]
+              batch(() => {
+                messageIndex.set(sessionID, new Map(messages.map((message, index) => [message.id, index])))
+                setStore("session", "message", sessionID, reconcile(messages))
+                // The first page's cursor points at the second page; with older pages loaded the kept
+                // cursor still walks the rest of the history down to it.
+                setStore(
+                  "session",
+                  "messageCursor",
+                  sessionID,
+                  preserved.length > 0
+                    ? store.session.messageCursor[sessionID]
+                    : (response.cursor.next ?? undefined),
+                )
+              })
+            } finally {
+              if (messageUpdates.get(sessionID) === touched) messageUpdates.delete(sessionID)
+              missingMessageResyncs.delete(sessionID)
+            }
           })
         },
         more(sessionID: string) {

@@ -88,6 +88,28 @@ pub(super) async fn authorize_patch(
     Ok(())
 }
 
+pub(super) fn is_auto_allowed(
+    runtime: &Runtime,
+    turn: &ResolvedTurn,
+    call: &PendingToolCall,
+) -> bool {
+    if call.name == "patch" {
+        return false;
+    }
+    let (action, resource, external) = permission_target(&call.name, &call.input, &turn.directory);
+    if let Some(path) = external
+        && runtime.effect(
+            &turn.agent_id,
+            &turn.session_rules,
+            "external_directory",
+            &path,
+        ) != ConfigEffect::Allow
+    {
+        return false;
+    }
+    runtime.effect(&turn.agent_id, &turn.session_rules, &action, &resource) == ConfigEffect::Allow
+}
+
 impl Runtime {
     #[allow(clippy::too_many_arguments)]
     async fn authorize(

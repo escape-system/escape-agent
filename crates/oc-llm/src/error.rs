@@ -24,6 +24,9 @@ pub enum FailureKind {
     /// from the account, or unknown to it). Distinct from [`Self::Auth`] and
     /// [`Self::InvalidRequest`] so the caller can advance the model chain.
     ModelUnavailable,
+    /// Safety, recitation, blocklist, or policy filter rejected the prompt or
+    /// candidate without output. Non-retryable and never triggers fallback.
+    PolicyBlocked,
     #[default]
     Unknown,
 }
@@ -40,6 +43,7 @@ impl FailureKind {
             Self::Auth => "auth",
             Self::InvalidRequest => "invalid_request",
             Self::ModelUnavailable => "model_unavailable",
+            Self::PolicyBlocked => "policy_blocked",
             Self::Unknown => "unknown",
         }
     }
@@ -69,7 +73,21 @@ impl fmt::Display for FailureKind {
 
 /// Substring rules, in evaluation order: the first group with any matching
 /// entry decides the kind, so earlier groups win over later ones.
-const MESSAGE_RULES: [(&[&str], FailureKind); 7] = [
+const MESSAGE_RULES: [(&[&str], FailureKind); 8] = [
+    (
+        &[
+            "policy_blocked",
+            "prohibited_content",
+            "prompt blocked",
+            "blocked prompt",
+            "finishreason: safety",
+            "finishreason: recitation",
+            "finishreason: blocklist",
+            "finishreason: spii",
+            "content_filter",
+        ],
+        FailureKind::PolicyBlocked,
+    ),
     (
         &[
             // Emitted by `oc-antigravity` after its bounded empty-response
@@ -228,6 +246,16 @@ pub enum LlmError {
         kind: FailureKind,
         message: String,
     },
+    /// Prompt or candidate rejected by provider policy (`promptFeedback.blockReason`
+    /// or `SAFETY` / `RECITATION` / `PROHIBITED_CONTENT` / `BLOCKLIST`). Never retried.
+    PolicyBlocked {
+        message: String,
+    },
+    /// Permanent account/project quota stop signalled by structured
+    /// `google.rpc.QuotaFailure` (`limit: 0`, `enforced_spend_limit_reached`, etc.).
+    QuotaTerminal {
+        message: String,
+    },
     Config {
         message: String,
     },
@@ -308,6 +336,12 @@ impl fmt::Display for LlmError {
             LlmError::Failure { kind, message } => {
                 write!(f, "provider failure ({kind}): {message}")
             }
+            LlmError::PolicyBlocked { message } => {
+                write!(f, "provider blocked request by policy: {message}")
+            }
+            LlmError::QuotaTerminal { message } => {
+                write!(f, "terminal quota limit reached: {message}")
+            }
             LlmError::Config { message } => {
                 write!(f, "catalog configuration is invalid: {message}")
             }
@@ -347,6 +381,8 @@ impl LlmError {
             LlmError::Failure { kind, .. } => kind.is_retryable(),
             LlmError::Timeout { .. }
             | LlmError::Provider { .. }
+            | LlmError::PolicyBlocked { .. }
+            | LlmError::QuotaTerminal { .. }
             | LlmError::InvalidRequest { .. }
             | LlmError::InvalidReference { .. }
             | LlmError::Catalog { .. }
@@ -366,6 +402,172 @@ impl LlmError {
             _ => None,
         }
     }
+}
+
+/// Structured telemetry extracted from Gemini / Google RPC error payloads.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GoogleErrorDetails {
+    /// Suggested retry wait parsed from `google.rpc.RetryInfo.retryDelay`.
+    pub retry_after_ms: Option<u64>,
+    /// True when `google.rpc.QuotaFailure` reports a permanent cap (`limit: 0`,
+    /// `quotaValue == "0"`, `enforced_spend_limit_reached`, etc.).
+    pub terminal_quota: bool,
+    /// Recorded violation reasons/descriptions for diagnostics (without secrets).
+    pub violations: Vec<String>,
+}
+
+/// Parse Google RPC duration literals (`"49s"`, `"2.5s"`, `"500ms"`, `"1h2m3s"`)
+/// into milliseconds.
+#[must_use]
+pub fn parse_google_duration_ms(raw: &str) -> Option<u64> {
+    let s = raw.trim();
+    if s.is_empty() {
+        return None;
+    }
+    if let Some(ms_str) = s.strip_suffix("ms")
+        && let Ok(ms) = ms_str.trim().parse::<f64>()
+        && ms.is_finite()
+        && ms >= 0.0
+    {
+        return Some(saturating_f64_u64(ms));
+    }
+    if s.chars().all(|c| c.is_ascii_digit() || c == '.')
+        && let Ok(secs) = s.parse::<f64>()
+        && secs.is_finite()
+        && secs >= 0.0
+    {
+        return Some(saturating_f64_u64(secs * 1000.0));
+    }
+    let mut total_ms = 0.0_f64;
+    let mut matched = false;
+    let mut num = String::new();
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c.is_ascii_digit() || c == '.' {
+            num.push(c);
+            continue;
+        }
+        if c.is_ascii_whitespace() {
+            continue;
+        }
+        if num.is_empty() {
+            return None;
+        }
+        let val: f64 = num.parse().ok()?;
+        num.clear();
+        if !val.is_finite() || val < 0.0 {
+            return None;
+        }
+        let unit_ms = match c {
+            'h' => 3_600_000.0,
+            'm' => {
+                if chars.peek() == Some(&'s') {
+                    chars.next();
+                    1.0
+                } else {
+                    60_000.0
+                }
+            }
+            's' => 1_000.0,
+            _ => return None,
+        };
+        total_ms += val * unit_ms;
+        matched = true;
+    }
+    if !num.is_empty() || !matched {
+        return None;
+    }
+    Some(saturating_f64_u64(total_ms))
+}
+
+fn saturating_f64_u64(v: f64) -> u64 {
+    if !v.is_finite() || v <= 0.0 {
+        return 0;
+    }
+    if v >= 18_446_744_073_709_551_615.0 {
+        return u64::MAX;
+    }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    {
+        v.round() as u64
+    }
+}
+
+/// Extract structured `RetryInfo` and `QuotaFailure` metadata from a Google/Gemini
+/// JSON error payload.
+#[must_use]
+pub fn parse_google_error_details(body: &str) -> GoogleErrorDetails {
+    let mut out = GoogleErrorDetails::default();
+    let Ok(val) = serde_json::from_str::<serde_json::Value>(body) else {
+        return out;
+    };
+    let details = val
+        .pointer("/error/details")
+        .or_else(|| val.get("details"))
+        .or_else(|| {
+            val.as_array()
+                .and_then(|arr| arr.first())
+                .and_then(|v| v.pointer("/error/details"))
+        })
+        .and_then(serde_json::Value::as_array);
+    let Some(entries) = details else {
+        return out;
+    };
+    for detail in entries {
+        let type_url = detail
+            .get("@type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        if type_url.ends_with("google.rpc.RetryInfo")
+            && let Some(delay) = detail
+                .get("retryDelay")
+                .and_then(serde_json::Value::as_str)
+                .and_then(parse_google_duration_ms)
+        {
+            out.retry_after_ms = Some(out.retry_after_ms.map_or(delay, |prev| prev.max(delay)));
+        } else if type_url.ends_with("google.rpc.QuotaFailure")
+            && let Some(violations) = detail
+                .get("violations")
+                .and_then(serde_json::Value::as_array)
+        {
+            for v in violations {
+                let quota_val = v
+                    .get("quotaValue")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                let reason = v
+                    .get("quotaId")
+                    .or_else(|| v.get("reason"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                let desc = v
+                    .get("description")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                let metric = v
+                    .get("quotaMetric")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                let joined = format!("{reason} {metric} {desc}");
+                let lower = joined.to_ascii_lowercase();
+                if quota_val.trim() == "0"
+                    || lower.contains("limit: 0")
+                    || lower.contains("limit=0")
+                    || lower.contains("enforced_spend_limit")
+                    || lower.contains("spend_limit")
+                    || lower.contains("billing")
+                    || lower.contains("free_tier")
+                    || lower.contains("not enabled")
+                {
+                    out.terminal_quota = true;
+                }
+                if !joined.trim().is_empty() {
+                    out.violations.push(joined.trim().to_owned());
+                }
+            }
+        }
+    }
+    out
 }
 
 impl From<reqwest::Error> for LlmError {
@@ -637,5 +839,61 @@ mod tests {
             classify_provider_message("cloud code returned a non-empty response"),
             FailureKind::Unknown
         );
+    }
+
+    #[test]
+    fn google_error_details_extracts_retry_info_and_terminal_quota_failure() {
+        let retry_body = serde_json::json!({
+            "error": {
+                "code": 429,
+                "message": "Resource exhausted",
+                "details": [
+                    { "@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": "49s" }
+                ]
+            }
+        })
+        .to_string();
+        let parsed = parse_google_error_details(&retry_body);
+        assert_eq!(parsed.retry_after_ms, Some(49_000));
+        assert!(!parsed.terminal_quota);
+
+        let quota_body = serde_json::json!({
+            "error": {
+                "code": 429,
+                "message": "Quota limit 0",
+                "details": [
+                    {
+                        "@type": "type.googleapis.com/google.rpc.QuotaFailure",
+                        "violations": [{
+                            "quotaMetric": "generativelanguage.googleapis.com/generate_content_free_tier_requests",
+                            "quotaValue": "0",
+                            "description": "enforced_spend_limit_reached (limit: 0)"
+                        }]
+                    }
+                ]
+            }
+        })
+        .to_string();
+        let parsed_quota = parse_google_error_details(&quota_body);
+        assert!(parsed_quota.terminal_quota);
+        assert!(!parsed_quota.violations.is_empty());
+
+        let policy_err = LlmError::PolicyBlocked {
+            message: "PROHIBITED_CONTENT".to_owned(),
+        };
+        assert!(!policy_err.is_retryable());
+        assert!(
+            !LlmError::QuotaTerminal {
+                message: "limit 0".to_owned()
+            }
+            .is_retryable()
+        );
+        assert_eq!(
+            classify_provider_message(
+                "policy_blocked: prompt blocked by Gemini (PROHIBITED_CONTENT)"
+            ),
+            FailureKind::PolicyBlocked
+        );
+        assert!(!FailureKind::PolicyBlocked.is_retryable());
     }
 }

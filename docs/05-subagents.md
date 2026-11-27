@@ -19,6 +19,17 @@ spawn_allowed, child_count, agent, model, status, title, location, project_id
 - `child_count` is incremented/decremented transactionally with session
   create/delete; deletion cascades to descendants (upstream behavior).
 - `role` is a policy hint, not a security boundary by itself.
+- **Coordinator upper-session worker placement (`Role::Coordinator`)**: when a
+  coordinator (such as `organizer`) spawns a worker subagent and has an upper
+  parent session (`parent_id`), `subagent` defaults `spawn.attach` to `"parent"`
+  (explicit `"parent" | "child"`). The worker row is created directly under the
+  coordinator's parent (`parent_id = coordinator.parent_id`, at the same depth so
+  all teammates appear side-by-side at depth 1 in the root tree and even
+  `/basic` `max_depth = 1` works) with `metadata.coordinatorID = coordinator.id`.
+  Completions, failures, timeouts, crash recovery (`recover.rs`), `roster`
+  watches, and worker `talk` escalations route to `coordinatorID` — keeping the
+  upper root session unspammed while the coordinator remains the persistent
+  leader across waves until delivering one consolidated synthesis upward.
 
 ## Model selection
 
@@ -31,13 +42,17 @@ Resolution order, highest first:
    model. Chat-picker visibility comes from `models.hidden` plus provider
    connectivity ([13](13-ui.md)), not from chain membership.
 2. When `model` is omitted: `Agent` (`agents.<id>.model`) → `Agent`
-   (`subagents.agents.<id>.model`) → `Default` (`subagents.default_model`) →
+   (`subagents.agents.<id>.model`) → (for `organizer` only: first entry of
+   `models.chains.organizer`) → `Default` (`subagents.default_model`) →
    `Parent` (the parent session's current model). `models.chain` /
-   `models.chains.<agent>` does not override subagent spawns or perform fallback
-   hopping.
+   `models.chains.<agent>` does not override worker subagent spawns or perform
+   fallback hopping.
 
 Standalone roles `scribe`, `observer`, and `compaction` still consult
-`chain_for(role)`. `compaction` resolves its configured `models.chains.compaction`
+`chain_for(role)`. `organizer` also resolves a configured single model selection
+from `models.chains.organizer[0]` when `agent.organizer.model` /
+`subagents.agents.organizer.model` are unset (still with no automatic model
+fallback). `compaction` resolves its configured `models.chains.compaction`
 (else `models.chain`) entry or the turn's current model with a single attempt
 (`COMPACTION_MAX_ATTEMPTS = 1`) and no automatic model fallback; the model it
 reports on the completed compaction row and in `session.compaction.ended` is
@@ -242,7 +257,11 @@ as `state="failed"` instead of hanging the parent.
   "sessionID": "ses_…",                // continue a direct child / descendant
   "background": true,
   "role": "worker",                    // worker | coordinator
-  "spawn": { "allow": false, "max_depth": 1 },
+  "spawn": {
+    "allow": false,
+    "max_depth": 1,
+    "attach": "parent"                 // optional "parent" | "child"; coordinators default to "parent"
+  },
   "lane": "build",                     // hint for the lane service
   "partitions": 3,                     // optional 2..16: graph-partitioned parallel fan-out
   "partition_index": 0,                // optional 0..15: single slice index when fan-out is manual
@@ -478,9 +497,15 @@ does **not** honor `permissions` and does **not** read `name` (the id is the
 file stem). The `opencode.json` entry is therefore load-bearing: drop it and
 the template loads with default permissions. `mode: subagent` is required for
 `subagent {agent:"steward"}` to resolve, because only `subagent`/`all` agents
-are advertised as spawnable. No lane coordinator is a built-in, and none ever
-was: the builtin set stays `engineer`, `architect`, `review`, `general`,
-`explore`, `ui`, `docs`, `compaction`, `title`, `summary`.
+are advertised as spawnable. Across arbitrary workspaces without `.opencode/agent/steward.md`,
+built-in **`builder`** (`mode: subagent`, read-only on source files, serialized via
+`lane`/shell) handles compile, lint, check, test, and benchmark verification gates.
+No lane coordinator template is a built-in: the built-in set is
+`engineer`, `architect`, `review`, `general`, `explore`, `ui`, `docs`,
+`organizer` (persistent resource/worker orchestrator, `role: coordinator`, spawns
+workers onto its parent session via `coordinatorID` reporting and delegates direct
+`shell`/search/edits), `builder` (compile/lint/test/bench verifier), `compaction`,
+`title`, `summary`.
 
 Canonical capability routing for every agent (mirrored in the builtin prompts at
 `crates/oc-config/src/agents.rs`): context boxes are session-tree shared, not
@@ -514,6 +539,6 @@ is `opencode-go/hy4-flash-free` unless the user explicitly approves a change.
 ## Roster semantics (updated)
 
 - Active status check: only `status == "busy"` is treated as active; `"completed"`, `"failed"`, `"interrupted"`, `"archived"`, `"suspended"`, and `"idle"` are settled terminal states.
-- `roster(wait_seconds=...)` snapshots active (`status == "busy"`) children (or optional `target` sessions) and existing caller inbox ids on entry. It wakes only when a watched active session leaves `"busy"` OR a **new** unread inbox item arrives (preventing 0 ms busy-loops on pre-existing queued rows), driven by runtime event bus notifications rather than tight 200 ms SQLite polling.
+- `roster(wait_seconds=..., wait_all?, session_ids?)` snapshots active (`status == "busy"`) children (filtered to `session_ids` when supplied) and existing caller inbox ids on entry. When `wait_all` is `false` (default), it wakes as soon as any watched active session leaves `"busy"` OR a **new** unread inbox item arrives (`wakeReason`: `immediate | no_active_children | inbox | child_settled | timeout`). When `wait_all` is `true`, it keeps waiting quietly across child completions until **all** watched children have settled (`wakeReason: "all_settled"`), `wait_seconds` expires, or an urgent `steer` inbox message / child escalation arrives (preventing 0 ms busy-loops and eliminating repeated parent `roster` turns).
 - Enriched `roster` entries include `status`, `parentID`, `depth`, `role`, `idleOutcome`, `idleReason`, `lastError`, `model`, `childCount`, `pendingInbox`, and `time`, alongside `counts`, `wakeReason`, and `settledIDs` on the outer response. No transcript body is exposed through `roster`.
-- Main-agent `subagent(..., key=...)`: main agents can select a specific provider key (`credentialID`, label, or `"env"`) per spawn, stored on the child's `SessionInfo.model.credentialID`. When omitted under `ModelSource::Parent`, the child inherits the parent session's `credentialID` if provider matches. Subagent peer messages posted through `POST /api/experimental/subagent/:SID/message` use materialized inbox delivery (`enqueue_materialized`) just like `talk` and `session_write`, guaranteeing timeline persistence across reloads.
+- Main-agent / `organizer` `subagent(..., key=...)`: callers can select a specific provider key (`credentialID`, normalized label, or `"env"`) or pass `key: "auto"` to request automatic balanced healthy-key assignment across non-cooling credentials on the chosen provider. When `key` is omitted: if the parent's pinned `credentialID` is currently cooling down in `KeyPool`, OR if the parent has no pinned `credentialID` and multiple healthy keys exist on the provider, `resolve_spawn_credential` automatically balances across healthy non-cooling keys via `KeyPool::pick_balanced_credential` (preserving same-model key rotation without switching models); an active non-cooling parent `credentialID` under `ModelSource::Parent` stays sticky unless `key: "auto"` is requested. Subagent peer messages posted through `POST /api/experimental/subagent/:SID/message` use materialized inbox delivery (`enqueue_materialized`) just like `talk` and `session_write`, guaranteeing timeline persistence across reloads.

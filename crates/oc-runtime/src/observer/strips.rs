@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 use oc_observer::{FlightStrip, StripState, TreeRow};
 use oc_types::now_millis;
@@ -11,46 +11,58 @@ pub(super) async fn build_tree(
     root: &str,
 ) -> Result<Vec<TreeRow>, oc_store::StoreError> {
     let store = &runtime.inner.config.store;
-    let mut rows = Vec::new();
-    let mut queue = VecDeque::new();
-    if let Some(node) = store.session_node(root).await? {
+    // Fetch a generous recursive window in a single read and preserve exact BFS
+    // order/truncation in memory.
+    let nodes = store.session_tree(root, MAX_TREE_ROWS * 4).await?;
+    let mut root_node = None;
+    let mut by_parent: HashMap<String, Vec<oc_store::SessionNodeRow>> = HashMap::new();
+    for node in nodes {
+        if node.id == root {
+            root_node = Some(node);
+        } else if let Some(parent) = node.parent_id.clone() {
+            by_parent.entry(parent).or_default().push(node);
+        }
+    }
+    let Some(root_node) = root_node else {
+        return Ok(Vec::new());
+    };
+
+    let row_of = |node: oc_store::SessionNodeRow, parent: Option<String>| {
         let state = if node.status == "busy" && runtime.is_waiting_permission(&node.id) {
             "waiting_permission".to_owned()
         } else {
             node.status
         };
-        rows.push(TreeRow {
-            sid: node.id.clone(),
-            parent: None,
+        TreeRow {
+            sid: node.id,
+            parent,
             agent: node.agent,
             state,
             idle_reason: node.idle_reason,
             depth: node.depth,
-        });
-        queue.push_back(node.id);
-    }
+        }
+    };
+
+    let mut rows = Vec::new();
+    let mut queue = VecDeque::new();
+    let root_id = root_node.id.clone();
+    rows.push(row_of(root_node, None));
+    queue.push_back(root_id);
+
     while let Some(parent) = queue.pop_front() {
         if rows.len() >= MAX_TREE_ROWS {
             break;
         }
-        for child in store.children(&parent).await? {
+        let Some(children) = by_parent.remove(&parent) else {
+            continue;
+        };
+        for child in children {
             if rows.len() >= MAX_TREE_ROWS {
                 break;
             }
             let id = child.id.clone();
-            let state = if child.status == "busy" && runtime.is_waiting_permission(&id) {
-                "waiting_permission".to_owned()
-            } else {
-                child.status
-            };
-            rows.push(TreeRow {
-                sid: id.clone(),
-                parent: child.parent_id,
-                agent: child.agent,
-                state,
-                idle_reason: child.idle_reason,
-                depth: child.depth,
-            });
+            let parent_id = child.parent_id.clone();
+            rows.push(row_of(child, parent_id));
             queue.push_back(id);
         }
     }

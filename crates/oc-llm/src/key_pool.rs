@@ -31,6 +31,8 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::{Arc, PoisonError, RwLock};
 
+use zeroize::Zeroizing;
+
 use crate::error::FailureKind;
 
 /// Credential id used for keys that do not come from a stored credential.
@@ -41,13 +43,68 @@ pub const ENV_KEY_ID: &str = "__env__";
 /// The caller builds these in priority order (active credential first). The
 /// pool only filters them; it never reorders, and never dedupes two entries
 /// with identical key material, because distinct credential ids keep distinct
-/// labels and distinct rotation state.
+/// labels and distinct rotation state. Key bytes are zeroized on drop.
 #[derive(Clone, PartialEq, Eq)]
 pub struct PoolKey {
     /// Stored credential this key came from, or `None` for an environment key.
     pub credential_id: Option<String>,
-    /// Secret material. Never formatted, never serialised.
-    pub key: String,
+    /// Secret material wrapped in [`Zeroizing`]. Never formatted, never serialized.
+    pub key: Zeroizing<String>,
+}
+
+impl PoolKey {
+    /// Construct a [`PoolKey`] wrapping secret bytes in [`Zeroizing`].
+    #[must_use]
+    pub fn new(credential_id: Option<String>, key: impl Into<String>) -> Self {
+        Self {
+            credential_id,
+            key: Zeroizing::new(key.into()),
+        }
+    }
+
+    /// Borrow the underlying secret key string.
+    #[must_use]
+    pub fn secret(&self) -> &str {
+        self.key.as_str()
+    }
+}
+
+/// Sanitized startup credential-presence report (`detect_auth()`).
+///
+/// Checks whether environment variables or stored credentials exist without
+/// logging or copying secret material.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthDetection {
+    pub provider: String,
+    pub env_vars_present: Vec<String>,
+    pub has_stored_credential: bool,
+    pub available: bool,
+}
+
+/// Detect which providers have credentials configured via env vars or store ids
+/// without exposing secret values.
+#[must_use]
+pub fn detect_auth(specs: &[(&str, &[&str])], stored_providers: &[&str]) -> Vec<AuthDetection> {
+    specs
+        .iter()
+        .map(|(provider, envs)| {
+            let env_vars_present: Vec<String> = envs
+                .iter()
+                .filter(|name| std::env::var_os(name).is_some_and(|val| !val.is_empty()))
+                .map(|name| (*name).to_owned())
+                .collect();
+            let has_stored_credential = stored_providers
+                .iter()
+                .any(|stored| stored.eq_ignore_ascii_case(provider));
+            let available = !env_vars_present.is_empty() || has_stored_credential;
+            AuthDetection {
+                provider: (*provider).to_owned(),
+                env_vars_present,
+                has_stored_credential,
+                available,
+            }
+        })
+        .collect()
 }
 
 impl fmt::Debug for PoolKey {
@@ -90,6 +147,8 @@ struct KeyState {
 pub struct KeyPool {
     /// `provider -> credential id (or `__env__`) -> cooldown`.
     entries: RwLock<BTreeMap<String, BTreeMap<String, KeyState>>>,
+    /// Process-local per-provider round-robin cursor for balanced healthy key selection.
+    cursors: RwLock<BTreeMap<String, usize>>,
 }
 
 impl KeyPool {
@@ -196,6 +255,59 @@ impl KeyPool {
             .write()
             .unwrap_or_else(PoisonError::into_inner)
             .clear();
+        self.cursors
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
+    }
+
+    /// Return whether `credential_id` (or `ENV_KEY_ID` when `None`) is cooling at `now_ms`.
+    #[must_use]
+    pub fn is_cooling(&self, provider: &str, credential_id: Option<&str>, now_ms: i64) -> bool {
+        let provider = normalize_provider(provider);
+        let id = pool_id(credential_id);
+        let entries = self.entries.read().unwrap_or_else(PoisonError::into_inner);
+        entries
+            .get(&provider)
+            .and_then(|state| state.get(&id))
+            .is_some_and(|entry| entry.until_ms > now_ms)
+    }
+
+    /// Pick the next unexpired healthy credential id from `candidate_ids` in round-robin
+    /// order so parallel subagent spawns spread load across healthy keys on one provider.
+    /// Returns `None` if `candidate_ids` has no healthy non-cooling entry.
+    #[must_use]
+    pub fn pick_balanced_credential(
+        &self,
+        provider: &str,
+        candidate_ids: &[Option<String>],
+        now_ms: i64,
+    ) -> Option<Option<String>> {
+        let provider = normalize_provider(provider);
+        let mut entries = self.entries.write().unwrap_or_else(PoisonError::into_inner);
+        let usable: Vec<Option<String>> = if let Some(state) = entries.get_mut(&provider) {
+            state.retain(|_, entry| entry.until_ms > now_ms);
+            candidate_ids
+                .iter()
+                .filter(|id| !state.contains_key(&pool_id(id.as_deref())))
+                .cloned()
+                .collect()
+        } else {
+            candidate_ids.to_vec()
+        };
+        if entries.get(&provider).is_some_and(BTreeMap::is_empty) {
+            entries.remove(&provider);
+        }
+        drop(entries);
+
+        if usable.is_empty() {
+            return None;
+        }
+        let mut cursors = self.cursors.write().unwrap_or_else(PoisonError::into_inner);
+        let cursor = cursors.entry(provider).or_insert(0);
+        let index = *cursor % usable.len();
+        *cursor = cursor.wrapping_add(1);
+        Some(usable[index].clone())
     }
 }
 
@@ -211,6 +323,7 @@ fn ttl_ms(kind: FailureKind) -> Option<i64> {
         FailureKind::Transport => Some(30_000),
         FailureKind::ModelUnavailable
         | FailureKind::InvalidRequest
+        | FailureKind::PolicyBlocked
         | FailureKind::EmptyResponse
         | FailureKind::Unknown => None,
     }
@@ -241,10 +354,7 @@ mod tests {
     use super::*;
 
     fn key(credential_id: Option<&str>, secret: &str) -> PoolKey {
-        PoolKey {
-            credential_id: credential_id.map(str::to_owned),
-            key: secret.to_owned(),
-        }
+        PoolKey::new(credential_id.map(str::to_owned), secret)
     }
 
     #[test]
@@ -401,5 +511,20 @@ mod tests {
         assert!(!rendered.contains("sk-super-secret"), "got {rendered}");
         assert!(rendered.contains("<redacted>"), "got {rendered}");
         assert!(rendered.contains("cred_a"), "got {rendered}");
+    }
+
+    #[test]
+    fn pick_balanced_credential_rotates_and_skips_cooling_keys() {
+        let pool = KeyPool::new();
+        let candidates = vec![Some("cred_a".to_owned()), Some("cred_b".to_owned()), None];
+        pool.mark("opencode-go", Some("cred_b"), FailureKind::RateLimit, 1_000);
+        let first = pool.pick_balanced_credential("opencode-go", &candidates, 1_000);
+        let second = pool.pick_balanced_credential("opencode-go", &candidates, 1_000);
+        let third = pool.pick_balanced_credential("opencode-go", &candidates, 1_000);
+        assert_eq!(first, Some(Some("cred_a".to_owned())));
+        assert_eq!(second, Some(None));
+        assert_eq!(third, Some(Some("cred_a".to_owned())));
+        assert!(pool.is_cooling("opencode-go", Some("cred_b"), 1_000));
+        assert!(!pool.is_cooling("opencode-go", Some("cred_b"), 70_000));
     }
 }

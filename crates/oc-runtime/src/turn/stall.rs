@@ -1,43 +1,65 @@
-//! Stall Guard: detects degenerate tool-call loops and repeating cycles (Hermes `tool_guardrails` port).
+//! Stall Guard: deterministic SHA-256 tool-call Loop Guard (Hermes + `OpenFang` pattern).
 //!
-//! When an LLM gets trapped repeating the exact same tool call (e.g. calling `read`
-//! on the same path 3 times, or ping-ponging in an A->B->A->B loop), `StallGuard`
-//! detects the stagnation and generates a synthetic system warning to break the loop.
+//! When an LLM gets trapped repeating the exact same tool call (canonical JSON
+//! arguments hashed with SHA-256) or repeating identical failing calls/cycles,
+//! `StallGuard` detects the stagnation and injects a synthetic system warning
+//! to break the loop (`docs/30-tos-safe-harness.md`).
 
-use std::collections::VecDeque;
-use std::hash::{DefaultHasher, Hash, Hasher};
+use std::collections::{BTreeMap, VecDeque};
 
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 
 const IDENTICAL_CALL_THRESHOLD: usize = 3;
+const IDENTICAL_FAILURE_THRESHOLD: usize = 3;
 const MAX_CYCLE_PERIOD: usize = 4;
 const MAX_HISTORY: usize = 32;
 
-/// Signature representing a tool call for deduplication / cycle detection.
+/// Deterministic SHA-256 signature representing a tool call.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct CallSignature {
     name: String,
-    input_hash: u64,
+    input_sha256: [u8; 32],
+}
+
+fn canonicalize_value(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let mut sorted = BTreeMap::new();
+            for (k, v) in map {
+                sorted.insert(k.clone(), canonicalize_value(v));
+            }
+            Value::Object(sorted.into_iter().collect())
+        }
+        Value::Array(items) => Value::Array(items.iter().map(canonicalize_value).collect()),
+        other => other.clone(),
+    }
+}
+
+fn sha256_call(name: &str, input: &Map<String, Value>) -> [u8; 32] {
+    let canonical = canonicalize_value(&Value::Object(input.clone()));
+    let serialized = serde_json::to_string(&canonical).unwrap_or_default();
+    let mut hasher = Sha256::new();
+    hasher.update(name.as_bytes());
+    hasher.update([0_u8]);
+    hasher.update(serialized.as_bytes());
+    hasher.finalize().into()
 }
 
 impl CallSignature {
     fn new(name: &str, input: &Map<String, Value>) -> Self {
-        let mut hasher = DefaultHasher::new();
-        // Hash canonical JSON representation of input
-        if let Ok(serialized) = serde_json::to_string(input) {
-            serialized.hash(&mut hasher);
-        }
         Self {
             name: name.to_owned(),
-            input_hash: hasher.finish(),
+            input_sha256: sha256_call(name, input),
         }
     }
 }
 
-/// Tracks tool calls during a turn to detect degenerate repeating patterns.
+/// Tracks tool calls and repeated identical failures during a turn using SHA-256 digests.
 #[derive(Debug, Default)]
 pub(super) struct StallGuard {
     history: VecDeque<CallSignature>,
+    failure_history: VecDeque<([u8; 32], [u8; 32])>,
     consecutive_repeats: usize,
     stalls_flagged: usize,
 }
@@ -94,6 +116,38 @@ impl StallGuard {
             ));
         }
 
+        None
+    }
+
+    /// Record a failed tool execution by `(call_sha256, error_sha256)`. Returns
+    /// a loop-guard warning if the same normalized failure repeats in the sliding window.
+    pub(super) fn record_failure(
+        &mut self,
+        name: &str,
+        input: &Map<String, Value>,
+        error_text: &str,
+    ) -> Option<String> {
+        let call_hash = sha256_call(name, input);
+        let mut err_hasher = Sha256::new();
+        err_hasher.update(error_text.trim().as_bytes());
+        let err_hash: [u8; 32] = err_hasher.finalize().into();
+
+        self.failure_history.push_back((call_hash, err_hash));
+        if self.failure_history.len() > MAX_HISTORY {
+            self.failure_history.pop_front();
+        }
+        let count = self
+            .failure_history
+            .iter()
+            .filter(|(c, e)| *c == call_hash && *e == err_hash)
+            .count();
+        if count >= IDENTICAL_FAILURE_THRESHOLD {
+            self.stalls_flagged += 1;
+            return Some(format!(
+                "[System: Loop Guard Warning: Tool `{name}` produced the identical failure {count} times \
+                 in the recent window. Stop retrying the failing call; inspect the root cause or switch strategy.]"
+            ));
+        }
         None
     }
 
@@ -191,5 +245,25 @@ mod tests {
         assert!(warning.is_some());
         assert!(warning.unwrap().contains("repeating 2-tool cycle"));
         assert_eq!(guard.stalls_flagged(), 1);
+    }
+
+    #[test]
+    fn sha256_canonicalizes_key_order_and_flags_repeated_failures() {
+        let mut guard = StallGuard::default();
+        let a: Map<String, Value> = serde_json::from_value(json!({"a": 1, "b": 2})).unwrap();
+        let b: Map<String, Value> = serde_json::from_value(json!({"b": 2, "a": 1})).unwrap();
+        assert!(guard.record_and_check("edit", &a).is_none());
+        assert!(guard.record_and_check("edit", &b).is_none());
+        let w = guard.record_and_check("edit", &a);
+        assert!(
+            w.is_some(),
+            "key-order differences must hash identically via canonical SHA-256"
+        );
+
+        let mut fail_guard = StallGuard::default();
+        assert!(fail_guard.record_failure("shell", &a, "exit 1").is_none());
+        assert!(fail_guard.record_failure("shell", &b, "exit 1").is_none());
+        let fw = fail_guard.record_failure("shell", &a, "exit 1");
+        assert!(fw.is_some_and(|m| m.contains("Loop Guard Warning")));
     }
 }

@@ -38,6 +38,13 @@ pub(super) fn resolve_auth_directory(directory: Option<PathBuf>) -> anyhow::Resu
     std::path::absolute(&dir).with_context(|| format!("resolve directory {}", dir.display()))
 }
 
+pub(super) fn is_antigravity_alias(provider: &str) -> bool {
+    matches!(
+        provider.trim().to_ascii_lowercase().as_str(),
+        "antigravity" | "google-antigravity"
+    )
+}
+
 pub(super) fn is_antigravity_provider(provider: &str) -> bool {
     matches!(
         provider.trim().to_ascii_lowercase().as_str(),

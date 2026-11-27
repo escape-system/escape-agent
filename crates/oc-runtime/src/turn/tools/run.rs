@@ -62,6 +62,19 @@ pub(super) async fn run_tool(
         };
     }
 
+    // Deterministic `pre_tool_use` secret-exfiltration policy gate (never
+    // delegated to model instructions).
+    if let Err(reason) = oc_tools::sandbox::pre_tool_use_secret_guard(&call.name, &call.input) {
+        return ToolOutcome::Failed {
+            index: call.index,
+            input: call.input,
+            error: StructuredError::new("PolicyGuardError", reason),
+            content: None,
+            metadata: None,
+            executed: false,
+        };
+    }
+
     if let Err(failure) = authorize_tool_call(&runtime, &turn, &message_id, &call, &cancel).await {
         return auth_outcome(failure, call);
     }
@@ -136,10 +149,34 @@ pub(super) async fn run_tool(
             }
         }
     }
+    let merged = runtime.inner.config.config.merged();
+    let sandbox_mode = merged
+        .pointer("/tools/sandbox")
+        .and_then(Value::as_str)
+        .and_then(oc_tools::sandbox::ShellSandboxMode::from_config_str)
+        .unwrap_or(oc_tools::sandbox::ShellSandboxMode::Off);
+    let writable_paths: Vec<std::path::PathBuf> = merged
+        .pointer("/tools/writable_paths")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(std::path::PathBuf::from)
+                .collect()
+        })
+        .unwrap_or_default();
+    let scrub_secrets = merged
+        .pointer("/tools/scrub_secrets")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
     let shell_cfg = oc_tools::shell::ShellRunConfig {
         env: shell_env,
         max_lines: turn.tool_output.max_lines,
         max_bytes: turn.tool_output.max_bytes,
+        sandbox: sandbox_mode,
+        writable_paths,
+        scrub_secrets,
     };
 
     let result = tokio::select! {
@@ -411,5 +448,29 @@ mod tests {
     #[test]
     fn a_turn_cancel_is_not_reported_as_observer_repair() {
         assert!(!cancelled_after_completion(true, true, true));
+    }
+
+    #[test]
+    fn pre_tool_use_secret_guard_blocks_protected_credential_artifacts() {
+        let mut read_input = serde_json::Map::new();
+        read_input.insert(
+            "path".to_owned(),
+            serde_json::Value::String("/root/.config/opencode/antigravity-accounts.json".into()),
+        );
+        assert!(oc_tools::sandbox::pre_tool_use_secret_guard("read", &read_input).is_err());
+
+        let mut shell_input = serde_json::Map::new();
+        shell_input.insert(
+            "command".to_owned(),
+            serde_json::Value::String("sqlite3 ~/.local/share/escape-agent/escape.db".into()),
+        );
+        assert!(oc_tools::sandbox::pre_tool_use_secret_guard("shell", &shell_input).is_err());
+
+        let mut ok_input = serde_json::Map::new();
+        ok_input.insert(
+            "path".to_owned(),
+            serde_json::Value::String("/root/escape-agent/src/lib.rs".into()),
+        );
+        assert!(oc_tools::sandbox::pre_tool_use_secret_guard("read", &ok_input).is_ok());
     }
 }

@@ -13,7 +13,7 @@ struct Fixture {
 }
 
 /// The contract order of the builtin agents (`contract-agents`).
-const CONTRACT_ORDER: [&str; 10] = [
+const CONTRACT_ORDER: [&str; 12] = [
     "engineer",
     "architect",
     "review",
@@ -21,6 +21,8 @@ const CONTRACT_ORDER: [&str; 10] = [
     "explore",
     "ui",
     "docs",
+    "organizer",
+    "builder",
     "compaction",
     "title",
     "summary",
@@ -467,7 +469,7 @@ fn builtin_agents_have_contract_modes_permissions_and_prompts() {
     let service = fixture.load(&project);
 
     let agents = service.agents();
-    assert_eq!(agents.len(), 10, "the contract builtin set");
+    assert_eq!(agents.len(), 12, "the contract builtin set");
     assert_eq!(
         agents[0]["id"], "architect",
         "the configured default agent is listed first"
@@ -488,7 +490,7 @@ fn builtin_agents_have_contract_modes_permissions_and_prompts() {
     });
     assert_eq!(
         canonical, CONTRACT_ORDER,
-        "the ten builtins are exactly the contract set"
+        "the eleven builtins are exactly the contract set"
     );
     // `agents()` lists the configured default first, then the remaining
     // builtins in contract order, so the tail is the contract order minus the
@@ -634,6 +636,53 @@ fn builtin_agents_have_contract_modes_permissions_and_prompts() {
             service.evaluate(Some("ui"), "edit", resource),
             expected,
             "ui scope for {resource}"
+        );
+    }
+
+    // organizer: subagent coordinator, read-only source access, no direct edits.
+    let organizer = service.agent("organizer").expect("organizer");
+    assert_eq!(organizer["mode"], "subagent");
+    assert_eq!(organizer["hidden"], false);
+    assert!(
+        organizer["system"]
+            .as_str()
+            .expect("organizer prompt")
+            .contains("key_health"),
+        "organizer prompt covers key_health resource checks"
+    );
+    for action in [
+        "edit", "write", "patch", "question", "shell", "bash", "glob", "grep",
+    ] {
+        assert_eq!(
+            service.evaluate(Some("organizer"), action, "crates/oc-config/src/lib.rs"),
+            Effect::Deny,
+            "organizer must delegate edits/questions/shell/search: {action}"
+        );
+    }
+    for action in ["read", "subagent"] {
+        assert_eq!(
+            service.evaluate(Some("organizer"), action, "*"),
+            Effect::Allow,
+            "organizer keeps {action}"
+        );
+    }
+
+    // builder: dedicated compile/lint/test runner, read-only on source files.
+    let builder = service.agent("builder").expect("builder");
+    assert_eq!(builder["mode"], "subagent");
+    assert_eq!(builder["hidden"], false);
+    for action in ["edit", "write", "patch", "question", "subagent"] {
+        assert_eq!(
+            service.evaluate(Some("builder"), action, "crates/oc-config/src/lib.rs"),
+            Effect::Deny,
+            "builder must not edit files or spawn children: {action}"
+        );
+    }
+    for action in ["shell", "lane", "read", "glob", "grep"] {
+        assert_eq!(
+            service.evaluate(Some("builder"), action, "*"),
+            Effect::Allow,
+            "builder keeps {action}"
         );
     }
 }

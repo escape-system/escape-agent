@@ -269,15 +269,34 @@ guessing.
 
 - **`key_health` tool** (`crates/oc-tools/src/key_health.rs`, source in
   `crates/oc-runtime/src/key_health.rs`): read-only, no required arguments, one
-  optional exact `provider` filter. It returns
+  optional exact `provider` filter and optional `include_models` boolean
+  (default `false`). By default it returns compact JSON
   `{summary, providers: [{providerID, keys: [{credentialID?, label?, active,
   limited, cooldownUntilMs?, kind?, failures?, source?}]}]}` — the same join
-  `/api/quotas` performs, without the spend columns. Every key of every provider
-  (or of the filtered one) is listed, including a provider whose keys are all
-  healthy, so the agent can answer "2 keys for opencode-go, both healthy". The
-  environment key is `source: "env"` with no `credentialID`; cooldown fields are
-  omitted unless `limited` is true. Key material has no field in the result
-  type, so it cannot leak through `output` or `metadata`.
+  `/api/quotas` performs, without the spend columns. When `include_models: true`
+  is requested (e.g. by the `organizer` coordinator), each provider also carries
+  `models: [{id, ref, name, contextLimit?, outputLimit?, tools, variants?,
+  costUsdPer1M?, favorite?, note?, unavailable?, quota?}]` filtered to **genuinely
+  selectable** models only (connected non-disabled providers; Antigravity dynamic
+  models without unselectable raw Google AI Studio entries when no direct Google
+  key is configured; excluding `!enabled`, `Protocol::Unsupported`,
+  `ModelStatus::Deprecated`, `!tools`, non-chat kinds, and `models.hidden`),
+  ranked by `favorite` -> `models.chain` -> `ref` alongside top-level
+  `agentModels` so `organizer` sees usable models, operator notes, cooldowns,
+  and quotas cleanly without catalog bloat. Every key
+  of every provider (or of the filtered one) is listed, including a provider whose
+  keys are all healthy, so the agent can answer "2 keys for opencode-go, both
+  healthy". The environment key is `source: "env"` with no `credentialID`;
+  cooldown fields are omitted unless `limited` is true. Key material has no
+  field in the result type, so it cannot leak through `output` or `metadata`.
+- **Automatic healthy key distribution for subagents**: `KeyPool::pick_balanced_credential`
+  maintains a per-provider round-robin cursor across unexpired non-cooling
+  credentials (`!limited`). When spawning a subagent with `key: "auto" | "rotate" | "pool"`,
+  or when `key` is omitted and either the parent carries no pinned `credentialID`
+  with multiple healthy keys on the provider OR the parent's pinned `credentialID`
+  is currently cooling down in `KeyPool`, `resolve_spawn_credential` automatically
+  assigns the next healthy key without switching models. Explicit `key` arguments
+  still pin strictly.
 - **`<key-health>` prompt line** (`crates/oc-runtime/src/key_health.rs`,
   appended at the end of the system prefix in `turn/session.rs`
   `refresh_instructions`): present **only** while at least one key is cooling

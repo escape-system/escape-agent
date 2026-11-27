@@ -1,4 +1,13 @@
-# 26 — Antigravity OAuth & Cloud Code Assist Gateway
+# 26 — Antigravity OAuth & Cloud Code Assist Gateway (Legacy / Disabled by Default)
+
+> **ToS Safety Lock**: Consumer Antigravity OAuth attachment is **disabled by default**
+> in `opencode serve`, `opencode run`, `opencode chat`, and `opencode mcp` per
+> [docs/30-tos-safe-harness.md](30-tos-safe-harness.md). Background maintenance timers
+> default to off (`quota_refresh_interval_minutes = 0`, `proactive_token_refresh = false`,
+> `auto_update = false`), and enabling legacy OAuth attachment requires an explicit
+> opt-in (`OC_ALLOW_ANTIGRAVITY_OAUTH=1` or `antigravity.allow_legacy_consumer_oauth = true`).
+> For autonomous harness usage, use Paid Gemini Developer API (`google`), Vertex AI ADC
+> (`google-vertex`), OpenRouter, Anthropic, or inverted human-driven `opencode mcp`.
 
 Architecture and interface contract for `oc-antigravity`, the native Rust port of
 `opencode-antigravity-auth` for `opencode-rust`.

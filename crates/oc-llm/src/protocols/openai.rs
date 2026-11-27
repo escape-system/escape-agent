@@ -67,7 +67,11 @@ pub(crate) fn request(request: &LlmRequest) -> WireRequest {
         object.insert(field.to_string(), json!(max_tokens));
     }
     if let Some(effort) = settings.get("reasoningEffort").and_then(Value::as_str) {
-        object.insert("reasoning_effort".to_string(), json!(effort));
+        let clamped = request.options.thinking_cap.as_deref().map_or_else(
+            || effort.to_owned(),
+            |cap| super::clamp_thinking_level_str(effort, cap),
+        );
+        object.insert("reasoning_effort".to_string(), json!(clamped));
     }
     if let Some(thinking) = settings.get("thinking") {
         object.insert("thinking".to_string(), thinking.clone());
@@ -207,12 +211,44 @@ pub(crate) struct Decoder {
     text_started: bool,
     tools: BTreeMap<u64, ToolAcc>,
     tool_order: Vec<u64>,
+    had_tools: bool,
     finish_reason: Option<String>,
     usage: Usage,
     pub(crate) done: bool,
 }
 
+fn tool_json_complete(acc: &ToolAcc) -> bool {
+    acc.started
+        && !acc.name.is_empty()
+        && !acc.args.trim().is_empty()
+        && serde_json::from_str::<Value>(acc.args.trim()).is_ok()
+}
+
 impl Decoder {
+    fn close_completed_prior_tools(&mut self, next_index: u64, events: &mut Vec<LlmEvent>) {
+        let ready: Vec<u64> = self
+            .tool_order
+            .iter()
+            .copied()
+            .filter(|&prev| {
+                prev < next_index && self.tools.get(&prev).is_some_and(tool_json_complete)
+            })
+            .collect();
+        for prev in ready {
+            if let Some(tool) = self.tools.remove(&prev) {
+                events.extend(tool.close_events());
+            }
+        }
+    }
+
+    fn close_all_open_tools(&mut self, events: &mut Vec<LlmEvent>) {
+        for index in self.tool_order.clone() {
+            if let Some(tool) = self.tools.remove(&index) {
+                events.extend(tool.close_events());
+            }
+        }
+    }
+
     #[allow(
         clippy::too_many_lines,
         reason = "one state machine handles text, reasoning, and split tool deltas per SSE frame"
@@ -253,10 +289,17 @@ impl Decoder {
         if choice.get("usage").is_some_and(|usage| !usage.is_null()) {
             self.usage = map_usage(&choice["usage"]);
         }
-        if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
-            self.finish_reason = Some(reason.to_string());
+        let choice_finished = choice
+            .get("finish_reason")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        if let Some(reason) = choice_finished {
+            self.finish_reason = Some(reason);
         }
         let Some(delta) = choice.get("delta") else {
+            if self.finish_reason.is_some() {
+                self.close_all_open_tools(&mut events);
+            }
             return events;
         };
 
@@ -289,7 +332,9 @@ impl Decoder {
                     .and_then(Value::as_u64)
                     .unwrap_or(position as u64);
                 if !self.tools.contains_key(&index) {
+                    self.close_completed_prior_tools(index, &mut events);
                     self.tool_order.push(index);
+                    self.had_tools = true;
                 }
                 let tool = self.tools.entry(index).or_default();
                 if let Some(id) = call.get("id").and_then(Value::as_str)
@@ -323,6 +368,9 @@ impl Decoder {
                 }
             }
         }
+        if self.finish_reason.is_some() {
+            self.close_all_open_tools(&mut events);
+        }
         events
     }
 
@@ -342,7 +390,7 @@ impl Decoder {
             });
         }
         let order = std::mem::take(&mut self.tool_order);
-        let has_tools = !self.tools.is_empty();
+        let has_tools = self.had_tools || !self.tools.is_empty();
         for index in order {
             if let Some(tool) = self.tools.remove(&index) {
                 events.extend(tool.close_events());

@@ -138,6 +138,16 @@ impl Runtime {
         let mut observations: Vec<budget::ToolObservation> = Vec::new();
         let compaction = self.compaction_config();
         let guard_armed = compaction.auto || compaction.ceiling_tokens.is_some();
+        let merged_cfg = self.inner.config.config.merged();
+        let mut cost_budget = turn
+            .info
+            .metadata
+            .as_ref()
+            .and_then(|meta| meta.get("costBudgetUsd"))
+            .or_else(|| merged_cfg.pointer("/models/cost_budget_usd"))
+            .and_then(Value::as_f64)
+            .filter(|usd| usd.is_finite() && *usd > 0.0)
+            .map(oc_subagents::CostBudget::from_usd);
 
         loop {
             // Recompute context ceiling/trigger from `turn.context_window` on every
@@ -204,8 +214,10 @@ impl Runtime {
             if step_number > 0 && self.promote_steers(session, &turn.directory).await? {
                 context = self.load_context(session).await?;
             }
+            let mut step_estimate: Option<u64> = None;
             if auto_compactions < MAX_AUTO_COMPACTIONS_PER_TURN && guard_armed {
                 let estimate = self.estimate_turn_tokens(session, turn, &context).await?;
+                step_estimate = Some(estimate);
                 let grew_since_compaction =
                     compacted_at_estimate.is_none_or(|previous| estimate > previous);
                 if estimate > trigger && grew_since_compaction {
@@ -229,6 +241,7 @@ impl Runtime {
                     match self.compact(session, turn, &context, cancel, request).await {
                         Ok(()) => {
                             context = self.load_context(session).await?;
+                            step_estimate = None;
                             auto_compactions += 1;
                             compacted_at_estimate = Some(estimate);
                         }
@@ -251,7 +264,10 @@ impl Runtime {
                 && context.len() >= 6
                 && turn.tool_names.iter().any(|name| name == "compact_context")
             {
-                let estimate = self.estimate_turn_tokens(session, turn, &context).await?;
+                let estimate = match step_estimate {
+                    Some(estimate) => estimate,
+                    None => self.estimate_turn_tokens(session, turn, &context).await?,
+                };
                 let effective_trigger = trigger.min(ceiling.min(turn.context_window * 85 / 100));
                 if effective_trigger > 0
                     && estimate.saturating_mul(100) >= effective_trigger.saturating_mul(65)
@@ -394,6 +410,22 @@ impl Runtime {
                 &base,
                 injected,
             );
+            let step_reservation = if let Some(budget) = cost_budget.as_mut() {
+                if budget.remaining_uc() == 0 {
+                    return Ok(ExecutionOutcome::Failed(
+                        oc_types::message::StructuredError::new(
+                            "BudgetError",
+                            "Session USD cost budget exhausted.",
+                        ),
+                    ));
+                }
+                let reserve_uc = budget.remaining_uc().min(1_000);
+                Some(budget.reserve(reserve_uc).map_err(|err| {
+                    RuntimeError::Config(format!("affine budget reservation failed: {err}"))
+                })?)
+            } else {
+                None
+            };
             let mut step = match self
                 .stream_step(session, turn, &messages, final_call, cancel, envelope)
                 .await
@@ -441,7 +473,14 @@ impl Runtime {
                     }
                 }
                 match self
-                    .execute_tools(session, turn, &mut step.state, &step.calls, cancel)
+                    .execute_tools(
+                        session,
+                        turn,
+                        &mut step.state,
+                        &step.calls,
+                        step.eager.take(),
+                        cancel,
+                    )
                     .await
                 {
                     Ok(()) => {}
@@ -452,6 +491,24 @@ impl Runtime {
                 }
             }
             self.finish_step(session, turn, &mut step).await?;
+            if let (Some(budget), Some(reservation)) = (cost_budget.as_mut(), step_reservation) {
+                let actual_uc = oc_subagents::usd_to_uc(step.state.cost.unwrap_or(step.cost));
+                if let Err(err) = budget.settle(reservation, actual_uc) {
+                    tracing::warn!(session = %session, %err, "session affine cost budget exhausted");
+                    return Ok(ExecutionOutcome::Failed(
+                        oc_types::message::StructuredError::new("BudgetError", err.to_string()),
+                    ));
+                }
+            }
+            for part in &step.state.content {
+                if let oc_types::message::AssistantPart::Tool(tool) = part
+                    && let oc_types::message::ToolState::Error { input, error, .. } = &tool.state
+                    && let Some(warning) =
+                        stall_guard.record_failure(&tool.name, input, &error.message)
+                {
+                    pending_stall_notice.get_or_insert(warning);
+                }
+            }
             collect_tool_lines(stats, &step.state, step_number);
             budget::observe(&mut observations, &step.state.content);
             if !final_call

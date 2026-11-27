@@ -59,8 +59,9 @@ pub(super) fn store_error(error: &oc_store::StoreError) -> ToolError {
     ToolError::new(format!("StoreError: {error}"))
 }
 
-/// Only the caller itself or one of its descendants may be summarized, so a
-/// child can never read a sibling, an ancestor, or an unrelated transcript.
+/// Only the caller itself, one of its descendants, or (when caller is a
+/// `coordinator`) an in-scope sibling/descendant may be summarized, so a
+/// worker can never read a sibling, an ancestor, or an unrelated transcript.
 pub(super) async fn authorize_digest(
     runtime: &Runtime,
     caller: &str,
@@ -87,6 +88,17 @@ pub(super) async fn authorize_digest(
             .await
             .map_err(|error| store_error(&error))?
             .and_then(|row| row.parent_id);
+    }
+    let caller_node = load_node(runtime, caller).await?;
+    if caller_node.role == Role::Coordinator {
+        let target_node = load_node(runtime, target).await?;
+        let tree = load_tree(runtime, &[caller.to_owned(), target.to_owned()]).await?;
+        if oc_subagents::Policy::default()
+            .can_write(&caller_node, &target_node, &tree)
+            .is_ok()
+        {
+            return Ok(());
+        }
     }
     Err(ToolError::new(format!(
         "DigestScopeError: session {target} is outside your subtree"

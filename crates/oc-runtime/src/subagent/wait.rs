@@ -15,23 +15,25 @@ use super::protocol::{
 use super::settings::{SubagentSettings, settings_for_session};
 use super::tree::{runtime_error, store_error};
 
-/// Poll interval while a foreground `subagent` call waits for its child.
-const POLL_INTERVAL: Duration = Duration::from_millis(100);
+/// Safety wakeup interval while waiting for [`Runtime::roster_wake`] notifications.
+/// Normal completion, inbox emission, background detach, and actor stop wake
+/// immediately via `roster_wake`; this cap bounds detection of direct store
+/// mutations such as session deletion.
+const WAIT_SAFETY_WAKE: Duration = Duration::from_millis(400);
 
 /// Grace allowed for an interrupted child to settle before a timeout report is
 /// delivered to the parent.
 const TIMEOUT_SETTLE_GRACE: Duration = Duration::from_millis(500);
 
-/// Poll ticks a queued prompt may stay unpromoted before the child is
-/// considered dead (2 s at [`POLL_INTERVAL`]).
-const CHILD_START_GRACE_TICKS: usize = 20;
+/// Duration a queued prompt may stay unpromoted before the child is considered dead.
+const CHILD_START_GRACE: Duration = Duration::from_secs(2);
 
-/// Poll the child until this prompt's turn has produced a final answer.
+/// Wait on the child until this prompt's turn has produced a final answer.
 ///
 /// Completion requires the prompt marker to exist **and** either a non-empty
 /// final assistant text while idle, or a durable failure/cancel outcome. An
 /// idle session before the marker is delivered (or before any assistant
-/// message exists) keeps polling until the start grace expires: it is the
+/// message exists) keeps waiting until the start grace expires: it is the
 /// actor's pre-execution state, not a completed turn.
 ///
 /// Error paths that bypass [`crate::turn`]'s settle step leave no idle row, so
@@ -42,6 +44,53 @@ const CHILD_START_GRACE_TICKS: usize = 20;
 /// when it is set, one pending request is consumed and the wait returns
 /// `("detached", "")` **without** touching the child. Watchers pass `None`, so
 /// a detach request can never shorten a background delivery.
+fn evaluate_idle_child(
+    durable: Option<&str>,
+    tail: &[Value],
+    observed_activity: bool,
+) -> Option<(String, String)> {
+    let has_assistant = tail
+        .iter()
+        .any(|message| message.get("type").and_then(Value::as_str) == Some("assistant"));
+    let state = child_state(tail, durable);
+    if let Some(state @ ("failed" | "cancelled")) = state {
+        let text = match final_assistant_text(tail).trim() {
+            "" => format!("subagent {state}"),
+            text => text.to_owned(),
+        };
+        return Some((state.to_owned(), text));
+    }
+    if let Some((state, text)) = assistant_failure(tail) {
+        return Some((state, text));
+    }
+    if has_assistant {
+        let text = final_assistant_text(tail);
+        if text.trim().is_empty() {
+            return Some((
+                "failed".to_owned(),
+                "subagent finished without final text".to_owned(),
+            ));
+        }
+        // Assistant text alone is not a result: only a turn the child
+        // settled as `succeeded` may be reported as completed. A child
+        // that went idle without settling (the actor died, or an error
+        // path bypassed `turn::settle`) did not deliver.
+        if state == Some("completed") {
+            return Some(("completed".to_owned(), text));
+        }
+        return Some((
+            "failed".to_owned(),
+            "subagent ended without a settled outcome".to_owned(),
+        ));
+    }
+    observed_activity.then(|| {
+        (
+            "failed".to_owned(),
+            "subagent ended without a final message".to_owned(),
+        )
+    })
+}
+
 async fn wait_child(
     runtime: &Runtime,
     child: &str,
@@ -51,12 +100,19 @@ async fn wait_child(
 ) -> Result<(String, String), ToolError> {
     let deadline = timeout.map(|timeout| tokio::time::Instant::now() + timeout);
     let store = &runtime.inner.config.store;
+    let mut started_observed = false;
     let mut observed_activity = false;
-    let mut unstarted_ticks = 0usize;
+    let mut unstarted_since: Option<tokio::time::Instant> = None;
     loop {
         if runtime.inner.shutdown.is_cancelled() {
             return Err(runtime_error(&crate::RuntimeError::Shutdown));
         }
+        // Register wake BEFORE inspecting store/actor state so no completion,
+        // emit, or background detach occurring mid-check can be lost.
+        let wake = runtime.inner.roster_wake.notified();
+        tokio::pin!(wake);
+        wake.as_mut().enable();
+
         if let Some(session) = detach_on
             && runtime.has_background_request(session)
         {
@@ -75,74 +131,69 @@ async fn wait_child(
             .get("outcome")
             .and_then(Value::as_str)
             .map(str::to_owned);
-        let idle = runtime
-            .is_idle(child)
-            .await
-            .map_err(|error| runtime_error(&error))?;
-        let messages = runtime
-            .list_all_messages(child)
-            .await
-            .map_err(|error| runtime_error(&error))?;
-        let (started, tail) = after_prompt(&messages, prompt_id);
-        let has_assistant = tail
-            .iter()
-            .any(|message| message.get("type").and_then(Value::as_str) == Some("assistant"));
-        if started && !idle {
-            observed_activity = true;
-        }
-        if !started && messages.is_empty() && idle {
-            unstarted_ticks += 1;
-            if unstarted_ticks >= CHILD_START_GRACE_TICKS {
-                return Ok(("failed".to_owned(), "child never started".to_owned()));
-            }
+        let idle = if runtime.is_actor_running(child) {
+            false
         } else {
-            unstarted_ticks = 0;
-        }
-        if idle && started {
-            let state = child_state(tail, durable.as_deref());
-            if let Some(state @ ("failed" | "cancelled")) = state {
-                let text = match final_assistant_text(tail).trim() {
-                    "" => format!("subagent {state}"),
-                    text => text.to_owned(),
-                };
-                return Ok((state.to_owned(), text));
-            }
-            if let Some((state, text)) = assistant_failure(tail) {
-                return Ok((state, text));
-            }
-            if has_assistant {
-                let text = final_assistant_text(tail);
-                if text.trim().is_empty() {
-                    return Ok((
-                        "failed".to_owned(),
-                        "subagent finished without final text".to_owned(),
-                    ));
+            runtime
+                .is_idle(child)
+                .await
+                .map_err(|error| runtime_error(&error))?
+        };
+        // Once the child's prompt has been observed and the child is still busy,
+        // skipping `list_all_messages` avoids repeated full-transcript loads on
+        // intermediate wakes until the child settles or goes idle.
+        if started_observed && !idle {
+            unstarted_since = None;
+        } else {
+            let messages = runtime
+                .list_all_messages(child)
+                .await
+                .map_err(|error| runtime_error(&error))?;
+            let (started, tail) = after_prompt(&messages, prompt_id);
+            if started {
+                started_observed = true;
+                if !idle {
+                    observed_activity = true;
                 }
-                // Assistant text alone is not a result: only a turn the child
-                // settled as `succeeded` may be reported as completed. A child
-                // that went idle without settling (the actor died, or an error
-                // path bypassed `turn::settle`) did not deliver.
-                if state == Some("completed") {
-                    return Ok(("completed".to_owned(), text));
+                unstarted_since = None;
+            } else if messages.is_empty() && idle {
+                let start = *unstarted_since.get_or_insert_with(tokio::time::Instant::now);
+                if start.elapsed() >= CHILD_START_GRACE {
+                    return Ok(("failed".to_owned(), "child never started".to_owned()));
                 }
-                return Ok((
-                    "failed".to_owned(),
-                    "subagent ended without a settled outcome".to_owned(),
-                ));
+            } else {
+                unstarted_since = None;
             }
-            if observed_activity {
-                return Ok((
-                    "failed".to_owned(),
-                    "subagent ended without a final message".to_owned(),
-                ));
+            if idle
+                && started
+                && let Some(outcome) =
+                    evaluate_idle_child(durable.as_deref(), tail, observed_activity)
+            {
+                return Ok(outcome);
             }
         }
+        let now = tokio::time::Instant::now();
         if let Some(deadline) = deadline
-            && tokio::time::Instant::now() >= deadline
+            && now >= deadline
         {
             return Ok(("running".to_owned(), String::new()));
         }
-        tokio::time::sleep(POLL_INTERVAL).await;
+        let mut next_wake = WAIT_SAFETY_WAKE;
+        if let Some(deadline) = deadline {
+            next_wake = next_wake.min(deadline.saturating_duration_since(now));
+        }
+        if let Some(start) = unstarted_since {
+            let remaining_grace = CHILD_START_GRACE.saturating_sub(start.elapsed());
+            next_wake = next_wake.min(remaining_grace.max(Duration::from_millis(20)));
+        }
+        tokio::select! {
+            biased;
+            () = runtime.inner.shutdown.cancelled() => {
+                return Err(runtime_error(&crate::RuntimeError::Shutdown));
+            }
+            () = &mut wake => {}
+            () = tokio::time::sleep(next_wake) => {}
+        }
     }
 }
 
@@ -182,13 +233,14 @@ pub(super) fn spawn_watcher(
                 ("failed".to_owned(), reason.clone(), Some(reason))
             }
         };
+        deliver_subagent_result(&runtime, &parent, &child, &agent, &description, outcome).await;
         {
             let mut state = runtime.inner.subagents.lock().expect("subagent state");
             state
                 .active_watchers
                 .remove(&(parent.clone(), child.clone()));
         }
-        deliver_subagent_result(&runtime, &parent, &child, &agent, &description, outcome).await;
+        runtime.inner.roster_wake.notify_waiters();
     });
 }
 
@@ -224,12 +276,6 @@ fn spawn_timeout_watcher(
             None,
         )
         .await;
-        {
-            let mut state = runtime.inner.subagents.lock().expect("subagent state");
-            state
-                .active_watchers
-                .remove(&(parent.clone(), child.clone()));
-        }
         deliver_subagent_result(
             &runtime,
             &parent,
@@ -239,6 +285,13 @@ fn spawn_timeout_watcher(
             timeout_failure(timeout),
         )
         .await;
+        {
+            let mut state = runtime.inner.subagents.lock().expect("subagent state");
+            state
+                .active_watchers
+                .remove(&(parent.clone(), child.clone()));
+        }
+        runtime.inner.roster_wake.notify_waiters();
     });
 }
 
@@ -461,8 +514,13 @@ pub(super) async fn enqueue_prompt(
     session: &str,
     prompt: &str,
     parent: &str,
+    coordinator: Option<&str>,
 ) -> Result<String, ToolError> {
     let id = MessageId::new().into_inner();
+    let mut metadata = json!({ "source": "subagent", "parentID": parent });
+    if let Some(coord) = coordinator.map(str::trim).filter(|s| !s.is_empty()) {
+        metadata["coordinatorID"] = json!(coord);
+    }
     runtime
         .enqueue_and_emit(NewInbox {
             id: id.clone(),
@@ -470,7 +528,7 @@ pub(super) async fn enqueue_prompt(
             kind: "user".to_owned(),
             payload: json!({
                 "text": prompt,
-                "metadata": { "source": "subagent", "parentID": parent },
+                "metadata": metadata,
             }),
             delivery: Delivery::Steer,
         })

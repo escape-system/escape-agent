@@ -147,6 +147,63 @@ impl Store {
         })
         .await
     }
+
+    /// Reads durable events of `kind` occurring strictly after the session's
+    /// newest terminal event (or from seq 0 if none exists), avoiding a full-log scan.
+    pub async fn events_in_open_window(
+        &self,
+        session_id: &str,
+        terminal_kinds: &[&str],
+        kind: &str,
+    ) -> Result<Vec<StoredEvent>, StoreError> {
+        let aggregate = session_id.to_owned();
+        let terminal_prefixes: Vec<String> = terminal_kinds
+            .iter()
+            .map(|item| format!("{item}.%"))
+            .collect();
+        let kind_prefix = format!("{kind}.%");
+        self.read(move |connection| {
+            let mut last_terminal = 0_i64;
+            let mut term_stmt = connection.prepare_cached(
+                "SELECT COALESCE(MAX(seq), 0) FROM event WHERE aggregate_id = ?1 AND type LIKE ?2",
+            )?;
+            for prefix in &terminal_prefixes {
+                let seq: i64 =
+                    term_stmt.query_row(params![&aggregate, prefix], |row| row.get(0))?;
+                if seq > last_terminal {
+                    last_terminal = seq;
+                }
+            }
+            let mut statement = connection.prepare_cached(
+                "SELECT id, aggregate_id, seq, created, type, data
+                 FROM event
+                 WHERE aggregate_id = ?1 AND seq > ?2 AND type LIKE ?3
+                 ORDER BY seq ASC",
+            )?;
+            let mut rows = statement.query(params![&aggregate, last_terminal, &kind_prefix])?;
+            let mut events = Vec::new();
+            while let Some(row) = rows.next()? {
+                let id: String = row.get(0)?;
+                let aggregate_id: String = row.get(1)?;
+                let seq: i64 = row.get(2)?;
+                let created: i64 = row.get(3)?;
+                let stored_type: String = row.get(4)?;
+                let data: String = row.get(5)?;
+                let (kind, version) = split_type(&stored_type, &id)?;
+                events.push(StoredEvent {
+                    id,
+                    aggregate_id,
+                    seq,
+                    kind,
+                    version,
+                    data: db::decode_json(&data)?,
+                    created,
+                });
+            }
+            Ok(events)
+        })
+        .await
+    }
 }
 
 fn split_type(stored_type: &str, event_id: &str) -> Result<(String, u32), StoreError> {

@@ -2,6 +2,7 @@
 
 pub(crate) mod anthropic;
 pub(crate) mod gemini;
+pub(crate) mod interactions;
 pub(crate) mod openai;
 
 use serde_json::{Map, Value};
@@ -24,6 +25,7 @@ pub(crate) fn build(request: &LlmRequest, protocol: Protocol) -> Result<WireRequ
         Protocol::OpenAiChat => Ok(openai::request(request)),
         Protocol::AnthropicMessages => Ok(anthropic::request(request)),
         Protocol::Gemini => Ok(gemini::request(request)),
+        Protocol::GeminiInteractions => Ok(interactions::request(request)),
         Protocol::Unsupported => Err(LlmError::UnsupportedProtocol {
             provider: request.model.provider.id.clone(),
             model: request.model.model.id.clone(),
@@ -38,6 +40,7 @@ pub(crate) enum Decoder {
     OpenAi(openai::Decoder),
     Anthropic(anthropic::Decoder),
     Gemini(gemini::Decoder),
+    GeminiInteractions(interactions::Decoder),
 }
 
 impl Decoder {
@@ -48,6 +51,9 @@ impl Decoder {
             }
             Protocol::AnthropicMessages => Decoder::Anthropic(anthropic::Decoder::default()),
             Protocol::Gemini => Decoder::Gemini(gemini::Decoder::default()),
+            Protocol::GeminiInteractions => {
+                Decoder::GeminiInteractions(interactions::Decoder::default())
+            }
         }
     }
 
@@ -56,6 +62,7 @@ impl Decoder {
             Decoder::OpenAi(decoder) => decoder.event(event),
             Decoder::Anthropic(decoder) => decoder.event(event),
             Decoder::Gemini(decoder) => decoder.event(event),
+            Decoder::GeminiInteractions(decoder) => decoder.event(event),
         }
     }
 
@@ -64,6 +71,7 @@ impl Decoder {
             Decoder::OpenAi(decoder) => decoder.finish(),
             Decoder::Anthropic(decoder) => decoder.finish(),
             Decoder::Gemini(decoder) => decoder.finish(),
+            Decoder::GeminiInteractions(decoder) => decoder.finish(),
         }
     }
 
@@ -72,6 +80,7 @@ impl Decoder {
             Decoder::OpenAi(decoder) => decoder.done,
             Decoder::Anthropic(decoder) => decoder.done,
             Decoder::Gemini(decoder) => decoder.done,
+            Decoder::GeminiInteractions(decoder) => decoder.done,
         }
     }
 
@@ -80,7 +89,41 @@ impl Decoder {
             Decoder::OpenAi(decoder) => decoder.had_completion(),
             Decoder::Anthropic(decoder) => decoder.had_completion(),
             Decoder::Gemini(decoder) => decoder.had_completion(),
+            Decoder::GeminiInteractions(decoder) => decoder.had_completion(),
         }
+    }
+}
+
+/// Clamp `thinkingConfig.thinkingLevel` to at most `cap` (`low < medium < high < xhigh`).
+pub(crate) fn clamp_thinking_config(raw: &Value, cap: Option<&str>) -> Value {
+    let Some(cap) = cap.map(str::trim).filter(|s| !s.is_empty()) else {
+        return raw.clone();
+    };
+    let Some(mut obj) = raw.as_object().cloned() else {
+        return raw.clone();
+    };
+    if let Some(level) = obj.get("thinkingLevel").and_then(Value::as_str) {
+        let clamped = clamp_thinking_level_str(level, cap);
+        obj.insert("thinkingLevel".to_owned(), Value::String(clamped));
+    }
+    Value::Object(obj)
+}
+
+pub(crate) fn thinking_level_rank(level: &str) -> u8 {
+    match level.trim().to_ascii_lowercase().as_str() {
+        "none" | "minimal" => 0,
+        "low" => 1,
+        "medium" => 2,
+        "xhigh" | "max" => 4,
+        _ => 3,
+    }
+}
+
+pub(crate) fn clamp_thinking_level_str(requested: &str, cap: &str) -> String {
+    if thinking_level_rank(requested) <= thinking_level_rank(cap) {
+        requested.to_owned()
+    } else {
+        cap.to_ascii_lowercase()
     }
 }
 
@@ -335,5 +378,64 @@ mod tests {
             })
             .expect("finish event");
         assert_eq!(finish, "tool-calls");
+    }
+
+    #[test]
+    fn openai_closes_completed_tool_call_when_next_index_starts() {
+        let mut decoder = openai::Decoder::default();
+        let ev0 = decoder.event(&SseEvent {
+            event: None,
+            data: r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_0","function":{"name":"subagent","arguments":"{\"description\":\"first\","}}]}}]}"#.to_string(),
+        });
+        assert!(
+            ev0.iter()
+                .any(|ev| matches!(ev, LlmEvent::ToolInputStart { id, .. } if id == "call_0"))
+        );
+        assert!(!ev0.iter().any(|ev| matches!(ev, LlmEvent::ToolCall { .. })));
+
+        let ev1 = decoder.event(&SseEvent {
+            event: None,
+            data: r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"prompt\":\"go\"}"}}]}}]}"#.to_string(),
+        });
+        assert!(!ev1.iter().any(|ev| matches!(ev, LlmEvent::ToolCall { .. })));
+
+        let ev2 = decoder.event(&SseEvent {
+            event: None,
+            data: r#"{"choices":[{"delta":{"tool_calls":[{"index":1,"id":"call_1","function":{"name":"subagent","arguments":"{"}}]}}]}"#.to_string(),
+        });
+        assert!(ev2
+            .iter()
+            .any(|ev| matches!(ev, LlmEvent::ToolCall { id, name, .. } if id == "call_0" && name == "subagent")));
+        assert!(
+            ev2.iter()
+                .any(|ev| matches!(ev, LlmEvent::ToolInputStart { id, .. } if id == "call_1"))
+        );
+    }
+
+    #[test]
+    fn openai_closes_tool_calls_on_finish_reason_before_done() {
+        let mut decoder = openai::Decoder::default();
+        let _ = decoder.event(&SseEvent {
+            event: None,
+            data: r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_a","function":{"name":"subagent","arguments":"{\"description\":\"d\",\"prompt\":\"p\"}"}}]}}]}"#.to_string(),
+        });
+        let on_reason = decoder.event(&SseEvent {
+            event: None,
+            data: r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#.to_string(),
+        });
+        assert!(
+            on_reason
+                .iter()
+                .any(|ev| matches!(ev, LlmEvent::ToolCall { id, .. } if id == "call_a"))
+        );
+        let on_done = decoder.event(&SseEvent {
+            event: None,
+            data: "[DONE]".to_string(),
+        });
+        assert!(
+            on_done
+                .iter()
+                .any(|ev| matches!(ev, LlmEvent::Finish { reason, .. } if reason == "tool-calls"))
+        );
     }
 }

@@ -31,6 +31,7 @@ pub mod grep;
 pub mod key_health;
 pub mod patch;
 pub mod read;
+pub mod sandbox;
 pub mod shell;
 pub mod shell_guard;
 pub mod symbol_edit;

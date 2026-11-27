@@ -421,6 +421,10 @@ export const SettingsModels: Component<{
 
     return model ? modelRef(model.providerID, model.id) : undefined
   }
+  const organizerRef = () => state()?.chains?.organizer?.[0] ?? ""
+  const organizerModels = () =>
+    [...all()].sort((a, b) => a.name.localeCompare(b.name) || refOf(a).localeCompare(refOf(b)))
+  const saveOrganizerModel = (ref: string) => void persist({ chains: { organizer: ref ? [ref] : [] } })
 
   const quotaRule = () => {
     const value = state()
@@ -938,6 +942,35 @@ export const SettingsModels: Component<{
               </section>
 
               <section class="flex min-w-0 flex-col gap-5" aria-label={language.t("settings.models.column.control")}>
+                <div
+                  data-testid="settings-models-organizer"
+                  class="flex flex-col gap-1.5 rounded-md border border-v2-border-border-base bg-v2-background-bg-layer-01 px-3 py-2.5"
+                >
+                  <label class="text-12-medium text-v2-text-text-base" for="settings-models-organizer-select">
+                    {language.t("settings.models.organizer.title")}
+                  </label>
+                  <span class="text-12-regular text-v2-text-text-muted">
+                    {language.t("settings.models.organizer.description")}
+                  </span>
+                  <select
+                    id="settings-models-organizer-select"
+                    data-testid="settings-models-organizer-select"
+                    class="h-7 w-full rounded border border-v2-border-border-base bg-v2-background-bg-base px-2 text-12-regular text-v2-text-text-base"
+                    value={organizerRef()}
+                    disabled={saving()}
+                    onChange={(event) => saveOrganizerModel(event.currentTarget.value)}
+                  >
+                    <option value="">{language.t("settings.models.organizer.inherit")}</option>
+                    <For each={organizerModels()}>
+                      {(model) => (
+                        <option value={refOf(model)}>
+                          {model.name} ({model.providerID})
+                        </option>
+                      )}
+                    </For>
+                  </select>
+                </div>
+
                 <div class="flex flex-col gap-1.5">
                   <label class="text-12-regular text-v2-text-text-muted" for="settings-models-scope">
                     {language.t("settings.models.scope.label")}
@@ -1024,7 +1057,7 @@ export const SettingsModels: Component<{
                   <span class="text-12-regular text-v2-text-text-faint">
                     {language.t("settings.models.chain.count", { count: scopeChain().length, max: MAX_CHAIN })}
                     {" · "}
-                    {language.t("settings.models.chain.hops", { hops: state()?.fallback.maxHops ?? 0 })}
+                    {language.t("settings.models.chain.hops")}
                   </span>
                   <Show
                     when={scopeChain().length > 0}

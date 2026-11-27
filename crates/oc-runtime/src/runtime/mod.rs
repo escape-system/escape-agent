@@ -449,7 +449,15 @@ impl Runtime {
         }
         handle.background.store(true, Ordering::SeqCst);
         handle.wake.notify_one();
+        self.inner.roster_wake.notify_waiters();
         Ok(true)
+    }
+
+    pub(crate) fn is_actor_running(&self, session_id: &str) -> bool {
+        let actors = self.inner.actors.lock().expect("actor map");
+        actors
+            .get(session_id)
+            .is_some_and(|handle| handle.running.load(Ordering::SeqCst))
     }
 
     /// Consume a pending background request for `session`, clearing it so one

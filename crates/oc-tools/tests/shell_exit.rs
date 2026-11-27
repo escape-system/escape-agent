@@ -133,6 +133,7 @@ async fn shell_run_config_applies_env_and_output_limits() {
         env,
         max_lines: Some(2),
         max_bytes: Some(4096),
+        ..Default::default()
     };
     let result = oc_tools::shell::with_shell_config(
         config,

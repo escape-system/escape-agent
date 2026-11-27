@@ -208,7 +208,7 @@ fn harness_mechanics_guidance_filters_by_enabled_tools() {
     );
     assert!(parts[0].contains("## Harness Mechanics & Consequences"));
     assert!(parts[0].contains("systemctl stop"));
-    assert!(parts[0].contains("roster(wait_seconds=...)"));
+    assert!(parts[0].contains("roster(wait_seconds=..., wait_all=...)"));
 
     let readonly = vec!["read".to_owned()];
     let ro_parts = system_prefix(Some("Custom readonly"), &readonly, "/tmp/work", false, "");

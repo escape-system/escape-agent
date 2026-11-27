@@ -53,6 +53,13 @@ Smoke verification passes on isolated ports and databases across core surfaces: 
 | `oc-testkit` | fake provider/process harness + binary-level scenarios |
 | UI | vendored SolidJS source (`ui/vendor/opencode`, MIT) built into `web/dist`; **Escape Agent brand layer** (dark default, gold/charcoal `oc-2` theme, glass panels/composer/tabs, centered home hero, six-letter wordmark + matching pin grid, branded connect/about, favicon/PWA/brand assets); settings tabs (memory, goals, observer, subagents, lanes) and session agent panels (subagent tree, peer drawer, observer repairs/budget, goal chip, lane pill); models with `time.released = 0` stay pickable (`0003`); missing tool metadata no longer crashes the session page (`0004`); `/compress` appears in the slash menu from `GET /api/command`; connect/login screen appears on a 401 and logs in with the configured password; live Playwright readiness suite in `packages/app/e2e/escape-agent` (**6/6** on 4096 + password 4097) |
 
+### Wave: coordinator organizer, builder agent, and ToS-safe Gemini/Vertex harness
+
+- **ToS safety lock (`docs/30-tos-safe-harness.md`).** Consumer Antigravity OAuth (`oc-antigravity`) is disabled by default unless opted into (`OC_ALLOW_ANTIGRAVITY_OAUTH=1`, `antigravity.allow_legacy_consumer_oauth: true`, or `opencode auth login --allow-consumer-oauth`); `AntigravityConfig::default()` sets `quota_refresh_interval_minutes = 0`, `proactive_token_refresh = false`, `auto_update = false`, and `credential_pool_for("google", ...)` ignores stored `type == "oauth"` rows so consumer tokens cannot hit `generativelanguage.googleapis.com`.
+- **`oc-llm` / Paid Gemini + Vertex AI + `governor` GCRA.** Added `google` Gemini 4 (`gemini-4-neon`, `gemini-4-carbon`, `gemini-4-hydrogen`), Interactions API (`Protocol::GeminiInteractions`, `antigravity-preview-09-2026`, `store: false` default), and `google-vertex` (`gemini-4-*`, `claude-opus-5-5@default`, `claude-sonnet-5-5@default`) with pure-Rust `ring` RS256 service-account JWT and `authorized_user` ADC (`crates/oc-llm/src/vertex.rs`), `${GOOGLE_VERTEX_*}` URL template resolution, Gemini `error.details` (`RetryInfo` + permanent `QuotaFailure`) and `PolicyBlocked` (`promptFeedback.blockReason` / blocked `finishReason`), `RetryPolicy::single_attempt()` under `Runtime`, `governor` GCRA RPM/TPM + spend-velocity rate limiter (`crates/oc-llm/src/rate_limit.rs`), `zeroize::Zeroizing<String>` key storage, `Timeouts::for_variant`, and `thinking_cap` clamping.
+- **`oc-subagents` & `oc-tools` & `oc-runtime` hardening.** Added `organizer` coordinator and `builder` compilation agent (`subagents` split cleanly into submodules); non-`Clone` affine `CostBudget` (`crates/oc-subagents/src/budget.rs`); Linux Bubblewrap `bwrap` sandboxing + `pre_tool_use_secret_guard` + `redact_sensitive_output` (`crates/oc-tools/src/sandbox.rs`); SHA-256 `StallGuard` + failure loop detection (`crates/oc-runtime/src/turn/stall.rs`), deterministic `microcompact_stale_tool_results` (`compaction.rs`), and OTel `gen_ai.*` tracing fields.
+- **`opencode mcp` stdio server (`rmcp 3.12.0`).** Added workspace-confined stdio MCP tool server (`crates/oc-cli/src/mcp_server.rs`) with `--read-only` and `--sandbox` flags so official human-driven IDE/app sessions can call deterministic Rust tools without outer harness automation over consumer plans.
+
 ### Wave: code_map/ripwire, explore toolset, actor finalization
 
 Per-crate counts below were verified in this wave; they are not a new
@@ -688,6 +695,7 @@ Verified workspace suite in that release wave (snapshot 2026-11-13, same commit 
   `x-opencode-config-reloaded: models` and **no** `x-opencode-restart`.
   `PATCH /api/experimental/config` still answers `x-opencode-restart: required`.
 - Builtin agents, canonical order: `engineer` (primary, default), `architect`,
-  `review`, `general`, `explore`, `ui`, `docs`, `compaction`, `title`, `summary`
-  (the last three hidden). Aliases: `build` → `engineer`, `plan` → `architect`,
-  `reviewer` → `review`. `steward` remains a project template, not a builtin.
+  `review`, `general`, `explore`, `ui`, `docs`, `organizer`, `builder`,
+  `compaction`, `title`, `summary` (the last three hidden). Aliases: `build` →
+  `engineer`, `plan` → `architect`, `reviewer` → `review`. `steward` remains a
+  project template, not a builtin.

@@ -34,6 +34,64 @@ pub(crate) async fn shutdown_services(
     broker.reject_all("The server is shutting down.");
 }
 
+pub(crate) fn antigravity_legacy_oauth_enabled(config: &oc_config::ConfigService) -> bool {
+    let env_enabled = std::env::var("OC_ALLOW_ANTIGRAVITY_OAUTH").is_ok_and(|raw| {
+        matches!(
+            raw.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes"
+        )
+    });
+    let cfg_enabled = config
+        .merged()
+        .pointer("/antigravity/allow_legacy_consumer_oauth")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    env_enabled || cfg_enabled
+}
+
+fn configure_provider_rate_limits(client: &oc_llm::LlmClient, config: &oc_config::ConfigService) {
+    let Some(providers) = config
+        .merged()
+        .get("providers")
+        .and_then(serde_json::Value::as_object)
+    else {
+        return;
+    };
+    for (provider_id, entry) in providers {
+        let Some(rl) = entry
+            .get("rate_limit")
+            .or_else(|| entry.get("rateLimit"))
+            .and_then(serde_json::Value::as_object)
+        else {
+            continue;
+        };
+        let rpm = rl
+            .get("rpm")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|v| u32::try_from(v).ok())
+            .unwrap_or(0);
+        let tpm = rl
+            .get("tpm")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|v| u32::try_from(v).ok())
+            .unwrap_or(0);
+        let spend_cap = rl
+            .get("spend_cap_10m_usd")
+            .or_else(|| rl.get("spendCap10mUsd"))
+            .and_then(serde_json::Value::as_f64);
+        let max_conc = rl
+            .get("max_concurrent")
+            .or_else(|| rl.get("maxConcurrent"))
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|v| usize::try_from(v).ok());
+        if rpm > 0 || tpm > 0 || spend_cap.is_some() || max_conc.is_some() {
+            let mut policy = oc_llm::RateLimitPolicy::new(rpm, tpm, spend_cap);
+            policy.max_concurrent = max_conc;
+            client.set_rate_limit_policy(provider_id, policy);
+        }
+    }
+}
+
 pub(crate) struct Services {
     pub(crate) store: std::sync::Arc<oc_store::Store>,
     pub(crate) config: std::sync::Arc<oc_config::ConfigService>,
@@ -127,25 +185,33 @@ pub(crate) async fn open_services(
         }
         embedded
     };
-    // `config_dir: None` is deliberate: Antigravity account, signature and
-    // model-cache state is global (`resolve_config_dir()`), so every project
-    // shares one account pool; only `antigravity.jsonc` discovery is per-project.
-    let antigravity = match oc_antigravity::AntigravityService::open(
-        Some(Arc::clone(&store)),
-        None,
-        Some(directory.to_path_buf()),
-        oc_antigravity::AntigravityEndpoints::default(),
-    )
-    .await
-    {
-        Ok(svc) => {
-            svc.overlay_catalog(&mut catalog);
-            Some(Arc::new(svc))
+    // Consumer Antigravity OAuth proxy and unattended Cloud Code polling carry a
+    // direct Article 6 ToS ban risk on consumer plans (`docs/30-tos-safe-harness.md`),
+    // so attachment stays completely disabled unless explicitly opted in.
+    let antigravity = if antigravity_legacy_oauth_enabled(config.as_ref()) {
+        tracing::warn!(
+            "legacy consumer Antigravity OAuth gateway enabled via opt-in; \
+             prefer Paid Gemini API (`GEMINI_API_KEY`), Vertex AI (`google-vertex`), or `opencode mcp` to avoid ToS bans"
+        );
+        match oc_antigravity::AntigravityService::open(
+            Some(Arc::clone(&store)),
+            None,
+            Some(directory.to_path_buf()),
+            oc_antigravity::AntigravityEndpoints::default(),
+        )
+        .await
+        {
+            Ok(svc) => {
+                svc.overlay_catalog(&mut catalog);
+                Some(Arc::new(svc))
+            }
+            Err(error) => {
+                tracing::warn!(%error, "Antigravity service unavailable");
+                None
+            }
         }
-        Err(error) => {
-            tracing::warn!(%error, "Antigravity service unavailable");
-            None
-        }
+    } else {
+        None
     };
     let catalog = std::sync::Arc::new(oc_llm::CatalogCell::new(catalog));
     oc_alloc::purge_idle_memory();
@@ -173,9 +239,13 @@ pub(crate) async fn attach_runtime(
     Arc<oc_server::PermissionBroker>,
 )> {
     let broker = Arc::new(oc_server::PermissionBroker::from_state(&state));
-    let client = Arc::new(oc_llm::SharedLlmClient::new(
-        oc_llm::LlmClient::new().context("create provider client")?,
-    ));
+    // Single-owner retry rule (`docs/30-tos-safe-harness.md`): Runtime owns
+    // retries & key rotation so LlmClient never multiplies attempts beneath it.
+    let raw_client = oc_llm::LlmClient::new()
+        .context("create provider client")?
+        .with_retry_policy(oc_llm::RetryPolicy::single_attempt());
+    configure_provider_rate_limits(&raw_client, services.config.as_ref());
+    let client = Arc::new(oc_llm::SharedLlmClient::new(raw_client));
     if let Some(antigravity) = services.antigravity.clone() {
         let hook: Arc<dyn oc_llm::LlmTransportHook> = antigravity;
         client.set_hook(Some(hook));
@@ -348,10 +418,9 @@ pub(crate) fn start_background_tasks(
 ) -> Option<JoinHandle<()>> {
     let signal = shutdown.clone();
     tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
-            tracing::info!("shutdown requested");
-            signal.cancel();
-        }
+        wait_for_shutdown_signal().await;
+        tracing::info!("shutdown requested");
+        signal.cancel();
     });
     if let Some((path, id)) = registration {
         let shutdown = shutdown.clone();
@@ -363,6 +432,27 @@ pub(crate) fn start_background_tasks(
         spawn_catalog_refresh_loop(std::sync::Arc::clone(cell), state.clone(), shutdown.clone());
     }
     spawn_schedule_runner(state.clone(), shutdown.clone())
+}
+
+#[cfg(unix)]
+async fn wait_for_shutdown_signal() {
+    use tokio::signal::unix::{SignalKind, signal};
+    match signal(SignalKind::terminate()) {
+        Ok(mut sigterm) => {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = sigterm.recv() => {}
+            }
+        }
+        Err(_) => {
+            let _ = tokio::signal::ctrl_c().await;
+        }
+    }
+}
+
+#[cfg(not(unix))]
+async fn wait_for_shutdown_signal() {
+    let _ = tokio::signal::ctrl_c().await;
 }
 
 fn apply_cached_nous_models(catalog: &mut oc_llm::Catalog) -> bool {
@@ -556,4 +646,33 @@ async fn refresh_catalog_once(cell: &Arc<oc_llm::CatalogCell>, state: &AppState)
         "models-dev.refreshed",
         serde_json::json!({}),
     ));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::antigravity_legacy_oauth_enabled;
+
+    #[test]
+    fn antigravity_legacy_oauth_defaults_false_and_requires_explicit_opt_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = oc_config::ConfigService::load(oc_config::LoadOptions {
+            directory: dir.path().to_path_buf(),
+            env: std::collections::HashMap::new(),
+        })
+        .unwrap();
+        assert!(!antigravity_legacy_oauth_enabled(&cfg));
+
+        let opt_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            opt_dir.path().join("opencode.json"),
+            r#"{"antigravity":{"allow_legacy_consumer_oauth":true}}"#,
+        )
+        .unwrap();
+        let opt_cfg = oc_config::ConfigService::load(oc_config::LoadOptions {
+            directory: opt_dir.path().to_path_buf(),
+            env: std::collections::HashMap::new(),
+        })
+        .unwrap();
+        assert!(antigravity_legacy_oauth_enabled(&opt_cfg));
+    }
 }

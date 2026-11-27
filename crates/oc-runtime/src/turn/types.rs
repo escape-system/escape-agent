@@ -13,6 +13,7 @@ use serde_json::{Map, Value};
 use crate::expectation::Expectation;
 
 use super::assistant::AssistantState;
+use super::tools::EagerToolBatch;
 
 /// Per-agent request overrides resolved from `agent.request`.
 #[derive(Clone, Debug, Default)]
@@ -168,6 +169,7 @@ pub(super) enum ExecutionOutcome {
 pub(super) struct StepRun {
     pub(super) state: AssistantState,
     pub(super) calls: Vec<PendingToolCall>,
+    pub(super) eager: Option<EagerToolBatch>,
     pub(super) tokens: Tokens,
     pub(super) cost: f64,
 }
@@ -182,6 +184,8 @@ pub(super) struct StreamFailure {
     pub(super) error: oc_llm::LlmError,
     pub(super) state: AssistantState,
     pub(super) kind: oc_llm::FailureKind,
+    /// Provider retry delay hint (`Retry-After` / `google.rpc.RetryInfo`), if any.
+    pub(super) retry_after_ms: Option<u64>,
     /// True when nothing was streamed or persisted beyond the initial row, so
     /// the assistant row can be rewritten in place for the next model.
     pub(super) reusable: bool,

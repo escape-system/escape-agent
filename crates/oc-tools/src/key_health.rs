@@ -11,6 +11,7 @@
 //! nothing is bound the tool returns a typed [`ToolError`] instead of inventing
 //! a healthy pool.
 
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -51,6 +52,34 @@ pub struct KeyHealthProvider {
     pub keys: Vec<KeyHealthKey>,
 }
 
+/// Verified chat model inventory entry reported when `include_models: true`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct KeyHealthModel {
+    pub model_id: String,
+    pub reference: String,
+    pub name: String,
+    pub context_limit: Option<u64>,
+    pub output_limit: Option<u64>,
+    pub tools: bool,
+    pub variants: Vec<String>,
+    pub cost_input_usd: Option<f64>,
+    pub cost_output_usd: Option<f64>,
+    pub favorite: bool,
+    pub note: Option<String>,
+    pub unavailable_kind: Option<String>,
+    pub unavailable_until_ms: Option<i64>,
+    pub remaining_percent: Option<f64>,
+    pub quota_limited: Option<bool>,
+}
+
+/// Combined provider-key, verified-model, and configured agent-default snapshot.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct KeyHealthReport {
+    pub providers: Vec<KeyHealthProvider>,
+    pub provider_models: BTreeMap<String, Vec<KeyHealthModel>>,
+    pub agent_models: BTreeMap<String, String>,
+}
+
 /// Host-supplied credential state for `key_health`.
 ///
 /// Implemented by the runtime (`oc_runtime::key_health`), which owns the store
@@ -68,6 +97,22 @@ pub trait KeyHealthSource: Send + Sync {
         provider: Option<&str>,
         now_ms: i64,
     ) -> Result<Vec<KeyHealthProvider>, String>;
+
+    /// Full provider key + optional model/quota report (`include_models: true`).
+    async fn report(
+        &self,
+        provider: Option<&str>,
+        include_models: bool,
+        now_ms: i64,
+    ) -> Result<KeyHealthReport, String> {
+        let _ = include_models;
+        let providers = self.providers(provider, now_ms).await?;
+        Ok(KeyHealthReport {
+            providers,
+            provider_models: BTreeMap::new(),
+            agent_models: BTreeMap::new(),
+        })
+    }
 }
 
 tokio::task_local! {
@@ -103,7 +148,7 @@ impl Tool for KeyHealthTool {
     }
 
     fn description(&self) -> &str {
-        "Show the provider credentials this runtime holds and which of them are cooling down after a quota, rate-limit or auth failure. Read-only: returns credential ids, labels and cooldown deadlines, never key material. Use it before telling the user which key served a request."
+        "Show the provider credentials this runtime holds and which of them are cooling down after a quota, rate-limit or auth failure. Read-only: returns credential ids, labels and cooldown deadlines, never key material. Pass `include_models: true` (used by `organizer`) to also list selectable tool-capable chat models, cooldowns, quotas, favorites/notes, and configured agent model defaults for connected providers."
     }
 
     fn schema(&self) -> Value {
@@ -113,6 +158,10 @@ impl Tool for KeyHealthTool {
                 "provider": {
                     "type": "string",
                     "description": "Exact provider id to filter by, for example `opencode-go`."
+                },
+                "include_models": {
+                    "type": "boolean",
+                    "description": "Include selectable chat models (excluding hidden, deprecated, non-tool, and unconfigured direct entries), limits, costs, unavailability windows, quotas, favorites/notes, and configured agent model defaults for connected providers."
                 }
             },
             "additionalProperties": false
@@ -128,28 +177,62 @@ impl Tool for KeyHealthTool {
             }
             Some(_) => return Err(ToolError::new("`provider` must be a string")),
         };
+        let include_models = match input.get("include_models") {
+            None | Some(Value::Null) => false,
+            Some(Value::Bool(flag)) => *flag,
+            Some(_) => return Err(ToolError::new("`include_models` must be a boolean")),
+        };
         let Some(source) = current_source() else {
             return Err(ToolError::new(
                 "key_health is unavailable: no runtime key pool is attached to this session, so no credential state can be reported",
             ));
         };
         let now = now_ms();
-        let mut providers = source
-            .providers(provider.as_deref(), now)
+        let mut report = source
+            .report(provider.as_deref(), include_models, now)
             .await
             .map_err(ToolError::new)?;
-        providers.sort_by(|left, right| left.provider_id.cmp(&right.provider_id));
-        let summary = summarize(&providers, provider.as_deref());
-        let payload = json!({
-            "summary": summary,
-            "providers": providers.iter().map(provider_json).collect::<Vec<_>>(),
-        });
-        let text = serde_json::to_string_pretty(&payload).unwrap_or_else(|_| payload.to_string());
+        report
+            .providers
+            .sort_by(|left, right| left.provider_id.cmp(&right.provider_id));
+        let summary = summarize(&report.providers, provider.as_deref());
+        let providers_json: Vec<Value> = report
+            .providers
+            .iter()
+            .map(|entry| {
+                let models = if include_models {
+                    report
+                        .provider_models
+                        .get(&entry.provider_id)
+                        .or_else(|| {
+                            report
+                                .provider_models
+                                .get(&entry.provider_id.to_ascii_lowercase())
+                        })
+                        .map(Vec::as_slice)
+                } else {
+                    None
+                };
+                provider_json(entry, models)
+            })
+            .collect();
+        let mut payload = Map::new();
+        payload.insert("summary".to_owned(), Value::String(summary));
+        payload.insert("providers".to_owned(), Value::Array(providers_json));
+        if include_models && !report.agent_models.is_empty() {
+            let mut agent_map = Map::new();
+            for (agent, reference) in &report.agent_models {
+                agent_map.insert(agent.clone(), Value::String(reference.clone()));
+            }
+            payload.insert("agentModels".to_owned(), Value::Object(agent_map));
+        }
+        let payload = Value::Object(payload);
+        let text = payload.to_string();
         Ok(ToolResult::text(text).with_metadata(payload))
     }
 }
 
-fn provider_json(provider: &KeyHealthProvider) -> Value {
+fn provider_json(provider: &KeyHealthProvider, models: Option<&[KeyHealthModel]>) -> Value {
     let mut map = Map::new();
     map.insert(
         "providerID".to_owned(),
@@ -159,6 +242,67 @@ fn provider_json(provider: &KeyHealthProvider) -> Value {
         "keys".to_owned(),
         Value::Array(provider.keys.iter().map(key_json).collect()),
     );
+    if let Some(models) = models
+        && !models.is_empty()
+    {
+        map.insert(
+            "models".to_owned(),
+            Value::Array(models.iter().map(model_json).collect()),
+        );
+    }
+    Value::Object(map)
+}
+
+fn model_json(model: &KeyHealthModel) -> Value {
+    let mut map = Map::new();
+    map.insert("id".to_owned(), Value::String(model.model_id.clone()));
+    map.insert("ref".to_owned(), Value::String(model.reference.clone()));
+    map.insert("name".to_owned(), Value::String(model.name.clone()));
+    if let Some(limit) = model.context_limit {
+        map.insert("contextLimit".to_owned(), json!(limit));
+    }
+    if let Some(limit) = model.output_limit {
+        map.insert("outputLimit".to_owned(), json!(limit));
+    }
+    map.insert("tools".to_owned(), Value::Bool(model.tools));
+    if !model.variants.is_empty() {
+        map.insert("variants".to_owned(), json!(model.variants));
+    }
+    if let (Some(input), Some(output)) = (model.cost_input_usd, model.cost_output_usd) {
+        map.insert(
+            "costUsdPer1M".to_owned(),
+            json!({ "input": input, "output": output }),
+        );
+    }
+    if model.favorite {
+        map.insert("favorite".to_owned(), Value::Bool(true));
+    }
+    if let Some(note) = model
+        .note
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        map.insert("note".to_owned(), Value::String(note.to_owned()));
+    }
+    if let Some(kind) = &model.unavailable_kind {
+        let mut unavail = Map::new();
+        unavail.insert("kind".to_owned(), Value::String(kind.clone()));
+        if let Some(until) = model.unavailable_until_ms {
+            unavail.insert("untilMs".to_owned(), json!(until));
+        }
+        map.insert("unavailable".to_owned(), Value::Object(unavail));
+    }
+    if model.remaining_percent.is_some() || model.quota_limited.is_some() {
+        let mut quota = Map::new();
+        if let Some(pct) = model.remaining_percent {
+            quota.insert("remainingPercent".to_owned(), json!(pct));
+        }
+        if let Some(limited) = model.quota_limited {
+            quota.insert("limited".to_owned(), json!(limited));
+        }
+        map.insert("quota".to_owned(), Value::Object(quota));
+    }
     Value::Object(map)
 }
 
@@ -473,5 +617,112 @@ mod tests {
                 "`{forbidden}` must not appear in the result: {text}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn include_models_surfaces_models_and_agent_defaults_only_when_requested() {
+        #[derive(Debug)]
+        struct ModelSource;
+
+        #[async_trait]
+        impl KeyHealthSource for ModelSource {
+            async fn providers(
+                &self,
+                _provider: Option<&str>,
+                _now_ms: i64,
+            ) -> Result<Vec<KeyHealthProvider>, String> {
+                Ok(vec![KeyHealthProvider {
+                    provider_id: "opencode-go".to_owned(),
+                    keys: vec![healthy("cred_a", "OpenCode Go", true)],
+                }])
+            }
+
+            async fn report(
+                &self,
+                provider: Option<&str>,
+                include_models: bool,
+                now_ms: i64,
+            ) -> Result<KeyHealthReport, String> {
+                let providers = self.providers(provider, now_ms).await?;
+                if !include_models {
+                    return Ok(KeyHealthReport {
+                        providers,
+                        ..KeyHealthReport::default()
+                    });
+                }
+                let mut provider_models = BTreeMap::new();
+                provider_models.insert(
+                    "opencode-go".to_owned(),
+                    vec![
+                        KeyHealthModel {
+                            model_id: "fast-1".to_owned(),
+                            reference: "opencode-go/fast-1".to_owned(),
+                            name: "Fast 1".to_owned(),
+                            context_limit: Some(128_000),
+                            output_limit: Some(16_384),
+                            tools: true,
+                            favorite: true,
+                            note: Some("fast coding default".to_owned()),
+                            ..KeyHealthModel::default()
+                        },
+                        KeyHealthModel {
+                            model_id: "fast-2".to_owned(),
+                            reference: "opencode-go/fast-2".to_owned(),
+                            name: "Fast 2".to_owned(),
+                            context_limit: Some(128_000),
+                            output_limit: Some(16_384),
+                            tools: true,
+                            ..KeyHealthModel::default()
+                        },
+                    ],
+                );
+                let mut agent_models = BTreeMap::new();
+                agent_models.insert("organizer".to_owned(), "opencode-go/fast-1".to_owned());
+                Ok(KeyHealthReport {
+                    providers,
+                    provider_models,
+                    agent_models,
+                })
+            }
+        }
+
+        let without = with_key_health_source(
+            Some(Arc::new(ModelSource)),
+            KeyHealthTool.execute(&ctx(), json!({})),
+        )
+        .await
+        .expect("default")
+        .metadata
+        .expect("metadata");
+        assert!(without["providers"][0].get("models").is_none());
+        assert!(without.get("agentModels").is_none());
+
+        let with_res = with_key_health_source(
+            Some(Arc::new(ModelSource)),
+            KeyHealthTool.execute(&ctx(), json!({"include_models": true})),
+        )
+        .await
+        .expect("with models");
+        let compact = with_res.output.expect("compact text");
+        assert!(
+            !compact.contains('\n'),
+            "key_health output uses compact single-line JSON: {compact}"
+        );
+        let with = with_res.metadata.expect("metadata");
+        assert_eq!(
+            with["providers"][0]["models"][0]["ref"],
+            json!("opencode-go/fast-1")
+        );
+        assert_eq!(with["providers"][0]["models"][0]["favorite"], json!(true));
+        assert_eq!(
+            with["providers"][0]["models"][0]["note"],
+            json!("fast coding default")
+        );
+        assert!(with["providers"][0]["models"][1].get("favorite").is_none());
+        assert!(with["providers"][0]["models"][1].get("note").is_none());
+        assert_eq!(
+            with["agentModels"]["organizer"],
+            json!("opencode-go/fast-1")
+        );
     }
 }

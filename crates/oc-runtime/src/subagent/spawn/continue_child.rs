@@ -26,7 +26,7 @@ pub(super) async fn continue_child(
     Policy::new(settings.limits.clone())
         .can_write(&caller_node, &target_node, &tree)
         .map_err(|error| write_error(&error))?;
-    let prompt_id = enqueue_prompt(runtime, target, prompt, caller).await?;
+    let prompt_id = enqueue_prompt(runtime, target, prompt, caller, None).await?;
     runtime
         .notify(target)
         .await

@@ -41,6 +41,18 @@ impl Default for RetryPolicy {
 }
 
 impl RetryPolicy {
+    /// A single-attempt policy (`max_attempts: 1`, `max_timeout_retries: 0`)
+    /// used when an outer runtime owns retries and key rotation so retry counts
+    /// never multiply across layers (`docs/30-tos-safe-harness.md`).
+    #[must_use]
+    pub fn single_attempt() -> Self {
+        Self {
+            max_attempts: 1,
+            max_timeout_retries: 0,
+            ..Self::default()
+        }
+    }
+
     /// A deterministic policy used by tests.
     #[must_use]
     pub fn fixed(base: Duration, max: Duration, max_attempts: u32) -> Self {
@@ -77,9 +89,17 @@ impl RetryPolicy {
             return backoff;
         };
         // Clamp the hint before comparing so an absurd value can neither park
-        // the turn nor overflow the arithmetic below.
+        // the turn nor overflow the arithmetic below, and add positive jitter on
+        // top of server hints when jitter is enabled.
         let hint = hint.min(self.max_retry_after);
-        backoff.max(hint).min(self.max.max(self.max_retry_after))
+        let hinted = if self.jitter && hint > Duration::ZERO {
+            let max_extra = (hint / 10).min(Duration::from_millis(500));
+            let roll: f64 = rand::random();
+            hint.saturating_add(max_extra.mul_f64(roll))
+        } else {
+            hint
+        };
+        backoff.max(hinted).min(self.max.max(self.max_retry_after))
     }
 }
 

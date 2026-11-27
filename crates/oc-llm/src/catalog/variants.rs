@@ -194,7 +194,7 @@ fn resolve_for_package(
     match protocol {
         Protocol::OpenAiChat => openai_variants(model, support),
         Protocol::AnthropicMessages => anthropic_variants(model, support),
-        Protocol::Gemini => gemini_variants(model, support),
+        Protocol::Gemini | Protocol::GeminiInteractions => gemini_variants(model, support),
         Protocol::Unsupported => Vec::new(),
     }
 }

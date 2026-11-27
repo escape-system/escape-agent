@@ -239,11 +239,6 @@ impl AntigravityService {
             .map_or_else(|_| DiscoveredModelCache::default(), |g| g.clone())
     }
 
-    /// Persist dirty thought signatures when `force` is true or the write interval has elapsed.
-    pub(crate) fn flush_signature_cache(&self, force: bool) {
-        flush_signature_cache_handle(&self.inner.signature_cache, force);
-    }
-
     /// Fetch the Hub auto-updater manifest and refresh quotas/models in background at startup.
     pub fn spawn_background_version_check(&self) {
         let check_manifest = self.config().auto_update;
@@ -309,10 +304,16 @@ impl AntigravityService {
                         tracing::debug!(error = %err, "antigravity: background quota refresh failed");
                     }
                 }
-                svc.flush_signature_cache(false);
+                svc.flush_signature_cache_async(false).await;
             }
         });
         true
+    }
+}
+
+impl AntigravityService {
+    pub(crate) async fn flush_signature_cache_async(&self, force: bool) {
+        flush_signature_cache_handle_async(&self.inner.signature_cache, force).await;
     }
 }
 
@@ -323,9 +324,76 @@ impl Drop for ServiceInner {
 }
 
 pub(crate) fn flush_signature_cache_handle(cache: &Arc<StdMutex<SignatureCache>>, force: bool) {
-    if let Ok(mut guard) = cache.lock()
-        && let Err(err) = guard.flush_if_due(now_ms(), force)
+    let pending = {
+        let Ok(mut guard) = cache.lock() else {
+            return;
+        };
+        match guard.prepare_flush(now_ms(), force) {
+            Ok(pending) => pending,
+            Err(err) => {
+                tracing::debug!(error = %err, "antigravity: failed to prepare signature cache flush");
+                return;
+            }
+        }
+    };
+    if let Some((path, json)) = pending
+        && let Err(err) = SignatureCache::write_flush_payload(&path, &json)
     {
         tracing::debug!(error = %err, "antigravity: failed to flush signature cache");
+    }
+}
+
+pub(crate) async fn flush_signature_cache_handle_async(
+    cache: &Arc<StdMutex<SignatureCache>>,
+    force: bool,
+) {
+    let pending = {
+        let Ok(mut guard) = cache.lock() else {
+            return;
+        };
+        match guard.prepare_flush(now_ms(), force) {
+            Ok(pending) => pending,
+            Err(err) => {
+                tracing::debug!(error = %err, "antigravity: failed to prepare signature cache flush");
+                return;
+            }
+        }
+    };
+    if let Some((path, json)) = pending {
+        let _ = tokio::task::spawn_blocking(move || {
+            if let Err(err) = SignatureCache::write_flush_payload(&path, &json) {
+                tracing::debug!(error = %err, "antigravity: failed to flush signature cache");
+            }
+        })
+        .await;
+    }
+}
+
+pub(crate) fn spawn_flush_signature_cache_handle(
+    cache: &Arc<StdMutex<SignatureCache>>,
+    force: bool,
+) {
+    let pending = {
+        let Ok(mut guard) = cache.lock() else {
+            return;
+        };
+        match guard.prepare_flush(now_ms(), force) {
+            Ok(pending) => pending,
+            Err(err) => {
+                tracing::debug!(error = %err, "antigravity: failed to prepare signature cache flush");
+                return;
+            }
+        }
+    };
+    if let Some((path, json)) = pending {
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn_blocking(move || {
+                if let Err(err) = SignatureCache::write_flush_payload(&path, &json) {
+                    tracing::debug!(error = %err, "antigravity: failed to flush signature cache");
+                }
+            });
+        } else if let Err(err) = SignatureCache::write_flush_payload(&path, &json) {
+            tracing::debug!(error = %err, "antigravity: failed to flush signature cache");
+        }
     }
 }

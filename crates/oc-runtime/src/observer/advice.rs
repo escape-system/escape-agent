@@ -145,11 +145,30 @@ impl Runtime {
     /// tick path always passes [`now_millis`], and the gate itself stays pure.
     #[doc(hidden)]
     pub async fn advise_context_pressure_at(&self, sessions: &[String], now: i64) -> bool {
+        if sessions.is_empty() {
+            return false;
+        }
         let compaction = CompactionConfig::from_merged(self.inner.config.config.merged());
         let auto = compaction.auto;
         let ceiling_set = compaction.ceiling_tokens.is_some();
+        // Fast path: when automatic compaction or an explicit ceiling is armed,
+        // `decide` unconditionally returns `AdviceSkip::Auto` — skip building
+        // tool schemas, contexts, and token estimates on every 1 s observer tick.
+        if auto || ceiling_set {
+            return false;
+        }
         let mut advised = false;
         for session in sessions {
+            let last_advised_ms = self
+                .inner
+                .observer_advised
+                .lock()
+                .expect("observer advice clock")
+                .get(session)
+                .copied();
+            if last_advised_ms.is_some_and(|last| now.saturating_sub(last) < ADVICE_COOLDOWN_MS) {
+                continue;
+            }
             let pressure = match self.context_pressure(session).await {
                 Ok(Some(pressure)) => pressure,
                 Ok(None) => continue,
@@ -165,13 +184,6 @@ impl Runtime {
                     continue;
                 }
             };
-            let last_advised_ms = self
-                .inner
-                .observer_advised
-                .lock()
-                .expect("observer advice clock")
-                .get(session)
-                .copied();
             let input = AdviceInput {
                 estimated: pressure.estimated,
                 ceiling: pressure.ceiling,

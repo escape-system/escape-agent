@@ -43,6 +43,7 @@ scope; the TUI must keep working against our server.
 | 27 | [key pool](27-key-pool.md) | Backup keys per provider, pool ordering, cooldowns, rotation seam |
 | 28 | [dsh alignment](28-dsh-alignment.md) | DeepSeek Harness invariant we adopted, mechanisms studied, what we declined |
 | 29 | [step budget](29-step-budget.md) | Deterministic step-budget extension policy, grants, observability |
+| 30 | [ToS-safe harness](30-tos-safe-harness.md) | Zero-ToS OAuth lock, Gemini/Vertex ADC, GCRA, affine budget, sandbox & MCP server |
 
 ## Rules that apply to every doc
 

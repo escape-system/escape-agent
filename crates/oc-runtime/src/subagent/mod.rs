@@ -35,13 +35,12 @@ mod tree;
 mod wait;
 mod write;
 
-pub(crate) use settings::session_subagent_mode;
+pub(crate) use settings::{load_settings, session_subagent_mode};
 pub(crate) use state::SubagentState;
 pub(crate) use wait::deliver_subagent_result;
 
 use digest::DigestTool;
 use roster::RosterTool;
-use settings::load_settings;
 use spawn::SubagentTool;
 use talk::TalkTool;
 use write::WriteSessionTool;

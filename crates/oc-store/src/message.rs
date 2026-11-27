@@ -100,8 +100,9 @@ impl Store {
             ));
         }
         let encoded = db::encode_json(&data)?;
-        let id_for_read = id.clone();
-        let session_for_read = session_id.clone();
+        let id_for_wire = id.clone();
+        let session_for_wire = session_id.clone();
+        let kind_for_wire = kind.clone();
         self.write(move |connection| {
             in_tx(connection, |transaction| {
                 ensure_session(transaction, &session_id)?;
@@ -127,9 +128,13 @@ impl Store {
             })
         })
         .await?;
-        self.get_message(&session_for_read, &id_for_read)
-            .await?
-            .ok_or_else(|| StoreError::NotFound(format!("message {id_for_read}")))
+        compose(
+            data,
+            &id_for_wire,
+            &session_for_wire,
+            &kind_for_wire,
+            time_created,
+        )
     }
 
     /// Loads one message as a wire message object.

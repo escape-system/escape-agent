@@ -1,8 +1,30 @@
 use std::collections::{HashSet, VecDeque};
+use std::sync::Arc;
 
 use oc_subagents::{Limits, SiblingBudget, SpawnBudget, WriteBudget};
 
 use super::digest::DIGEST_CACHE_CAPACITY;
+use super::settings::SubagentSettings;
+
+/// Maximum lifetime of an armed streaming subagent caller pre-warm entry.
+pub(super) const PREWARM_TTL_MS: i64 = 10_000;
+
+/// Pre-loaded caller metadata computed concurrently while `subagent` JSON args stream.
+#[derive(Clone, Debug)]
+pub(crate) struct WarmCallerData {
+    pub(crate) parent: oc_subagents::SessionNode,
+    pub(crate) parent_info: oc_types::SessionInfo,
+    pub(crate) settings: SubagentSettings,
+    pub(crate) available_agents: Vec<String>,
+    pub(crate) primary_only: Vec<String>,
+    pub(crate) quota_usage: Option<Vec<oc_store::ModelUsageRow>>,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct WarmCallerSlot {
+    pub(super) created_ms: i64,
+    pub(super) cell: Arc<tokio::sync::OnceCell<Arc<WarmCallerData>>>,
+}
 
 /// Per-runtime mutable tool state: rate budgets, active watcher set, and the digest cache.
 #[derive(Debug, Default)]
@@ -14,6 +36,7 @@ pub(crate) struct SubagentState {
     pub(super) digest_rate: std::collections::HashMap<String, VecDeque<i64>>,
     pub(super) active_watchers: HashSet<(String, String)>,
     pub(super) seen_queue_inbox_ids: std::collections::HashMap<String, HashSet<String>>,
+    pub(super) warm_callers: std::collections::HashMap<String, WarmCallerSlot>,
 }
 
 impl SubagentState {
@@ -23,13 +46,12 @@ impl SubagentState {
         limits: &Limits,
         current_children: u32,
     ) -> &mut SpawnBudget {
-        let rate = limits
-            .max_children
-            .clamp(oc_subagents::DEFAULT_SPAWNS_PER_MIN, 32);
+        let rate = limits.max_children.clamp(16, 64);
         let budget = self
             .spawn
             .entry(session.to_owned())
             .or_insert_with(|| SpawnBudget::new(limits.max_children, rate));
+        budget.reconfigure(limits.max_children, rate);
         budget.sync_active(current_children);
         budget
     }

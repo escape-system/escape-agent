@@ -37,11 +37,25 @@ function fakeStore() {
     session: { pending: Record<string, unknown[]>; message: Record<string, unknown[]> }
   }>({ session: { pending: {}, message: {} } })
 
+  const pendingHydrates: string[] = []
+  const messageHydrates: string[] = []
   return {
+    pendingHydrates,
+    messageHydrates,
     store: {
       session: {
-        pending: { list: (sessionID: string) => store.session.pending[sessionID] ?? [] },
-        message: { list: (sessionID: string) => store.session.message[sessionID] ?? [] },
+        pending: {
+          list: (sessionID: string) => store.session.pending[sessionID] ?? [],
+          hydrate: async (sessionID: string) => {
+            pendingHydrates.push(sessionID)
+          },
+        },
+        message: {
+          list: (sessionID: string) => store.session.message[sessionID] ?? [],
+          hydrate: async (sessionID: string) => {
+            messageHydrates.push(sessionID)
+          },
+        },
       },
     },
     setPending(sessionID: string, rows: unknown[]) {
@@ -443,6 +457,18 @@ describe("peer feed", () => {
         streaming: false,
       })
 
+      // Updates to a non-last text part (when a tool part follows) still invalidate transcriptSignature.
+      assistantMsg.content = [
+        { type: "text", text: "Step 1: scanning" },
+        { type: "tool", id: "call_1", name: "grep", state: { status: "running", input: {} }, time: { created: 2 } },
+      ]
+      expect(peer.thread?.()[1]).toMatchObject({ id: "msg_a1", text: "Step 1: scanning" })
+      assistantMsg.content = [
+        { type: "text", text: "Step 1: scanning files and routes" },
+        { type: "tool", id: "call_1", name: "grep", state: { status: "running", input: {} }, time: { created: 2 } },
+      ]
+      expect(peer.thread?.()[1]).toMatchObject({ id: "msg_a1", text: "Step 1: scanning files and routes" })
+
       // Own sends preserve `delivery: "steer"` and never bump `unread`.
       peer.add({ id: "msg_own_steer", from: "you", own: true, text: "Hurry up", created: 10 }, "steer")
       expect(peer.unread()).toBe(0)
@@ -454,6 +480,12 @@ describe("peer feed", () => {
         delivery: "steer",
         status: "queued",
       })
+
+      // SSE reconnect (`server.connected`) drops stale live-only queued placeholders and re-hydrates.
+      server.emit("server.connected", {})
+      expect(peer.queued()).toEqual([])
+      expect(state.pendingHydrates).toContain("ses_child")
+      expect(state.messageHydrates).toContain("ses_child")
     } finally {
       peer.dispose()
     }

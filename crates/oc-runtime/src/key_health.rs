@@ -9,16 +9,19 @@
 //! still reports the layout, and the prompt block is absent so the cached
 //! prefix is not churned.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write as _;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use oc_llm::{KeyHealthEntry, KeyPool};
+use oc_llm::{Activation, KeyHealthEntry, KeyPool, ModelInfo, ModelStatus, Protocol};
 use oc_store::{CredentialRow, Store, StoreError};
-use oc_tools::key_health::{KeyHealthKey, KeyHealthProvider, KeyHealthSource};
+use oc_tools::key_health::{
+    KeyHealthKey, KeyHealthModel, KeyHealthProvider, KeyHealthReport, KeyHealthSource,
+};
 
 use crate::runtime::Runtime;
+use crate::subagent::settings::model_key;
 
 /// Longest `<key-health>` line that is injected; an aggregate that would exceed
 /// it falls back to the short form so the system prompt stays compact.
@@ -49,6 +52,336 @@ impl KeyHealthSource for RuntimeKeyHealth {
         .await
         .map_err(|error| format!("could not read the credential pool: {error}"))
     }
+
+    async fn report(
+        &self,
+        provider: Option<&str>,
+        include_models: bool,
+        now_ms: i64,
+    ) -> Result<KeyHealthReport, String> {
+        let providers = self.providers(provider, now_ms).await?;
+        if !include_models {
+            return Ok(KeyHealthReport {
+                providers,
+                provider_models: BTreeMap::new(),
+                agent_models: BTreeMap::new(),
+            });
+        }
+        let (provider_models, agent_models) =
+            collect_model_inventory(&self.runtime, &providers, now_ms).await;
+        Ok(KeyHealthReport {
+            providers,
+            provider_models,
+            agent_models,
+        })
+    }
+}
+
+fn normalize_model_ref(reference: &str) -> String {
+    model_key(reference)
+        .trim()
+        .to_ascii_lowercase()
+        .replace('.', "-")
+}
+
+fn hidden_model_refs(models_section: &serde_json::Value) -> HashSet<String> {
+    let mut hidden = HashSet::new();
+    match models_section.get("hidden") {
+        Some(serde_json::Value::Array(items)) => {
+            for item in items {
+                if let Some(reference) = item.as_str() {
+                    hidden.insert(normalize_model_ref(reference));
+                }
+            }
+        }
+        Some(serde_json::Value::Object(map)) => {
+            for (reference, flag) in map {
+                if flag.as_bool() == Some(true) {
+                    hidden.insert(normalize_model_ref(reference));
+                }
+            }
+        }
+        _ => {}
+    }
+    hidden
+}
+
+fn favorite_model_refs(models_section: &serde_json::Value) -> HashSet<String> {
+    let mut favorites = HashSet::new();
+    match models_section.get("favorites") {
+        Some(serde_json::Value::Array(items)) => {
+            for item in items {
+                if let Some(reference) = item.as_str() {
+                    favorites.insert(normalize_model_ref(reference));
+                }
+            }
+        }
+        Some(serde_json::Value::Object(map)) => {
+            for (reference, flag) in map {
+                if flag.as_bool() == Some(true) {
+                    favorites.insert(normalize_model_ref(reference));
+                }
+            }
+        }
+        _ => {}
+    }
+    favorites
+}
+
+fn model_notes_map(models_section: &serde_json::Value) -> BTreeMap<String, String> {
+    let mut notes = BTreeMap::new();
+    if let Some(map) = models_section
+        .get("notes")
+        .and_then(serde_json::Value::as_object)
+    {
+        for (reference, note) in map {
+            if let Some(text) = note.as_str().map(str::trim).filter(|s| !s.is_empty()) {
+                notes.insert(normalize_model_ref(reference), text.to_owned());
+            }
+        }
+    }
+    notes
+}
+
+fn has_direct_google_access(runtime: &Runtime, credentials: &[serde_json::Value]) -> bool {
+    if runtime.inner.config.client.hook().is_none() {
+        return true;
+    }
+    if runtime
+        .inner
+        .config
+        .config
+        .merged()
+        .get("providers")
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|p| p.contains_key("google"))
+    {
+        return true;
+    }
+    if credentials.iter().any(|entry| {
+        entry
+            .get("integrationID")
+            .and_then(serde_json::Value::as_str)
+            == Some("google")
+            && entry.get("active").and_then(serde_json::Value::as_bool) == Some(true)
+            && entry
+                .pointer("/value/type")
+                .and_then(serde_json::Value::as_str)
+                != Some("oauth")
+    }) {
+        return true;
+    }
+    env_key_present(runtime, "google")
+}
+
+fn merged_catalog_models(runtime: &Runtime, credentials: &[serde_json::Value]) -> Vec<ModelInfo> {
+    let dynamic = runtime.inner.config.client.dynamic_models();
+    let has_ag_google = dynamic
+        .iter()
+        .any(|m| same_provider(&m.provider_id, "google"));
+    let direct_google = !has_ag_google || has_direct_google_access(runtime, credentials);
+    let mut all = runtime.inner.config.catalog.current().models();
+    if !direct_google {
+        all.retain(|m| !same_provider(&m.provider_id, "google"));
+    }
+    for extra in dynamic {
+        if let Some(pos) = all
+            .iter()
+            .position(|m| m.provider_id == extra.provider_id && m.id == extra.id)
+        {
+            all[pos] = extra;
+        } else {
+            all.push(extra);
+        }
+    }
+    all
+}
+
+fn model_remaining_percent(
+    quota: Option<&crate::subagent::settings::QuotaPolicy>,
+    usage: Option<&[oc_store::ModelUsageRow]>,
+    reference: &str,
+    norm: &str,
+) -> Option<f64> {
+    let (Some(quota), Some(rows)) = (quota, usage) else {
+        return None;
+    };
+    let budget = quota.budget_for(reference)?;
+    let max = budget.max_cost_usd?;
+    if max <= 0.0 {
+        return Some(0.0);
+    }
+    let spend = rows
+        .iter()
+        .find(|r| norm == normalize_model_ref(&format!("{}/{}", r.provider_id, r.model_id)))
+        .map_or(0.0, |r| r.cost);
+    Some((((max - spend) / max) * 100.0).clamp(0.0, 100.0))
+}
+
+fn collect_agent_models(
+    config: &oc_config::ConfigService,
+    settings: &crate::subagent::settings::SubagentSettings,
+) -> BTreeMap<String, String> {
+    let defaults = crate::subagent::settings::model_defaults(config, settings);
+    let mut agent_models = BTreeMap::new();
+    for id in [
+        "engineer",
+        "organizer",
+        "builder",
+        "general",
+        "explore",
+        "ui",
+        "docs",
+    ] {
+        if let Some(reference) = defaults.agent_models.get(id) {
+            agent_models.insert(id.to_owned(), reference.clone());
+        } else if let Some(reference) = defaults.policy_models.get(id) {
+            agent_models.insert(id.to_owned(), reference.clone());
+        } else if id == "organizer"
+            && let Some(reference) = settings
+                .models
+                .chains
+                .get("organizer")
+                .and_then(|c| c.iter().map(|s| s.trim()).find(|s| !s.is_empty()))
+        {
+            agent_models.insert(id.to_owned(), reference.to_owned());
+        }
+    }
+    if let Some(default_model) = defaults.default_model {
+        agent_models.insert("default".to_owned(), default_model);
+    }
+    agent_models
+}
+
+fn is_selectable_model(model: &ModelInfo, catalog: &oc_llm::Catalog) -> bool {
+    let is_chat = model.kind.as_deref().is_none_or(|kind| kind == "chat");
+    is_chat
+        && model.enabled
+        && model.protocol != Protocol::Unsupported
+        && model.status != ModelStatus::Deprecated
+        && model.capabilities.tools
+        && catalog
+            .provider(&model.provider_id)
+            .is_none_or(|p| p.activation != Activation::Disabled)
+}
+
+fn sort_provider_models(
+    by_provider: &mut BTreeMap<String, Vec<KeyHealthModel>>,
+    chain_order: &BTreeMap<String, usize>,
+) {
+    for models in by_provider.values_mut() {
+        models.sort_by(|left, right| {
+            let left_rank = chain_order
+                .get(&normalize_model_ref(&left.reference))
+                .copied()
+                .unwrap_or(usize::MAX);
+            let right_rank = chain_order
+                .get(&normalize_model_ref(&right.reference))
+                .copied()
+                .unwrap_or(usize::MAX);
+            right
+                .favorite
+                .cmp(&left.favorite)
+                .then_with(|| left_rank.cmp(&right_rank))
+                .then_with(|| left.model_id.cmp(&right.model_id))
+        });
+    }
+}
+
+async fn collect_model_inventory(
+    runtime: &Runtime,
+    providers: &[KeyHealthProvider],
+    now_ms: i64,
+) -> (
+    BTreeMap<String, Vec<KeyHealthModel>>,
+    BTreeMap<String, String>,
+) {
+    let config = &runtime.inner.config.config;
+    let catalog = runtime.inner.config.catalog.current();
+    let settings = crate::subagent::load_settings(config);
+    let models_section = config.models_section();
+    let hidden = hidden_model_refs(&models_section);
+    let favorites = favorite_model_refs(&models_section);
+    let notes = model_notes_map(&models_section);
+    let chain_order: BTreeMap<String, usize> = settings
+        .models
+        .chain
+        .iter()
+        .enumerate()
+        .map(|(idx, reference)| (normalize_model_ref(reference), idx))
+        .collect();
+    let credentials = runtime
+        .inner
+        .config
+        .store
+        .list_credentials()
+        .await
+        .unwrap_or_default();
+    let unavail_map: BTreeMap<String, _> =
+        runtime.model_health().entries(now_ms).into_iter().collect();
+    let usage = match &settings.models.quota {
+        Some(quota) => {
+            let window_ms = i64::from(quota.window_hours) * 3_600_000;
+            runtime
+                .inner
+                .config
+                .store
+                .model_usage(now_ms.saturating_sub(window_ms))
+                .await
+                .ok()
+        }
+        None => None,
+    };
+
+    let mut by_provider: BTreeMap<String, Vec<KeyHealthModel>> = BTreeMap::new();
+    for model in merged_catalog_models(runtime, &credentials) {
+        if !is_selectable_model(&model, &catalog) {
+            continue;
+        }
+        let Some(matched_provider) = providers
+            .iter()
+            .find(|p| same_provider(&p.provider_id, &model.provider_id))
+            .map(|p| p.provider_id.clone())
+        else {
+            continue;
+        };
+        let reference = format!("{}/{}", model.provider_id, model.id);
+        let norm = normalize_model_ref(&reference);
+        if hidden.contains(&norm) {
+            continue;
+        }
+        let unavail = unavail_map.get(&norm);
+        let remaining_pct = model_remaining_percent(
+            settings.models.quota.as_ref(),
+            usage.as_deref(),
+            &reference,
+            &norm,
+        );
+        let first_cost = model.cost.first();
+        by_provider
+            .entry(matched_provider)
+            .or_default()
+            .push(KeyHealthModel {
+                model_id: model.id.clone(),
+                reference,
+                name: model.name.clone(),
+                context_limit: Some(model.limit.context),
+                output_limit: Some(model.limit.output),
+                tools: model.capabilities.tools,
+                variants: model.variants.iter().map(|v| v.id.clone()).collect(),
+                cost_input_usd: first_cost.map(|c| c.input),
+                cost_output_usd: first_cost.map(|c| c.output),
+                favorite: favorites.contains(&norm),
+                note: notes.get(&norm).cloned(),
+                unavailable_kind: unavail.map(|u| u.kind.as_str().to_owned()),
+                unavailable_until_ms: unavail.map(|u| u.until_ms),
+                remaining_percent: remaining_pct,
+                quota_limited: remaining_pct.map(|pct| pct <= 0.0),
+            });
+    }
+    sort_provider_models(&mut by_provider, &chain_order);
+
+    (by_provider, collect_agent_models(config, &settings))
 }
 
 impl Runtime {

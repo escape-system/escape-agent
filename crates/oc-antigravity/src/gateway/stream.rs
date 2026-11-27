@@ -4,7 +4,10 @@
 use crate::accounts::ModelFamily;
 use crate::constants::{HeaderStyle, headers_for_style};
 use crate::rotation::RateLimitReason;
-use crate::service::{ActiveCredentials, AntigravityService, flush_signature_cache_handle, now_ms};
+use crate::service::{
+    ActiveCredentials, AntigravityService, flush_signature_cache_handle_async, now_ms,
+    spawn_flush_signature_cache_handle,
+};
 use crate::signature_cache::SignatureCache;
 use crate::stream::{CloudCodeSseDecoder, StreamDecodeFailure};
 use crate::transform::build_cloud_code_request;
@@ -130,7 +133,7 @@ pub(super) async fn prime_decoder_stream(
                 match decoder.finish() {
                     Ok(evts) => {
                         initial_events.extend(evts);
-                        flush_signature_cache_handle(&sig_cache, false);
+                        flush_signature_cache_handle_async(&sig_cache, false).await;
                     }
                     Err(failure) => {
                         tracing::debug!(
@@ -202,7 +205,7 @@ struct TailState {
 
 impl Drop for TailState {
     fn drop(&mut self) {
-        flush_signature_cache_handle(&self.sig_cache, false);
+        spawn_flush_signature_cache_handle(&self.sig_cache, false);
     }
 }
 
@@ -260,7 +263,7 @@ fn build_llm_stream(
                         Ok(evts) => return Some((stream::iter(evts), st)),
                         Err(err) => {
                             st.finished = true;
-                            flush_signature_cache_handle(&st.sig_cache, false);
+                            flush_signature_cache_handle_async(&st.sig_cache, false).await;
                             let msg = mid_stream_error_message(err);
                             return Some((
                                 stream::iter(vec![LlmEvent::ProviderError { message: msg }]),
@@ -270,7 +273,7 @@ fn build_llm_stream(
                     },
                     Some(Err(err)) => {
                         st.finished = true;
-                        flush_signature_cache_handle(&st.sig_cache, false);
+                        flush_signature_cache_handle_async(&st.sig_cache, false).await;
                         return Some((
                             stream::iter(vec![LlmEvent::ProviderError {
                                 message: format!(
@@ -291,7 +294,7 @@ fn build_llm_stream(
                                 }]
                             }
                         };
-                        flush_signature_cache_handle(&st.sig_cache, false);
+                        flush_signature_cache_handle_async(&st.sig_cache, false).await;
                         return Some((stream::iter(final_evts), st));
                     }
                 }

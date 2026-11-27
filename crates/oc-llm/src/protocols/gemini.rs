@@ -27,7 +27,9 @@ pub(crate) fn request(request: &LlmRequest) -> WireRequest {
         generation.insert("topP".to_string(), json!(top_p));
     }
     if let Some(thinking) = settings.get("thinkingConfig") {
-        generation.insert("thinkingConfig".to_string(), thinking.clone());
+        let clamped =
+            super::clamp_thinking_config(thinking, request.options.thinking_cap.as_deref());
+        generation.insert("thinkingConfig".to_string(), clamped);
     }
 
     let mut body = Map::new();
@@ -227,6 +229,19 @@ impl Decoder {
         if let Some(usage) = value.get("usageMetadata") {
             self.usage = map_usage(usage);
         }
+        if let Some(feedback) = value.get("promptFeedback")
+            && let Some(reason) = feedback.get("blockReason").and_then(Value::as_str)
+        {
+            let detail = feedback
+                .get("blockReasonMessage")
+                .and_then(Value::as_str)
+                .map(|m| format!(": {m}"))
+                .unwrap_or_default();
+            self.done = true;
+            return vec![LlmEvent::ProviderError {
+                message: format!("policy_blocked: prompt blocked by Gemini ({reason}){detail}"),
+            }];
+        }
         let mut events = Vec::new();
         let Some(candidate) = value
             .get("candidates")
@@ -236,6 +251,17 @@ impl Decoder {
             return events;
         };
         if let Some(reason) = candidate.get("finishReason").and_then(Value::as_str) {
+            if matches!(
+                reason,
+                "SAFETY" | "RECITATION" | "BLOCKLIST" | "PROHIBITED_CONTENT" | "SPII"
+            ) && !self.text_started
+                && self.tool_calls == 0
+            {
+                self.done = true;
+                return vec![LlmEvent::ProviderError {
+                    message: format!("policy_blocked: Gemini candidate stopped ({reason})"),
+                }];
+            }
             self.finish_reason = Some(reason.to_string());
         }
         let Some(parts) = candidate

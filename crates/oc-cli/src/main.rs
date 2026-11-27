@@ -5,6 +5,7 @@ mod auth;
 mod bootstrap;
 mod cli;
 mod lane;
+mod mcp_server;
 mod net;
 mod paths;
 mod run;
@@ -22,7 +23,8 @@ static GLOBAL: MiMalloc = MiMalloc;
 
 use crate::antigravity_cmd::run_auth;
 use crate::auth::service_get;
-use crate::cli::{ChatOptions, Cli, Command, RunOptions, ServeOptions, ServiceCommand};
+use crate::cli::{ChatOptions, Cli, Command, McpOptions, RunOptions, ServeOptions, ServiceCommand};
+use crate::mcp_server::run_mcp;
 use crate::run::{run_chat, run_once};
 use crate::serve::serve;
 
@@ -41,7 +43,10 @@ async fn async_main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let default_level = match &cli.command {
         Some(Command::Serve { .. } | Command::Service { .. }) => "info",
-        Some(Command::Run { .. } | Command::Chat { .. } | Command::Auth(_)) | None => "warn",
+        Some(
+            Command::Run { .. } | Command::Chat { .. } | Command::Auth(_) | Command::Mcp { .. },
+        )
+        | None => "warn",
     };
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
@@ -50,7 +55,11 @@ async fn async_main() -> anyhow::Result<()> {
         )
         .init();
 
-    match cli.command {
+    dispatch_command(cli.command).await
+}
+
+async fn dispatch_command(command: Option<Command>) -> anyhow::Result<()> {
+    match command {
         Some(Command::Run {
             prompt,
             model,
@@ -128,5 +137,17 @@ async fn async_main() -> anyhow::Result<()> {
             command: ServiceCommand::Get { key },
         }) => service_get(&key),
         Some(Command::Auth(args)) => run_auth(args).await,
+        Some(Command::Mcp {
+            directory,
+            read_only,
+            sandbox,
+        }) => {
+            run_mcp(McpOptions {
+                directory,
+                read_only,
+                sandbox,
+            })
+            .await
+        }
     }
 }

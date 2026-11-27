@@ -35,7 +35,7 @@ mod session_title_and_config;
 mod step_grants;
 #[path = "runtime/stop.rs"]
 mod stop;
-#[path = "runtime/subagents.rs"]
+#[path = "runtime/subagents/mod.rs"]
 mod subagents;
 #[path = "runtime/support.rs"]
 mod support;

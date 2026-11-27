@@ -7,12 +7,17 @@ use std::future::Future;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(unix)]
+use std::time::Instant;
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
-use tokio::process::{Child, Command};
+use tokio::process::Child;
+#[cfg(windows)]
+use tokio::process::Command;
 
+use crate::sandbox::{ShellSandboxMode, build_sandboxed_shell_command};
 use crate::util;
 use crate::{Tool, ToolContext, ToolError, ToolResult};
 
@@ -22,12 +27,16 @@ pub const MAX_BYTES: usize = 50 * 1024;
 #[cfg(unix)]
 const KILL_GRACE: Duration = Duration::from_secs(3);
 
-/// Per-call runtime overrides for [`ShellTool`] (session `metadata.environment` and `tool_output` bounds).
+/// Per-call runtime overrides for [`ShellTool`] (session `metadata.environment`,
+/// `tool_output` bounds, and OS sandbox settings).
 #[derive(Debug, Clone, Default)]
 pub struct ShellRunConfig {
     pub env: BTreeMap<String, String>,
     pub max_lines: Option<usize>,
     pub max_bytes: Option<usize>,
+    pub sandbox: ShellSandboxMode,
+    pub writable_paths: Vec<PathBuf>,
+    pub scrub_secrets: bool,
 }
 
 tokio::task_local! {
@@ -154,40 +163,37 @@ impl Tool for ShellTool {
             .map_err(|error| ToolError::new(format!("Unable to capture shell output: {error}")))?;
         drop(file);
 
-        let mut process = Command::new(&shell);
-        match kind {
+        let shell_args: &[&str] = match kind {
             #[cfg(windows)]
-            ShellKind::Cmd => {
-                // cmd.exe has no pipefail: `exit` stays the last segment's
-                // status, matching what a user sees in a normal cmd session.
-                process.arg("/c").arg(&command);
-            }
+            ShellKind::Cmd => &["/c"],
             #[cfg(windows)]
-            ShellKind::PowerShell => {
-                // PowerShell has no pipefail either. `$LASTEXITCODE` reflects
-                // only the last native command, so the reported exit is the
-                // final pipeline stage's status.
-                process
-                    .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"])
-                    .arg(&command);
-            }
+            ShellKind::PowerShell => &["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"],
             ShellKind::Posix => {
                 // Without pipefail a pipeline reports the *last* segment's
                 // status, so `cargo clippy … | tail` looks like a success even
                 // when clippy failed. pipefail makes the pipeline report the
                 // last non-zero status, which is the status a reader expects.
                 if util::shell_supports_pipefail(&shell) {
-                    process.args(["-o", "pipefail", "-c"]).arg(&command);
+                    &["-o", "pipefail", "-c"]
                 } else {
                     // A POSIX sh without pipefail support keeps the historical
                     // last-segment behaviour rather than refusing to run.
-                    process.arg("-c").arg(&command);
+                    &["-c"]
                 }
             }
-        }
+        };
         let run_cfg = current_shell_config();
+        let (mut process, _sandboxed) = build_sandboxed_shell_command(
+            &shell,
+            shell_args,
+            &command,
+            &workdir,
+            run_cfg.sandbox,
+            &run_cfg.writable_paths,
+            run_cfg.scrub_secrets,
+        )
+        .map_err(ToolError::new)?;
         process
-            .current_dir(&workdir)
             .stdin(Stdio::null())
             .stdout(Stdio::from(stdout))
             .stderr(Stdio::from(stderr));
@@ -220,24 +226,19 @@ impl Tool for ShellTool {
                 ToolError::new(format!("Unable to execute command: {command}: {error}"))
             })?
         } else {
-            let deadline = Instant::now().checked_add(Duration::from_millis(timeout_ms));
-            loop {
-                match child.try_wait() {
-                    Ok(Some(status)) => break status,
-                    Ok(None) => {}
-                    Err(error) => {
-                        return Err(ToolError::new(format!(
-                            "Unable to execute command: {command}: {error}"
-                        )));
-                    }
+            match tokio::time::timeout(Duration::from_millis(timeout_ms), child.wait()).await {
+                Ok(Ok(status)) => status,
+                Ok(Err(error)) => {
+                    return Err(ToolError::new(format!(
+                        "Unable to execute command: {command}: {error}"
+                    )));
                 }
-                if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                Err(_) => {
                     timed_out = true;
-                    break kill_tree(&mut child, pid).await.map_err(|error| {
+                    kill_tree(&mut child, pid).await.map_err(|error| {
                         ToolError::new(format!("Unable to terminate timed out command: {error}"))
-                    })?;
+                    })?
                 }
-                tokio::time::sleep(Duration::from_millis(10)).await;
             }
         };
         #[cfg(unix)]
@@ -245,8 +246,12 @@ impl Tool for ShellTool {
 
         let max_lines = run_cfg.max_lines.filter(|v| *v > 0).unwrap_or(MAX_LINES);
         let max_bytes = run_cfg.max_bytes.filter(|v| *v > 0).unwrap_or(MAX_BYTES);
-        let (text, truncated, total, shown) = capture_tail(&output_path, max_lines, max_bytes)
-            .map_err(|error| ToolError::new(format!("Unable to read shell output: {error}")))?;
+        let tail_path = output_path.clone();
+        let (text, truncated, total, shown) =
+            tokio::task::spawn_blocking(move || capture_tail(&tail_path, max_lines, max_bytes))
+                .await
+                .map_err(|error| ToolError::new(format!("Unable to read shell output: {error}")))?
+                .map_err(|error| ToolError::new(format!("Unable to read shell output: {error}")))?;
 
         let exit = status.code();
         #[cfg(unix)]

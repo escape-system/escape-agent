@@ -43,6 +43,24 @@ const PROMPT_DOCS: &str = "You are a technical documentation agent. Your write s
 - Keep documentation aligned with actual implementation and public contracts in the codebase. Never document unbuilt behavior as shipped.
 - Edit concisely in place, preserve cross-references, check inbound links when restructuring, and avoid inventing numbers or unverified claims.";
 
+const PROMPT_ORGANIZER: &str = "You are a persistent resource and subagent orchestration coordinator (`role: \"coordinator\"`).
+
+Responsibilities:
+- You act as team leader for the parent session, persisting across worker waves so the parent only talks to you.
+- Workers you spawn automatically attach onto your parent session alongside you (so the whole team appears flat under root), while completion wakes, `roster` barriers, and `talk` updates route exclusively back to you — never spamming the parent session.
+- Inspect resources FIRST: call `key_health` with `{\"include_models\": true}` before dispatching any wave (and again whenever a worker hits quota, rate limits, or auth errors) so you see active vs cooling keys, connected providers, selectable tool-capable models, operator `note`/`favorite` hints, and quotas.
+- Choose verified models & healthy keys intentionally: pick fast/efficient models for read-only or build work (`explore`, `docs`, `builder`) and strong coding models for implementation (`general`, `ui`). Spread parallel workers across healthy (`limited == false`) provider keys (`key` id/label or `key: \"auto\"`), never assign a cooling key, and never invent unverified model names.
+- Delegate ALL execution — never run shell commands, file searches, or edits yourself:
+  - Send codebase exploration to `explore`, code edits to `general`/`ui`/`docs`, and ALL compile/check/clippy/fmt/lint/test/benchmark runs to `builder` so builds serialize cleanly via lanes.
+- Dispatch workers in parallel with strictly disjoint file/module ownership (or `partitions`) and `background: true`, wait quietly in ONE call using `roster` with `{\"wait_seconds\": 240, \"wait_all\": true}` (or end your step cleanly to wake on worker completions), inspect failures with `digest`, retry transients on another healthy key, and deliver ONE concise consolidated report to your parent.";
+
+const PROMPT_BUILDER: &str = "You are a dedicated compile, lint, format-check, test, and benchmark verification agent (`builder`).
+
+Responsibilities:
+- Execute build, typecheck, linter/clippy, formatting check, test suite, and benchmark commands cleanly in any workspace (Rust, TypeScript/JS, Go, Python, C/C++, etc.) using `lane` (preferred when available — inspect `lane` `status`/`list` first and queue one command per ticket with automatic coalescing) or lane-serialized `shell`.
+- You NEVER edit application source files, tests, or docs (`edit`/`write`/`patch` are denied). When checks fail, identify the exact failing commands/tests and root compiler/runtime diagnostics (`file:line` + concise error snippet) so coding workers or the coordinator can fix them.
+- Report compactly: command run, pass/fail status, duration, failing test/target IDs, and first root errors (or `output_path`), never pasting huge raw build logs.";
+
 const PROMPT_EXPLORE: &str = "You are a file search specialist. You excel at thoroughly navigating and exploring codebases.
 
 Guidelines:
@@ -290,10 +308,11 @@ pub fn normalize_agent_id(id: &str) -> &str {
     }
 }
 
-/// The ten built-in agents in their canonical order.
+/// The twelve built-in agents in their canonical order.
 ///
-/// `engineer`, `architect`, `review`, `general`, `explore`, `ui`, `docs`, then
-/// the hidden system agents `compaction`, `title`, `summary`.
+/// `engineer`, `architect`, `review`, `general`, `explore`, `ui`, `docs`,
+/// `organizer`, `builder`, then the hidden system agents `compaction`, `title`,
+/// `summary`.
 #[must_use]
 pub(crate) fn builtins(home: &Path) -> Vec<AgentState> {
     // Preserve the historical `~/.opencode` expansion for the home-scoped
@@ -407,6 +426,34 @@ pub(crate) fn builtins(home: &Path) -> Vec<AgentState> {
         docs.permissions.push(allow("patch", resource));
     }
 
+    let mut organizer = AgentState::new("organizer", "Organizer", "subagent");
+    organizer.description = Some(
+        "Persistent team coordinator (`role: coordinator`). Inspects `key_health(include_models=true)`, spawns worker and `builder` subagents onto the parent session while handling completions/retries/`roster`, and reports one synthesis back to root."
+            .to_owned(),
+    );
+    organizer.system = Some(PROMPT_ORGANIZER.to_owned());
+    organizer.permissions.push(deny("question", "*"));
+    organizer.permissions.push(deny("edit", "*"));
+    organizer.permissions.push(deny("write", "*"));
+    organizer.permissions.push(deny("patch", "*"));
+    organizer.permissions.push(deny("shell", "*"));
+    organizer.permissions.push(deny("bash", "*"));
+    organizer.permissions.push(deny("glob", "*"));
+    organizer.permissions.push(deny("grep", "*"));
+
+    let mut builder = AgentState::new("builder", "Builder", "subagent");
+    builder.description = Some(
+        "Dedicated compile, check, lint, fmt-check, test, and benchmark runner. Executes serialized build/test gates via `lane` or `shell` without modifying files."
+            .to_owned(),
+    );
+    builder.system = Some(PROMPT_BUILDER.to_owned());
+    builder.permissions.push(deny("question", "*"));
+    builder.permissions.push(deny("edit", "*"));
+    builder.permissions.push(deny("write", "*"));
+    builder.permissions.push(deny("patch", "*"));
+    builder.permissions.push(deny("subagent", "*"));
+    builder.permissions.push(allow("external_directory", "*"));
+
     let mut compaction = AgentState::new("compaction", "Compaction", "primary");
     compaction.hidden = true;
     compaction.permissions.push(deny("*", "*"));
@@ -422,7 +469,8 @@ pub(crate) fn builtins(home: &Path) -> Vec<AgentState> {
     summary.permissions.push(deny("*", "*"));
 
     vec![
-        engineer, architect, review, general, explore, ui, docs, compaction, title, summary,
+        engineer, architect, review, general, explore, ui, docs, organizer, builder, compaction,
+        title, summary,
     ]
 }
 

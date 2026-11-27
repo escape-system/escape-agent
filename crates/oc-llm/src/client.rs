@@ -17,13 +17,16 @@ use std::sync::RwLock;
 use reqwest::{Client, Response};
 
 use crate::catalog::{Protocol, ResolvedModel};
-use crate::error::LlmError;
-use crate::event::{LlmEvent, LlmRequest, LlmStream, Timeouts};
+use crate::error::{LlmError, parse_google_error_details};
+use crate::event::{LlmEvent, LlmRequest, LlmStream, Timeouts, model_supports_request_modalities};
 use crate::hook::LlmTransportHook;
 use crate::protocols::{self, Decoder};
 use crate::quota::{ProviderRateLimit, extract_rate_limit, now_epoch_ms};
+use crate::rate_limit::{ProviderRateLimiter, RateLimitPolicy};
 use crate::retry::{RetryPolicy, RetryState, parse_retry_after};
 use crate::sse::SseParser;
+use crate::token::estimate_request_tokens;
+use crate::vertex::{GoogleAdcClient, is_vertex_target, resolve_vertex_base_url};
 
 /// Provider transport.
 #[derive(Debug, Clone)]
@@ -33,6 +36,8 @@ pub struct LlmClient {
     timeouts: Timeouts,
     hook: Arc<RwLock<Option<Arc<dyn LlmTransportHook>>>>,
     rate_limits: Arc<RwLock<BTreeMap<String, ProviderRateLimit>>>,
+    rate_limiter: Arc<ProviderRateLimiter>,
+    adc: Arc<GoogleAdcClient>,
 }
 
 impl LlmClient {
@@ -57,7 +62,26 @@ impl LlmClient {
             timeouts: Timeouts::default(),
             hook: Arc::new(RwLock::new(None)),
             rate_limits: Arc::new(RwLock::new(BTreeMap::new())),
+            rate_limiter: Arc::new(ProviderRateLimiter::new()),
+            adc: Arc::new(GoogleAdcClient::default()),
         })
+    }
+
+    /// Borrow the proactive GCRA rate limiter for this client.
+    #[must_use]
+    pub fn rate_limiter(&self) -> &Arc<ProviderRateLimiter> {
+        &self.rate_limiter
+    }
+
+    /// Install a proactive GCRA + spend-velocity policy for `provider`.
+    pub fn set_rate_limit_policy(&self, provider: &str, policy: RateLimitPolicy) {
+        self.rate_limiter.set_policy(provider, policy);
+    }
+
+    /// Borrow the GCP ADC token cache client.
+    #[must_use]
+    pub fn adc(&self) -> &Arc<GoogleAdcClient> {
+        &self.adc
     }
 
     /// Borrow the underlying pooled HTTP client for auxiliary requests (e.g. quota probes).
@@ -123,11 +147,23 @@ impl LlmClient {
         clippy::result_large_err,
         reason = "the public API returns the typed LlmError directly rather than boxing it"
     )]
-    pub async fn stream(&self, request: LlmRequest) -> Result<LlmStream, LlmError> {
+    pub async fn stream(&self, mut request: LlmRequest) -> Result<LlmStream, LlmError> {
         if let Some(hook) = self.hook()
             && hook.handles(&request)
         {
             return hook.stream(request).await;
+        }
+        if !model_supports_request_modalities(&request.model, &request.messages) {
+            return Err(LlmError::InvalidRequest {
+                message: format!(
+                    "model `{}` supports input modalities {:?}, which does not cover every attachment in this request",
+                    request.model.reference, request.model.model.capabilities.input
+                ),
+            });
+        }
+        if is_vertex_target(&request.model.provider.id, &request.model.base_url) {
+            let settings = request.model.settings();
+            request.model.base_url = resolve_vertex_base_url(&request.model.base_url, &settings)?;
         }
         let model = request.model.clone();
         if model.protocol == Protocol::Unsupported {
@@ -144,7 +180,7 @@ impl LlmClient {
             });
         }
         let wire = protocols::build(&request, model.protocol)?;
-        let headers = Self::headers(&request, &model);
+        let headers = self.resolve_headers(&request, &model).await?;
         let timeouts = request
             .options
             .timeouts
@@ -155,6 +191,22 @@ impl LlmClient {
         let body = serde_json::to_vec(&wire.body).map_err(|error| LlmError::InvalidRequest {
             message: format!("could not encode request body: {error}"),
         })?;
+        let est_tokens = u32::try_from(estimate_request_tokens(
+            &request.system,
+            &request.messages,
+            &request.tools,
+        ))
+        .unwrap_or(u32::MAX);
+        let est_cost_usd = model
+            .model
+            .cost
+            .first()
+            .map_or(0.0, |c| (f64::from(est_tokens) / 1_000_000.0) * c.input);
+        let cred_slot = request
+            .options
+            .credential_id
+            .as_deref()
+            .unwrap_or("default");
         let response = self
             .send(
                 &url,
@@ -162,7 +214,13 @@ impl LlmClient {
                 &headers,
                 &timeouts,
                 deadline,
-                Some((&model.provider.id, &model.model.id)),
+                Some((
+                    &model.provider.id,
+                    &model.model.id,
+                    cred_slot,
+                    est_tokens,
+                    est_cost_usd,
+                )),
             )
             .await?;
         let chunk_timeout = timeouts.chunk;
@@ -178,31 +236,49 @@ impl LlmClient {
         Ok(into_llm_stream(state))
     }
 
-    fn headers(request: &LlmRequest, model: &ResolvedModel) -> Vec<(String, String)> {
+    async fn resolve_headers(
+        &self,
+        request: &LlmRequest,
+        model: &ResolvedModel,
+    ) -> Result<Vec<(String, String)>, LlmError> {
         let mut headers = BTreeMap::new();
+        let is_vertex = is_vertex_target(&model.provider.id, &model.base_url);
         let key = request
             .options
             .api_key
             .clone()
             .or_else(|| model.api_key_from_env());
-        match model.protocol {
-            Protocol::OpenAiChat => {
-                if let Some(key) = &key {
-                    headers.insert("Authorization".to_string(), format!("Bearer {key}"));
+
+        if is_vertex {
+            let settings = model.settings();
+            let token = self
+                .adc
+                .bearer_token(&self.http, key.as_deref(), &settings)
+                .await?;
+            headers.insert(
+                "Authorization".to_string(),
+                format!("Bearer {}", token.as_str()),
+            );
+        } else {
+            match model.protocol {
+                Protocol::OpenAiChat => {
+                    if let Some(key) = &key {
+                        headers.insert("Authorization".to_string(), format!("Bearer {key}"));
+                    }
                 }
-            }
-            Protocol::AnthropicMessages => {
-                if let Some(key) = &key {
-                    headers.insert("x-api-key".to_string(), key.clone());
+                Protocol::AnthropicMessages => {
+                    if let Some(key) = &key {
+                        headers.insert("x-api-key".to_string(), key.clone());
+                    }
+                    headers.insert("anthropic-version".to_string(), "2023-06-01".to_string());
                 }
-                headers.insert("anthropic-version".to_string(), "2023-06-01".to_string());
-            }
-            Protocol::Gemini => {
-                if let Some(key) = &key {
-                    headers.insert("x-goog-api-key".to_string(), key.clone());
+                Protocol::Gemini | Protocol::GeminiInteractions => {
+                    if let Some(key) = &key {
+                        headers.insert("x-goog-api-key".to_string(), key.clone());
+                    }
                 }
+                Protocol::Unsupported => {}
             }
-            Protocol::Unsupported => {}
         }
         for (name, value) in model.headers() {
             headers.insert(name, value);
@@ -217,7 +293,7 @@ impl LlmClient {
         for (name, value) in &request.options.headers {
             headers.insert(name.clone(), value.clone());
         }
-        headers.into_iter().collect()
+        Ok(headers.into_iter().collect())
     }
 
     async fn send(
@@ -227,13 +303,32 @@ impl LlmClient {
         headers: &[(String, String)],
         timeouts: &Timeouts,
         deadline: Option<Instant>,
-        target: Option<(&str, &str)>,
+        target: Option<(&str, &str, &str, u32, f64)>,
     ) -> Result<Response, LlmError> {
         let mut state = RetryState::new(self.retry.clone());
         loop {
+            let permit = if let Some((provider_id, _, cred_slot, est_tokens, est_cost)) = target {
+                Some(
+                    self.rate_limiter
+                        .acquire(provider_id, cred_slot, est_tokens, est_cost)
+                        .await,
+                )
+            } else {
+                None
+            };
             let result = self
-                .attempt(url, body, headers, timeouts.header, deadline, target)
+                .attempt(
+                    url,
+                    body,
+                    headers,
+                    timeouts.header,
+                    deadline,
+                    target.map(|(p, m, _, _, _)| (p, m)),
+                )
                 .await;
+            // Release concurrency permit immediately before checking/sleeping on retry
+            // so backoff never pins a scarce worker/rate slot.
+            drop(permit);
             let error = match result {
                 Ok(response) => return Ok(response),
                 Err(error) => error,
@@ -313,39 +408,69 @@ impl LlmClient {
         if status.is_success() {
             return Ok(response);
         }
-        let retry_after = response
-            .headers()
-            .get("retry-after")
-            .and_then(|value| value.to_str().ok())
-            .and_then(parse_retry_after)
-            .map(|delay| u64::try_from(delay.as_millis()).unwrap_or(u64::MAX));
-        let should_retry = response
-            .headers()
-            .get("x-should-retry")
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_string);
-        let body = match tokio::time::timeout(Duration::from_secs(10), response.text()).await {
-            Ok(Ok(body)) => body,
-            Ok(Err(_)) | Err(_) => String::new(),
+        Err(classify_http_error(response).await)
+    }
+}
+
+async fn classify_http_error(response: Response) -> LlmError {
+    let status = response.status();
+    let header_retry_after = response
+        .headers()
+        .get("retry-after")
+        .and_then(|value| value.to_str().ok())
+        .and_then(parse_retry_after)
+        .map(|delay| u64::try_from(delay.as_millis()).unwrap_or(u64::MAX))
+        .or_else(|| {
+            response
+                .headers()
+                .get("retry-after-ms")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|raw| raw.trim().parse::<u64>().ok())
+        });
+    let should_retry = response
+        .headers()
+        .get("x-should-retry")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let body = match tokio::time::timeout(Duration::from_secs(10), response.text()).await {
+        Ok(Ok(body)) => body,
+        Ok(Err(_)) | Err(_) => String::new(),
+    };
+    let details = parse_google_error_details(&body);
+    let retry_after = match (header_retry_after, details.retry_after_ms) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (a, b) => a.or(b),
+    };
+    let body = truncate(&body, 2_000);
+    if details.terminal_quota {
+        let reason = if details.violations.is_empty() {
+            body.clone()
+        } else {
+            format!("{} ({})", details.violations.join("; "), body)
         };
-        let body = truncate(&body, 2_000);
-        if should_retry.as_deref() == Some("false") && status.is_server_error() {
-            return Err(LlmError::InvalidRequest {
-                message: format!("provider returned HTTP {status}: {body}"),
-            });
-        }
-        Err(LlmError::Http {
-            status: status.as_u16(),
-            message: if body.is_empty() {
-                status
-                    .canonical_reason()
-                    .unwrap_or("provider error")
-                    .to_string()
-            } else {
-                body
-            },
-            retry_after_ms: retry_after,
-        })
+        return LlmError::QuotaTerminal { message: reason };
+    }
+    if (body.contains("PROHIBITED_CONTENT") || body.contains("SAFETY")) && status.as_u16() == 400 {
+        return LlmError::PolicyBlocked {
+            message: format!("HTTP {status}: {body}"),
+        };
+    }
+    if should_retry.as_deref() == Some("false") && status.is_server_error() {
+        return LlmError::InvalidRequest {
+            message: format!("provider returned HTTP {status}: {body}"),
+        };
+    }
+    LlmError::Http {
+        status: status.as_u16(),
+        message: if body.is_empty() {
+            status
+                .canonical_reason()
+                .unwrap_or("provider error")
+                .to_string()
+        } else {
+            body
+        },
+        retry_after_ms: retry_after,
     }
 }
 

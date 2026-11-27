@@ -175,15 +175,15 @@ impl SignatureCache {
         None
     }
 
-    /// Evict expired entries and persist to disk if dirty and past the configured write interval.
-    pub fn flush_if_due(&mut self, now_ms: i64, force: bool) -> Result<()> {
+    /// Prepare a dirty cache snapshot for off-thread persistence if due.
+    pub fn prepare_flush(&mut self, now_ms: i64, force: bool) -> Result<Option<(PathBuf, String)>> {
         if !self.cfg.enabled || !self.dirty {
-            return Ok(());
+            return Ok(None);
         }
         let interval_ms =
             i64::try_from(self.cfg.write_interval_seconds.saturating_mul(1000)).unwrap_or(60_000);
         if !force && now_ms.saturating_sub(self.last_write_ms) < interval_ms {
-            return Ok(());
+            return Ok(None);
         }
 
         let disk_ttl_ms =
@@ -191,21 +191,37 @@ impl SignatureCache {
         self.entries
             .retain(|_, v| now_ms.saturating_sub(v.last_accessed) <= disk_ttl_ms);
 
-        if let Some(ref path) = self.path {
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
+        let pending = if let Some(ref path) = self.path {
             let payload = BorrowedSignatureStore {
                 version: 1,
                 entries: &self.entries,
             };
-            let tmp = path.with_extension("json.tmp");
-            std::fs::write(&tmp, serde_json::to_string(&payload)?)?;
-            std::fs::rename(&tmp, path)?;
-        }
+            Some((path.clone(), serde_json::to_string(&payload)?))
+        } else {
+            None
+        };
 
         self.dirty = false;
         self.last_write_ms = now_ms;
+        Ok(pending)
+    }
+
+    /// Persist a previously prepared cache snapshot to disk atomically.
+    pub fn write_flush_payload(path: &Path, json: &str) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, json)?;
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    }
+
+    /// Evict expired entries and persist to disk if dirty and past the configured write interval.
+    pub fn flush_if_due(&mut self, now_ms: i64, force: bool) -> Result<()> {
+        if let Some((path, json)) = self.prepare_flush(now_ms, force)? {
+            Self::write_flush_payload(&path, &json)?;
+        }
         Ok(())
     }
 }

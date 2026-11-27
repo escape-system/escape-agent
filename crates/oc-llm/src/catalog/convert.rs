@@ -20,6 +20,7 @@ pub(super) fn protocol_for_route(api_name: &str, package: &str) -> Protocol {
         "chat-completions" => Protocol::OpenAiChat,
         "messages" => Protocol::AnthropicMessages,
         "generate-content" => Protocol::Gemini,
+        "interactions" => Protocol::GeminiInteractions,
         "responses" | "converse" => Protocol::Unsupported,
         _ => protocol_for(package),
     }
@@ -45,7 +46,9 @@ pub(super) fn default_base_url(protocol: Protocol) -> &'static str {
     match protocol {
         Protocol::OpenAiChat => "https://api.openai.com/v1",
         Protocol::AnthropicMessages => "https://api.anthropic.com/v1",
-        Protocol::Gemini => "https://generativelanguage.googleapis.com/v1beta",
+        Protocol::Gemini | Protocol::GeminiInteractions => {
+            "https://generativelanguage.googleapis.com/v1beta"
+        }
         Protocol::Unsupported => "",
     }
 }

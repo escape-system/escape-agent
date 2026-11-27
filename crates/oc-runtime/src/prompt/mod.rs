@@ -127,20 +127,25 @@ fn append_coordination_and_memory_routing(
             "- When the user explicitly asks you to spawn subagents, call `subagent` before reading \
              files or running commands; give each child a self-contained prompt. Otherwise delegate \
              self-contained parallel work with `subagent` instead of doing everything yourself; omit \
-             `agent` to use the configured default, and use `explore` for read-only searches. Pass \
+             `agent` to use the configured default, use `explore` for read-only searches, and use \
+             `builder` for compile/lint/test/benchmark runs. Pass \
              `partitions` (2..16) to auto-split cross-module tasks using `code_map` graph partitioning \
-             so parallel workers stay disjoint with minimal `<shared_core>` overhead. For complex \
-             multi-phase work, delegate to a coordinator (`role: \"coordinator\"`) to manage sub-tasks \
-             hierarchically. Use `sessionID` to continue an existing child rather than spawning duplicates. \
-             Several independent spawns may be issued in one step; `background: true` returns immediately \
-             and reports the result later as a synthetic message.\n",
+             so parallel workers stay disjoint with minimal `<shared_core>` overhead. For multi-worker \
+             tasks that need `key_health` inspection, model/key routing across providers, retries, and \
+             single-report consolidation, delegate to persistent coordinator `agent: \"organizer\"` \
+             (`role: \"coordinator\"` — reuse its `sessionID` across waves if already present in `roster`, \
+             and let it call `key_health` and manage worker `roster` barriers while you finish your step \
+             cleanly and wait to be woken with its single synthesis). Use `sessionID` to continue an \
+             existing child rather than spawning duplicates. Several independent spawns may be issued in \
+             one step; `background: true` returns immediately and wakes you automatically when finished \
+             (do not poll `roster` repeatedly between steps).\n",
         );
     }
     if has_any_tool(tool_names, &["talk", "roster", "session_write", "digest"]) {
         let mut parts = Vec::new();
         if has_tool(tool_names, "roster") {
             parts.push(
-                "`roster` (`wait_seconds` blocks until child state changes; never poll with sleep)",
+                "`roster` (`wait_seconds` + `wait_all: true` blocks quietly until an entire wave settles; never poll with sleep)",
             );
         }
         if has_tool(tool_names, "talk") {
@@ -263,12 +268,12 @@ fn append_harness_mechanics(prompt: &mut String, tool_names: &[String]) {
     }
     if has_tool(tool_names, "subagent") {
         notes.push(
-            "- `subagent` consequences: runs in the background by default unless `background: false`. Only pass `model` when intentionally choosing a catalog-verified model; omit it to follow configured defaults/parent model. When you have multiple keys on a provider (check `key_health`), pass `key` (credential id, label, or `\"env\"`) to pin a child to a specific key; omit `key` to inherit the parent session key.",
+            "- `subagent` consequences: runs in the background by default unless `background: false`. Only pass `model` when intentionally choosing a catalog-verified model (from `key_health(include_models=true)`); omit it to follow configured defaults/parent model. Omitting `key` (or passing `key: \"auto\"`) automatically load-balances across healthy non-cooling provider keys on the same model without switching models; pass an explicit `key` only to pin a specific credential. When a coordinator (`role: \"coordinator\"`) spawns workers with a parent session, workers default to attaching beside the coordinator on the parent session (`spawn.attach: \"parent\"`) while completions, `roster`, and `talk` route exclusively back to the coordinator.",
         );
     }
     if has_tool(tool_names, "roster") {
         notes.push(
-            "- `roster(wait_seconds=...)`: waits only for active (`status == \"busy\"`) children or newly arrived unread inbox items, and returns terminal states (`completed`, `failed`, `interrupted`), `idleReason`, `lastError`, `counts`, `wakeReason`, and `callerInbox` without reading transcripts (use `digest` to read a child's output/transcript). If `wakeReason == \"inbox\"` or `callerInbox` lists pending queue items while children remain busy, finish your step instead of spinning on `roster` so queued messages can deliver.",
+            "- `roster(wait_seconds=..., wait_all=...)`: waits only for active (`status == \"busy\"`) children or newly arrived unread inbox items (`wait_all: true` suppresses staggered per-child wakes until the entire watched wave settles), returning terminal states, `idleReason`, `lastError`, `counts`, `wakeReason`, and `callerInbox`. When children run with `background: true` and you have nothing else to do in parallel, finish your step rather than calling `roster` repeatedly so background delivery wakes you in one hop.",
         );
     }
     if has_tool(tool_names, "talk") || has_tool(tool_names, "session_write") {

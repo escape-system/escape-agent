@@ -373,7 +373,9 @@ public surface; `cargo doc -p <crate> --no-deps` is the reference.
   siblings 20 messages/min, 20 writes/min), `Policy::{spawn,can_message,
   can_write,resolve_model}`, `TreeLookup`/`SessionTree`, `SpawnBudget`,
   `SiblingBudget`, `WriteBudget::try_write(now_ms) -> Result<(), BudgetError>`
-  (60 s fixed window per sender, in memory), typed errors.
+  (60 s fixed window per sender, in memory), affine `CostBudget` (non-`Clone`,
+  non-`Copy`, micro-cents `1 uc = $0.00001`: `reserve`, `settle`, `split`,
+  `reclaim`), typed errors.
   `Limits::unrestricted()` sets every cap to `u32::MAX`; a configured
   `max_writes_per_min: 0` denies every write instead of meaning unlimited.
   The runtime reads `subagents.siblings.max_writes_per_min` (default 20) and
@@ -1031,9 +1033,9 @@ pub enum Effect { Allow, Deny, Ask }
 ```
 
 Must implement: file discovery order, JSONC parse, `{env:}`/`{file:}`, V1
-aliases, agent builtins (engineer/architect/review/general/explore/ui/docs plus the
-hidden compaction/title/summary; legacy ids build/plan/reviewer normalize to
-engineer/architect/review),
+aliases, agent builtins (engineer/architect/review/general/explore/ui/docs/organizer/builder
+plus the hidden compaction/title/summary; legacy ids build/plan/reviewer
+normalize to engineer/architect/review),
 last-match-wins glob permissions, agent permission composition. Tests for each.
 No network. `ConfigService::load` must not block on well-known/Console; those
 are out of scope in phase 1.
@@ -1215,10 +1217,15 @@ pub mod catalog::refresh {
 loop cannot disagree about which models exist. The cache path is
 `OPENCODE_MODELS_CACHE`, else `<data dir>/models-cache.json`.
 
-OpenAI-compatible chat, Anthropic messages and Gemini streams, SSE parser,
-retry/timeout policy. Tests use a local axum fake server; no real API keys, and
-the live fetch is never exercised — replacement, the plausibility gate and the
-cache are covered by fixtures.
+OpenAI-compatible chat, Anthropic messages and Gemini `:streamGenerateContent`
+plus Gemini Interactions (`/interactions`) streams, Google Cloud Vertex AI ADC
+(`${GOOGLE_VERTEX_*}` endpoint expansion + RS256 Service Account / `authorized_user`
+OAuth2 refresh), SSE parser, single-owner `RetryPolicy`, `governor` GCRA + Tier 1
+spend velocity rate limiter, Gemini `error.details` (`RetryInfo` / `QuotaFailure`)
++ `promptFeedback.blockReason` (`FailureKind::PolicyBlocked`) classification,
+tiered dynamic timeouts (`Timeouts::for_variant`), `zeroize`-protected secrets
+and `detect_auth()`, and `apply_builtin_providers` frontier Gemini/Vertex specs.
+Tests use local axum fake servers; no real API keys.
 
 
 

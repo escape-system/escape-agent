@@ -726,7 +726,7 @@ fn available_models_from_slice(source: &[ModelInfo]) -> Vec<String> {
     models
 }
 
-pub(super) fn model_defaults(config: &ConfigService, settings: &SubagentSettings) -> ModelDefaults {
+pub(crate) fn model_defaults(config: &ConfigService, settings: &SubagentSettings) -> ModelDefaults {
     let mut defaults = ModelDefaults::new();
     for agent in config.agents() {
         let Some(id) = agent.get("id").and_then(Value::as_str) else {
@@ -757,10 +757,19 @@ pub(super) fn requested_role(input: &Value, settings: &SubagentSettings, agent: 
                 .get(agent)
                 .and_then(|over| over.role.clone())
         })
-        .map_or(Role::Subagent, |role| match role.as_str() {
-            "coordinator" => Role::Coordinator,
-            _ => Role::Subagent,
-        })
+        .map_or_else(
+            || {
+                if agent == "organizer" {
+                    Role::Coordinator
+                } else {
+                    Role::Subagent
+                }
+            },
+            |role| match role.as_str() {
+                "coordinator" => Role::Coordinator,
+                _ => Role::Subagent,
+            },
+        )
 }
 
 pub(super) fn model_value(

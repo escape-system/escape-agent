@@ -60,15 +60,22 @@ DEFAULT — implements changes across crates, one owner per crate per wave),
 code edits), `review` (primary — read-only diff review plus running the build
 gates), `general` (subagent, the DEFAULT subagent, full tools), `explore`
 (subagent — read-only search/navigation), `ui` (subagent — owns `ui/**` and
-`web/**`), `docs` (subagent — owns `docs/**`, `README.md`, `AGENTS.md`), plus the
-hidden system agents `compaction`, `title`, `summary`.
+`web/**`), `docs` (subagent — owns `docs/**`, `README.md`, `AGENTS.md`),
+`organizer` (subagent — persistent on-demand `role: "coordinator"` resource manager that
+inspects `key_health(include_models=true)`, spawns worker subagents onto the parent/upper
+session with `coordinatorID` reporting so the whole team appears flat under root while
+only `organizer` reports back to root, assigns healthy keys and verified models, awaits
+batches cleanly via `roster(wait_all=true)`, and delegates builds/tests without holding
+direct `shell`/edit tools), `builder` (subagent — dedicated compile, lint, check, test,
+and benchmark runner serialized via workspace `lane`/shell, read-only on source files,
+never edits code), plus the hidden system agents `compaction`, `title`, `summary`.
 
 Legacy ids are aliases, normalized at config load and wherever a stored or
 requested agent id is resolved (session rows, spawn targets, observer):
 `build` → `engineer`, `plan` → `architect`, `reviewer` → `review`. `steward` is a
 project template, never a builtin.
 
-Model policy: `models.chain` / `models.chains.<agent>` and `models.fallback` are kept in configuration and `PUT /api/config/models` for compatibility with the Models control-plane UI, while **automatic model fallback is disabled**: turns and compaction execute only their resolved model (same-model multi-key rotation via `KeyPool` stays active), and subagent spawns never advance across `models.chain` or silently override an explicit `model:` argument. Chat-picker visibility is `!models.hidden[ref] && providerConnected`; the chain and `models.favorites` only reorder picker rows. `PUT /api/config/models` applies to the next spawn/turn without a restart; only an external edit of the config file needs one.
+Model policy: `models.chain` / `models.chains.<agent>` and `models.fallback` are kept in configuration and `PUT /api/config/models` for compatibility with the Models control-plane UI, while **automatic model fallback is disabled**: turns and compaction execute only their resolved model (same-model multi-key rotation via `KeyPool` stays active, including balanced healthy-key selection for subagents), and subagent spawns never advance across `models.chain` or silently override an explicit `model:` argument (`organizer` is a dedicated coordinator role whose configured model selection resolves `agent.organizer.model` -> `subagents.agents.organizer.model` -> `models.chains.organizer[0]` -> `subagents.default_model` -> parent model without fallback hops). Chat-picker visibility is `!models.hidden[ref] && providerConnected`; the chain and `models.favorites` only reorder picker rows. `PUT /api/config/models` applies to the next spawn/turn without a restart; only an external edit of the config file needs one.
 
 ## Build gates (run from `opencode-rust/`)
 

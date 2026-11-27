@@ -208,6 +208,68 @@ impl Default for Timeouts {
     }
 }
 
+impl Timeouts {
+    /// Select tiered header/stream timeouts based on reasoning variant/effort.
+    ///
+    /// Frontier deep reasoning tiers (`max`, `xhigh`) routinely exceed 300 s
+    /// TTFT (e.g. Opus `#max` ~338 s), so headers wait up to 600 s instead of
+    /// aborting prematurely while `low`/`minimal` stay tight at 120 s.
+    #[must_use]
+    pub fn for_variant(variant: Option<&str>, thinking_level: Option<&str>) -> Self {
+        let tier = variant
+            .or(thinking_level)
+            .map(str::trim)
+            .map(str::to_ascii_lowercase);
+        let header_secs = match tier.as_deref() {
+            Some("max" | "xhigh") => 600,
+            Some("high") => 420,
+            Some("low" | "minimal" | "none") => 120,
+            _ => 300,
+        };
+        Self {
+            header: Duration::from_secs(header_secs),
+            chunk: Duration::from_secs(900),
+            total: None,
+        }
+    }
+}
+
+/// Return true when `model` supports every input modality present in `messages`.
+///
+/// Prevents audio/video requests from falling back onto text+image-only models.
+#[must_use]
+pub fn model_supports_request_modalities(model: &ResolvedModel, messages: &[LlmMessage]) -> bool {
+    let inputs = &model.model.capabilities.input;
+    if inputs.is_empty() {
+        return true;
+    }
+    let has = |kind: &str| inputs.iter().any(|entry| entry.eq_ignore_ascii_case(kind));
+    for message in messages {
+        for part in &message.content {
+            let media_type = match part {
+                ContentPart::Image { media_type, .. }
+                | ContentPart::Document { media_type, .. } => media_type.as_str(),
+                ContentPart::Text { .. }
+                | ContentPart::ToolCall { .. }
+                | ContentPart::ToolResult { .. } => continue,
+            };
+            let needed = if media_type == "application/pdf" {
+                "pdf"
+            } else {
+                media_type.split('/').next().unwrap_or(media_type)
+            };
+            match needed {
+                "image" if !has("image") => return false,
+                "audio" if !has("audio") => return false,
+                "video" if !has("video") => return false,
+                "pdf" if !has("pdf") && !has("document") => return false,
+                _ => {}
+            }
+        }
+    }
+    true
+}
+
 /// Provider-independent request options.
 #[derive(Debug, Clone, Default)]
 pub struct LlmOptions {
@@ -224,6 +286,10 @@ pub struct LlmOptions {
     pub tool_choice: Option<String>,
     /// Optional session / cache affinity key used for sticky KV-cache routing.
     pub cache_key: Option<String>,
+    /// Explicit privacy/retention control (`store: false` sent on Interactions API).
+    pub store: Option<bool>,
+    /// Maximum allowed reasoning/thinking level (`low`, `medium`, `high`, `xhigh`).
+    pub thinking_cap: Option<String>,
     pub timeouts: Option<Timeouts>,
 }
 

@@ -65,15 +65,36 @@ impl Tool for TalkTool {
         let request_reply = optional_bool(&input, "request_reply").unwrap_or(false);
         let settings = settings_for_session(runtime, &caller).await;
         let from_node = load_node(runtime, &caller).await?;
-        let to = match optional_str(&input, "to")
+        let from_info = load_info(runtime, &caller).await?;
+        let team_coord = from_info
+            .metadata
+            .as_ref()
+            .and_then(|meta| meta.get("coordinatorID"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+        let explicit_to = optional_str(&input, "to")
             .or_else(|| optional_str(&input, "session_id"))
             .or_else(|| optional_str(&input, "sessionID"))
-            .or_else(|| optional_str(&input, "target"))
+            .or_else(|| optional_str(&input, "target"));
+        let to = match explicit_to
+            .or_else(|| team_coord.clone())
             .or_else(|| from_node.parent_id.clone())
         {
             Some(target) => target,
             None => required_str(&input, "to")?,
         };
+        if let Some(coord) = team_coord.as_deref()
+            && from_node.parent_id.as_deref() == Some(to.as_str())
+            && to != coord
+            && let Ok(Some(coord_row)) = runtime.inner.config.store.get_session(coord).await
+            && coord_row.pointer("/time/archived").is_none()
+        {
+            return Err(ToolError::new(format!(
+                "SiblingScopeError: workers managed by coordinator {coord} must report to {coord} via `talk` instead of messaging parent session {to} directly"
+            )));
+        }
         let to_node = load_node(runtime, &to).await?;
         let to_info = load_info(runtime, &to).await?;
         let tree = load_tree(runtime, &[caller.clone(), to.clone()]).await?;

@@ -99,6 +99,18 @@ pub(crate) enum Command {
     },
     /// Authenticate providers and manage the Google Antigravity multi-account pool.
     Auth(AuthArgs),
+    /// Expose deterministic Rust workspace tools over stdio MCP (`rmcp`) for human-driven IDE sessions.
+    Mcp {
+        /// Workspace root directory to serve (defaults to current working directory).
+        #[arg(short = 'C', long)]
+        directory: Option<PathBuf>,
+        /// Expose read-only workspace inspection tools only (`read`, `glob`, `grep`, `code_map`).
+        #[arg(long)]
+        read_only: bool,
+        /// Shell sandbox policy (`auto`, `bwrap`, `no-net`, `off`).
+        #[arg(long, default_value = "auto")]
+        sandbox: String,
+    },
 }
 
 #[derive(Debug, clap::Args)]
@@ -138,6 +150,9 @@ pub(crate) enum AuthCommand {
         /// Explicit API key when authenticating a non-OAuth provider.
         #[arg(long, hide_env_values = true)]
         api_key: Option<String>,
+        /// Explicitly opt into legacy consumer Antigravity OAuth (carries Article 6 `ToS` ban risk).
+        #[arg(long)]
+        allow_consumer_oauth: bool,
     },
     /// List stored credentials and Google Antigravity pool accounts.
     #[command(visible_alias = "ls")]
@@ -214,6 +229,12 @@ pub(crate) struct ChatOptions {
     pub(crate) session: Option<String>,
     pub(crate) db: Option<PathBuf>,
     pub(crate) ask_permissions: bool,
+}
+
+pub(crate) struct McpOptions {
+    pub(crate) directory: Option<PathBuf>,
+    pub(crate) read_only: bool,
+    pub(crate) sandbox: String,
 }
 
 #[cfg(test)]
@@ -306,6 +327,32 @@ mod tests {
                 AuthCommand::Use { account } => assert_eq!(account, "user@example.com"),
                 other => panic!("unexpected auth subcommand: {other:?}"),
             },
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mcp_subcommand_parses_read_only_and_sandbox_flags() {
+        let parsed = Cli::try_parse_from([
+            "opencode",
+            "mcp",
+            "-C",
+            "/tmp/ws",
+            "--read-only",
+            "--sandbox",
+            "no-net",
+        ])
+        .unwrap();
+        match parsed.command.unwrap() {
+            Command::Mcp {
+                directory,
+                read_only,
+                sandbox,
+            } => {
+                assert_eq!(directory, Some(PathBuf::from("/tmp/ws")));
+                assert!(read_only);
+                assert_eq!(sandbox, "no-net");
+            }
             other => panic!("unexpected command: {other:?}"),
         }
     }

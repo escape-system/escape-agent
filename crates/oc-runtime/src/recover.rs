@@ -6,6 +6,9 @@
 //! published, then sessions with deliverable inbox rows are woken with at most
 //! eight concurrent notifications.
 
+use std::cmp::Reverse;
+use std::collections::{HashMap, HashSet};
+
 use oc_types::message::ToolContent;
 use oc_types::payload::{CompactionTrigger, SessionCompactionFailed, SessionExecutionInterrupted};
 use oc_types::{InterruptReason, MessageId, StructuredError};
@@ -13,18 +16,14 @@ use serde_json::{Map, Value, json};
 
 use crate::runtime::{Runtime, RuntimeError};
 
-/// Event kinds that close a session's execution. A second one for the same
-/// session contradicts the first.
-const TERMINAL_EXECUTIONS: [&str; 3] = [
-    "session.execution.succeeded",
-    "session.execution.failed",
-    "session.execution.interrupted",
-];
-
 impl Runtime {
     #[allow(clippy::too_many_lines)] // boot repair: rows + terminals + settle + wake
     pub(crate) async fn recover(&self) -> Result<(), RuntimeError> {
-        let sessions = self.list_all_sessions().await?;
+        let mut sessions = self.list_all_sessions().await?;
+        // Repair descendants before ancestors so a parent inspecting
+        // `recovered_child_outcome` sees its crashed child's settled outcome
+        // rather than `None`.
+        order_children_first(&mut sessions);
         let mut repaired = Vec::new();
         for session in &sessions {
             let Some(id) = session.get("id").and_then(Value::as_str) else {
@@ -36,6 +35,7 @@ impl Runtime {
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_owned();
+            let was_busy = is_session_busy(session);
             let mut changed = false;
             for message in self.list_all_messages(id).await? {
                 let repaired = match message.get("type").and_then(Value::as_str) {
@@ -94,21 +94,47 @@ impl Runtime {
                     }
                 }
             }
-            if changed {
-                // A terminal event may already be durable for this session: the
-                // crashed process published it before dying, or an earlier boot
-                // already recovered it. Publishing `interrupted` on top would
-                // give the session two contradicting terminals.
-                if !self.has_terminal_execution(id).await? {
-                    self.emit(
-                        id,
-                        &directory,
-                        SessionExecutionInterrupted {
-                            session_id: Self::session_id(id),
-                            reason: InterruptReason::Shutdown,
-                        },
-                    )
-                    .await?;
+            if changed || was_busy {
+                // Commit the durable idle transition before publishing
+                // `session.execution.interrupted` so `session_v2`, `roster`,
+                // and parent `recovered_child_outcome` never observe a dead
+                // session as still `busy`.
+                match self.execution_window(id).await? {
+                    ExecutionWindow::NeedsTerminal => {
+                        self.inner
+                            .config
+                            .store
+                            .mark_session_idle_with_reason(
+                                id,
+                                oc_types::now_millis(),
+                                "interrupted",
+                                Some("shutdown"),
+                            )
+                            .await?;
+                        self.emit(
+                            id,
+                            &directory,
+                            SessionExecutionInterrupted {
+                                session_id: Self::session_id(id),
+                                reason: InterruptReason::Shutdown,
+                            },
+                        )
+                        .await?;
+                    }
+                    ExecutionWindow::Settled(outcome) if was_busy => {
+                        let reason = (outcome == "interrupted").then_some("shutdown");
+                        self.inner
+                            .config
+                            .store
+                            .mark_session_idle_with_reason(
+                                id,
+                                oc_types::now_millis(),
+                                outcome,
+                                reason,
+                            )
+                            .await?;
+                    }
+                    ExecutionWindow::Settled(_) => {}
                 }
                 repaired.push(id.to_owned());
             }
@@ -171,7 +197,15 @@ impl Runtime {
         let Some(node) = self.inner.config.store.session_node(child).await? else {
             return Ok(());
         };
-        let Some(parent) = node.parent_id.clone() else {
+        let child_info = self.inner.config.store.get_session(child).await?;
+        let coordinator = child_info
+            .as_ref()
+            .and_then(|session| session.pointer("/metadata/coordinatorID"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+        let Some(parent) = coordinator.or_else(|| node.parent_id.clone()) else {
             return Ok(());
         };
         let parent_messages = self.list_all_messages(&parent).await?;
@@ -202,17 +236,10 @@ impl Runtime {
                 {
                     continue;
                 }
-                let input = part.pointer("/state/input");
-                let target = input
-                    .and_then(|value| value.get("sessionID"))
-                    .and_then(Value::as_str)
-                    .or_else(|| {
-                        part.pointer("/state/metadata/sessionID")
-                            .and_then(Value::as_str)
-                    });
-                if target != Some(child) {
+                if !is_detached_running_subagent(part, child) {
                     continue;
                 }
+                let input = part.pointer("/state/input");
                 offered = true;
                 if let Some(value) = input
                     .and_then(|value| value.get("agent"))
@@ -294,11 +321,95 @@ fn body(mut message: Value) -> Value {
     message
 }
 
+enum ExecutionWindow {
+    NeedsTerminal,
+    Settled(&'static str),
+}
+
+fn is_session_busy(session: &Value) -> bool {
+    let Some(busy) = session.pointer("/time/busy").and_then(Value::as_i64) else {
+        return false;
+    };
+    session
+        .pointer("/time/idle")
+        .and_then(Value::as_i64)
+        .is_none_or(|idle| busy > idle)
+}
+
+fn order_children_first(sessions: &mut [Value]) {
+    let parents: HashMap<String, Option<String>> = sessions
+        .iter()
+        .filter_map(|session| {
+            let id = session.get("id").and_then(Value::as_str)?.to_owned();
+            let parent = session
+                .get("parentID")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            Some((id, parent))
+        })
+        .collect();
+    let depth_of = |id: &str| -> usize {
+        let mut depth = 0_usize;
+        let mut cursor = id;
+        let mut seen = HashSet::new();
+        while let Some(Some(parent)) = parents.get(cursor) {
+            if !seen.insert(cursor) {
+                break;
+            }
+            depth += 1;
+            cursor = parent.as_str();
+        }
+        depth
+    };
+    sessions.sort_by_key(|session| {
+        let depth = session
+            .get("id")
+            .and_then(Value::as_str)
+            .map_or(0, depth_of);
+        Reverse(depth)
+    });
+}
+
+fn is_detached_running_subagent(part: &Value, child: &str) -> bool {
+    if part.pointer("/state/status").and_then(Value::as_str) != Some("completed") {
+        return false;
+    }
+    let input = part.pointer("/state/input");
+    let direct_target = input
+        .and_then(|value| value.get("sessionID"))
+        .and_then(Value::as_str)
+        .or_else(|| {
+            part.pointer("/state/metadata/sessionID")
+                .and_then(Value::as_str)
+        });
+    if direct_target == Some(child) {
+        return part
+            .pointer("/state/metadata/status")
+            .and_then(Value::as_str)
+            == Some("running")
+            || input
+                .and_then(|value| value.get("background"))
+                .and_then(Value::as_bool)
+                == Some(true);
+    }
+    part.pointer("/state/metadata/sessions")
+        .and_then(Value::as_array)
+        .is_some_and(|entries| {
+            entries.iter().any(|entry| {
+                entry.get("sessionID").and_then(Value::as_str) == Some(child)
+                    && entry.get("status").and_then(Value::as_str) == Some("running")
+            })
+        })
+}
+
 impl Runtime {
-    /// `true` when the session's event log already holds a durable terminal
-    /// execution event.
-    async fn has_terminal_execution(&self, session: &str) -> Result<bool, RuntimeError> {
+    /// Inspects the session's durable event log to determine whether the latest
+    /// execution already closed with a terminal event or still needs
+    /// `session.execution.interrupted`.
+    async fn execution_window(&self, session: &str) -> Result<ExecutionWindow, RuntimeError> {
         let mut after = 0;
+        let mut last_terminal: Option<&'static str> = None;
+        let mut open_after_terminal = false;
         loop {
             let events = self
                 .inner
@@ -307,13 +418,30 @@ impl Runtime {
                 .events_after(session, after, 1_000)
                 .await?;
             let Some(last) = events.last() else {
-                return Ok(false);
+                return Ok(match (last_terminal, open_after_terminal) {
+                    (Some(outcome), false) => ExecutionWindow::Settled(outcome),
+                    _ => ExecutionWindow::NeedsTerminal,
+                });
             };
-            if events
-                .iter()
-                .any(|event| TERMINAL_EXECUTIONS.contains(&event.kind.as_str()))
-            {
-                return Ok(true);
+            for event in &events {
+                match event.kind.as_str() {
+                    "session.execution.started" => {
+                        open_after_terminal = true;
+                    }
+                    "session.execution.succeeded" => {
+                        last_terminal = Some("succeeded");
+                        open_after_terminal = false;
+                    }
+                    "session.execution.failed" => {
+                        last_terminal = Some("failed");
+                        open_after_terminal = false;
+                    }
+                    "session.execution.interrupted" => {
+                        last_terminal = Some("interrupted");
+                        open_after_terminal = false;
+                    }
+                    _ => {}
+                }
             }
             after = last.seq;
         }

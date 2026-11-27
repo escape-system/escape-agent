@@ -60,13 +60,9 @@ impl Runtime {
         match self.inner.config.store.credential_pool(provider).await {
             Ok(rows) => {
                 for row in rows {
-                    let Some(key) = credential_value_key(&row.value) else {
-                        continue;
-                    };
-                    keys.push(oc_llm::PoolKey {
-                        credential_id: Some(row.id),
-                        key,
-                    });
+                    if let Some(entry) = pool_key_from_row(provider, row) {
+                        keys.push(entry);
+                    }
                 }
             }
             Err(error) => {
@@ -79,12 +75,9 @@ impl Runtime {
         // appended when it carries material no stored row already provides, so
         // a rotation never retries the same secret under a second identity.
         if let Some(key) = self.env_credential_key(provider)
-            && !keys.iter().any(|entry| entry.key == key)
+            && !keys.iter().any(|entry| entry.secret() == key)
         {
-            keys.push(oc_llm::PoolKey {
-                credential_id: None,
-                key,
-            });
+            keys.push(oc_llm::PoolKey::new(None, key));
         }
 
         let ordered = self.key_pool().select(provider, keys, now_ms);
@@ -125,10 +118,119 @@ impl Runtime {
             .iter()
             .find_map(|name| std::env::var(name).ok().filter(|value| !value.is_empty()))
     }
+}
 
+fn normalize_key_token(value: &str) -> String {
+    value
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
+}
+
+fn match_credential_key(
+    provider: &str,
+    raw: &str,
+    rows: &[oc_store::CredentialRow],
+    has_env: bool,
+) -> Result<Option<String>, String> {
+    if raw.eq_ignore_ascii_case("env") {
+        return if has_env {
+            Ok(Some("env".to_owned()))
+        } else {
+            Err(format!(
+                "InvalidKeyError: provider `{provider}` has no environment key set"
+            ))
+        };
+    }
+    if let Some(exact) = rows.iter().find(|r| r.id == raw) {
+        return Ok(Some(exact.id.clone()));
+    }
+    let exact_labels: Vec<&oc_store::CredentialRow> = rows
+        .iter()
+        .filter(|r| {
+            let trimmed = r.label.trim();
+            !trimmed.is_empty() && trimmed.eq_ignore_ascii_case(raw)
+        })
+        .collect();
+    if exact_labels.len() == 1 {
+        return Ok(Some(exact_labels[0].id.clone()));
+    }
+    if exact_labels.len() > 1 {
+        let ids: Vec<&str> = exact_labels.iter().map(|r| r.id.as_str()).collect();
+        return Err(format!(
+            "AmbiguousKeyError: multiple credentials for `{provider}` match label `{raw}` ({}); pass the credentialID instead",
+            ids.join(", ")
+        ));
+    }
+    let raw_norm = normalize_key_token(raw);
+    if !raw_norm.is_empty() {
+        let norm_labels: Vec<&oc_store::CredentialRow> = rows
+            .iter()
+            .filter(|r| {
+                let label_norm = normalize_key_token(&r.label);
+                !label_norm.is_empty() && label_norm == raw_norm
+            })
+            .collect();
+        if norm_labels.len() == 1 {
+            return Ok(Some(norm_labels[0].id.clone()));
+        }
+        if norm_labels.len() > 1 {
+            let ids: Vec<&str> = norm_labels.iter().map(|r| r.id.as_str()).collect();
+            return Err(format!(
+                "AmbiguousKeyError: multiple credentials for `{provider}` match label `{raw}` ({}); pass the credentialID instead",
+                ids.join(", ")
+            ));
+        }
+    }
+    let is_default_alias = matches!(
+        raw_norm.as_str(),
+        "default" | "primary" | "active" | "inherit" | "parent" | "none" | "null"
+    ) || (!raw_norm.is_empty() && raw_norm == normalize_key_token(provider));
+    if is_default_alias && (!rows.is_empty() || has_env) {
+        return Ok(None);
+    }
+    let mut available: Vec<String> = rows
+        .iter()
+        .map(|r| {
+            let trimmed = r.label.trim();
+            if trimmed.is_empty() {
+                r.id.clone()
+            } else {
+                format!("{} ({trimmed})", r.id)
+            }
+        })
+        .collect();
+    if has_env {
+        available.push("env".to_owned());
+    }
+    Err(format!(
+        "InvalidKeyError: unknown key `{raw}` for provider `{provider}`; available: [{}]",
+        available.join(", ")
+    ))
+}
+
+fn balanced_healthy_key(
+    key_pool: &oc_llm::KeyPool,
+    provider: &str,
+    rows: &[oc_store::CredentialRow],
+    has_env: bool,
+    now_ms: i64,
+) -> Option<String> {
+    let mut candidates: Vec<Option<String>> = rows.iter().map(|r| Some(r.id.clone())).collect();
+    if has_env {
+        candidates.push(None);
+    }
+    key_pool
+        .pick_balanced_credential(provider, &candidates, now_ms)
+        .map(|picked| picked.unwrap_or_else(|| "env".to_owned()))
+}
+
+impl Runtime {
     /// Resolve a child spawn's credential selection from an explicit `key`
-    /// argument (credential id, label, or `"env"`) or by inheriting the
-    /// parent's `credential_id` on `ModelSource::Parent` when providers match.
+    /// argument (credential id, label, normalized label, `"auto"`/`"rotate"`,
+    /// provider alias, or `"env"`), or automatically balance healthy non-cooling
+    /// keys across parallel spawns when no sticky healthy parent key applies.
     pub(crate) async fn resolve_spawn_credential(
         &self,
         provider: &str,
@@ -136,61 +238,30 @@ impl Runtime {
         parent_model: Option<&ModelRef>,
         inherit_parent: bool,
     ) -> Result<Option<String>, String> {
+        let now_ms = oc_types::now_millis();
+        let pool_rows = self
+            .inner
+            .config
+            .store
+            .credential_pool(provider)
+            .await
+            .unwrap_or_default();
+        let has_env = self.env_credential_key(provider).is_some();
+
         if let Some(raw) = requested_key.map(str::trim).filter(|s| !s.is_empty()) {
-            let rows = self
-                .inner
-                .config
-                .store
-                .credential_pool(provider)
-                .await
-                .unwrap_or_default();
-            let has_env = self.env_credential_key(provider).is_some();
-            if raw.eq_ignore_ascii_case("env") {
-                if has_env {
-                    return Ok(Some("env".to_owned()));
-                }
-                return Err(format!(
-                    "InvalidKeyError: provider `{provider}` has no environment key set"
+            let norm = normalize_key_token(raw);
+            if matches!(norm.as_str(), "auto" | "rotate" | "pool" | "balanced") {
+                return Ok(balanced_healthy_key(
+                    self.key_pool(),
+                    provider,
+                    &pool_rows,
+                    has_env,
+                    now_ms,
                 ));
             }
-            if let Some(exact) = rows.iter().find(|r| r.id == raw) {
-                return Ok(Some(exact.id.clone()));
+            if let Some(matched) = match_credential_key(provider, raw, &pool_rows, has_env)? {
+                return Ok(Some(matched));
             }
-            let mut label_matches: Vec<&oc_store::CredentialRow> = rows
-                .iter()
-                .filter(|r| {
-                    let trimmed = r.label.trim();
-                    !trimmed.is_empty() && trimmed.eq_ignore_ascii_case(raw)
-                })
-                .collect();
-            if label_matches.len() == 1 {
-                return Ok(Some(label_matches.remove(0).id.clone()));
-            }
-            if label_matches.len() > 1 {
-                let ids: Vec<&str> = label_matches.iter().map(|r| r.id.as_str()).collect();
-                return Err(format!(
-                    "AmbiguousKeyError: multiple credentials for `{provider}` match label `{raw}` ({}); pass the credentialID instead",
-                    ids.join(", ")
-                ));
-            }
-            let mut available: Vec<String> = rows
-                .iter()
-                .map(|r| {
-                    let trimmed = r.label.trim();
-                    if trimmed.is_empty() {
-                        r.id.clone()
-                    } else {
-                        format!("{} ({trimmed})", r.id)
-                    }
-                })
-                .collect();
-            if has_env {
-                available.push("env".to_owned());
-            }
-            return Err(format!(
-                "InvalidKeyError: unknown key `{raw}` for provider `{provider}`; available: [{}]",
-                available.join(", ")
-            ));
         }
 
         if inherit_parent
@@ -198,7 +269,27 @@ impl Runtime {
             && pm.provider_id == provider
             && let Some(cid) = pm.credential_id.as_deref().filter(|s| !s.is_empty())
         {
+            let pool_id = (cid != "env").then_some(cid);
+            if !self.key_pool().is_cooling(provider, pool_id, now_ms) {
+                return Ok(Some(cid.to_owned()));
+            }
+            if let Some(alt) =
+                balanced_healthy_key(self.key_pool(), provider, &pool_rows, has_env, now_ms)
+            {
+                return Ok(Some(alt));
+            }
             return Ok(Some(cid.to_owned()));
+        }
+
+        let total_candidates = pool_rows.len() + usize::from(has_env);
+        if total_candidates > 1 {
+            return Ok(balanced_healthy_key(
+                self.key_pool(),
+                provider,
+                &pool_rows,
+                has_env,
+                now_ms,
+            ));
         }
         Ok(None)
     }
@@ -379,7 +470,7 @@ impl Runtime {
         let goal = goal_value.as_ref().map(crate::goal_store::snapshot);
         let stored = self.list_all_messages(session).await?;
         let skill_ids = loaded_skill_ids(&stored);
-        let context = self.load_context(session).await?;
+        let context = prompt::messages_from_store(&stored);
         let query = prompt::last_user_text(&context);
         let mut box_rows = self
             .inner
@@ -499,6 +590,9 @@ impl Runtime {
         );
         if let Some(mode_block) = subagent_mode_instructions(subagent_mode.as_deref(), depth) {
             turn.system.push(mode_block);
+        }
+        if let Some(coord_block) = team_role_instructions(node.as_ref(), info) {
+            turn.system.push(coord_block);
         }
         // `<key-health>` is appended only while a key is cooling down, so a
         // healthy pool leaves the cached prefix untouched
@@ -728,18 +822,18 @@ fn subagent_mode_instructions(mode: Option<&str>, depth: u32) -> Option<String> 
             "[Subagent Mode: /complex — 3-Level Multi-Agent Orchestrator]\n\
              - Hierarchy depth limit: max_depth = 3 (Root = depth 0; Level 1 = depth 1; Level 2 = depth 2; Level 3 = depth 3).\n\
              - You are the Root Primary Orchestrator (depth = 0). Do NOT call direct file or shell tools (`read`, `write`, `edit`, `patch`, `glob`, `grep`, `shell`) yourself.\n\
-             - Delegate all file exploration, code modifications, and shell/test execution by spawning `subagent` workers or `role: \"coordinator\"` (\"abi/kardeş\" older-brother/sibling coordinator) subagents.\n\
-             - Level 1 and Level 2 subagents (especially with `role: \"coordinator\"`) can spawn their own child subagents up to depth 3 and coordinate with siblings via `talk`, `session_write`, `roster`, and `digest`.\n\
-             - Waiting & synchronization: When you need results from one or several subagents before taking the next step, pass `background: false` (up to 8 `subagent` calls in a single step run concurrently in parallel and return their final `<subagent>` results directly). If children are running with `background: true`, call `roster` with `wait_seconds` (e.g. `{\"wait_seconds\": 120}`) to wait until a child settles or a message arrives. NEVER spawn `explore` subagents with `sleep` commands or poll `roster`/`digest` in a tight loop.\n\
-             - Strict file ownership: Assign disjoint file paths to concurrent subagents. Never spawn a second writer for a file while an earlier writer is still `busy`; check `roster` first or steer the active owner via `session_write`/`talk`.\n\
+             - Preferred pattern for multi-step or multi-worker requests: delegate cleanly to persistent coordinator `agent: \"organizer\"` (defaults to `role: \"coordinator\"`; reuse its `sessionID` across waves if one already exists in your `roster`). State what you want achieved cleanly without calling `key_health` yourself; `organizer` inspects `key_health(include_models=true)`, selects selectable models & healthy keys, attaches worker subagents (`general`, `explore`, `ui`, `docs`, `builder`) onto your session tree so the whole team stays visible while managing retries/`roster`, and wakes you once with ONE consolidated synthesis.\n\
+             - Once `organizer` (or background workers) is running, FINISH YOUR STEP cleanly so completion wakes you automatically — do NOT sit in repeated `roster` polling loops from root.\n\
+             - For small single-focus tasks you may spawn a worker directly (`background: false` or up to 16 parallel calls in one step, using `builder` for build/test gates).\n\
+             - Strict file ownership: Assign disjoint file paths to concurrent subagents. Never spawn a second writer for a file while an earlier writer is still `busy`.\n\
              - Context boxes (`box_write`) are for concise shared architecture specs, API contracts, and status notes — do NOT write full source code files into context boxes only to spawn subagents to copy them to disk."
                 .to_owned(),
         ),
         Some("complex") => Some(format!(
             "[Subagent Mode: /complex — 3-Level Hierarchy (current depth = {depth}/3)]\n\
              - This session tree runs in `/complex` mode (`max_depth = 3`).\n\
-             - {}Use `talk`, `roster`, `session_write`, and `digest` to coordinate with siblings and child subagents.\n\
-             - Respect strict file ownership: only modify files assigned to your task, and use `roster(wait_seconds=...)` rather than `sleep` commands when waiting on running children.",
+             - {}Use `talk`, `roster(wait_seconds=..., wait_all=true)`, `session_write`, and `digest` quietly without polling loops.\n\
+             - Respect strict file ownership: only modify files assigned to your task, and never spawn `sleep` polling subagents.",
             if depth < 3 {
                 format!(
                     "You may spawn child subagents (up to depth 3; next child depth = {}) to parallelize subtasks. ",
@@ -751,11 +845,42 @@ fn subagent_mode_instructions(mode: Option<&str>, depth: u32) -> Option<String> 
         )),
         Some("basic") => Some(
             "[Subagent Mode: /basic — Single-Level Hierarchy]\n\
-             - Hierarchy depth limit: max_depth = 1 (only root depth 0 may spawn depth-1 subagents; depth-1 subagents cannot spawn further children)."
+             - Hierarchy depth limit: max_depth = 1 (only root depth 0, or a depth-1 coordinator attaching siblings to root, may spawn depth-1 workers; workers cannot spawn depth-2 children)."
                 .to_owned(),
         ),
         _ => None,
     }
+}
+
+fn team_role_instructions(
+    node: Option<&oc_store::SessionNodeRow>,
+    info: &SessionInfo,
+) -> Option<String> {
+    if let Some(coord) = info
+        .metadata
+        .as_ref()
+        .and_then(|meta| meta.get("coordinatorID"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return Some(format!(
+            "[Team Coordinator: {coord}]\n\
+             - You were dispatched by team coordinator `{coord}` on the parent session's tree.\n\
+             - Route all progress updates, blocker questions, and escalations via `talk(to=\"{coord}\", ...)` and do NOT message the root session directly unless `{coord}` is unavailable."
+        ));
+    }
+    let node = node?;
+    if node.role == "coordinator"
+        && let Some(parent_id) = node.parent_id.as_deref()
+    {
+        return Some(format!(
+            "[Coordinator Placement]\n\
+             - Your parent session is `{parent_id}`. Worker subagents you spawn (`general`, `explore`, `ui`, `docs`, `builder`) automatically attach onto `{parent_id}` alongside you (`coordinatorID: \"{}\"`) while completion notifications, `roster` barriers, `digest`, and `talk` updates route back to you until you send one consolidated synthesis to `{parent_id}`.",
+            node.id
+        ));
+    }
+    None
 }
 
 fn session_rules(info: &SessionInfo) -> Vec<PermissionRule> {
@@ -772,6 +897,18 @@ fn session_rules(info: &SessionInfo) -> Vec<PermissionRule> {
             PermissionRule::new(rule.action, rule.resource, effect)
         })
         .collect()
+}
+
+fn pool_key_from_row(provider: &str, row: oc_store::CredentialRow) -> Option<oc_llm::PoolKey> {
+    if provider.eq_ignore_ascii_case("google")
+        && row.value.get("type").and_then(Value::as_str) == Some("oauth")
+    {
+        // Consumer Antigravity OAuth tokens must never be sent
+        // as `x-goog-api-key` to direct Gemini Developer API.
+        return None;
+    }
+    let key = credential_value_key(&row.value)?;
+    Some(oc_llm::PoolKey::new(Some(row.id), key))
 }
 
 fn loaded_skill_ids(messages: &[Value]) -> Vec<String> {
@@ -793,4 +930,33 @@ fn loaded_skill_ids(messages: &[Value]) -> Vec<String> {
         }
     }
     ids
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pool_key_from_row;
+    use serde_json::json;
+
+    #[test]
+    fn google_credential_pool_skips_consumer_oauth_rows_and_keeps_api_keys() {
+        let oauth_row = oc_store::CredentialRow {
+            id: "cred_oauth".to_owned(),
+            integration_id: "google".to_owned(),
+            label: "default".to_owned(),
+            value: json!({"type": "oauth", "access": "ya29.consumer-token"}),
+            active: true,
+        };
+        assert!(pool_key_from_row("google", oauth_row).is_none());
+
+        let api_row = oc_store::CredentialRow {
+            id: "cred_api".to_owned(),
+            integration_id: "google".to_owned(),
+            label: "paid".to_owned(),
+            value: json!({"type": "api", "key": "AIzaPaidApiKey123"}),
+            active: true,
+        };
+        let accepted = pool_key_from_row("google", api_row).expect("paid key accepted");
+        assert_eq!(accepted.credential_id.as_deref(), Some("cred_api"));
+        assert_eq!(accepted.secret(), "AIzaPaidApiKey123");
+    }
 }

@@ -1594,6 +1594,152 @@ test("subagent session.created leaves message.sync ready and requests at least 1
   }
 })
 
+test("message.sync preserves in-flight SSE step updates, editAssistant heals missing targets, and server.connected hydrates running children", async () => {
+  const fetchGate = Promise.withResolvers<void>()
+  const fetchStarted = Promise.withResolvers<void>()
+  let childMessages = [
+    { id: "msg_user_1", type: "user", text: "Go", time: { created: 1 } },
+  ] as unknown[]
+  let serverActive: Record<string, { type: string }> = { ses_child_live: { type: "running" } }
+  let familyChildren: SessionInfo[] = [{ ...session(0), id: "ses_child_live", parentID: "ses_parent_live" }]
+  const requests: string[] = []
+  const listeners = new Set<Parameters<CreateDataInput["event"]["listen"]>[0]>()
+  const api = OpenCode.make({
+    baseUrl: "http://opencode.local",
+    fetch: async (input, init) => {
+      const url = new URL((input instanceof Request ? input : new Request(input, init)).url)
+      requests.push(`${url.pathname}?${url.searchParams}`)
+      if (url.pathname === "/api/session/active") return Response.json({ data: serverActive })
+      if (url.pathname === "/api/session/ses_parent_live") {
+        return Response.json({ data: { ...session(0), id: "ses_parent_live" } })
+      }
+      if (url.pathname === "/api/session/ses_child_live") {
+        return Response.json({ data: { ...session(0), id: "ses_child_live", parentID: "ses_parent_live" } })
+      }
+      if (url.pathname === "/api/session" && url.searchParams.get("parentID") === "ses_parent_live") {
+        return Response.json({ data: familyChildren, cursor: {} })
+      }
+      if (url.pathname === "/api/session/ses_child_live/message") {
+        if (requests.filter((r) => r.startsWith("/api/session/ses_child_live/message")).length === 1) {
+          fetchStarted.resolve()
+          await fetchGate.promise
+        }
+        return Response.json({ data: [...childMessages].reverse(), cursor: {} })
+      }
+      return Response.json({ location: { directory: "/project" }, data: [] })
+    },
+  })
+  const setup = createRoot((dispose) => ({
+    data: createData({
+      api: () => api,
+      directory: "/project",
+      event: {
+        on: () => () => {},
+        listen(handler) {
+          listeners.add(handler)
+          return () => listeners.delete(handler)
+        },
+      },
+    }),
+    emit: (details: OpenCodeEvent) => listeners.forEach((listener) => listener({ name: details.type, details })),
+    dispose,
+  }))
+
+  try {
+    await setup.data.session.sync("ses_parent_live", { children: true })
+    setup.data.session.setStatus("ses_child_live", "running")
+
+    // 1. Start message.sync while SSE concurrently starts an assistant step and streams text.
+    const initialSync = setup.data.session.message.sync("ses_child_live")
+    await fetchStarted.promise
+    setup.emit({
+      id: "evt_step_start",
+      created: 2,
+      type: "session.step.started",
+      durable: { aggregateID: "ses_child_live", seq: 1, version: 1 },
+      data: {
+        sessionID: "ses_child_live",
+        assistantMessageID: "msg_asst_1",
+        agent: "explore",
+        model: { providerID: "p", modelID: "m" },
+        started: 2,
+      },
+    } as unknown as OpenCodeEvent)
+    setup.emit({
+      id: "evt_text_start",
+      created: 3,
+      type: "session.text.started",
+      data: { sessionID: "ses_child_live", assistantMessageID: "msg_asst_1" },
+    } as unknown as OpenCodeEvent)
+    setup.emit({
+      id: "evt_text_delta_1",
+      created: 4,
+      type: "session.text.delta",
+      data: { sessionID: "ses_child_live", assistantMessageID: "msg_asst_1", delta: "hello " },
+    } as unknown as OpenCodeEvent)
+    fetchGate.resolve()
+    await initialSync
+
+    // Live assistant step survived stale snapshot reconcile and accepts further deltas.
+    setup.emit({
+      id: "evt_text_delta_2",
+      created: 5,
+      type: "session.text.delta",
+      data: { sessionID: "ses_child_live", assistantMessageID: "msg_asst_1", delta: "world" },
+    } as unknown as OpenCodeEvent)
+    expect(setup.data.session.message.list("ses_child_live")).toMatchObject([
+      { id: "msg_user_1" },
+      { id: "msg_asst_1", type: "assistant", content: [{ type: "text", text: "hello world" }] },
+    ])
+
+    // 2. When a delta arrives for an assistant row missing from the loaded transcript, self-heal via hydrate.
+    childMessages = [
+      { id: "msg_user_1", type: "user", text: "Go", time: { created: 1 } },
+      {
+        id: "msg_asst_2",
+        type: "assistant",
+        agent: "explore",
+        model: { providerID: "p", modelID: "m" },
+        content: [{ type: "text", text: "recovered" }],
+        time: { created: 10 },
+      },
+    ]
+    setup.emit({
+      id: "evt_missed_step_delta",
+      created: 11,
+      type: "session.text.delta",
+      data: { sessionID: "ses_child_live", assistantMessageID: "msg_asst_2", delta: "!" },
+    } as unknown as OpenCodeEvent)
+    await wait(() => setup.data.session.message.list("ses_child_live").some((m) => m.id === "msg_asst_2"))
+
+    // 3. On SSE reconnect (`server.connected`), still-running children AND new spawned siblings re-sync.
+    childMessages = [
+      { id: "msg_user_1", type: "user", text: "Go", time: { created: 1 } },
+      {
+        id: "msg_asst_2",
+        type: "assistant",
+        agent: "explore",
+        model: { providerID: "p", modelID: "m" },
+        content: [{ type: "text", text: "recovered updated" }],
+        time: { created: 10, completed: 12 },
+      },
+    ]
+    familyChildren = [
+      { ...session(0), id: "ses_child_live", parentID: "ses_parent_live" },
+      { ...session(0), id: "ses_child_missed", parentID: "ses_parent_live" },
+    ]
+    setup.emit({ type: "server.connected", data: {} })
+    await wait(() =>
+      setup.data.session.family("ses_parent_live").includes("ses_child_missed") &&
+      setup.data.session.message
+        .list("ses_child_live")
+        .some((m) => m.id === "msg_asst_2" && m.type === "assistant" && m.content[0]?.type === "text" && m.content[0].text === "recovered updated"),
+    )
+  } finally {
+    setup.dispose()
+  }
+})
+
 function modelInfo(name: string): ModelInfo {
   return {
     id: "chat",

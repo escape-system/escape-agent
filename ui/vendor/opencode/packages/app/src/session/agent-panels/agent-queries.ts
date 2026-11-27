@@ -101,15 +101,32 @@ export function useSubagentTreeQuery(sessionID: () => string | undefined) {
         : undefined
   }
   const knownNodes = () => new Set((query.data?.available ? query.data.value.nodes : []).map((node) => node.id))
+  const belongsToCurrent = (candidate: string, current: string) => {
+    let cursor: string | undefined = candidate
+    const visited = new Set<string>()
+    while (cursor && !visited.has(cursor)) {
+      if (cursor === current || knownNodes().has(cursor)) return true
+      visited.add(cursor)
+      cursor = server.ctx.data.session.get(cursor)?.parentID
+    }
+    return false
+  }
   const related = (raw: { type?: string; data?: unknown }, current: string) => {
     const source = eventSession(raw)
     if (!source || source === current) return true
     if (knownNodes().has(source)) return true
     const family = server.ctx.data.session.family(current)
     if (family.includes(source)) return true
+    if (belongsToCurrent(source, current)) return true
     if (raw.data && typeof raw.data === "object") {
       const parentID = (raw.data as { parentID?: unknown }).parentID
-      if (typeof parentID === "string" && (parentID === current || knownNodes().has(parentID) || family.includes(parentID)))
+      if (
+        typeof parentID === "string" &&
+        (parentID === current ||
+          knownNodes().has(parentID) ||
+          family.includes(parentID) ||
+          belongsToCurrent(parentID, current))
+      )
         return true
     }
 
@@ -121,6 +138,10 @@ export function useSubagentTreeQuery(sessionID: () => string | undefined) {
     const current = sessionID()
 
     if (!current || !raw.type) return
+    if (raw.type === "server.connected") {
+      refetchDebounce.schedule()
+      return
+    }
     if (!related(raw, current)) return
     if (
       raw.type === "session.created" ||

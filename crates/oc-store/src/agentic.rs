@@ -169,6 +169,36 @@ impl Store {
         .await
     }
 
+    /// Loads `root_id` and its descendants in a single query, capped at `limit`.
+    pub async fn session_tree(
+        &self,
+        root_id: &str,
+        limit: usize,
+    ) -> Result<Vec<SessionNodeRow>, StoreError> {
+        let root_id = root_id.to_owned();
+        let cap = i64::try_from(limit.max(1)).unwrap_or(i64::MAX);
+        self.read(move |connection| {
+            let sql = format!(
+                "WITH RECURSIVE tree(id) AS (
+                     SELECT id FROM session_v2 WHERE id = ?1
+                     UNION
+                     SELECT s.id FROM session_v2 s JOIN tree t ON s.parent_id = t.id
+                 )
+                 SELECT {NODE_COLUMNS} FROM session_v2
+                 WHERE id IN (SELECT id FROM tree LIMIT ?2)
+                 ORDER BY depth ASC, time_created ASC, id ASC"
+            );
+            let mut statement = connection.prepare(&sql)?;
+            let mut rows = statement.query(params![&root_id, cap])?;
+            let mut items = Vec::new();
+            while let Some(row) = rows.next()? {
+                items.push(node_row(row)?);
+            }
+            Ok(items)
+        })
+        .await
+    }
+
     /// Adjusts a session's `child_count`, clamped at zero, in one statement.
     pub async fn increment_child_count(&self, id: &str, delta: i32) -> Result<(), StoreError> {
         let id = id.to_owned();
@@ -396,6 +426,79 @@ impl Store {
                         started,
                         &parent_call,
                         i64::from(synthetic),
+                    ],
+                )?;
+                Ok(())
+            })
+        })
+        .await
+    }
+
+    /// Records an already-settled observation strip in one transaction.
+    pub async fn record_settled_observation(
+        &self,
+        new: NewObservation,
+        state: &str,
+        outcome: Option<&str>,
+        settled: i64,
+    ) -> Result<(), StoreError> {
+        if new.tool.trim().is_empty() {
+            return Err(StoreError::Invalid(
+                "observation tool must not be empty".to_owned(),
+            ));
+        }
+        if state.trim().is_empty() {
+            return Err(StoreError::Invalid(
+                "observation state must not be empty".to_owned(),
+            ));
+        }
+        let NewObservation {
+            id,
+            root_id,
+            session_id,
+            tool_call_id,
+            tool,
+            why,
+            expect_s,
+            intervene_s,
+            started,
+            parent_call,
+            synthetic,
+        } = new;
+        let state = state.to_owned();
+        let outcome = outcome.map(str::to_owned);
+        self.write(move |connection| {
+            in_tx(connection, |transaction| {
+                let duplicate: Option<i64> = transaction
+                    .query_row("SELECT 1 FROM observation WHERE id = ?1", [&id], |row| {
+                        row.get(0)
+                    })
+                    .optional()?;
+                if duplicate.is_some() {
+                    return Err(StoreError::Conflict(format!(
+                        "observation {id} already exists"
+                    )));
+                }
+                transaction.execute(
+                    "INSERT INTO observation
+                        (id, root_id, session_id, tool_call_id, tool, why, expect_s,
+                         intervene_s, started, settled, parent_call, synthetic, state, outcome)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                    params![
+                        &id,
+                        &root_id,
+                        &session_id,
+                        &tool_call_id,
+                        &tool,
+                        &why,
+                        i64::from(expect_s),
+                        i64::from(intervene_s),
+                        started,
+                        settled,
+                        &parent_call,
+                        i64::from(synthetic),
+                        &state,
+                        &outcome,
                     ],
                 )?;
                 Ok(())

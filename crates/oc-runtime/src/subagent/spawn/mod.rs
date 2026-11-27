@@ -3,7 +3,7 @@ use serde_json::{Value, json};
 
 use crate::runtime::Runtime;
 
-use super::settings::{SubagentSettings, available_agents, settings_for_session};
+use super::settings::{SubagentSettings, available_agents};
 use super::tree::{optional_bool, optional_str, required_str};
 use super::wait::{finish_foreground, spawn_watcher};
 
@@ -86,7 +86,7 @@ impl Tool for SubagentTool {
                 "description": { "type": "string", "description": "Short label shown in the session tree." },
                 "prompt": { "type": "string", "description": "Task text delivered to the child." },
                 "model": { "type": "string", "description": "Optional model override: provider/id or provider/id#variant. Omit to inherit the agent or parent model." },
-                "key": { "type": "string", "description": "Optional credential id, label, or \"env\" (for main agent routing to pin a specific provider key for this child). Omit to inherit parent key or provider default." },
+                "key": { "type": "string", "description": "Optional credential id, exact/normalized label, 'env', or 'auto' for balanced healthy-key rotation. Omit to automatically load-balance across multiple healthy keys or keep a healthy pinned parent key." },
                 "sessionID": { "type": "string", "description": "Continue an existing direct child or descendant. Omit when spawning a new child." },
                 "background": { "type": "boolean", "description": self.background_description() },
                 "role": { "type": "string", "enum": ["worker", "coordinator"], "description": "Child policy role." },
@@ -94,7 +94,8 @@ impl Tool for SubagentTool {
                     "type": "object",
                     "properties": {
                         "allow": { "type": "boolean", "description": "Allow the child to spawn its own children." },
-                        "max_depth": { "type": "integer", "minimum": 0, "description": "Absolute tree depth cap for this subtree (must be >= this child's depth, i.e. parent.depth + 1). Omit to use the configured default." }
+                        "max_depth": { "type": "integer", "minimum": 0, "description": "Absolute tree depth cap for this subtree (must be >= this child's depth, i.e. parent.depth + 1). Omit to use the configured default." },
+                        "attach": { "type": "string", "enum": ["parent", "child"], "description": "Optional placement: 'parent' attaches the spawned worker directly under this coordinator's parent session (routing completions/talk back to the coordinator); 'child' nests beneath the caller. Coordinators with a parent session default to 'parent'." }
                     },
                     "additionalProperties": false
                 },
@@ -104,19 +105,19 @@ impl Tool for SubagentTool {
                     "type": "integer",
                     "minimum": 2,
                     "maximum": 16,
-                    "description": "Automatically partition the task via `code_map` graph clustering into N disjoint slices (each receiving `<shared_core>` + its `<partition>`) and launch N parallel workers."
+                    "description": "Batch mode: automatically partition the task via `code_map` graph clustering into N disjoint slices and launch N parallel workers in one call. Do not pass `partition_index` unless launching a single slice instead."
                 },
                 "partition_index": {
                     "type": "integer",
                     "minimum": 0,
                     "maximum": 15,
-                    "description": "Manual 0-based partition slice index when spawning a single worker with `partition_count`."
+                    "description": "Single-worker manual slice: 0-based slice index (pair with `partition_count`; omit `partitions` for clarity)."
                 },
                 "partition_count": {
                     "type": "integer",
                     "minimum": 2,
                     "maximum": 16,
-                    "description": "Total manual partition count paired with `partition_index`."
+                    "description": "Single-worker manual slice: total slice count paired with `partition_index` (omit when using `partitions`)."
                 }
             },
             "required": ["description", "prompt"],
@@ -128,7 +129,8 @@ impl Tool for SubagentTool {
     async fn execute(&self, ctx: &ToolContext, input: Value) -> Result<ToolResult, ToolError> {
         let runtime = &self.runtime;
         let caller = ctx.session_id.clone();
-        let settings = settings_for_session(runtime, &caller).await;
+        let warm = runtime.load_warm_caller(&caller).await?;
+        let settings = warm.settings.clone();
         let agent =
             optional_str(&input, "agent").unwrap_or_else(|| settings.limits.default_agent.clone());
         let description = required_str(&input, "description")?;
@@ -165,21 +167,17 @@ impl Tool for SubagentTool {
             .await;
         }
 
-        if let Some(count) = partitions {
-            if !(2..=16).contains(&count) {
-                return Err(ToolError::new("partitions must be between 2 and 16"));
-            }
-            if partition_index.is_some() || partition_count.is_some() {
-                return Err(ToolError::new(
-                    "partitions cannot be combined with partition_index or partition_count",
-                ));
-            }
-        }
+        let plan = normalize_partition_args(partitions, partition_index, partition_count)?;
+        let (partitions, manual_slice) = match plan {
+            PartitionPlan::None => (None, None),
+            PartitionPlan::Auto(count) => (Some(count), None),
+            PartitionPlan::Manual { index, count } => (
+                None,
+                resolve_manual_partition(ctx, &prompt, Some(index), Some(count)).await?,
+            ),
+        };
 
-        let manual_slice =
-            resolve_manual_partition(ctx, &prompt, partition_index, partition_count).await?;
-
-        let ctx_spawn = prepare_spawn_context(runtime, &caller, &agent, &input, &settings).await?;
+        let ctx_spawn = prepare_spawn_context(runtime, &caller, &agent, &input, &warm).await?;
 
         if let Some(count) = partitions {
             return execute_partitioned(ctx, &ctx_spawn, &description, &prompt, count, background)
@@ -188,7 +186,7 @@ impl Tool for SubagentTool {
 
         reserve_spawn_slots(
             runtime,
-            &caller,
+            &ctx_spawn.parent_id,
             &ctx_spawn.limits,
             ctx_spawn.active_children,
             1,
@@ -207,11 +205,12 @@ impl Tool for SubagentTool {
             partition_meta.as_ref(),
         )
         .await?;
+        let report_target = ctx_spawn.reports_to().to_owned();
 
         if background {
             spawn_watcher(
                 runtime.clone(),
-                caller.clone(),
+                report_target,
                 child.session_id.clone(),
                 agent,
                 description,
@@ -230,7 +229,7 @@ impl Tool for SubagentTool {
         crate::turn::report_tool_progress(running_meta);
         let mut result = finish_foreground(
             runtime,
-            &caller,
+            &report_target,
             &child.session_id,
             &agent,
             &description,
@@ -342,6 +341,11 @@ impl QuotaSnapshot {
 struct SpawnContext {
     runtime: Runtime,
     caller: String,
+    /// Parent row id in `session_v2` (equals `caller` for nested children, or
+    /// the coordinator's parent session when attaching team workers flatly).
+    parent_id: String,
+    /// Owning coordinator id when `parent_id != caller` (`metadata.coordinatorID`).
+    coordinator_id: Option<String>,
     agent: String,
     settings: SubagentSettings,
     limits: oc_subagents::Limits,
@@ -362,6 +366,13 @@ struct SpawnContext {
     group: Option<String>,
 }
 
+impl SpawnContext {
+    /// Session that receives child completion/failure deliveries and watches.
+    pub(super) fn reports_to(&self) -> &str {
+        self.coordinator_id.as_deref().unwrap_or(&self.caller)
+    }
+}
+
 struct SpawnedPartitionChild {
     session_id: String,
     prompt_id: String,
@@ -374,4 +385,55 @@ struct PartitionMeta {
     index: usize,
     count: usize,
     files: Vec<String>,
+}
+
+enum PartitionPlan {
+    None,
+    Auto(usize),
+    Manual { index: usize, count: usize },
+}
+
+fn normalize_partition_args(
+    partitions: Option<usize>,
+    partition_index: Option<usize>,
+    partition_count: Option<usize>,
+) -> Result<PartitionPlan, ToolError> {
+    match (partitions, partition_index, partition_count) {
+        (Some(1), None, None | Some(1)) | (None, Some(0), Some(1)) | (None, None, None) => {
+            Ok(PartitionPlan::None)
+        }
+        (Some(p), Some(idx), count) => {
+            if let Some(c) = count
+                && c != p
+            {
+                return Err(ToolError::new(format!(
+                    "partitions ({p}) does not match partition_count ({c})"
+                )));
+            }
+            if !(2..=16).contains(&p) {
+                return Err(ToolError::new("partitions must be between 2 and 16"));
+            }
+            Ok(PartitionPlan::Manual {
+                index: idx,
+                count: p,
+            })
+        }
+        (Some(p), None, count) => {
+            if let Some(c) = count
+                && c != p
+            {
+                return Err(ToolError::new(format!(
+                    "partitions ({p}) does not match partition_count ({c})"
+                )));
+            }
+            if !(2..=16).contains(&p) {
+                return Err(ToolError::new("partitions must be between 2 and 16"));
+            }
+            Ok(PartitionPlan::Auto(p))
+        }
+        (None, Some(index), Some(count)) => Ok(PartitionPlan::Manual { index, count }),
+        (None, Some(_), None) | (None, None, Some(_)) => Err(ToolError::new(
+            "partition_index and partition_count must both be provided together",
+        )),
+    }
 }

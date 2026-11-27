@@ -97,8 +97,8 @@ fn chain_display(chain: &[ModelCandidate]) -> String {
         .join(", ")
 }
 
-/// Spawn/message rate-limit failure. Times are explicit milliseconds, so the
-/// policy stays pure and testable.
+/// Spawn/message rate-limit or affine cost-budget failure. Times and amounts
+/// are explicit values, so the policy stays pure and testable.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum BudgetError {
     #[error("session spawn limit reached (max {max})")]
@@ -108,4 +108,6 @@ pub enum BudgetError {
         max_per_minute: u32,
         retry_after_ms: i64,
     },
+    #[error("cost budget exceeded (needed {needed_uc} uc, remaining {remaining_uc} uc)")]
+    CostExceeded { needed_uc: u64, remaining_uc: u64 },
 }

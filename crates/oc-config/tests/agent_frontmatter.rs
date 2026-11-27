@@ -348,7 +348,7 @@ fn steward_is_not_a_builtin() {
     let service = fixture.load(&project);
     let agents = service.agents();
 
-    assert_eq!(agents.len(), 10, "the builtin set is the product agent set");
+    assert_eq!(agents.len(), 12, "the builtin set is the product agent set");
     assert_eq!(
         agents[0].get("id").and_then(Value::as_str),
         Some("engineer"),

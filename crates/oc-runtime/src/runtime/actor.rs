@@ -125,6 +125,15 @@ impl CancelToken {
         }
     }
 
+    pub(crate) fn child(&self) -> Self {
+        Self {
+            cancelled: AtomicBool::new(self.is_cancelled()),
+            reason: Mutex::new(self.reason()),
+            notify: Notify::new(),
+            token: self.token.child_token(),
+        }
+    }
+
     pub(crate) fn cancel(&self, reason: InterruptReason) {
         *self.reason.lock().expect("cancel lock") = reason;
         self.cancelled.store(true, Ordering::SeqCst);
@@ -192,6 +201,7 @@ impl Runtime {
             handle.running.store(false, Ordering::SeqCst);
             handle.idle.notify_waiters();
             self.inner.idle.notify_waiters();
+            self.inner.roster_wake.notify_waiters();
             if let Err(error) = result {
                 tracing::error!(session = %session, error = %error, "session actor stopped");
                 // The turn may have died before `settle` ran. Repair the rows

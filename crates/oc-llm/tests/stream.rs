@@ -649,3 +649,269 @@ async fn non_retryable_failure_is_returned_immediately() {
     assert!(!error.is_retryable(), "{error}");
     assert!(elapsed < Duration::from_secs(1), "{elapsed:?}");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn gemini_prompt_feedback_block_emits_policy_blocked_provider_error() {
+    let app = Router::new().route(
+        "/models/{*rest}",
+        post(|| async {
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "text/event-stream")
+                .body(Body::from(
+                    "data: {\"promptFeedback\":{\"blockReason\":\"PROHIBITED_CONTENT\",\"blockReasonMessage\":\"blocked\"}}\n\n",
+                ))
+                .unwrap()
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let client = LlmClient::new().unwrap().with_retry_policy(no_retry());
+    let mut stream = client
+        .stream(request("test/gemini-pro", format!("http://{addr}")))
+        .await
+        .expect("stream opens");
+    let mut events = Vec::new();
+    while let Some(ev) = stream.next().await {
+        events.push(ev);
+    }
+    server.abort();
+    assert!(events.iter().any(|ev| matches!(
+        ev,
+        LlmEvent::ProviderError { message }
+            if message.contains("policy_blocked")
+                && oc_llm::classify_provider_message(message) == oc_llm::FailureKind::PolicyBlocked
+    )));
+    assert!(
+        !events
+            .iter()
+            .any(|ev| matches!(ev, LlmEvent::Finish { .. }))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn gemini_retry_info_and_terminal_quota_failure_work_over_http() {
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let attempts_retry = Arc::clone(&attempts);
+    let app = Router::new()
+        .route(
+            "/terminal/models/{*rest}",
+            post(move || {
+                let counter = Arc::clone(&attempts_retry);
+                async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    (
+                        StatusCode::TOO_MANY_REQUESTS,
+                        json!({
+                            "error": {
+                                "code": 429,
+                                "details": [{
+                                    "@type": "type.googleapis.com/google.rpc.QuotaFailure",
+                                    "violations": [{ "quotaValue": "0", "description": "enforced_spend_limit_reached" }]
+                                }]
+                            }
+                        })
+                        .to_string(),
+                    )
+                }
+            }),
+        )
+        .route(
+            "/hint/models/{*rest}",
+            post(|| async {
+                (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    json!({
+                        "error": {
+                            "code": 429,
+                            "details": [{
+                                "@type": "type.googleapis.com/google.rpc.RetryInfo",
+                                "retryDelay": "49s"
+                            }]
+                        }
+                    })
+                    .to_string(),
+                )
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let client = LlmClient::new()
+        .unwrap()
+        .with_retry_policy(RetryPolicy::fixed(
+            Duration::from_millis(1),
+            Duration::from_millis(2),
+            5,
+        ));
+    let err = stream_error(
+        &client,
+        request("test/gemini-pro", format!("http://{addr}/terminal")),
+    )
+    .await;
+    assert!(
+        !err.is_retryable(),
+        "terminal QuotaFailure must not retry: {err}"
+    );
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        1,
+        "must abort immediately after 1 attempt"
+    );
+
+    let no_retry_client = LlmClient::new().unwrap().with_retry_policy(no_retry());
+    let hint_err = stream_error(
+        &no_retry_client,
+        request("test/gemini-pro", format!("http://{addr}/hint")),
+    )
+    .await;
+    assert_eq!(hint_err.retry_after_ms(), Some(49_000));
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn gemini_interactions_uses_store_false_and_applies_variant_timeouts() {
+    let seen = Arc::new(Mutex::new(Vec::<(Value, String)>::new()));
+    let seen_cb = Arc::clone(&seen);
+    let app = Router::new().route(
+        "/interactions",
+        post({
+            let seen_cb = Arc::clone(&seen_cb);
+            move |headers: axum::http::HeaderMap, axum::Json(body): axum::Json<Value>| async move {
+                let key = headers
+                    .get("x-goog-api-key")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_owned();
+                seen_cb.lock().unwrap().push((body, key));
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "text/event-stream")
+                    .body(Body::from(
+                        "data: {\"event_type\":\"content.delta\",\"delta\":{\"type\":\"text\",\"text\":\"managed ok\"}}\n\n\
+                         data: {\"event_type\":\"interaction.completed\",\"finish_reason\":\"completed\"}\n\n",
+                    ))
+                    .unwrap()
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let mut catalog = Catalog::embedded().unwrap().clone();
+    oc_llm::catalog::refresh::apply_builtin_providers(&mut catalog);
+    let client = LlmClient::new().unwrap().with_retry_policy(no_retry());
+
+    let mut inter_model = catalog
+        .resolve("google/antigravity-preview-09-2026")
+        .unwrap();
+    inter_model.base_url = format!("http://{addr}");
+    let mut inter_req = LlmRequest::new(inter_model);
+    inter_req.messages = vec![oc_llm::LlmMessage::user("hi")];
+    inter_req.options.api_key = Some("AIza-test".to_owned());
+    let mut inter_stream = client.stream(inter_req).await.unwrap();
+    let mut collected = String::new();
+    while let Some(ev) = inter_stream.next().await {
+        if let LlmEvent::TextDelta { delta } = ev {
+            collected.push_str(&delta);
+        }
+    }
+    assert_eq!(collected, "managed ok");
+    assert_eq!(
+        Timeouts::for_variant(Some("max"), None).header,
+        Duration::from_secs(600)
+    );
+    assert_eq!(
+        Timeouts::for_variant(Some("high"), None).header,
+        Duration::from_secs(420)
+    );
+    assert_eq!(
+        Timeouts::for_variant(Some("low"), None).header,
+        Duration::from_secs(120)
+    );
+
+    server.abort();
+    let guard = seen.lock().unwrap();
+    assert_eq!(guard[0].0["store"], json!(false));
+    assert_eq!(guard[0].1, "AIza-test");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn vertex_anthropic_stream_raw_predict_and_modality_guard() {
+    let seen = Arc::new(Mutex::new(Vec::<(Value, String)>::new()));
+    let seen_cb = Arc::clone(&seen);
+    let app = Router::new().route(
+        "/publishers/anthropic/models/{path}",
+        post({
+            let seen_cb = Arc::clone(&seen_cb);
+            move |headers: axum::http::HeaderMap, axum::Json(body): axum::Json<Value>| async move {
+                let auth = headers
+                    .get("authorization")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_owned();
+                seen_cb.lock().unwrap().push((body, auth));
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "text/event-stream")
+                    .body(Body::from(
+                        "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10}}}\n\n\
+                         event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
+                         event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"vertex claude ok\"}}\n\n\
+                         event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":3}}\n\n",
+                    ))
+                    .unwrap()
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let mut catalog = Catalog::embedded().unwrap().clone();
+    oc_llm::catalog::refresh::apply_builtin_providers(&mut catalog);
+    let client = LlmClient::new().unwrap().with_retry_policy(no_retry());
+
+    let mut vertex_model = catalog
+        .resolve("google-vertex/claude-opus-5-5@default")
+        .unwrap();
+    vertex_model.base_url = format!("http://{addr}/publishers/anthropic/models");
+    let mut vertex_req = LlmRequest::new(vertex_model);
+    vertex_req.messages = vec![oc_llm::LlmMessage::user("hi")];
+    vertex_req.options.api_key = Some("ya29.test_adc_token".to_owned());
+    let mut v_stream = client.stream(vertex_req.clone()).await.unwrap();
+    let mut v_collected = String::new();
+    while let Some(ev) = v_stream.next().await {
+        if let LlmEvent::TextDelta { delta } = ev {
+            v_collected.push_str(&delta);
+        }
+    }
+    assert_eq!(v_collected, "vertex claude ok");
+
+    vertex_req.messages = vec![oc_llm::LlmMessage::new(
+        oc_llm::Role::User,
+        vec![ContentPart::document(
+            "audio/mp3",
+            "AAA",
+            Some("clip.mp3".to_owned()),
+        )],
+    )];
+    let modality_err = stream_error(&client, vertex_req).await;
+    assert!(
+        modality_err.to_string().contains("input modalities"),
+        "{modality_err}"
+    );
+
+    server.abort();
+    let guard = seen.lock().unwrap();
+    assert_eq!(guard[0].0["anthropic_version"], json!("vertex-2023-10-16"));
+    assert!(
+        guard[0].0.get("model").is_none(),
+        "Vertex Anthropic omits redundant model body key"
+    );
+    assert_eq!(guard[0].1, "Bearer ya29.test_adc_token");
+}

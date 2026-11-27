@@ -290,16 +290,12 @@ impl Runtime {
             parent_call: None,
             synthetic: true,
         };
-        if let Err(error) = store.record_observation(new).await {
-            tracing::warn!(root = %root, %error, "observer evaluation row write failed");
-            return;
-        }
         let state = if ok { "ok" } else { "error" };
         if let Err(error) = store
-            .settle_observation(&id, state, Some(reason), now)
+            .record_settled_observation(new, state, Some(reason), now)
             .await
         {
-            tracing::warn!(root = %root, %error, "observer evaluation row settle failed");
+            tracing::warn!(root = %root, %error, "observer evaluation row write failed");
         }
     }
 

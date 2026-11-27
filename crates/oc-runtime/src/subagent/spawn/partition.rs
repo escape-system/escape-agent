@@ -38,7 +38,7 @@ pub(super) async fn execute_partitioned(
 
     reserve_spawn_slots(
         &ctx_spawn.runtime,
-        &ctx_spawn.caller,
+        &ctx_spawn.parent_id,
         &ctx_spawn.limits,
         ctx_spawn.active_children,
         count_u32,
@@ -65,10 +65,11 @@ pub(super) async fn execute_partitioned(
 
     if background {
         let mut sessions_meta = Vec::with_capacity(children.len());
+        let report_target = ctx_spawn.reports_to().to_owned();
         for (child, slice_desc) in children {
             spawn_watcher(
                 ctx_spawn.runtime.clone(),
-                ctx_spawn.caller.clone(),
+                report_target.clone(),
                 child.session_id.clone(),
                 ctx_spawn.agent.clone(),
                 slice_desc,
@@ -128,14 +129,14 @@ async fn wait_partitioned_foreground(
     let mut join_set = tokio::task::JoinSet::new();
     for (child, slice_desc) in children {
         let runtime = ctx_spawn.runtime.clone();
-        let caller = ctx_spawn.caller.clone();
+        let report_target = ctx_spawn.reports_to().to_owned();
         let agent = ctx_spawn.agent.clone();
         let settings = ctx_spawn.settings.clone();
         let cancel_cloned = cancel.cloned();
         join_set.spawn(async move {
             let res = finish_foreground(
                 &runtime,
-                &caller,
+                &report_target,
                 &child.session_id,
                 &agent,
                 &slice_desc,

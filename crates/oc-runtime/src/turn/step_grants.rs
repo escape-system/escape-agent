@@ -52,9 +52,6 @@ const TERMINALS: [&str; 3] = [
 /// The grant event this module replays.
 const GRANT: &str = "session.execution.step_extended";
 
-/// Page size of the log scan; the store caps a page at 1000 events.
-const PAGE: usize = 1_000;
-
 /// Grants that still apply to the session's open execution window.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct ReplayedGrants {
@@ -80,35 +77,25 @@ pub(super) async fn replay(
 /// The `steps` values of the grants in the open window, oldest first.
 async fn recorded_steps(runtime: &Runtime, session: &str) -> Result<Vec<usize>, RuntimeError> {
     let store = &runtime.inner.config.store;
-    let mut recorded: Vec<usize> = Vec::new();
-    let mut after = 0_i64;
-    loop {
-        let events = store.events_after(session, after, PAGE).await?;
-        let Some(last) = events.last() else {
-            return Ok(recorded);
-        };
-        after = last.seq;
-        for event in &events {
-            if TERMINALS.contains(&event.kind.as_str()) {
-                // A terminal closes the window: the grants before it belong to a
-                // turn that already settled and must not be inherited.
-                recorded.clear();
-                continue;
-            }
-            if event.kind != GRANT {
-                continue;
-            }
-            let Some(steps) = grant_steps(&event.data) else {
-                tracing::warn!(
-                    session = %session,
-                    event = %event.id,
-                    "step grant carries no usable `steps` value; ignoring it"
-                );
-                continue;
-            };
-            recorded.push(steps);
+    let events = store
+        .events_in_open_window(session, &TERMINALS, GRANT)
+        .await?;
+    let mut recorded: Vec<usize> = Vec::with_capacity(events.len());
+    for event in &events {
+        if event.kind != GRANT {
+            continue;
         }
+        let Some(steps) = grant_steps(&event.data) else {
+            tracing::warn!(
+                session = %session,
+                event = %event.id,
+                "step grant carries no usable `steps` value; ignoring it"
+            );
+            continue;
+        };
+        recorded.push(steps);
     }
+    Ok(recorded)
 }
 
 /// The granted step count of one `session.execution.step_extended` payload.

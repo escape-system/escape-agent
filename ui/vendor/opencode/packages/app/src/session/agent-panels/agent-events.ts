@@ -174,6 +174,16 @@ export function createPeerFeed(sessionID: () => string | undefined): PeerFeed {
     const raw = event as unknown as RawEvent
     const id = sessionID()
     if (!id) return
+    if (raw.type === "server.connected") {
+      // Any queued placeholder captured before an SSE drop is authoritative on
+      // reconnect only if the server's hydrated inbox/transcript still has it.
+      setLive([])
+      const pending = server.ctx.data.session.pending as { hydrate?: (sessionID: string) => Promise<unknown> }
+      const messages = server.ctx.data.session.message as { hydrate?: (sessionID: string) => Promise<unknown> }
+      void pending.hydrate?.(id)?.catch(() => undefined)
+      void messages.hydrate?.(id)?.catch(() => undefined)
+      return
+    }
     if (
       (raw.type === "session.inbox.delivered" || raw.type === "session.inbox.cancelled") &&
       isConfigObject(raw.data) &&
@@ -219,11 +229,31 @@ export function createPeerFeed(sessionID: () => string | undefined): PeerFeed {
         if (!isConfigObject(item)) return ""
         const rawItem = item as Record<string, unknown>
         const content = Array.isArray(rawItem.content) ? rawItem.content : undefined
-        const tail = content?.at(-1)
-        const tailLen = isConfigObject(tail) && typeof tail.text === "string" ? tail.text.length : 0
-        const completed = isConfigObject(rawItem.time) ? (asCount(rawItem.time.completed) ?? -1) : -1
+        const contentSig = content
+          ? content
+              .map((part) => {
+                if (!isConfigObject(part)) return ""
+                const p = part as Record<string, unknown>
+                const pType = asText(p.type) ?? ""
+                const textLen = typeof p.text === "string" ? p.text.length : 0
+                const state = isConfigObject(p.state) ? (asText(p.state.status) ?? "") : ""
+                const outLen =
+                  isConfigObject(p.state) && typeof p.state.output === "string"
+                    ? p.state.output.length
+                    : isConfigObject(p.state) && Array.isArray(p.state.content)
+                      ? p.state.content.length
+                      : 0
+                return `${pType}:${textLen}:${state}:${outLen}`
+              })
+              .join(",")
+          : ""
+        const textLen = typeof rawItem.text === "string" ? rawItem.text.length : 0
+        const time = isConfigObject(rawItem.time) ? (rawItem.time as Record<string, unknown>) : undefined
+        const streamed = time ? (asCount(time.streamed) ?? -1) : -1
+        const completed = time ? (asCount(time.completed) ?? -1) : -1
+        const cancelled = isConfigObject(rawItem.metadata) && rawItem.metadata.cancelled === true ? 1 : 0
         const err = isConfigObject(rawItem.error) ? (asText(rawItem.error.message)?.length ?? 1) : 0
-        return `${asText(rawItem.id) ?? ""}:${createdOf(rawItem) ?? 0}:${content?.length ?? 0}:${tailLen}:${completed}:${err}`
+        return `${asText(rawItem.id) ?? ""}:${createdOf(rawItem) ?? 0}:${textLen}:${contentSig}:${streamed}:${completed}:${cancelled}:${err}`
       })
       .join("|")
 

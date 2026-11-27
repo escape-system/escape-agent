@@ -21,6 +21,15 @@ use super::types::{
     tokens_from_usage,
 };
 
+async fn recv_eager_progress(
+    eager: &mut Option<super::tools::EagerToolBatch>,
+) -> Option<(usize, String, serde_json::Map<String, serde_json::Value>)> {
+    match eager.as_mut() {
+        Some(batch) => batch.recv_progress().await,
+        None => std::future::pending().await,
+    }
+}
+
 /// Turn a raw provider message into a typed failure when the text names a known
 /// class.
 ///
@@ -50,6 +59,14 @@ pub(super) fn classified_provider_error(message: &str) -> oc_llm::LlmError {
 pub(super) fn classify_llm_error(error: oc_llm::LlmError) -> oc_llm::LlmError {
     match error {
         oc_llm::LlmError::Provider { message } => classified_provider_error(&message),
+        oc_llm::LlmError::PolicyBlocked { message } => oc_llm::LlmError::Failure {
+            kind: oc_llm::FailureKind::PolicyBlocked,
+            message,
+        },
+        oc_llm::LlmError::QuotaTerminal { message } => oc_llm::LlmError::Failure {
+            kind: oc_llm::FailureKind::Quota,
+            message,
+        },
         oc_llm::LlmError::Transport { message } => oc_llm::LlmError::Failure {
             kind: oc_llm::FailureKind::Transport,
             message,
@@ -248,6 +265,7 @@ impl Runtime {
             error,
             state,
             kind: _,
+            retry_after_ms: _,
             reusable: _,
         } = failure;
         let original = RuntimeError::Llm(error);
@@ -307,10 +325,13 @@ impl Runtime {
         session: &str,
         provider: &str,
         round: usize,
+        retry_after_ms: Option<u64>,
         error_text: &str,
         cancel: &Arc<CancelToken>,
     ) -> Result<(), RuntimeError> {
-        let wait_ms = TRANSPORT_RETRY_BASE_MS * u64::try_from(round + 1).unwrap_or(1);
+        let base_ms = TRANSPORT_RETRY_BASE_MS * u64::try_from(round + 1).unwrap_or(1);
+        let hinted_ms = retry_after_ms.map_or(0, |ms| ms.min(60_000));
+        let wait_ms = base_ms.max(hinted_ms);
         tracing::warn!(
             session = %session,
             provider = %provider,
@@ -328,6 +349,7 @@ impl Runtime {
     }
 
     fn build_step_request(
+        &self,
         turn: &ResolvedTurn,
         session: &str,
         model: &oc_llm::ResolvedModel,
@@ -335,6 +357,26 @@ impl Runtime {
         messages: &[LlmMessage],
         final_call: bool,
     ) -> LlmRequest {
+        let merged = self.inner.config.config.merged();
+        let thinking_cap = merged
+            .pointer(&format!("/agents/{}/thinking_cap", turn.agent_id))
+            .or_else(|| merged.pointer("/models/thinking_cap"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        let store = merged
+            .pointer(&format!("/providers/{}/store", model.provider.id))
+            .or_else(|| merged.pointer("/models/store"))
+            .and_then(serde_json::Value::as_bool);
+        let settings_thinking = model
+            .settings()
+            .get("thinkingConfig")
+            .and_then(|cfg| cfg.get("thinkingLevel"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        let timeouts = oc_llm::Timeouts::for_variant(
+            model_ref.variant.as_deref(),
+            settings_thinking.as_deref(),
+        );
         LlmRequest {
             model: model.clone(),
             system: turn.system.clone(),
@@ -348,6 +390,9 @@ impl Runtime {
                 headers: turn.agent_request.headers.clone(),
                 tool_choice: final_call.then(|| "none".to_owned()),
                 cache_key: Some(session.to_owned()),
+                store,
+                thinking_cap,
+                timeouts: Some(timeouts),
                 ..LlmOptions::default()
             },
         }
@@ -371,7 +416,7 @@ impl Runtime {
         // The request is built once, here, so the transport-hook probe below and
         // the dispatch in `stream_once` cannot disagree about it.
         let base_request =
-            Self::build_step_request(turn, session, model, model_ref, messages, final_call);
+            self.build_step_request(turn, session, model, model_ref, messages, final_call);
         let hook_owns_pool = self
             .inner
             .config
@@ -402,7 +447,7 @@ impl Runtime {
             let active_len = active_indices.len();
             for (pos, index) in active_indices.into_iter().enumerate() {
                 let candidate = &attempts[index];
-                let api_key = candidate.as_ref().map(|entry| entry.key.clone());
+                let api_key = candidate.as_ref().map(|entry| entry.secret().to_owned());
                 let credential_id = candidate
                     .as_ref()
                     .and_then(|entry| entry.credential_id.clone());
@@ -423,7 +468,13 @@ impl Runtime {
                     StepAttempt::Done(run) => return Ok(StepAttempt::Done(run)),
                     StepAttempt::Retry(failure) => failure,
                 };
-                let transport_retryable = is_transport_retryable(&failure.error);
+                let retry_after_ms = failure.retry_after_ms;
+                // Explicit `Retry-After` / `RetryInfo` server hints on 429 are bounded-retried
+                // here by the single retry owner after `sleep_transport_backoff`, whereas
+                // unhinted rate-limit failures rotate keys without blind loops.
+                let transport_retryable = is_transport_retryable(&failure.error)
+                    || (failure.kind == oc_llm::FailureKind::RateLimit
+                        && retry_after_ms.is_some_and(|ms| ms <= 60_000));
                 let error_text = failure.error.to_string();
                 if let Some(credential) = candidate.as_ref() {
                     let Some(kind) = key_failure_kind(&failure) else {
@@ -460,6 +511,7 @@ impl Runtime {
                         session,
                         &provider,
                         transport_round,
+                        retry_after_ms,
                         &error_text,
                         cancel,
                     )
@@ -645,6 +697,7 @@ impl Runtime {
         let mut stream = match stream_result {
             Ok(stream) => stream,
             Err(error) => {
+                let retry_after_ms = error.retry_after_ms();
                 // Classify all pre-stream provider/transport/timeout/HTTP errors
                 // uniformly so fallback/rotation recovers reliably.
                 let error = classify_llm_error(error);
@@ -658,6 +711,7 @@ impl Runtime {
                         error,
                         state,
                         kind,
+                        retry_after_ms,
                         reusable: true,
                     }));
                 }
@@ -669,13 +723,24 @@ impl Runtime {
         };
         let mut calls = Vec::new();
         let mut provider_error = None;
+        let mut eager: Option<super::tools::EagerToolBatch> = None;
+        let mut prewarm_started = false;
         loop {
             let event = tokio::select! {
                 biased;
                 () = cancel.cancelled() => {
+                    if let Some(mut batch) = eager.take() {
+                        batch.abort_only(cancel.reason()).await;
+                    }
+                    self.clear_subagent_prewarm(session);
                     self.schedule_finalizer(session.to_owned(), turn.directory.clone(), state)
                         .await;
                     return Err(RuntimeError::Cancelled);
+                }
+                Some((p_index, p_call_id, p_meta)) = recv_eager_progress(&mut eager) => {
+                    self.apply_tool_progress(session, turn, &mut state, p_index, p_call_id, p_meta)
+                        .await?;
+                    continue;
                 }
                 event = stream.next() => event,
             };
@@ -769,6 +834,10 @@ impl Runtime {
                 oc_llm::LlmEvent::ToolInputStart { id: call_id, name } => {
                     if final_call(base_request) {
                         continue;
+                    }
+                    if name == "subagent" && !prewarm_started {
+                        prewarm_started = true;
+                        self.prewarm_subagent_caller(session);
                     }
                     self.close_reasoning(session, turn, &mut state).await?;
                     self.mark_streamed(session, turn, &mut state).await?;
@@ -891,6 +960,26 @@ impl Runtime {
                         expectation,
                         invalid,
                     });
+                    if let Some(last_call) = calls.last()
+                        && last_call.name == "subagent"
+                        && last_call.invalid.is_none()
+                    {
+                        if !prewarm_started {
+                            prewarm_started = true;
+                            self.prewarm_subagent_caller(session);
+                        }
+                        if eager.is_none() {
+                            match super::tools::EagerToolBatch::new(self, session, cancel).await {
+                                Ok(batch) => eager = Some(batch),
+                                Err(error) => {
+                                    tracing::debug!(session = %session, %error, "eager subagent init skipped");
+                                }
+                            }
+                        }
+                        if let Some(batch) = &mut eager {
+                            batch.try_spawn_subagent(self, turn, &id, last_call);
+                        }
+                    }
                 }
                 oc_llm::LlmEvent::Finish { reason, usage } => {
                     state.finish = Some(finish_reason(&reason));
@@ -934,6 +1023,10 @@ impl Runtime {
         self.close_reasoning(session, turn, &mut state).await?;
         self.close_text(session, turn, &mut state).await?;
         if let Some(message) = provider_error {
+            if let Some(mut batch) = eager.take() {
+                batch.abort_only(oc_types::InterruptReason::Shutdown).await;
+            }
+            self.clear_subagent_prewarm(session);
             // A classifiable in-band provider/transport error advances the model
             // chain instead of killing the step. If zero output was streamed
             // yet, the assistant row stays reusable (`reusable == true`).
@@ -945,6 +1038,7 @@ impl Runtime {
                     error,
                     state,
                     kind,
+                    retry_after_ms: None,
                     reusable,
                 }));
             }
@@ -956,11 +1050,19 @@ impl Runtime {
             return Err(RuntimeError::Llm(classified_provider_error(&message)));
         }
         if cancel.is_cancelled() {
+            if let Some(mut batch) = eager.take() {
+                batch.abort_only(cancel.reason()).await;
+            }
+            self.clear_subagent_prewarm(session);
             self.schedule_finalizer(session.to_owned(), turn.directory.clone(), state)
                 .await;
             return Err(RuntimeError::Cancelled);
         }
         if state.finish.is_none() {
+            if let Some(mut batch) = eager.take() {
+                batch.abort_only(oc_types::InterruptReason::Shutdown).await;
+            }
+            self.clear_subagent_prewarm(session);
             let message = "stream closed before finish event";
             let error = classified_provider_error(message);
             if let oc_llm::LlmError::Failure { kind, .. } = &error {
@@ -970,6 +1072,7 @@ impl Runtime {
                     error,
                     state,
                     kind,
+                    retry_after_ms: None,
                     reusable,
                 }));
             }
@@ -980,12 +1083,22 @@ impl Runtime {
                 .await?;
             return Err(RuntimeError::Llm(error));
         }
+        if let Some(batch) = &mut eager {
+            for (p_index, p_call_id, p_meta) in batch.drain_progress() {
+                self.apply_tool_progress(session, turn, &mut state, p_index, p_call_id, p_meta)
+                    .await?;
+            }
+        }
+        if calls.is_empty() && prewarm_started {
+            self.clear_subagent_prewarm(session);
+        }
         self.persist_assistant(session, &state).await?;
         Ok(StepAttempt::Done(StepRun {
             tokens: state.tokens.clone().unwrap_or_default(),
             cost: state.cost.unwrap_or(0.0),
             state,
             calls,
+            eager,
         }))
     }
 
@@ -1083,6 +1196,49 @@ impl Runtime {
         step.state.tokens = Some(tokens.clone());
         let cost = step.state.cost.unwrap_or(step.cost);
         step.state.cost = Some(cost);
+
+        let duration_ms = step
+            .state
+            .completed
+            .unwrap_or_default()
+            .saturating_sub(step.state.created);
+        let prompt_total = tokens.input.saturating_add(tokens.cache.read);
+        let cache_hit_pct = if prompt_total > 0 {
+            (tokens.cache.read.saturating_mul(100)) / prompt_total
+        } else {
+            0
+        };
+        let finish_str = match step.state.finish {
+            Some(FinishReason::Stop) => "stop",
+            Some(FinishReason::Length) => "length",
+            Some(FinishReason::ToolCalls) => "tool-calls",
+            Some(FinishReason::ContentFilter) => "content-filter",
+            Some(FinishReason::Error) => "error",
+            Some(FinishReason::Unknown) | None => "unknown",
+        };
+        // Payload-free OTel GenAI Semantic Conventions telemetry (`gen_ai.*`).
+        tracing::info!(
+            "gen_ai.system" = %turn.model_ref.provider_id,
+            "gen_ai.operation.name" = "chat",
+            "gen_ai.request.model" = %turn.model_ref.id,
+            "gen_ai.response.finish_reasons" = %finish_str,
+            "gen_ai.usage.input_tokens" = tokens.input,
+            "gen_ai.usage.output_tokens" = tokens.output,
+            "gen_ai.usage.cache_read.input_tokens" = tokens.cache.read,
+            "gen_ai.usage.reasoning_tokens" = tokens.reasoning,
+            "gen_ai.client.operation.duration_ms" = duration_ms,
+            "gen_ai.usage.cost_usd" = cost,
+            cache_hit_pct,
+            session = %session,
+            "gen_ai.chat.completed"
+        );
+        let cred_slot = turn.model_ref.credential_id.as_deref().unwrap_or("default");
+        self.inner.config.client.0.rate_limiter().record_spend(
+            &turn.model_ref.provider_id,
+            cred_slot,
+            cost,
+        );
+
         self.persist_assistant(session, &step.state).await?;
         self.emit(
             session,

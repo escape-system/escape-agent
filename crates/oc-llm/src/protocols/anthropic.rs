@@ -7,6 +7,7 @@ use serde_json::{Map, Value, json};
 use super::{
     ToolAcc, WireRequest, apply_body_overlays, finish_event, normalize_finish, text_of, u64_at,
 };
+use crate::ResolvedModel;
 use crate::event::{ContentPart, LlmEvent, LlmMessage, LlmRequest, Role, Usage};
 use crate::sse::SseEvent;
 
@@ -95,13 +96,31 @@ pub(crate) fn request(request: &LlmRequest) -> WireRequest {
         object.insert("thinking".to_string(), anthropic_settings(thinking));
     }
     if let Some(effort) = settings.get("effort").and_then(Value::as_str) {
-        object.insert("output_config".to_string(), json!({"effort": effort}));
+        let clamped = request.options.thinking_cap.as_deref().map_or_else(
+            || effort.to_owned(),
+            |cap| super::clamp_thinking_level_str(effort, cap),
+        );
+        object.insert("output_config".to_string(), json!({"effort": clamped}));
     }
+    let path = apply_vertex_or_messages_route(model, &settings, &mut object);
     let mut body = Value::Object(object);
     apply_body_overlays(&mut body, model);
-    WireRequest {
-        path: "/messages".to_string(),
-        body,
+    WireRequest { path, body }
+}
+
+fn apply_vertex_or_messages_route(
+    model: &ResolvedModel,
+    settings: &Map<String, Value>,
+    object: &mut Map<String, Value>,
+) -> String {
+    let is_vertex_raw_predict = model.base_url.contains("/publishers/anthropic/models")
+        || settings.get("vertex").and_then(Value::as_bool) == Some(true);
+    if is_vertex_raw_predict {
+        object.remove("model");
+        object.insert("anthropic_version".to_string(), json!("vertex-2023-10-16"));
+        format!("/{}:streamRawPredict", model.model_id())
+    } else {
+        "/messages".to_string()
     }
 }
 

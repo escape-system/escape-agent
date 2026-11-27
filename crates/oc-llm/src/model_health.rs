@@ -122,6 +122,7 @@ fn ttl_ms(kind: FailureKind) -> Option<i64> {
         FailureKind::Transport => Some(30_000),
         FailureKind::Auth
         | FailureKind::InvalidRequest
+        | FailureKind::PolicyBlocked
         | FailureKind::EmptyResponse
         | FailureKind::Unknown => None,
     }

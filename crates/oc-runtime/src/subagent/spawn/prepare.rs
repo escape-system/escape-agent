@@ -10,8 +10,7 @@ use tokio_util::sync::CancellationToken;
 use crate::runtime::Runtime;
 
 use super::super::settings::{
-    SubagentSettings, available_agents, available_models, model_defaults, model_key, model_value,
-    requested_role,
+    available_agents, available_models, model_defaults, model_key, model_value, requested_role,
 };
 use super::super::tree::{
     budget_error, load_info, load_node, optional_str, runtime_error, spawn_error, store_error,
@@ -78,6 +77,114 @@ pub(super) async fn resolve_manual_partition(
     }
 }
 
+async fn compute_warm_caller(
+    runtime: &Runtime,
+    caller: &str,
+) -> Result<crate::subagent::state::WarmCallerData, ToolError> {
+    let parent = load_node(runtime, caller).await?;
+    let parent_info = load_info(runtime, caller).await?;
+    let settings = crate::subagent::settings::settings_for_session(runtime, caller).await;
+    let available = available_agents(&runtime.inner.config.config);
+    let primary_only = crate::subagent::settings::primary_only_agents(&runtime.inner.config.config);
+    let quota_usage = match &settings.models.quota {
+        Some(quota) => {
+            let window_ms = i64::from(quota.window_hours) * 3_600_000;
+            let usage = runtime
+                .inner
+                .config
+                .store
+                .model_usage(oc_types::now_millis().saturating_sub(window_ms))
+                .await
+                .map_err(|error| store_error(&error))?;
+            Some(usage)
+        }
+        None => None,
+    };
+    Ok(crate::subagent::state::WarmCallerData {
+        parent,
+        parent_info,
+        settings,
+        available_agents: available,
+        primary_only,
+        quota_usage,
+    })
+}
+
+impl Runtime {
+    /// Start pre-loading subagent caller metadata while tool-call JSON arguments stream.
+    pub(crate) fn prewarm_subagent_caller(&self, caller: &str) {
+        let now = oc_types::now_millis();
+        let cell = {
+            let mut state = self.inner.subagents.lock().expect("subagent state");
+            if let Some(existing) = state.warm_callers.get(caller)
+                && now.saturating_sub(existing.created_ms) < crate::subagent::state::PREWARM_TTL_MS
+            {
+                return;
+            }
+            let cell = std::sync::Arc::new(tokio::sync::OnceCell::new());
+            state.warm_callers.insert(
+                caller.to_owned(),
+                crate::subagent::state::WarmCallerSlot {
+                    created_ms: now,
+                    cell: std::sync::Arc::clone(&cell),
+                },
+            );
+            cell
+        };
+        let runtime = self.clone();
+        let caller = caller.to_owned();
+        tokio::spawn(async move {
+            let _ = cell
+                .get_or_try_init(|| async {
+                    compute_warm_caller(&runtime, &caller)
+                        .await
+                        .map(std::sync::Arc::new)
+                })
+                .await;
+        });
+    }
+
+    /// Clear any step-scoped subagent caller pre-warm state once tool dispatch finishes.
+    pub(crate) fn clear_subagent_prewarm(&self, caller: &str) {
+        self.inner
+            .subagents
+            .lock()
+            .expect("subagent state")
+            .warm_callers
+            .remove(caller);
+    }
+
+    pub(super) async fn load_warm_caller(
+        &self,
+        caller: &str,
+    ) -> Result<std::sync::Arc<crate::subagent::state::WarmCallerData>, ToolError> {
+        let now = oc_types::now_millis();
+        let slot = {
+            let state = self.inner.subagents.lock().expect("subagent state");
+            state
+                .warm_callers
+                .get(caller)
+                .filter(|entry| {
+                    now.saturating_sub(entry.created_ms) < crate::subagent::state::PREWARM_TTL_MS
+                })
+                .map(|entry| std::sync::Arc::clone(&entry.cell))
+        };
+        if let Some(cell) = slot {
+            return cell
+                .get_or_try_init(|| async {
+                    compute_warm_caller(self, caller)
+                        .await
+                        .map(std::sync::Arc::new)
+                })
+                .await
+                .map(std::sync::Arc::clone);
+        }
+        compute_warm_caller(self, caller)
+            .await
+            .map(std::sync::Arc::new)
+    }
+}
+
 // Long because the spawn decision has to report every refusal (limits, model,
 // quota) before any session row exists; splitting it would hide that ordering.
 #[allow(clippy::too_many_lines)]
@@ -86,32 +193,95 @@ pub(super) async fn prepare_spawn_context(
     caller: &str,
     agent: &str,
     input: &Value,
-    settings: &SubagentSettings,
+    warm: &crate::subagent::state::WarmCallerData,
 ) -> Result<SpawnContext, ToolError> {
-    let mut parent = load_node(runtime, caller).await?;
+    let settings = &warm.settings;
+    let caller_node = &warm.parent;
     let mut limits = settings.limits.clone();
-    if let Some(over) = settings.overrides.get(&parent.agent) {
-        if over.allow_spawn == Some(false) {
-            return Err(spawn_error(&SpawnError::SpawnNotAllowed {
-                id: caller.to_owned(),
-            }));
+    if !limits.enabled {
+        return Err(spawn_error(&SpawnError::Disabled));
+    }
+    if !caller_node.spawn_allowed {
+        return Err(spawn_error(&SpawnError::SpawnNotAllowed {
+            id: caller.to_owned(),
+        }));
+    }
+    if let Some(over) = settings.overrides.get(&caller_node.agent)
+        && over.allow_spawn == Some(false)
+    {
+        return Err(spawn_error(&SpawnError::SpawnNotAllowed {
+            id: caller.to_owned(),
+        }));
+    }
+
+    let attach_parent = match input.pointer("/spawn/attach") {
+        None | Some(Value::Null) => {
+            caller_node.role == oc_subagents::Role::Coordinator
+                && caller_node.parent_id.is_some()
+                && agent != "organizer"
         }
-        if let Some(max_children) = over.max_children {
-            limits.max_children = max_children;
+        Some(Value::String(val)) => match val.trim() {
+            "parent" => {
+                if caller_node.role != oc_subagents::Role::Coordinator {
+                    return Err(ToolError::new(
+                        "SpawnForbiddenError: only coordinator sessions may attach workers to their parent session",
+                    ));
+                }
+                if caller_node.parent_id.is_none() {
+                    return Err(ToolError::new(
+                        "SpawnForbiddenError: root session has no parent session to attach to",
+                    ));
+                }
+                true
+            }
+            "child" => false,
+            other => {
+                return Err(ToolError::new(format!(
+                    "InvalidToolInput: spawn.attach must be \"parent\" or \"child\", got {other:?}"
+                )));
+            }
+        },
+        Some(_) => {
+            return Err(ToolError::new(
+                "InvalidToolInput: spawn.attach must be a string (\"parent\" or \"child\")",
+            ));
         }
+    };
+
+    let (parent_id, coordinator_id, mut parent, parent_info) = if attach_parent {
+        let upper_id = caller_node
+            .parent_id
+            .clone()
+            .expect("coordinator parent_id checked above");
+        let upper_node = load_node(runtime, &upper_id).await?;
+        let upper_info = load_info(runtime, &upper_id).await?;
+        (upper_id, Some(caller.to_owned()), upper_node, upper_info)
+    } else {
+        (
+            caller.to_owned(),
+            None,
+            caller_node.clone(),
+            warm.parent_info.clone(),
+        )
+    };
+
+    if let Some(over) = settings.overrides.get(&parent.agent)
+        && let Some(max_children) = over.max_children
+    {
+        limits.max_children = max_children;
     }
     let active = runtime
         .inner
         .config
         .store
-        .active_child_count(caller)
+        .active_child_count(&parent_id)
         .await
         .unwrap_or(parent.child_count);
     if active < parent.child_count {
         parent.child_count = active;
     }
-    let available = available_agents(&runtime.inner.config.config);
-    let primary_only = crate::subagent::settings::primary_only_agents(&runtime.inner.config.config);
+    let available = &warm.available_agents;
+    let primary_only = &warm.primary_only;
     let policy = Policy::new(limits.clone());
     let requested_depth = input
         .get("spawn")
@@ -119,9 +289,12 @@ pub(super) async fn prepare_spawn_context(
         .and_then(Value::as_u64)
         .map(|depth| u32::try_from(depth).unwrap_or(u32::MAX));
     let mut plan = policy
-        .spawn_with_primary(&parent, agent, requested_depth, &available, &primary_only)
+        .spawn_with_primary(&parent, agent, requested_depth, available, primary_only)
         .map_err(|error| spawn_error(&error))?;
 
+    if !caller_node.spawn_allowed {
+        plan.spawn_allowed = false;
+    }
     if let Some(over) = settings.overrides.get(agent)
         && over.allow_spawn == Some(false)
     {
@@ -136,9 +309,10 @@ pub(super) async fn prepare_spawn_context(
         plan.spawn_allowed = false;
     }
 
-    let parent_model = parent
+    let parent_model = caller_node
         .model
         .clone()
+        .or_else(|| parent.model.clone())
         .or_else(|| runtime.inner.config.config.model())
         .unwrap_or_default();
     let defaults = model_defaults(&runtime.inner.config.config, settings);
@@ -171,6 +345,27 @@ pub(super) async fn prepare_spawn_context(
             }
             list.push((reference.to_owned(), source));
         };
+    let organizer_chain: Vec<String> = if call_model.is_none()
+        && agent == "organizer"
+        && !defaults.agent_models.contains_key("organizer")
+        && !defaults.policy_models.contains_key("organizer")
+    {
+        models
+            .chains
+            .get("organizer")
+            .and_then(|chain| {
+                chain
+                    .iter()
+                    .map(|s| s.trim())
+                    .find(|s| !s.is_empty())
+                    .map(str::to_owned)
+            })
+            .into_iter()
+            .collect()
+    } else {
+        Vec::new()
+    };
+
     if let Some(reference) = call_model.as_deref() {
         push_ordered(&mut ordered, reference, oc_subagents::ModelSource::Call);
     } else {
@@ -179,6 +374,9 @@ pub(super) async fn prepare_spawn_context(
         }
         if let Some(reference) = defaults.policy_models.get(agent) {
             push_ordered(&mut ordered, reference, oc_subagents::ModelSource::Agent);
+        }
+        for reference in &organizer_chain {
+            push_ordered(&mut ordered, reference, oc_subagents::ModelSource::Chain);
         }
         if let Some(reference) = defaults.default_model.as_deref() {
             push_ordered(&mut ordered, reference, oc_subagents::ModelSource::Default);
@@ -216,17 +414,7 @@ pub(super) async fn prepare_spawn_context(
 
     let mut denied: Vec<String> = Vec::new();
     let mut quota_denials: Vec<(String, String)> = Vec::new();
-    if let Some(quota) = &models.quota {
-        // The usage rollup comes from the store (one GROUP BY), never a session
-        // full scan.
-        let window_ms = i64::from(quota.window_hours) * 3_600_000;
-        let usage = runtime
-            .inner
-            .config
-            .store
-            .model_usage(oc_types::now_millis().saturating_sub(window_ms))
-            .await
-            .map_err(|error| store_error(&error))?;
+    if let (Some(quota), Some(usage)) = (&models.quota, warm.quota_usage.as_deref()) {
         let fraction = quota.usable_fraction();
         // `(100 - reserve_percent)` as an integer so request counts never go
         // through a lossy float.
@@ -269,7 +457,7 @@ pub(super) async fn prepare_spawn_context(
         }
     }
 
-    let filter = oc_subagents::model::CandidateFilter::new(&[], &denied);
+    let filter = oc_subagents::model::CandidateFilter::new(&organizer_chain, &denied);
     let choice = if let Some(reference) = call_model.as_deref() {
         oc_subagents::model::resolve_model_with(
             Some(reference),
@@ -323,7 +511,11 @@ pub(super) async fn prepare_spawn_context(
         }
         rejected_models.push(skip.clone());
     }
-    let parent_info = load_info(runtime, caller).await?;
+    let credential_parent_info = if caller_node.model.is_some() {
+        &warm.parent_info
+    } else {
+        &parent_info
+    };
     let mut model_value = model_value(
         &choice.reference,
         &runtime.inner.config.catalog.current(),
@@ -339,7 +531,7 @@ pub(super) async fn prepare_spawn_context(
         .resolve_spawn_credential(
             &chosen_provider,
             requested_key.as_deref(),
-            parent_info.model.as_ref(),
+            credential_parent_info.model.as_ref(),
             choice.source == oc_subagents::ModelSource::Parent,
         )
         .await
@@ -381,19 +573,10 @@ pub(super) async fn prepare_spawn_context(
         }
         None => Vec::new(),
     };
-    // Quota snapshot for the model that actually won. Computed whenever a quota
-    // policy exists (it now covers every candidate, chain or not), so the
-    // no-quota path still performs exactly the same store reads as before.
-    let quota_snapshot = match &settings.models.quota {
-        Some(quota) => {
-            let window_ms = i64::from(quota.window_hours) * 3_600_000;
-            let usage = runtime
-                .inner
-                .config
-                .store
-                .model_usage(oc_types::now_millis().saturating_sub(window_ms))
-                .await
-                .map_err(|error| store_error(&error))?;
+    // Quota snapshot for the model that actually won, reusing `warm.quota_usage`
+    // rather than scanning SQLite usage twice per spawn.
+    let quota_snapshot = match (&models.quota, warm.quota_usage.as_deref()) {
+        (Some(quota), Some(usage)) => {
             let key = crate::subagent::settings::model_key(&choice.reference);
             let provider_id = key
                 .split_once('/')
@@ -434,6 +617,8 @@ pub(super) async fn prepare_spawn_context(
     Ok(SpawnContext {
         runtime: runtime.clone(),
         caller: caller.to_owned(),
+        parent_id,
+        coordinator_id,
         agent: agent.to_owned(),
         settings: settings.clone(),
         limits,
@@ -502,6 +687,9 @@ pub(super) async fn create_and_notify_child(
     let runtime = &ctx_spawn.runtime;
     let child = SessionId::new().into_inner();
     let mut meta = serde_json::Map::new();
+    if let Some(coord) = &ctx_spawn.coordinator_id {
+        meta.insert("coordinatorID".to_owned(), Value::String(coord.clone()));
+    }
     if let Some(lane) = &ctx_spawn.lane {
         meta.insert("lane".to_owned(), Value::String(lane.clone()));
     }
@@ -527,7 +715,7 @@ pub(super) async fn create_and_notify_child(
         .create_session_with_tree(
             NewSession {
                 id: child.clone(),
-                parent_id: Some(ctx_spawn.caller.clone()),
+                parent_id: Some(ctx_spawn.parent_id.clone()),
                 project_id: ctx_spawn.parent_info.project_id.to_string(),
                 directory: ctx_spawn.parent_info.location.directory.clone(),
                 title: Some(description.to_owned()),
@@ -556,7 +744,7 @@ pub(super) async fn create_and_notify_child(
                 project_id: ctx_spawn.parent_info.project_id.clone(),
                 location: ctx_spawn.parent_info.location.clone(),
                 subpath: ctx_spawn.parent_info.subpath.clone(),
-                parent_id: Some(SessionId::from_wire(ctx_spawn.caller.clone())),
+                parent_id: Some(SessionId::from_wire(ctx_spawn.parent_id.clone())),
                 slug: format!("subagent-{}", &child[child.len().saturating_sub(6)..]),
                 title: Some(description.to_owned()),
                 agent: Some(ctx_spawn.agent.clone()),
@@ -569,7 +757,14 @@ pub(super) async fn create_and_notify_child(
         .await
         .map_err(|error| runtime_error(&error))?;
 
-    let prompt_id = enqueue_prompt(runtime, &child, prompt, &ctx_spawn.caller).await?;
+    let prompt_id = enqueue_prompt(
+        runtime,
+        &child,
+        prompt,
+        &ctx_spawn.parent_id,
+        ctx_spawn.coordinator_id.as_deref(),
+    )
+    .await?;
     runtime
         .notify(&child)
         .await

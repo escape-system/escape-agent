@@ -272,7 +272,7 @@ impl Runtime {
                 return None;
             }
             let mut request = base_request.clone();
-            request.options.api_key = candidate.as_ref().map(|entry| entry.key.clone());
+            request.options.api_key = candidate.as_ref().map(|entry| entry.secret().to_owned());
             let stream_res = tokio::select! {
                 biased;
                 () = cancel.cancelled() => return None,
